@@ -1,0 +1,66 @@
+{
+  "name": "@gamaze/hicortex",
+  "version": "0.4.3",
+  "description": "Human-like memory for self-improving AI agents. Automatic capturing, nightly reflection, and cross-agent learning. Works with Claude Code and OpenClaw.",
+  "main": "dist/index.js",
+  "bin": {
+    "hicortex": "dist/cli.js"
+  },
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  },
+  "keywords": [
+    "mcp-server",
+    "memory",
+    "ai-agents",
+    "agent-memory",
+    "self-improving",
+    "claude-code",
+    "openclaw",
+    "vector-search",
+    "nightly-distillation"
+  ],
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist/",
+    "skills/",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "homepage": "https://hicortex.gamaze.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gamaze-labs/hicortex.git",
+    "directory": "packages/openclaw-plugin"
+  },
+  "bugs": {
+    "url": "https://github.com/gamaze-labs/hicortex/issues"
+  },
+  "author": "Mattias Hansson",
+  "dependencies": {
+    "@huggingface/transformers": "^3.0.0",
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "better-sqlite3": "^11.0.0",
+    "express": "^4.21.0",
+    "sqlite-vec": "^0.1.7"
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "id": "hicortex",
+  "name": "Hicortex — Long-term Memory That Learns",
+  "description": "Your agents remember past decisions, avoid repeated mistakes, and get smarter every day. Nightly reflection generates actionable lessons that automatically update agent behavior.",
+  "version": "0.3.11",
+  "kind": "lifecycle",
+  "skills": ["./skills/hicortex-memory", "./skills/hicortex-learn", "./skills/hicortex-activate"],
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "licenseKey": {
+        "type": "string",
+        "description": "Hicortex license key (hctx-...). Leave empty for free tier (100 memory cap)."
+      },
+      "llmBaseUrl": {
+        "type": "string",
+        "description": "LLM API base URL. Auto-detected from OpenClaw config or env vars if omitted."
+      },
+      "llmApiKey": {
+        "type": "string",
+        "description": "LLM API key. Auto-detected from OpenClaw config or env vars if omitted."
+      },
+      "llmModel": {
+        "type": "string",
+        "default": "qwen3.5:4b",
+        "description": "Model for importance scoring and distillation (local recommended)"
+      },
+      "reflectModel": {
+        "type": "string",
+        "default": "qwen3.5:cloud",
+        "description": "Model for nightly reflection (cloud recommended)"
+      },
+      "consolidateHour": {
+        "type": "number",
+        "default": 2,
+        "description": "Hour (0-23, local time) to run nightly consolidation"
+      },
+      "dbPath": {
+        "type": "string",
+        "description": "Custom path for the SQLite database file"
+      }
+    },
+    "required": []
+  },
+  "uiHints": {
+    "licenseKey": {
+      "label": "License Key",
+      "placeholder": "hctx-... (optional, free tier without key)",
+      "sensitive": true
+    },
+    "llmBaseUrl": {
+      "label": "LLM API URL",
+      "placeholder": "Auto-detected if empty"
+    },
+    "llmApiKey": {
+      "label": "LLM API Key",
+      "sensitive": true,
+      "placeholder": "Auto-detected if empty"
+    },
+    "llmModel": {
+      "label": "Scoring Model"
+    },
+    "reflectModel": {
+      "label": "Reflection Model"
+    },
+    "consolidateHour": {
+      "label": "Consolidation Hour"
+    }
+  }
+}
