@@ -1,0 +1,511 @@
+/**
+ * Nightly pipeline — manual trigger or called by the persistent server.
+ *
+ * Steps:
+ *   1. Read new CC transcripts since last run
+ *   2. Distill each session into memories via LLM
+ *   3. Run consolidation (scoring, reflection, linking, decay)
+ *   4. Inject lessons into CLAUDE.md
+ *   5. Update last-run timestamp
+ */
+
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import type Database from "better-sqlite3";
+
+import { initDb, resolveDbPath } from "./db.js";
+import { resolveLlmConfigForCC, LlmClient, findClaudeBinary, claudeCliConfig, preferOllamaForBatch, type LlmConfig } from "./llm.js";
+import { embed } from "./embedder.js";
+import * as storage from "./storage.js";
+import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
+import { runConsolidation } from "./consolidate.js";
+import { readCcTranscripts } from "./transcript-reader.js";
+import { injectLessons } from "./claude-md.js";
+import { initFeatures, memoryCapReached, maxMemoriesAllowed } from "./features.js";
+
+const HICORTEX_HOME = join(homedir(), ".hicortex");
+const LAST_RUN_PATH = join(HICORTEX_HOME, "nightly-last-run.txt");
+
+function readNightlyConfig(stateDir: string): Record<string, unknown> | null {
+  try {
+    const configPath = join(stateDir, "config.json");
+    return JSON.parse(readFileSync(configPath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function readConfigLicenseKey(stateDir: string): string | undefined {
+  try {
+    const configPath = join(stateDir, "config.json");
+    const raw = readFileSync(configPath, "utf-8");
+    const config = JSON.parse(raw);
+    return config.licenseKey || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readLastRun(): Date {
+  try {
+    const ts = readFileSync(LAST_RUN_PATH, "utf-8").trim();
+    const d = new Date(ts);
+    if (!isNaN(d.getTime())) return d;
+  } catch {
+    // No file — first run
+  }
+  return new Date(0); // Process everything
+}
+
+function writeLastRun(): void {
+  mkdirSync(HICORTEX_HOME, { recursive: true });
+  writeFileSync(LAST_RUN_PATH, new Date().toISOString());
+}
+
+export async function runNightly(options: {
+  dryRun?: boolean;
+  dbPath?: string;
+  stateDir?: string;
+} = {}): Promise<void> {
+  const dryRun = options.dryRun ?? false;
+  const stateDir = options.stateDir ?? HICORTEX_HOME;
+
+  // Check mode: client or server
+  const savedConfig = readNightlyConfig(stateDir);
+  if (savedConfig?.mode === "client") {
+    await runClientNightly(savedConfig, dryRun);
+    return;
+  }
+
+  const dbPath = resolveDbPath(options.dbPath);
+  console.log(`[hicortex] Nightly pipeline starting${dryRun ? " (dry run)" : ""}`);
+  console.log(`[hicortex] DB: ${dbPath}`);
+
+  // Init DB
+  const db = initDb(dbPath);
+
+  try {
+    // License: read from config file or env var, init feature cache
+    const licenseKey = readConfigLicenseKey(stateDir) ?? process.env.HICORTEX_LICENSE_KEY;
+    await initFeatures(licenseKey, stateDir);
+
+    // Init LLM: check config.json first, then auto-detect
+    let llmConfig;
+    const savedConfig = readNightlyConfig(stateDir);
+    if (savedConfig?.llmBackend === "claude-cli") {
+      const claudePath = findClaudeBinary();
+      if (claudePath) {
+        llmConfig = claudeCliConfig(claudePath);
+      } else {
+        console.warn("[hicortex] claude-cli configured but binary not found, falling back");
+        llmConfig = resolveLlmConfigForCC({
+          llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
+          llmApiKey: savedConfig?.llmApiKey as string | undefined,
+          llmModel: savedConfig?.llmModel as string | undefined,
+          reflectModel: savedConfig?.reflectModel as string | undefined,
+        });
+      }
+    } else if (savedConfig?.llmBackend === "ollama") {
+      llmConfig = {
+        baseUrl: (savedConfig.llmBaseUrl as string | undefined) ?? "http://localhost:11434",
+        apiKey: "",
+        model: (savedConfig.llmModel as string) ?? "qwen3.5:4b",
+        reflectModel: (savedConfig.reflectModel as string) ?? (savedConfig.llmModel as string) ?? "qwen3.5:4b",
+        provider: "ollama",
+      };
+    } else {
+      llmConfig = resolveLlmConfigForCC({
+        llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
+        llmApiKey: savedConfig?.llmApiKey as string | undefined,
+        llmModel: savedConfig?.llmModel as string | undefined,
+        reflectModel: savedConfig?.reflectModel as string | undefined,
+      });
+    }
+    // Apply distill and reflect overrides from config
+    if (savedConfig?.distillModel) {
+      llmConfig.distillModel = savedConfig.distillModel as string;
+    }
+    if (savedConfig?.distillBaseUrl) {
+      llmConfig.distillBaseUrl = savedConfig.distillBaseUrl as string;
+      llmConfig.distillApiKey = (savedConfig.distillApiKey as string | undefined) ?? llmConfig.apiKey;
+      llmConfig.distillProvider = (savedConfig.distillProvider as string | undefined) ?? llmConfig.provider;
+    }
+    if (savedConfig?.reflectBaseUrl) {
+      llmConfig.reflectBaseUrl = savedConfig.reflectBaseUrl as string;
+      llmConfig.reflectApiKey = (savedConfig.reflectApiKey as string | undefined) ?? llmConfig.apiKey;
+      llmConfig.reflectProvider = (savedConfig.reflectProvider as string | undefined) ?? llmConfig.provider;
+    }
+    // Auto-detect Ollama for batch distillation (claude-cli has rate limits)
+    llmConfig = await preferOllamaForBatch(llmConfig);
+    if (llmConfig.provider === "ollama") {
+      console.log(`[hicortex] Auto-detected local Ollama (${llmConfig.model}) — using for batch distillation`);
+    }
+    const llm = new LlmClient(llmConfig);
+    const distillInfo = llmConfig.distillBaseUrl
+      ? `${llmConfig.distillProvider}/${llmConfig.distillModel}@${llmConfig.distillBaseUrl}`
+      : llmConfig.distillModel ?? "";
+    console.log(`[hicortex] LLM: ${llmConfig.provider}/${llmConfig.model}${distillInfo ? `, distill: ${distillInfo}` : ""}`);
+
+    // Step 1: Read new CC transcripts
+    const since = readLastRun();
+    console.log(`[hicortex] Reading CC transcripts since ${since.toISOString()}`);
+
+    const batches = readCcTranscripts(since);
+    console.log(`[hicortex] Found ${batches.length} new session(s)`);
+
+    if (batches.length === 0 && !dryRun) {
+      // Still run consolidation — there may be unscored memories from OC
+      console.log(`[hicortex] No new CC transcripts. Running consolidation only.`);
+    }
+
+    // Step 2: Distill each session
+    let memoriesIngested = 0;
+
+    // Detect safe chunk size based on model context window
+    const chunkSize = await detectChunkSize(llmConfig.provider, llmConfig.distillModel ?? llmConfig.model, llmConfig.baseUrl);
+
+    for (const batch of batches) {
+      const transcript = extractConversationText(batch.entries);
+      if (transcript.length < 200) {
+        console.log(`[hicortex]   Skip ${batch.sessionId.slice(0, 8)} (${batch.projectName}): too short`);
+        continue;
+      }
+
+      console.log(
+        `[hicortex]   Distilling ${batch.sessionId.slice(0, 8)} (${batch.projectName}, ${batch.date})`
+      );
+
+      if (dryRun) {
+        console.log(`[hicortex]     [dry-run] Would distill ${transcript.length} chars`);
+        continue;
+      }
+
+      // Check cap before distilling
+      if (memoryCapReached(storage.countMemories(db))) {
+        console.log(
+          `[hicortex]   Free tier limit (${maxMemoriesAllowed()} memories). Skipping new ingestion. ` +
+          `Upgrade: https://hicortex.gamaze.com/`
+        );
+        break;
+      }
+
+      try {
+        const entries = await distillSession(llm, transcript, batch.projectName, batch.date, chunkSize);
+
+        for (const entry of entries) {
+          try {
+            const embedding = await embed(entry);
+            storage.insertMemory(db, entry, embedding, {
+              sourceAgent: `claude-code/${batch.projectName}`,
+              sourceSession: batch.sessionId,
+              project: batch.projectName,
+              privacy: "WORK",
+              memoryType: "episode",
+            });
+            memoriesIngested++;
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            console.error(`[hicortex]     Failed to ingest entry: ${msg}`);
+          }
+        }
+
+        console.log(`[hicortex]     → ${entries.length} memories extracted`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[hicortex]     Distillation failed: ${msg}`);
+      }
+    }
+
+    console.log(`[hicortex] Distillation complete: ${memoriesIngested} new memories`);
+
+    // Step 3: Consolidation
+    if (!dryRun) {
+      console.log(`[hicortex] Running consolidation...`);
+      const report = await runConsolidation(db, llm, embed, dryRun);
+      console.log(
+        `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
+        (report.stages.reflection ? ` (${report.stages.reflection.lessons_generated} lessons)` : "")
+      );
+    }
+
+    // Step 4: Inject lessons into CLAUDE.md
+    if (!dryRun) {
+      const injection = injectLessons(db, { stateDir });
+      console.log(`[hicortex] CLAUDE.md updated: ${injection.lessonsCount} lessons at ${injection.path}`);
+    }
+
+    // Step 5: Update last-run timestamp
+    if (!dryRun) {
+      writeLastRun();
+    }
+
+    console.log(`[hicortex] Nightly pipeline complete.`);
+  } finally {
+    db.close();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Client Mode Nightly — distill locally, POST to remote server
+// ---------------------------------------------------------------------------
+
+async function runClientNightly(
+  config: Record<string, unknown>,
+  dryRun: boolean
+): Promise<void> {
+  const serverUrl = (config.serverUrl as string).replace(/\/+$/, "");
+  const authToken = config.authToken as string | undefined;
+
+  console.log(`[hicortex] Client nightly starting${dryRun ? " (dry run)" : ""}`);
+  console.log(`[hicortex] Server: ${serverUrl}`);
+
+  // Verify server is reachable
+  try {
+    const resp = await fetch(`${serverUrl}/health`, { signal: AbortSignal.timeout(5000) });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json() as Record<string, unknown>;
+    console.log(`[hicortex] Server OK: v${data.version}, ${data.memories} memories`);
+  } catch (err) {
+    console.error(`[hicortex] Server unreachable at ${serverUrl}: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`[hicortex] Aborting. Will retry next run.`);
+    return; // Don't update last-run so we retry
+  }
+
+  // Init LLM for local distillation
+  let llmConfig: LlmConfig;
+  if (config.llmBackend === "claude-cli") {
+    const claudePath = findClaudeBinary();
+    if (claudePath) {
+      llmConfig = claudeCliConfig(claudePath);
+    } else {
+      llmConfig = resolveLlmConfigForCC();
+    }
+  } else if (config.llmBackend === "ollama") {
+    llmConfig = {
+      baseUrl: (config.llmBaseUrl as string) ?? "http://localhost:11434",
+      apiKey: "",
+      model: (config.llmModel as string) ?? "qwen3.5:4b",
+      reflectModel: (config.reflectModel as string) ?? (config.llmModel as string) ?? "qwen3.5:4b",
+      provider: "ollama",
+    };
+  } else {
+    llmConfig = resolveLlmConfigForCC({
+      llmBaseUrl: config.llmBaseUrl as string | undefined,
+      llmApiKey: config.llmApiKey as string | undefined,
+      llmModel: config.llmModel as string | undefined,
+    });
+  }
+  if (config.distillModel) {
+    llmConfig.distillModel = config.distillModel as string;
+  }
+  if (config.distillBaseUrl) {
+    llmConfig.distillBaseUrl = config.distillBaseUrl as string;
+    llmConfig.distillApiKey = (config.distillApiKey as string | undefined) ?? llmConfig.apiKey;
+    llmConfig.distillProvider = (config.distillProvider as string | undefined) ?? llmConfig.provider;
+  }
+  // Auto-detect Ollama for batch distillation when claude-cli was resolved (fallback)
+  llmConfig = await preferOllamaForBatch(llmConfig);
+  if (llmConfig.provider === "ollama" && !config.distillBaseUrl) {
+    console.log(`[hicortex] Auto-detected local Ollama (${llmConfig.model}) — using for batch distillation`);
+  }
+  const llm = new LlmClient(llmConfig);
+  const distillInfo = llmConfig.distillBaseUrl
+    ? `${llmConfig.distillProvider}/${llmConfig.distillModel}@${llmConfig.distillBaseUrl}`
+    : llmConfig.distillModel ?? "";
+  console.log(`[hicortex] LLM: ${llmConfig.provider}/${llmConfig.model}${distillInfo ? `, distill: ${distillInfo}` : ""}`);
+
+  // Detect safe chunk size based on model context window
+  const chunkSize = await detectChunkSize(llmConfig.provider, llmConfig.distillModel ?? llmConfig.model, llmConfig.baseUrl);
+
+  // Read new CC transcripts
+  const since = readLastRun();
+  console.log(`[hicortex] Reading CC transcripts since ${since.toISOString()}`);
+
+  const batches = readCcTranscripts(since);
+  console.log(`[hicortex] Found ${batches.length} new session(s)`);
+
+  if (batches.length === 0) {
+    console.log(`[hicortex] Nothing to distill.`);
+    if (!dryRun) writeLastRun();
+    return;
+  }
+
+  // Distill each session and POST to server
+  let memoriesIngested = 0;
+  let sessionsSent = 0;
+
+  for (const batch of batches) {
+    const transcript = extractConversationText(batch.entries);
+    if (transcript.length < 200) {
+      console.log(`[hicortex]   Skip ${batch.sessionId.slice(0, 8)} (${batch.projectName}): too short`);
+      continue;
+    }
+
+    console.log(`[hicortex]   Distilling ${batch.sessionId.slice(0, 8)} (${batch.projectName}, ${batch.date})`);
+
+    if (dryRun) {
+      console.log(`[hicortex]     [dry-run] Would distill ${transcript.length} chars`);
+      continue;
+    }
+
+    try {
+      const entries = await distillSession(llm, transcript, batch.projectName, batch.date, chunkSize);
+      if (entries.length === 0) {
+        console.log(`[hicortex]     → No memories extracted`);
+        continue;
+      }
+
+      // POST each extracted memory to the server
+      let sessionCount = 0;
+      for (const entry of entries) {
+        const resp = await fetch(`${serverUrl}/ingest`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(authToken ? { "Authorization": `Bearer ${authToken}` } : {}),
+          },
+          body: JSON.stringify({
+            content: entry,
+            source_agent: `claude-code/${batch.projectName}`,
+            project: batch.projectName,
+            memory_type: "episode",
+            privacy: "WORK",
+            source_session: batch.sessionId,
+            session_date: batch.date,
+          }),
+          signal: AbortSignal.timeout(30_000),
+        });
+
+        const result = await resp.json() as Record<string, unknown>;
+
+        if (resp.status === 201) {
+          sessionCount++;
+          memoriesIngested++;
+        } else if (result.skipped) {
+          console.log(`[hicortex]     → Already ingested (${result.existing_count} existing)`);
+          break;
+        } else if (resp.status === 401) {
+          console.error(`[hicortex]     Auth failed. Check authToken in ~/.hicortex/config.json`);
+          return;
+        } else if (resp.status === 429) {
+          console.log(`[hicortex]     Server memory limit reached.`);
+          return;
+        } else {
+          console.error(`[hicortex]     Ingest failed (${resp.status}): ${result.error}`);
+        }
+      }
+      if (sessionCount > 0) {
+        sessionsSent++;
+        console.log(`[hicortex]     → ${sessionCount} memories sent to server`);
+      }
+    } catch (err) {
+      console.error(`[hicortex]     Failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Inject lessons from server into CLAUDE.md
+  if (!dryRun) {
+    try {
+      await injectLessonsFromServer(serverUrl, authToken);
+    } catch (err) {
+      console.error(`[hicortex] CLAUDE.md injection failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (!dryRun) writeLastRun();
+  console.log(`[hicortex] Client nightly complete: ${memoriesIngested} memories from ${sessionsSent} sessions → ${serverUrl}`);
+}
+
+/**
+ * Fetch lessons + memory index from server and inject into CLAUDE.md.
+ * Client mode equivalent of the server's injectLessons(db, ...).
+ */
+async function injectLessonsFromServer(serverUrl: string, authToken?: string): Promise<void> {
+  const resp = await fetch(`${serverUrl}/lessons`, {
+    headers: authToken ? { "Authorization": `Bearer ${authToken}` } : {},
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!resp.ok) {
+    console.log(`[hicortex] Could not fetch lessons from server (${resp.status})`);
+    return;
+  }
+
+  const data = await resp.json() as {
+    lessons: Array<{ content: string; created_at: string; base_strength: number; access_count: number }>;
+    index: { total: number; lessonCount: number; sourceCount: number; projects: Array<{ name: string; count: number }> };
+  };
+
+  const maxLessons = 10;
+  const selected = data.lessons.slice(0, maxLessons);
+
+  // Format lessons
+  const lessonLines = selected.map((l) => {
+    const titleMatch = l.content.match(/## Lesson: (.+)/);
+    const typeMatch = l.content.match(/\*\*Type:\*\* (\w+)/);
+    const severityMatch = l.content.match(/\*\*Severity:\*\* (\w+)/);
+    const title = titleMatch ? titleMatch[1] : l.content.slice(0, 150);
+    const meta = [severityMatch?.[1], typeMatch?.[1]].filter(Boolean).join(", ");
+    return `- ${title}${meta ? ` (${meta})` : ""}`;
+  });
+
+  // Format project index
+  const projectIndex = data.index.projects.map(p => `${p.name}: ${p.count}`);
+
+  // Build block
+  const START_MARKER = "<!-- HICORTEX-LEARNINGS:START -->";
+  const END_MARKER = "<!-- HICORTEX-LEARNINGS:END -->";
+
+  const blockParts = [START_MARKER, "## Hicortex Memory"];
+  blockParts.push(
+    "",
+    "You have access to shared long-term memory across all agents and sessions.",
+    "BEFORE making decisions, search memory: `hicortex_search` for prior decisions on the same topic.",
+    "Use `hicortex_context` at session start for recent project state."
+  );
+
+  if (lessonLines.length > 0) {
+    blockParts.push("", "### Lessons (updated nightly)");
+    blockParts.push(...lessonLines);
+  } else {
+    blockParts.push("", "### Getting Started");
+    blockParts.push("- Search past decisions with `hicortex_search` before starting work");
+    blockParts.push("- Save important decisions with `hicortex_ingest`");
+    blockParts.push("- Lessons will appear here after the first nightly run");
+  }
+
+  if (projectIndex.length > 0) {
+    blockParts.push("", "### Memory Index");
+    blockParts.push(projectIndex.join(" | "));
+    blockParts.push(
+      `${data.index.total} memories, ${data.index.lessonCount} lessons, ${data.index.sourceCount} agents. Search with \`hicortex_search\`.`
+    );
+  }
+
+  blockParts.push(END_MARKER);
+  const block = blockParts.join("\n");
+
+  // Write to CLAUDE.md
+  const { readFileSync, writeFileSync, mkdirSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { homedir } = await import("node:os");
+  const claudeMdPath = join(homedir(), ".claude", "CLAUDE.md");
+
+  let content = "";
+  try { content = readFileSync(claudeMdPath, "utf-8"); } catch {}
+
+  const startIdx = content.indexOf(START_MARKER);
+  const endIdx = content.indexOf(END_MARKER);
+
+  if (startIdx !== -1 && endIdx !== -1) {
+    content = content.slice(0, startIdx) + block + content.slice(endIdx + END_MARKER.length);
+  } else {
+    if (content.length > 0 && !content.endsWith("\n")) content += "\n";
+    if (content.length > 0) content += "\n";
+    content += block + "\n";
+  }
+
+  mkdirSync(dirname(claudeMdPath), { recursive: true });
+  writeFileSync(claudeMdPath, content);
+  console.log(`[hicortex] CLAUDE.md updated: ${lessonLines.length} lessons, ${data.index.total} memories indexed`);
+}
