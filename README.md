@@ -91,7 +91,7 @@ Plus skills: `/learn` to save explicit learnings.
 
 Hicortex is **MIT-licensed** and free forever. The npm package is the complete client: capture, distillation, retrieval, MCP tools, multi-client architecture.
 
-Commercial **Pro** features (lesson selection engine, validation, cross-agent learning, prescriptive distillation, smart context assembly) are sold separately by [Gamaze Labs](https://hicortex.gamaze.com). Pro is server-side intelligence — no separate npm package, no client-side license keys to bypass. You point your client at a Pro server and the same code calls Pro endpoints if available.
+Commercial **Pro** features (lesson selection engine, validation, cross-agent learning, prescriptive distillation, smart context assembly) are sold separately by [Gamaze](https://hicortex.gamaze.com). Pro is server-side intelligence — no separate npm package, no client-side license keys to bypass. You point your client at a Pro server and the same code calls Pro endpoints if available.
 
 This is the open-core model:
 - **OSS** (this repo): the memory client. Anyone can self-host, fork, modify, ship in their own product.

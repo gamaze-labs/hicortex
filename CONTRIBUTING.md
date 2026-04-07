@@ -1,7 +1,7 @@
 # Contributing to Hicortex
 
 Thanks for your interest in contributing! Hicortex is open source under MIT,
-maintained by [Gamaze Labs](https://github.com/gamaze-labs).
+maintained by [Gamaze](https://hicortex.gamaze.com).
 
 ## How to contribute
 
@@ -50,7 +50,7 @@ Requirements:
 ## Pro features
 
 Hicortex is open core: the client is MIT-licensed and free forever. Commercial
-"Pro" intelligence features are sold separately by Gamaze Labs and live in a
+"Pro" intelligence features are sold separately by Gamaze and live in a
 private repository. If you're interested in Pro features, see
 [hicortex.gamaze.com](https://hicortex.gamaze.com).
 
