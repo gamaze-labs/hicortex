@@ -43,7 +43,7 @@ INGEST (nightly)             CONSOLIDATE (nightly)        RETRIEVE (instant)
                              Injected into CLAUDE.md / agent context
 ```
 
-Memories decay over time (adaptive B+E+D model), strengthen on retrieval, and are linked automatically to related memories. Retrieval is zero-LLM: BM25 full-text + vector search fused with Reciprocal Rank Fusion, scored by similarity (40%) + strength (30%) + connections (20%) + recency (10%).
+Memories decay slower the more important and frequently used they are, strengthen on retrieval, and are linked automatically to related memories. Retrieval is zero-LLM: BM25 full-text + vector search fused with Reciprocal Rank Fusion, scored by similarity (40%) + strength (30%) + connections (20%) + recency (10%).
 
 ## MCP tools
 

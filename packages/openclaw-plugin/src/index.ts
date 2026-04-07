@@ -10,6 +10,8 @@ import { join } from "node:path";
 import type Database from "better-sqlite3";
 import { initDb, getStats, resolveDbPath } from "./db.js";
 import { initFeatures, lessonsLimit, memoryCapReached, maxMemoriesAllowed } from "./features.js";
+import { getLessonSelector } from "./extensions.js";
+import { migrateLegacyState } from "./state.js";
 import { resolveLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -69,6 +71,9 @@ export default {
             `(reflect: ${llmConfig.reflectModel})`
         );
 
+        // One-time migration of legacy state files (no-op if state.json exists)
+        migrateLegacyState(stateDir);
+
         // License: init feature cache (sync after this returns)
         await initFeatures(config.licenseKey, stateDir);
 
@@ -124,8 +129,13 @@ export default {
           if (lessons.length === 0) return {};
 
           const maxLessons = lessonsLimit();
+          const selected = await getLessonSelector().select(lessons, {
+            maxLessons,
+            project: ctx.project,
+            agentId: ctx.agentId,
+          });
 
-          const formatted = lessons.slice(0, maxLessons).map((l) => {
+          const formatted = selected.map((l) => {
             // Extract just the lesson text from the structured content
             const match = l.content.match(/## Lesson: (.+)/);
             return match ? `- ${match[1]}` : `- ${l.content.slice(0, 200)}`;
@@ -589,25 +599,6 @@ function persistProviderConfig(llmConfig: LlmConfig, log: (msg: string) => void)
     log(`[hicortex] Persisted LLM config: ${llmConfig.provider} → ${llmConfig.baseUrl}`);
   } catch {
     // Non-fatal — config works in memory even if we can't persist
-  }
-}
-
-/**
- * Track when the memory cap was first hit. Returns days since cap was reached.
- * Stores timestamp in stateDir/cap-hit.txt on first detection.
- */
-function getDaysSinceCapHit(dir: string): number {
-  const capFile = join(dir, "cap-hit.txt");
-  try {
-    const ts = readFileSync(capFile, "utf-8").trim();
-    const hitDate = new Date(ts);
-    return Math.floor((Date.now() - hitDate.getTime()) / (1000 * 60 * 60 * 24));
-  } catch {
-    // First time hitting cap — record it
-    try {
-      writeFileSync(capFile, new Date().toISOString());
-    } catch { /* non-fatal */ }
-    return 0;
   }
 }
 

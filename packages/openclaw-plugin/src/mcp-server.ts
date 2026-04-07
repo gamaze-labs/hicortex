@@ -20,6 +20,7 @@ import type Database from "better-sqlite3";
 import { initDb, getStats, resolveDbPath } from "./db.js";
 import { resolveLlmConfigForCC, LlmClient, findClaudeBinary, claudeCliConfig, type LlmConfig } from "./llm.js";
 import { initFeatures, memoryCapReached, maxMemoriesAllowed, remoteIngestAllowed } from "./features.js";
+import { migrateLegacyState } from "./state.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import * as retrieval from "./retrieval.js";
@@ -300,6 +301,9 @@ export async function startServer(options: {
     ? `${llmConfig.reflectProvider}/${llmConfig.reflectModel}@${llmConfig.reflectBaseUrl}`
     : llmConfig.reflectModel;
   console.log(`[hicortex] LLM fast: ${llmConfig.provider}/${llmConfig.model}${distillInfo ? `, distill: ${distillInfo}` : ""}, reflect: ${reflectInfo}`);
+
+  // One-time migration of legacy state files (no-op if state.json exists)
+  migrateLegacyState(stateDir);
 
   // License: read from options, config file, or env var, init feature cache
   const licenseKey = options.licenseKey

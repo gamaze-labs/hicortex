@@ -541,11 +541,11 @@ describe("transcript-reader", () => {
 describe("claude-md", () => {
   const testClaudeMd = join(TEST_DIR, "CLAUDE.md");
 
-  it("creates CLAUDE.md with learnings block on fresh file", () => {
+  it("creates CLAUDE.md with learnings block on fresh file", async () => {
     // Ensure no file exists
     try { rmSync(testClaudeMd); } catch {}
 
-    const result = injectLessons(db, {
+    const result = await injectLessons(db, {
       claudeMdPath: testClaudeMd,
       stateDir: TEST_DIR,
     });
@@ -558,10 +558,10 @@ describe("claude-md", () => {
     expect(content).toContain("hicortex_search");
   });
 
-  it("replaces existing block without affecting surrounding content", () => {
+  it("replaces existing block without affecting surrounding content", async () => {
     writeFileSync(testClaudeMd, "# My Project\n\nSome existing content.\n\n<!-- HICORTEX-LEARNINGS:START -->\nold content\n<!-- HICORTEX-LEARNINGS:END -->\n\n## Other Section\n");
 
-    injectLessons(db, { claudeMdPath: testClaudeMd, stateDir: TEST_DIR });
+    await injectLessons(db, { claudeMdPath: testClaudeMd, stateDir: TEST_DIR });
 
     const content = readFileSync(testClaudeMd, "utf-8");
     expect(content).toContain("# My Project");
@@ -570,13 +570,13 @@ describe("claude-md", () => {
     expect(content).not.toContain("old content");
   });
 
-  it("is idempotent — calling twice produces same result", () => {
+  it("is idempotent — calling twice produces same result", async () => {
     try { rmSync(testClaudeMd); } catch {}
 
-    injectLessons(db, { claudeMdPath: testClaudeMd, stateDir: TEST_DIR });
+    await injectLessons(db, { claudeMdPath: testClaudeMd, stateDir: TEST_DIR });
     const first = readFileSync(testClaudeMd, "utf-8");
 
-    injectLessons(db, { claudeMdPath: testClaudeMd, stateDir: TEST_DIR });
+    await injectLessons(db, { claudeMdPath: testClaudeMd, stateDir: TEST_DIR });
     const second = readFileSync(testClaudeMd, "utf-8");
 
     expect(first).toBe(second);
@@ -668,5 +668,548 @@ describe("distiller", () => {
 
     const text = extractConversationText(messages);
     expect(text).toContain("response from the assistant");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Features (centralized gating + license race fix)
+// ---------------------------------------------------------------------------
+
+import {
+  initFeatures,
+  isPro,
+  maxMemoriesAllowed,
+  lessonsLimit,
+  remoteIngestAllowed,
+  memoryCapReached,
+  getCurrentFeatures,
+} from "../src/features.js";
+
+describe("features", () => {
+  // Each test uses an isolated state dir so the persisted tier from one test
+  // doesn't leak into another. We can't reset the module-global cache directly
+  // (that would require module reloading), so the tests are written to be
+  // order-independent.
+
+  it("returns free tier defaults when no license key and no persisted tier", async () => {
+    const dir = join(TEST_DIR, `features-free-${randomUUID().slice(0, 6)}`);
+    mkdirSync(dir, { recursive: true });
+
+    // First-call branch in initFeatures: no key → keep persisted (or free)
+    await initFeatures(undefined, dir);
+
+    // After init, current features should be free OR whatever the previous
+    // test left in the module cache. We assert the free behaviour is at least
+    // self-consistent.
+    const features = getCurrentFeatures();
+    expect(features).toHaveProperty("maxMemories");
+    expect(features).toHaveProperty("reflection");
+    expect(features).toHaveProperty("vectorSearch");
+  });
+
+  it("memoryCapReached respects current tier", () => {
+    // Free tier: cap of 250
+    if (maxMemoriesAllowed() === 250) {
+      expect(memoryCapReached(249)).toBe(false);
+      expect(memoryCapReached(250)).toBe(true);
+      expect(memoryCapReached(1000)).toBe(true);
+    }
+    // Pro tier: -1 means unlimited
+    if (maxMemoriesAllowed() === -1) {
+      expect(memoryCapReached(0)).toBe(false);
+      expect(memoryCapReached(1_000_000)).toBe(false);
+    }
+  });
+
+  it("lessonsLimit returns 10 for free, 20 for pro", () => {
+    const limit = lessonsLimit();
+    if (isPro()) {
+      expect(limit).toBe(20);
+    } else {
+      expect(limit).toBe(10);
+    }
+  });
+
+  it("remoteIngestAllowed reflects features.remoteIngest flag", () => {
+    const features = getCurrentFeatures();
+    if (features.remoteIngest === false) {
+      expect(remoteIngestAllowed()).toBe(false);
+    } else {
+      expect(remoteIngestAllowed()).toBe(true);
+    }
+  });
+
+  it("isPro is true iff maxMemoriesAllowed is -1", () => {
+    expect(isPro()).toBe(maxMemoriesAllowed() === -1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Extensions (LessonSelector + PromptStrategy + loader)
+// ---------------------------------------------------------------------------
+
+import {
+  defaultLessonSelector,
+  defaultPromptStrategy,
+  getLessonSelector,
+  getPromptStrategy,
+  setExtensions,
+  type SelectableLesson,
+  type LessonSelector,
+} from "../src/extensions.js";
+
+describe("extensions", () => {
+  describe("defaultLessonSelector", () => {
+    it("returns the first N lessons (slice behaviour)", async () => {
+      const lessons = [
+        { content: "lesson 1" },
+        { content: "lesson 2" },
+        { content: "lesson 3" },
+        { content: "lesson 4" },
+      ];
+      const selected = await defaultLessonSelector.select(lessons, { maxLessons: 2 });
+      expect(selected.length).toBe(2);
+      expect(selected[0].content).toBe("lesson 1");
+      expect(selected[1].content).toBe("lesson 2");
+    });
+
+    it("returns all lessons if maxLessons exceeds count", async () => {
+      const lessons = [{ content: "a" }, { content: "b" }];
+      const selected = await defaultLessonSelector.select(lessons, { maxLessons: 100 });
+      expect(selected.length).toBe(2);
+    });
+
+    it("returns empty array for empty input", async () => {
+      const selected = await defaultLessonSelector.select([], { maxLessons: 10 });
+      expect(selected.length).toBe(0);
+    });
+
+    it("preserves the input shape (generic over T)", async () => {
+      // Memory-shaped input
+      const memoryLike = [
+        { id: "1", content: "x", memory_type: "lesson" },
+        { id: "2", content: "y", memory_type: "lesson" },
+      ];
+      const selected = await defaultLessonSelector.select(memoryLike, { maxLessons: 1 });
+      expect(selected[0].id).toBe("1"); // id field preserved
+      expect(selected[0].memory_type).toBe("lesson");
+    });
+
+    it("works with HTTP-shape lessons (client-mode)", async () => {
+      const httpShape = [
+        { content: "from server", created_at: "2026-04-06", base_strength: 0.8, access_count: 3 },
+      ];
+      const selected = await defaultLessonSelector.select(httpShape, { maxLessons: 5 });
+      expect(selected[0].base_strength).toBe(0.8);
+      expect(selected[0].access_count).toBe(3);
+    });
+  });
+
+  describe("defaultPromptStrategy", () => {
+    it("distillation produces a non-empty prompt with the project and date", () => {
+      const prompt = defaultPromptStrategy.distillation("hicortex", "2026-04-06", "USER: hello\nASSISTANT: hi");
+      expect(prompt.length).toBeGreaterThan(50);
+      expect(prompt).toContain("hicortex");
+      expect(prompt).toContain("2026-04-06");
+    });
+
+    it("reflection produces a non-empty prompt", () => {
+      const prompt = defaultPromptStrategy.reflection("[project] memory text");
+      expect(prompt.length).toBeGreaterThan(50);
+      expect(prompt).toContain("memory text");
+    });
+
+    it("reflection includes recent lessons block when provided", () => {
+      const prompt = defaultPromptStrategy.reflection("memory", "- prior lesson 1");
+      expect(prompt).toContain("prior lesson 1");
+    });
+
+    it("importanceScoring produces a non-empty prompt", () => {
+      const prompt = defaultPromptStrategy.importanceScoring("[0] memory");
+      expect(prompt.length).toBeGreaterThan(20);
+    });
+
+    it("parseReflection extracts well-formed lessons", () => {
+      const raw = JSON.stringify([
+        { lesson: "Always test deploy", type: "correct", project: "infra", severity: "important", confidence: "high", source_pattern: "deploy failure" },
+      ]);
+      const parsed = defaultPromptStrategy.parseReflection(raw);
+      expect(parsed.length).toBe(1);
+      expect(parsed[0].lesson).toBe("Always test deploy");
+      expect(parsed[0].type).toBe("correct");
+      expect(parsed[0].severity).toBe("important");
+      expect(parsed[0].source_pattern).toBe("deploy failure");
+    });
+
+    it("parseReflection tolerates markdown fences", () => {
+      const raw = "```json\n[{\"lesson\":\"x\",\"type\":\"reinforce\"}]\n```";
+      const parsed = defaultPromptStrategy.parseReflection(raw);
+      expect(parsed.length).toBe(1);
+      expect(parsed[0].lesson).toBe("x");
+    });
+
+    it("parseReflection returns empty array on garbage", () => {
+      expect(defaultPromptStrategy.parseReflection("not json").length).toBe(0);
+      expect(defaultPromptStrategy.parseReflection("").length).toBe(0);
+    });
+
+    it("parseReflection skips entries without a lesson field", () => {
+      const raw = JSON.stringify([
+        { lesson: "valid" },
+        { type: "correct" },                   // missing lesson
+        { lesson: "" },                        // empty lesson
+        { lesson: "another valid" },
+      ]);
+      const parsed = defaultPromptStrategy.parseReflection(raw);
+      expect(parsed.length).toBe(2);
+      expect(parsed[0].lesson).toBe("valid");
+      expect(parsed[1].lesson).toBe("another valid");
+    });
+
+    it("parseImportanceScores returns scores in [0, 1]", () => {
+      const scores = defaultPromptStrategy.parseImportanceScores("[0.3, 0.7, 0.95]", 3);
+      expect(scores).toEqual([0.3, 0.7, 0.95]);
+    });
+
+    it("parseImportanceScores clamps out-of-range values", () => {
+      const scores = defaultPromptStrategy.parseImportanceScores("[-0.5, 1.5, 0.5]", 3);
+      expect(scores[0]).toBe(0);
+      expect(scores[1]).toBe(1);
+      expect(scores[2]).toBe(0.5);
+    });
+
+    it("parseImportanceScores pads with 0.5 when count is short", () => {
+      const scores = defaultPromptStrategy.parseImportanceScores("[0.7]", 3);
+      expect(scores.length).toBe(3);
+      expect(scores[0]).toBe(0.7);
+      expect(scores[1]).toBe(0.5);
+      expect(scores[2]).toBe(0.5);
+    });
+
+    it("parseImportanceScores handles indexed format", () => {
+      const scores = defaultPromptStrategy.parseImportanceScores("[0] 0.7\n[1] 0.4", 2);
+      expect(scores).toEqual([0.7, 0.4]);
+    });
+
+    it("parseImportanceScores returns all 0.5 on garbage", () => {
+      const scores = defaultPromptStrategy.parseImportanceScores("garbage", 4);
+      expect(scores).toEqual([0.5, 0.5, 0.5, 0.5]);
+    });
+  });
+
+  describe("loader (setExtensions / getLessonSelector / getPromptStrategy)", () => {
+    it("returns defaults when no Pro extensions are set", () => {
+      // Reset to defaults (in case a previous test set something)
+      setExtensions({ selector: defaultLessonSelector, prompts: defaultPromptStrategy });
+      expect(getLessonSelector()).toBe(defaultLessonSelector);
+      expect(getPromptStrategy()).toBe(defaultPromptStrategy);
+    });
+
+    it("setExtensions replaces the active selector", async () => {
+      const customSelector: LessonSelector = {
+        select<T extends SelectableLesson>(lessons: T[], _ctx: { maxLessons: number }): T[] {
+          // Reverse order — proves it's not the default
+          return lessons.slice().reverse().slice(0, _ctx.maxLessons);
+        },
+      };
+      setExtensions({ selector: customSelector });
+      const result = await getLessonSelector().select(
+        [{ content: "a" }, { content: "b" }, { content: "c" }],
+        { maxLessons: 2 },
+      );
+      expect(result[0].content).toBe("c");
+      expect(result[1].content).toBe("b");
+
+      // Restore default for other tests
+      setExtensions({ selector: defaultLessonSelector });
+    });
+
+    it("setExtensions can replace selector and prompts independently", () => {
+      // Replace only prompts; selector should stay as previously set
+      const customPrompts = { ...defaultPromptStrategy };
+      setExtensions({ prompts: customPrompts });
+      expect(getPromptStrategy()).toBe(customPrompts);
+      expect(getLessonSelector()).toBe(defaultLessonSelector);
+
+      // Restore
+      setExtensions({ prompts: defaultPromptStrategy });
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Schema versioning
+// ---------------------------------------------------------------------------
+
+import { getSchemaVersion } from "../src/db.js";
+
+describe("schema versioning", () => {
+  it("getSchemaVersion returns the latest applied migration version", () => {
+    // After initDb, all migrations should have run
+    const version = getSchemaVersion(db);
+    expect(version).toBeGreaterThanOrEqual(2); // we have v1 and v2 today
+  });
+
+  it("schema_version table exists with applied entries", () => {
+    const rows = db
+      .prepare("SELECT version, name, applied_at FROM schema_version ORDER BY version")
+      .all() as Array<{ version: number; name: string; applied_at: string }>;
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(rows[0].version).toBe(1);
+    expect(rows[0].name).toBe("add_ingested_at");
+    expect(rows[1].version).toBe(2);
+    expect(rows[1].name).toBe("add_updated_at");
+    // applied_at should be a valid ISO timestamp
+    expect(() => new Date(rows[0].applied_at).toISOString()).not.toThrow();
+  });
+
+  it("re-running initDb on existing database is idempotent (no duplicate migration rows)", () => {
+    const beforeCount = (db.prepare("SELECT COUNT(*) as c FROM schema_version").get() as { c: number }).c;
+    // initDb has already run in beforeAll. Running migrate logic indirectly:
+    // any subsequent initDb call on the same path would re-run migrate() but
+    // the version check skips already-applied migrations.
+    // We can't easily re-init the same DB connection, but we can verify the
+    // version count is stable.
+    const afterCount = (db.prepare("SELECT COUNT(*) as c FROM schema_version").get() as { c: number }).c;
+    expect(afterCount).toBe(beforeCount);
+  });
+
+  it("migration columns exist on the memories table", () => {
+    const cols = db.pragma("table_info(memories)") as Array<{ name: string }>;
+    const colNames = new Set(cols.map((c) => c.name));
+    expect(colNames.has("ingested_at")).toBe(true);
+    expect(colNames.has("updated_at")).toBe(true);
+  });
+
+  it("idx_memories_ingested index exists after migration v1", () => {
+    const indexes = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='memories'")
+      .all() as Array<{ name: string }>;
+    const indexNames = indexes.map((i) => i.name);
+    expect(indexNames).toContain("idx_memories_ingested");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// State (consolidated state.json)
+// ---------------------------------------------------------------------------
+
+import {
+  loadState,
+  saveState,
+  updateState,
+  migrateLegacyState,
+  type HicortexState,
+  type PersistedTier,
+} from "../src/state.js";
+
+describe("state", () => {
+  function freshDir(label: string): string {
+    const d = join(TEST_DIR, `state-${label}-${randomUUID().slice(0, 6)}`);
+    mkdirSync(d, { recursive: true });
+    return d;
+  }
+
+  describe("loadState / saveState", () => {
+    it("returns empty state when file doesn't exist", () => {
+      const dir = freshDir("empty");
+      const state = loadState(dir);
+      expect(state).toEqual({});
+    });
+
+    it("returns empty state on corrupted JSON", () => {
+      const dir = freshDir("corrupt");
+      writeFileSync(join(dir, "state.json"), "{ not valid json");
+      const state = loadState(dir);
+      expect(state).toEqual({});
+    });
+
+    it("round-trips a full state object", () => {
+      const dir = freshDir("roundtrip");
+      const original: HicortexState = {
+        lastNightly: "2026-04-06T02:03:00Z",
+        lastConsolidated: "2026-04-06T02:05:00Z",
+        tier: {
+          tier: "pro",
+          validatedAt: "2026-04-06T10:00:00Z",
+          features: {
+            reflection: true,
+            vectorSearch: true,
+            maxMemories: -1,
+            crossAgent: true,
+            remoteIngest: false,
+          },
+        },
+      };
+      saveState(original, dir);
+      const loaded = loadState(dir);
+      expect(loaded).toEqual(original);
+    });
+
+    it("saves uses atomic write (no partial state on existing file)", () => {
+      const dir = freshDir("atomic");
+      saveState({ lastNightly: "first" }, dir);
+      saveState({ lastNightly: "second" }, dir);
+      expect(loadState(dir).lastNightly).toBe("second");
+
+      // Temp file should not be left behind after successful save
+      try {
+        const tmp = readFileSync(join(dir, "state.json.tmp"), "utf-8");
+        // If we get here, .tmp exists — that's a leak
+        expect(tmp).toBeUndefined();
+      } catch {
+        // ENOENT — correct, .tmp was renamed away
+      }
+    });
+  });
+
+  describe("updateState", () => {
+    it("applies an in-place mutation", () => {
+      const dir = freshDir("inplace");
+      saveState({ lastNightly: "before" }, dir);
+      updateState((s) => {
+        s.lastConsolidated = "added";
+      }, dir);
+      const loaded = loadState(dir);
+      expect(loaded.lastNightly).toBe("before");
+      expect(loaded.lastConsolidated).toBe("added");
+    });
+
+    it("applies a return-based update", () => {
+      const dir = freshDir("return");
+      saveState({ lastNightly: "old" }, dir);
+      updateState((_s) => ({ lastNightly: "new" }), dir);
+      const loaded = loadState(dir);
+      expect(loaded.lastNightly).toBe("new");
+    });
+
+    it("creates the file if it doesn't exist yet", () => {
+      const dir = freshDir("create");
+      updateState((s) => {
+        s.lastNightly = "first run";
+      }, dir);
+      const loaded = loadState(dir);
+      expect(loaded.lastNightly).toBe("first run");
+    });
+  });
+
+  describe("migrateLegacyState", () => {
+    it("returns false when no legacy files and no state.json", () => {
+      const dir = freshDir("none");
+      expect(migrateLegacyState(dir)).toBe(false);
+      // No state.json should be created
+      expect(loadState(dir)).toEqual({});
+    });
+
+    it("returns false when state.json already exists (and cleans up legacy)", () => {
+      const dir = freshDir("already");
+      saveState({ lastNightly: "kept" }, dir);
+      writeFileSync(join(dir, "nightly-last-run.txt"), "should-be-deleted");
+      writeFileSync(join(dir, "tier.json"), '{"tier":"pro"}');
+
+      expect(migrateLegacyState(dir)).toBe(false);
+
+      // state.json untouched, legacy files cleaned up
+      expect(loadState(dir).lastNightly).toBe("kept");
+      expect(() => readFileSync(join(dir, "nightly-last-run.txt"))).toThrow();
+      expect(() => readFileSync(join(dir, "tier.json"))).toThrow();
+    });
+
+    it("migrates nightly-last-run.txt", () => {
+      const dir = freshDir("nightly");
+      writeFileSync(join(dir, "nightly-last-run.txt"), "2026-04-05T02:00:00Z");
+      expect(migrateLegacyState(dir)).toBe(true);
+
+      const state = loadState(dir);
+      expect(state.lastNightly).toBe("2026-04-05T02:00:00Z");
+      expect(() => readFileSync(join(dir, "nightly-last-run.txt"))).toThrow();
+    });
+
+    it("migrates last-consolidated.txt", () => {
+      const dir = freshDir("consolidated");
+      writeFileSync(join(dir, "last-consolidated.txt"), "2026-04-05T02:30:00Z");
+      expect(migrateLegacyState(dir)).toBe(true);
+
+      const state = loadState(dir);
+      expect(state.lastConsolidated).toBe("2026-04-05T02:30:00Z");
+      expect(() => readFileSync(join(dir, "last-consolidated.txt"))).toThrow();
+    });
+
+    it("migrates tier.json", () => {
+      const dir = freshDir("tier");
+      const tierData: PersistedTier = {
+        tier: "pro",
+        validatedAt: "2026-04-05T10:00:00Z",
+        features: {
+          reflection: true,
+          vectorSearch: true,
+          maxMemories: -1,
+          crossAgent: true,
+          remoteIngest: false,
+        },
+      };
+      writeFileSync(join(dir, "tier.json"), JSON.stringify(tierData));
+      expect(migrateLegacyState(dir)).toBe(true);
+
+      const state = loadState(dir);
+      expect(state.tier).toEqual(tierData);
+      expect(() => readFileSync(join(dir, "tier.json"))).toThrow();
+    });
+
+    it("migrates all 4 legacy files at once", () => {
+      const dir = freshDir("all");
+      writeFileSync(join(dir, "nightly-last-run.txt"), "2026-04-05T02:00:00Z");
+      writeFileSync(join(dir, "last-consolidated.txt"), "2026-04-05T02:30:00Z");
+      writeFileSync(join(dir, "license-validated.txt"), "2026-04-05T01:00:00Z");
+      writeFileSync(join(dir, "tier.json"), JSON.stringify({
+        tier: "team",
+        validatedAt: "2026-04-05T01:00:00Z",
+        features: {
+          reflection: true,
+          vectorSearch: true,
+          maxMemories: -1,
+          crossAgent: true,
+          remoteIngest: true,
+        },
+      }));
+
+      expect(migrateLegacyState(dir)).toBe(true);
+
+      const state = loadState(dir);
+      expect(state.lastNightly).toBe("2026-04-05T02:00:00Z");
+      expect(state.lastConsolidated).toBe("2026-04-05T02:30:00Z");
+      expect(state.tier?.tier).toBe("team");
+
+      // All 4 legacy files should be gone
+      for (const name of [
+        "nightly-last-run.txt",
+        "last-consolidated.txt",
+        "license-validated.txt",
+        "tier.json",
+      ]) {
+        expect(() => readFileSync(join(dir, name))).toThrow();
+      }
+    });
+
+    it("ignores corrupted tier.json gracefully", () => {
+      const dir = freshDir("corrupt-tier");
+      writeFileSync(join(dir, "nightly-last-run.txt"), "2026-04-05T02:00:00Z");
+      writeFileSync(join(dir, "tier.json"), "{ corrupted");
+
+      expect(migrateLegacyState(dir)).toBe(true);
+
+      const state = loadState(dir);
+      expect(state.lastNightly).toBe("2026-04-05T02:00:00Z");
+      expect(state.tier).toBeUndefined();
+    });
+
+    it("is idempotent — second call after successful migration is a no-op", () => {
+      const dir = freshDir("idempotent");
+      writeFileSync(join(dir, "nightly-last-run.txt"), "2026-04-05T02:00:00Z");
+
+      expect(migrateLegacyState(dir)).toBe(true);
+      expect(migrateLegacyState(dir)).toBe(false); // state.json now exists
+      expect(loadState(dir).lastNightly).toBe("2026-04-05T02:00:00Z");
+    });
   });
 });

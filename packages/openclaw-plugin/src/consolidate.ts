@@ -4,9 +4,6 @@
  * Ported from hicortex/consolidate/ (stages.py, __init__.py, budget.py).
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import type Database from "better-sqlite3";
 import type { Memory, ConsolidationReport } from "./types.js";
 import type { LlmClient } from "./llm.js";
@@ -15,12 +12,7 @@ import { effectiveStrength } from "./retrieval.js";
 import * as storage from "./storage.js";
 import { importanceScoring, reflection } from "./prompts.js";
 import { memoryCapReached, maxMemoriesAllowed } from "./features.js";
-
-const LAST_CONSOLIDATED_PATH = join(
-  homedir(),
-  ".hicortex",
-  "last-consolidated.txt"
-);
+import { loadState, updateState } from "./state.js";
 
 // Default config constants (matching Python config.py)
 const CONSOLIDATE_MAX_LLM_CALLS = 200;
@@ -116,11 +108,7 @@ export function parseJsonLenient<T>(text: string, fallback: T): T {
 // ---------------------------------------------------------------------------
 
 function readLastConsolidated(): string {
-  try {
-    return readFileSync(LAST_CONSOLIDATED_PATH, "utf-8").trim();
-  } catch {
-    return "";
-  }
+  return loadState().lastConsolidated ?? "";
 }
 
 function stagePrecheck(
@@ -547,13 +535,10 @@ export async function runConsolidation(
 
   // Update last-consolidated timestamp
   if (!dryRun && report.status === "completed") {
-    try {
-      const dir = join(homedir(), ".claude", "memory");
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(LAST_CONSOLIDATED_PATH, new Date().toISOString());
-    } catch {
-      // Non-fatal
-    }
+    updateState((s) => {
+      s.lastConsolidated = new Date().toISOString();
+      return s;
+    });
   }
 
   report.budget = budget.summary();

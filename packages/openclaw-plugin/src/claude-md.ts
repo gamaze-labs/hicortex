@@ -15,6 +15,7 @@ import { homedir } from "node:os";
 import type Database from "better-sqlite3";
 import * as storage from "./storage.js";
 import { lessonsLimit } from "./features.js";
+import { getLessonSelector } from "./extensions.js";
 
 const START_MARKER = "<!-- HICORTEX-LEARNINGS:START -->";
 const END_MARKER = "<!-- HICORTEX-LEARNINGS:END -->";
@@ -26,14 +27,14 @@ const DEFAULT_CLAUDE_MD = join(homedir(), ".claude", "CLAUDE.md");
  * Creates the file if it doesn't exist.
  * Replaces existing block if present, appends if not.
  */
-export function injectLessons(
+export async function injectLessons(
   db: Database.Database,
   options: {
     claudeMdPath?: string;
     stateDir?: string;
     project?: string;
   } = {}
-): { lessonsCount: number; path: string } {
+): Promise<{ lessonsCount: number; path: string }> {
   const claudeMdPath = options.claudeMdPath ?? DEFAULT_CLAUDE_MD;
 
   // Determine limits based on license
@@ -41,7 +42,10 @@ export function injectLessons(
 
   // --- Lessons ---
   const lessons = storage.getLessons(db, 30, options.project);
-  const selected = lessons.slice(0, maxLessons);
+  const selected = await getLessonSelector().select(lessons, {
+    maxLessons,
+    project: options.project,
+  });
 
   const lessonLines = selected.map((l) => {
     const titleMatch = l.content.match(/## Lesson: (.+)/);

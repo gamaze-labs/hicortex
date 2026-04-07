@@ -3,6 +3,43 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.4] - 2026-04-06
+
+### Added
+- **Centralized feature gating** (`src/features.ts`) — single source of truth
+  for tier-dependent values. Replaces 8+ scattered `getFeatures()` call sites.
+- **Extension interfaces** (`src/extensions.ts`) — `LessonSelector` and
+  `PromptStrategy` define the seam for future commercial Pro features.
+  The OSS client ships default implementations preserving current behaviour;
+  Pro features plug in at runtime via `setExtensions()`.
+- **Versioned schema migrations** — `schema_version` table + migration runner
+  with transactional application. Replaces ad-hoc `ALTER TABLE` on every boot.
+- **`src/pro/` IP boundary** — `tsconfig.json` excludes `src/pro/**` from build
+  so commercial code can never compile into `dist/` and reach npm.
+- **31 new vitest tests** for features, extensions, and schema versioning
+  (81 total, all passing).
+
+### Fixed
+- **License validation race** — Pro users could see free-tier features during
+  the async validation window because `getFeatures()` was sync but
+  `validateLicense` was async with a module-global cache. Now `initFeatures()`
+  reads a persisted tier from `~/.hicortex/tier.json` synchronously at boot,
+  awaits validation only on first run, and re-validates in background on
+  subsequent boots.
+- **Dynamic-import-in-loop bug** at `consolidate.ts:308` — was added to dodge
+  a circular import. Now resolved via the centralized `features.ts`.
+
+### Changed
+- `injectLessons()` is now async (callers updated).
+- `LessonSelector` is generic over `T extends SelectableLesson` so the same
+  interface works for `Memory[]` (server mode) and HTTP-shape lessons
+  (client mode).
+
+### Removed
+- Python backend (`hicortex/`, `tests/`, `pyproject.toml`, `uv.lock`,
+  `deploy/*.service`, root `Dockerfile`, `.env.example`) — bedrock now runs
+  the TypeScript MCP server, the Python files were stale leftovers.
+
 ## [0.4.3] - 2026-04-06
 
 ### Fixed
