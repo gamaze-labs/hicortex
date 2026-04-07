@@ -1213,3 +1213,126 @@ describe("state", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Distillation error propagation (regression test for data-loss bug)
+//
+// Bug: before this fix, distillChunk swallowed LLM errors and returned [].
+// That was indistinguishable from "nothing to extract", so nightly.ts would
+// advance lastRun past sessions that had never actually been processed, and
+// those sessions were permanently lost.
+//
+// Fix contract:
+//   - distillChunk THROWS on transient LLM errors (network, 4xx/5xx, timeout)
+//   - distillChunk returns [] only for legitimate empty results (NO_EXTRACT,
+//     empty response, transcript too short)
+//   - distillSession rethrows if ALL chunks fail; returns partial otherwise
+// ---------------------------------------------------------------------------
+
+import { distillSession } from "../src/distiller.js";
+import { probeOllamaModel } from "../src/llm.js";
+
+// Minimal LlmClient stub — only completeDistill is exercised by distillSession
+interface StubClientOpts {
+  responses?: string[];       // sequence of successful responses, one per call
+  errors?: (Error | null)[];  // sequence of errors (null = success from responses)
+}
+
+function makeStubLlm(opts: StubClientOpts = {}): any {
+  let call = 0;
+  const { responses = [], errors = [] } = opts;
+  return {
+    async completeDistill(_prompt: string): Promise<string> {
+      const idx = call++;
+      const err = errors[idx] ?? null;
+      if (err) throw err;
+      return responses[idx] ?? "NO_EXTRACT";
+    },
+  };
+}
+
+describe("distillSession error propagation", () => {
+  it("returns [] for transcripts shorter than MIN_CONVERSATION_CHARS", async () => {
+    const llm = makeStubLlm();
+    const result = await distillSession(llm, "tiny", "test", "2026-04-07");
+    expect(result).toEqual([]);
+  });
+
+  it("returns [] for NO_EXTRACT response (legitimate empty)", async () => {
+    const llm = makeStubLlm({ responses: ["NO_EXTRACT"] });
+    const longText = "USER: " + "x".repeat(300);
+    const result = await distillSession(llm, longText, "test", "2026-04-07");
+    expect(result).toEqual([]);
+  });
+
+  it("propagates transient LLM error on single-chunk path", async () => {
+    const llm = makeStubLlm({ errors: [new Error("Ollama error 404: model not found")] });
+    const longText = "USER: " + "x".repeat(300);
+    await expect(
+      distillSession(llm, longText, "test", "2026-04-07"),
+    ).rejects.toThrow(/Ollama error 404/);
+  });
+
+  // A stub that fails ALL calls regardless of count. Avoids having to
+  // predict exactly how many chunks splitIntoChunks produces — the contract
+  // we care about is "if every chunk fails, distillSession throws".
+  function makeAlwaysFailLlm(errMsg: string): any {
+    return {
+      async completeDistill(_p: string): Promise<string> {
+        throw new Error(errMsg);
+      },
+    };
+  }
+
+  // A stub where odd-indexed calls fail, even-indexed calls return a valid
+  // distilled block. Used to test partial-success.
+  function makeAlternatingLlm(errMsg: string): any {
+    let call = 0;
+    return {
+      async completeDistill(_p: string): Promise<string> {
+        const idx = call++;
+        if (idx % 2 === 1) throw new Error(errMsg);
+        return `### Decisions Made\n- decision ${idx} (2026-04-07)`;
+      },
+    };
+  }
+
+  it("propagates transient LLM error on multi-chunk path when ALL chunks fail", async () => {
+    const llm = makeAlwaysFailLlm("Ollama error 404: model not found");
+    // Transcript long enough to force multi-chunk (>20K chars, chunk size 20K)
+    const longText = "USER: " + "a".repeat(30_000) + "\n\nASSISTANT: " + "b".repeat(30_000);
+    await expect(
+      distillSession(llm, longText, "test", "2026-04-07", 20_000),
+    ).rejects.toThrow(/Ollama error 404/);
+  });
+
+  it("returns partial result when SOME chunks succeed and some fail", async () => {
+    const llm = makeAlternatingLlm("middle chunk LLM failure");
+    // Forces multiple chunks
+    const text = "USER: " + "a".repeat(20_000) + "\n\nUSER: " + "b".repeat(20_000) + "\n\nUSER: " + "c".repeat(20_000);
+    const result = await distillSession(llm, text, "test", "2026-04-07", 20_000);
+    // Should have extracted entries from the successful chunks (even-indexed)
+    expect(result.length).toBeGreaterThan(0);
+  });
+});
+
+describe("probeOllamaModel", () => {
+  it("returns unreachable when fetch fails", async () => {
+    // Use a port nothing listens on
+    const result = await probeOllamaModel("http://127.0.0.1:1", "any-model");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unreachable");
+  });
+
+  it("returns unreachable for an invalid hostname", async () => {
+    // Nonexistent TLD — DNS resolution fails fast
+    const result = await probeOllamaModel("http://nonexistent.invalid", "any-model");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe("unreachable");
+  });
+
+  // NOTE: Tests for "ok: true" and "ok: false, reason: model_missing" would
+  // require a local HTTP stub server. Skipped in the smoke suite to keep it
+  // dependency-free. The two unreachable cases above cover the control flow
+  // into the abort branch in nightly.ts.
+});

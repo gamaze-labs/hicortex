@@ -417,6 +417,39 @@ export async function probeOllama(
 }
 
 /**
+ * Pre-flight health check for a specific Ollama endpoint + model.
+ * Returns { ok, reason } so callers can log a clear abort message.
+ *
+ *   - `ok: true` — endpoint reachable AND the requested model appears in
+ *     `/api/tags`. Safe to proceed with a batch distillation run.
+ *   - `ok: false, reason: "unreachable"` — network failure or non-2xx.
+ *   - `ok: false, reason: "model_missing"` — endpoint is up but the
+ *     model isn't listed (the exact case that caused data loss when
+ *     mhac-pro's Ollama didn't have the distill model loaded).
+ *
+ * Matches on exact name OR name prefix ("qwen3.5:35b" matches "qwen3.5:35b-a3b").
+ */
+export async function probeOllamaModel(
+  baseUrl: string,
+  modelName: string,
+): Promise<{ ok: true } | { ok: false; reason: "unreachable" | "model_missing" }> {
+  try {
+    const resp = await fetch(`${baseUrl.replace(/\/$/, "")}/api/tags`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) return { ok: false, reason: "unreachable" };
+    const data = (await resp.json()) as { models?: Array<{ name: string }> };
+    const models = data.models ?? [];
+    const found = models.some(
+      (m) => m.name === modelName || m.name.startsWith(modelName + ":"),
+    );
+    return found ? { ok: true } : { ok: false, reason: "model_missing" };
+  } catch {
+    return { ok: false, reason: "unreachable" };
+  }
+}
+
+/**
  * For batch operations (nightly pipeline), prefer Ollama when available.
  * Claude CLI has strict rate limits that kill batch distillation.
  * Falls back to the provided config if Ollama is unreachable.

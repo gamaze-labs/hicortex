@@ -1,6 +1,6 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "description": "Human-like memory for self-improving AI agents. Automatic capturing, nightly reflection, and cross-agent learning. Works with Claude Code and OpenClaw.",
   "main": "dist/index.js",
   "bin": {

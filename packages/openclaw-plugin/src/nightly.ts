@@ -15,7 +15,7 @@ import { homedir } from "node:os";
 import type Database from "better-sqlite3";
 
 import { initDb, resolveDbPath } from "./db.js";
-import { resolveLlmConfigForCC, LlmClient, findClaudeBinary, claudeCliConfig, preferOllamaForBatch, type LlmConfig } from "./llm.js";
+import { resolveLlmConfigForCC, LlmClient, findClaudeBinary, claudeCliConfig, preferOllamaForBatch, probeOllamaModel, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
@@ -163,6 +163,25 @@ export async function runNightly(options: {
 
     // Step 2: Distill each session
     let memoriesIngested = 0;
+    let hadTransientFailure = false;
+
+    // Pre-flight health check for a remote distill endpoint.
+    // If the distill provider is Ollama on a remote host and that host (or the
+    // required model) is unreachable, abort BEFORE touching any sessions —
+    // prevents the data-loss bug where lastRun advances past sessions that
+    // were never actually processed.
+    if (batches.length > 0 && llmConfig.distillBaseUrl && (llmConfig.distillProvider ?? llmConfig.provider) === "ollama") {
+      const distillModel = llmConfig.distillModel ?? llmConfig.model;
+      const health = await probeOllamaModel(llmConfig.distillBaseUrl, distillModel);
+      if (!health.ok) {
+        const reason = health.reason === "unreachable"
+          ? `distill endpoint unreachable (${llmConfig.distillBaseUrl})`
+          : `distill model not loaded (${distillModel} missing on ${llmConfig.distillBaseUrl})`;
+        console.error(`[hicortex] ABORT: ${reason} — will retry next run, lastRun unchanged`);
+        hadTransientFailure = true;
+        batches.length = 0; // Skip the distillation loop entirely
+      }
+    }
 
     // Detect safe chunk size based on model context window
     const chunkSize = await detectChunkSize(llmConfig.provider, llmConfig.distillModel ?? llmConfig.model, llmConfig.baseUrl);
@@ -172,6 +191,21 @@ export async function runNightly(options: {
       if (transcript.length < 200) {
         console.log(`[hicortex]   Skip ${batch.sessionId.slice(0, 8)} (${batch.projectName}): too short`);
         continue;
+      }
+
+      // Server-mode per-session dedup: skip sessions already in the DB.
+      // Client mode gets this for free via the server's /ingest endpoint;
+      // server mode writes directly via storage.insertMemory and needs
+      // an explicit check. This makes retries of previously-failed runs
+      // idempotent.
+      if (!dryRun) {
+        const existing = db
+          .prepare("SELECT COUNT(*) as c FROM memories WHERE source_session = ?")
+          .get(batch.sessionId) as { c: number };
+        if (existing.c > 0) {
+          console.log(`[hicortex]   Skip ${batch.sessionId.slice(0, 8)} (${batch.projectName}): already ingested`);
+          continue;
+        }
       }
 
       console.log(
@@ -215,7 +249,8 @@ export async function runNightly(options: {
         console.log(`[hicortex]     → ${entries.length} memories extracted`);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[hicortex]     Distillation failed: ${msg}`);
+        console.error(`[hicortex]     Distillation failed: ${msg} — will retry next run`);
+        hadTransientFailure = true;
       }
     }
 
@@ -238,8 +273,18 @@ export async function runNightly(options: {
     }
 
     // Step 5: Update last-run timestamp
+    // CRITICAL: only advance lastRun if every session was processed without
+    // a transient failure. Otherwise failed sessions would be permanently
+    // lost — they'd be older than the new lastRun and never retried.
     if (!dryRun) {
-      writeLastRun();
+      if (hadTransientFailure) {
+        console.warn(
+          `[hicortex] Not advancing lastRun — one or more sessions failed. ` +
+          `They will be retried on the next run.`
+        );
+      } else {
+        writeLastRun();
+      }
     }
 
     console.log(`[hicortex] Nightly pipeline complete.`);
@@ -333,6 +378,23 @@ async function runClientNightly(
     return;
   }
 
+  // Pre-flight health check for a remote distill endpoint (client mode).
+  // If the distill provider is Ollama on a remote host and the required model
+  // isn't loaded, abort BEFORE touching any sessions — same data-loss fix
+  // as server mode.
+  let hadTransientFailure = false;
+  if (llmConfig.distillBaseUrl && (llmConfig.distillProvider ?? llmConfig.provider) === "ollama") {
+    const distillModel = llmConfig.distillModel ?? llmConfig.model;
+    const health = await probeOllamaModel(llmConfig.distillBaseUrl, distillModel);
+    if (!health.ok) {
+      const reason = health.reason === "unreachable"
+        ? `distill endpoint unreachable (${llmConfig.distillBaseUrl})`
+        : `distill model not loaded (${distillModel} missing on ${llmConfig.distillBaseUrl})`;
+      console.error(`[hicortex] ABORT: ${reason} — will retry next run, lastRun unchanged`);
+      return; // Don't touch lastRun; next trigger retries the same sessions
+    }
+  }
+
   // Distill each session and POST to server
   let memoriesIngested = 0;
   let sessionsSent = 0;
@@ -395,6 +457,7 @@ async function runClientNightly(
           return;
         } else {
           console.error(`[hicortex]     Ingest failed (${resp.status}): ${result.error}`);
+          hadTransientFailure = true;
         }
       }
       if (sessionCount > 0) {
@@ -402,7 +465,8 @@ async function runClientNightly(
         console.log(`[hicortex]     → ${sessionCount} memories sent to server`);
       }
     } catch (err) {
-      console.error(`[hicortex]     Failed: ${err instanceof Error ? err.message : String(err)}`);
+      console.error(`[hicortex]     Distillation failed: ${err instanceof Error ? err.message : String(err)} — will retry next run`);
+      hadTransientFailure = true;
     }
   }
 
@@ -415,7 +479,18 @@ async function runClientNightly(
     }
   }
 
-  if (!dryRun) writeLastRun();
+  // Only advance lastRun if every session was processed without a transient
+  // failure. Otherwise failed sessions would be permanently lost.
+  if (!dryRun) {
+    if (hadTransientFailure) {
+      console.warn(
+        `[hicortex] Not advancing lastRun — one or more sessions failed. ` +
+        `They will be retried on the next run.`
+      );
+    } else {
+      writeLastRun();
+    }
+  }
   console.log(`[hicortex] Client nightly complete: ${memoriesIngested} memories from ${sessionsSent} sessions → ${serverUrl}`);
 }
 
