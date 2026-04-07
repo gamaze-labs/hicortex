@@ -191,23 +191,113 @@ export function initDb(dbPath: string): Database.Database {
   return db;
 }
 
+// ---------------------------------------------------------------------------
+// Versioned migrations
+// ---------------------------------------------------------------------------
+
+interface Migration {
+  version: number;
+  name: string;
+  up: (db: Database.Database) => void;
+}
+
 /**
- * Apply schema migrations for existing databases.
+ * Helper: check if a column exists on a table without aborting.
+ * Used by migrations to stay idempotent across partially-migrated databases.
+ */
+function hasColumn(db: Database.Database, table: string, column: string): boolean {
+  const cols = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+  return cols.some((c) => c.name === column);
+}
+
+/**
+ * Migrations are append-only. Add new entries at the end with monotonically
+ * increasing version numbers. Each migration runs in a single transaction
+ * and the schema_version row is inserted only on success.
+ *
+ * IMPORTANT: never edit a migration after it has shipped — write a new one.
+ *
+ * IMPORTANT: sqlite-vec virtual tables (memory_vectors) and FTS5 virtual
+ * tables (memories_fts) cannot be ALTER'd. If a future Pro feature needs
+ * per-vector metadata, add a sidecar table and JOIN, do not try to extend
+ * the virtual table in place.
+ */
+const MIGRATIONS: Migration[] = [
+  {
+    version: 1,
+    name: "add_ingested_at",
+    up: (db) => {
+      if (!hasColumn(db, "memories", "ingested_at")) {
+        db.exec("ALTER TABLE memories ADD COLUMN ingested_at TIMESTAMP");
+        db.exec("UPDATE memories SET ingested_at = created_at WHERE ingested_at IS NULL");
+      }
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_ingested ON memories(ingested_at)");
+    },
+  },
+  {
+    version: 2,
+    name: "add_updated_at",
+    up: (db) => {
+      if (!hasColumn(db, "memories", "updated_at")) {
+        db.exec("ALTER TABLE memories ADD COLUMN updated_at TIMESTAMP");
+      }
+    },
+  },
+];
+
+/**
+ * Run all pending migrations against the database.
+ *
+ * Creates the schema_version tracking table if missing, then applies any
+ * migration whose version > the current max. Each migration runs inside its
+ * own transaction so a partial failure rolls back cleanly. Existing databases
+ * with the relevant columns already present pass through as no-ops because
+ * each migration's up() is idempotent.
  */
 function migrate(db: Database.Database): void {
-  const cols = db.pragma("table_info(memories)") as Array<{ name: string }>;
-  const colNames = new Set(cols.map((c) => c.name));
-
-  if (!colNames.has("ingested_at")) {
-    db.exec("ALTER TABLE memories ADD COLUMN ingested_at TIMESTAMP");
-    db.exec("UPDATE memories SET ingested_at = created_at");
-    db.exec(
-      "CREATE INDEX IF NOT EXISTS idx_memories_ingested ON memories(ingested_at)"
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_version (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at TEXT NOT NULL
     );
-  }
+  `);
 
-  if (!colNames.has("updated_at")) {
-    db.exec("ALTER TABLE memories ADD COLUMN updated_at TIMESTAMP");
+  const row = db
+    .prepare("SELECT MAX(version) as v FROM schema_version")
+    .get() as { v: number | null };
+  const currentVersion = row.v ?? 0;
+
+  const pending = MIGRATIONS.filter((m) => m.version > currentVersion);
+  if (pending.length === 0) return;
+
+  for (const m of pending) {
+    const tx = db.transaction(() => {
+      m.up(db);
+      db.prepare(
+        "INSERT INTO schema_version (version, name, applied_at) VALUES (?, ?, ?)",
+      ).run(m.version, m.name, new Date().toISOString());
+    });
+
+    try {
+      tx();
+      console.log(`[hicortex] Applied migration ${m.version}: ${m.name}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`Migration ${m.version} (${m.name}) failed: ${msg}`);
+    }
+  }
+}
+
+/** Read the currently-applied schema version. Returns 0 if no migrations applied. */
+export function getSchemaVersion(db: Database.Database): number {
+  try {
+    const row = db
+      .prepare("SELECT MAX(version) as v FROM schema_version")
+      .get() as { v: number | null };
+    return row.v ?? 0;
+  } catch {
+    return 0;
   }
 }
 

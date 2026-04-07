@@ -12,20 +12,13 @@
  * process boot before serving any requests; sync getters become deterministic.
  */
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { validateLicense } from "./license.js";
+import { loadState, updateState } from "./state.js";
 import type { LicenseInfo } from "./types.js";
 
 const DEFAULT_STATE_DIR = join(homedir(), ".hicortex");
-const TIER_PERSIST_FILE = "tier.json";
-
-interface PersistedTier {
-  tier: LicenseInfo["tier"];
-  validatedAt: string;
-  features: LicenseInfo["features"];
-}
 
 const FREE_FEATURES: LicenseInfo["features"] = {
   reflection: true,
@@ -38,26 +31,15 @@ const FREE_FEATURES: LicenseInfo["features"] = {
 let currentFeatures: LicenseInfo["features"] = FREE_FEATURES;
 let initialized = false;
 
-function readPersistedTier(stateDir: string): PersistedTier | null {
-  try {
-    const path = join(stateDir, TIER_PERSIST_FILE);
-    const raw = readFileSync(path, "utf-8");
-    return JSON.parse(raw) as PersistedTier;
-  } catch {
-    return null;
-  }
-}
-
-function writePersistedTier(stateDir: string, persisted: PersistedTier): void {
-  try {
-    mkdirSync(stateDir, { recursive: true });
-    writeFileSync(
-      join(stateDir, TIER_PERSIST_FILE),
-      JSON.stringify(persisted, null, 2),
-    );
-  } catch {
-    // Non-critical — next boot will re-validate
-  }
+function persistTier(stateDir: string, info: LicenseInfo): void {
+  updateState((s) => {
+    s.tier = {
+      tier: info.tier,
+      validatedAt: new Date().toISOString(),
+      features: info.features,
+    };
+    return s;
+  }, stateDir);
 }
 
 /**
@@ -77,8 +59,8 @@ export async function initFeatures(
   if (initialized) return;
   initialized = true;
 
-  // Step 1: Load persisted tier (instant)
-  const persisted = readPersistedTier(stateDir);
+  // Step 1: Load persisted tier from state.json (instant)
+  const persisted = loadState(stateDir).tier;
   if (persisted) {
     currentFeatures = persisted.features;
   } else {
@@ -95,11 +77,7 @@ export async function initFeatures(
       const info = await validateLicense(licenseKey, stateDir);
       currentFeatures = info.features;
       if (info.valid) {
-        writePersistedTier(stateDir, {
-          tier: info.tier,
-          validatedAt: new Date().toISOString(),
-          features: info.features,
-        });
+        persistTier(stateDir, info);
       }
     } catch {
       // Validation failed (network, etc.) — stay on free
@@ -110,11 +88,7 @@ export async function initFeatures(
       .then((info) => {
         currentFeatures = info.features;
         if (info.valid) {
-          writePersistedTier(stateDir, {
-            tier: info.tier,
-            validatedAt: new Date().toISOString(),
-            features: info.features,
-          });
+          persistTier(stateDir, info);
         }
       })
       .catch(() => {

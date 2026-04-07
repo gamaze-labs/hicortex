@@ -10,7 +10,7 @@
  */
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type Database from "better-sqlite3";
 
@@ -22,10 +22,11 @@ import { extractConversationText, distillSession, detectChunkSize } from "./dist
 import { runConsolidation } from "./consolidate.js";
 import { readCcTranscripts } from "./transcript-reader.js";
 import { injectLessons } from "./claude-md.js";
-import { initFeatures, memoryCapReached, maxMemoriesAllowed } from "./features.js";
+import { initFeatures, lessonsLimit, memoryCapReached, maxMemoriesAllowed } from "./features.js";
+import { getLessonSelector } from "./extensions.js";
+import { loadState, updateState, migrateLegacyState } from "./state.js";
 
 const HICORTEX_HOME = join(homedir(), ".hicortex");
-const LAST_RUN_PATH = join(HICORTEX_HOME, "nightly-last-run.txt");
 
 function readNightlyConfig(stateDir: string): Record<string, unknown> | null {
   try {
@@ -47,20 +48,18 @@ function readConfigLicenseKey(stateDir: string): string | undefined {
   }
 }
 
-function readLastRun(): Date {
-  try {
-    const ts = readFileSync(LAST_RUN_PATH, "utf-8").trim();
-    const d = new Date(ts);
-    if (!isNaN(d.getTime())) return d;
-  } catch {
-    // No file — first run
-  }
-  return new Date(0); // Process everything
+function readLastRun(stateDir: string = HICORTEX_HOME): Date {
+  const ts = loadState(stateDir).lastNightly;
+  if (!ts) return new Date(0); // First run — process everything
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? new Date(0) : d;
 }
 
-function writeLastRun(): void {
-  mkdirSync(HICORTEX_HOME, { recursive: true });
-  writeFileSync(LAST_RUN_PATH, new Date().toISOString());
+function writeLastRun(stateDir: string = HICORTEX_HOME): void {
+  updateState((s) => {
+    s.lastNightly = new Date().toISOString();
+    return s;
+  }, stateDir);
 }
 
 export async function runNightly(options: {
@@ -70,6 +69,9 @@ export async function runNightly(options: {
 } = {}): Promise<void> {
   const dryRun = options.dryRun ?? false;
   const stateDir = options.stateDir ?? HICORTEX_HOME;
+
+  // One-time migration of legacy state files (no-op if state.json exists)
+  migrateLegacyState(stateDir);
 
   // Check mode: client or server
   const savedConfig = readNightlyConfig(stateDir);
@@ -231,7 +233,7 @@ export async function runNightly(options: {
 
     // Step 4: Inject lessons into CLAUDE.md
     if (!dryRun) {
-      const injection = injectLessons(db, { stateDir });
+      const injection = await injectLessons(db, { stateDir });
       console.log(`[hicortex] CLAUDE.md updated: ${injection.lessonsCount} lessons at ${injection.path}`);
     }
 
@@ -436,8 +438,8 @@ async function injectLessonsFromServer(serverUrl: string, authToken?: string): P
     index: { total: number; lessonCount: number; sourceCount: number; projects: Array<{ name: string; count: number }> };
   };
 
-  const maxLessons = 10;
-  const selected = data.lessons.slice(0, maxLessons);
+  const maxLessons = lessonsLimit();
+  const selected = await getLessonSelector().select(data.lessons, { maxLessons });
 
   // Format lessons
   const lessonLines = selected.map((l) => {
@@ -485,10 +487,7 @@ async function injectLessonsFromServer(serverUrl: string, authToken?: string): P
   blockParts.push(END_MARKER);
   const block = blockParts.join("\n");
 
-  // Write to CLAUDE.md
-  const { readFileSync, writeFileSync, mkdirSync } = await import("node:fs");
-  const { join, dirname } = await import("node:path");
-  const { homedir } = await import("node:os");
+  // Write to CLAUDE.md (uses fs/path/os already imported at top of file)
   const claudeMdPath = join(homedir(), ".claude", "CLAUDE.md");
 
   let content = "";
