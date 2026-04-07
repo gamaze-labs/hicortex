@@ -3,7 +3,7 @@
  *
  * Detection:
  *   1. Local HC server running (localhost:8787)
- *   2. Remote HC server (HICORTEX_SERVER_URL or bedrock:8787)
+ *   2. Remote HC server (HICORTEX_SERVER_URL — any reachable host:port)
  *   3. OC plugin installed (~/.openclaw/openclaw.json)
  *   4. CC MCP already registered (~/.claude/settings.json)
  *   5. Existing DB (~/.hicortex/ or ~/.openclaw/data/)
@@ -207,10 +207,10 @@ When invoked with \`/learn <text>\`, store the learning in long-term memory via 
 
 ## Example
 
-\`/learn z.ai API uses Bearer auth on all endpoints, not x-api-key\`
+\`/learn always check provider docs before assuming an API uses the same auth scheme as OpenAI\`
 
 Becomes a call to hicortex_ingest with:
-- content: "LEARNING: z.ai API uses Bearer auth on all three endpoints (paas, coding, anthropic). Not x-api-key. (2026-03-26)"
+- content: "LEARNING: always check provider docs before assuming an API uses the same auth scheme as OpenAI — header names and token formats vary widely (Bearer vs x-api-key vs custom)."
 - memory_type: "lesson"
 `;
   const learnPath = join(CC_COMMANDS_DIR, "learn.md");
@@ -428,7 +428,7 @@ async function persistLlmConfig(): Promise<void> {
   options.push({
     label: "Other provider (requires API key)",
     save: async () => {
-      console.log("\n  Providers: Anthropic, OpenAI, Google, z.ai, OpenRouter, or any OpenAI-compatible");
+      console.log("\n  Providers: Anthropic, OpenAI, Google, OpenRouter, or any OpenAI-compatible endpoint");
       const baseUrl = await ask("  Provider base URL: ");
       if (!baseUrl) { console.log("  ⚠ Cancelled."); process.exit(0); }
       const apiKey = await ask("  API key: ");

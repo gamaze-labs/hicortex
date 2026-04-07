@@ -66,7 +66,7 @@ Plus skills: `/learn` to save explicit learnings.
 - **better-sqlite3** + **sqlite-vec** + FTS5 (semantic + full-text search in one DB)
 - **@huggingface/transformers** (bge-small-en-v1.5 ONNX, runs on CPU)
 - **MCP protocol** over HTTP/SSE (Claude Code, OpenClaw, any MCP client)
-- **Multi-provider LLM** — Ollama, Claude CLI, OpenAI, Anthropic, Google, OpenRouter, z.ai, 15+ more
+- **Multi-provider LLM** — Ollama, Claude CLI, OpenAI, Anthropic, Google, OpenRouter, or any OpenAI-compatible endpoint
 - **Auto-detects** Ollama models, Claude CLI, API keys during setup
 
 ## Architecture: Server + Client
