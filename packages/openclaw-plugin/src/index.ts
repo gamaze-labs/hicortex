@@ -531,28 +531,7 @@ async function autoConfigureLlm(
     log(`[hicortex] LLM test failed (${llmConfig.baseUrl}): ${msg}`);
   }
 
-  // Step 4: If test failed and this is z.ai, try the alternate endpoint
-  if (llmConfig.provider === "zai") {
-    const altUrl = llmConfig.baseUrl.includes("/coding/")
-      ? llmConfig.baseUrl.replace("/coding/", "/")
-      : llmConfig.baseUrl.replace("/api/paas/", "/api/coding/paas/");
-    log(`[hicortex] Trying alternate z.ai endpoint: ${altUrl}`);
-    llmConfig.baseUrl = altUrl;
-    const altClient = new LlmClient(llmConfig);
-    try {
-      const response = await altClient.completeFast("Respond with just the word OK", 10);
-      if (response && response.length > 0) {
-        log(`[hicortex] LLM connection verified on alternate endpoint`);
-        persistProviderConfig(llmConfig, log);
-        return llmConfig;
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log(`[hicortex] Alternate z.ai endpoint also failed: ${msg}`);
-    }
-  }
-
-  // Step 5: Fall back — return the config anyway, log instructions
+  // Step 4: Fall back — return the config anyway, log instructions
   log(
     `[hicortex] WARNING: Could not verify LLM connection. ` +
     `Distillation and consolidation may fail. ` +

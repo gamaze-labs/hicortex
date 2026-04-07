@@ -1,6 +1,5 @@
 /**
  * Multi-provider LLM client for consolidation and distillation.
- * Ported from hicortex/consolidate/llm.py.
  *
  * Resolution for OC adapter (resolveLlmConfig):
  *   1. Plugin config (llmBaseUrl, llmApiKey, llmModel)
@@ -10,12 +9,14 @@
  *
  * Resolution for CC adapter (resolveLlmConfigForCC):
  *   1. Explicit env vars (HICORTEX_LLM_BASE_URL + HICORTEX_LLM_API_KEY + HICORTEX_LLM_MODEL)
- *   2. ANTHROPIC_API_KEY → Haiku (cheap, CC users always have this)
- *   3. OPENAI_API_KEY → gpt-4o-mini
- *   4. GOOGLE_API_KEY → gemini-2.0-flash
- *   5. Fallback: Ollama at http://localhost:11434
+ *   2. ANTHROPIC_API_KEY → Claude Haiku (cheap, CC users always have this)
+ *   3. OPENAI_API_KEY → gpt-5.4-nano
+ *   4. GOOGLE_API_KEY → gemini-2.5-flash
+ *   5. Claude CLI fallback (uses subscription, no API key needed)
+ *   6. Fallback: Ollama at http://localhost:11434
  *
- * Supports: OpenAI, Anthropic, Google, OpenRouter, Ollama, z.ai, and 15+ more
+ * Supports any OpenAI-compatible endpoint plus first-class support for
+ * OpenAI, Anthropic, Google, Ollama, OpenRouter, and Claude CLI.
  */
 
 import { readFileSync } from "node:fs";
@@ -101,7 +102,7 @@ export function resolveLlmConfigForCC(overrides?: {
       baseUrl: overrides.llmBaseUrl,
       apiKey: overrides.llmApiKey,
       model: overrides.llmModel ?? "claude-haiku-4-5-20251001",
-      reflectModel: overrides.reflectModel ?? overrides.llmModel ?? "claude-sonnet-4-5-20250514",
+      reflectModel: overrides.reflectModel ?? overrides.llmModel ?? "claude-sonnet-4-6",
       provider,
     };
   }
@@ -116,7 +117,7 @@ export function resolveLlmConfigForCC(overrides?: {
       baseUrl: hcBaseUrl,
       apiKey: hcApiKey,
       model: hcModel ?? "claude-haiku-4-5-20251001",
-      reflectModel: process.env.HICORTEX_REFLECT_MODEL ?? hcModel ?? "claude-sonnet-4-5-20250514",
+      reflectModel: process.env.HICORTEX_REFLECT_MODEL ?? hcModel ?? "claude-sonnet-4-6",
       provider,
     };
   }
@@ -128,7 +129,7 @@ export function resolveLlmConfigForCC(overrides?: {
       baseUrl: process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
       apiKey: anthropicKey,
       model: "claude-haiku-4-5-20251001",
-      reflectModel: "claude-sonnet-4-5-20250514",
+      reflectModel: "claude-sonnet-4-6",
       provider: "anthropic",
     };
   }
@@ -139,8 +140,8 @@ export function resolveLlmConfigForCC(overrides?: {
     return {
       baseUrl,
       apiKey: openaiKey,
-      model: "gpt-4o-mini",
-      reflectModel: "gpt-4o-mini",
+      model: "gpt-5.4-nano",
+      reflectModel: "gpt-5.4-nano",
       provider: detectProvider(baseUrl),
     };
   }
@@ -150,8 +151,8 @@ export function resolveLlmConfigForCC(overrides?: {
     return {
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
       apiKey: googleKey,
-      model: "gemini-2.0-flash",
-      reflectModel: "gemini-2.0-flash",
+      model: "gemini-2.5-flash",
+      reflectModel: "gemini-2.5-flash",
       provider: "google",
     };
   }
@@ -180,7 +181,6 @@ function detectProvider(
   if (u.includes("anthropic")) return "anthropic";
   if (u.includes("openrouter")) return "openrouter";
   if (u.includes("googleapis") || u.includes("generativelanguage")) return "google";
-  if (u.includes("z.ai") || u.includes("zai")) return "zai";
   return "openai";
 }
 
@@ -192,7 +192,7 @@ function readOpenClawConfig(): LlmConfig | null {
     const primary = config?.agents?.defaults?.model?.primary;
     if (!primary) return null;
 
-    // primary format is "provider/model" (e.g. "zai/glm-5-turbo", "openai/gpt-4o")
+    // primary format is "provider/model" (e.g. "openai/gpt-5", "anthropic/claude-sonnet-4-6")
     if (typeof primary === "string" && (primary.includes("/") || primary.includes(":"))) {
       const sep = primary.includes("/") ? "/" : ":";
       const [providerHint, ...rest] = primary.split(sep);
@@ -254,7 +254,7 @@ function readOcAuthKey(provider: string): string | undefined {
         const auth = JSON.parse(raw);
         const profiles = auth?.profiles ?? {};
 
-        // Look for a profile matching the provider (e.g. "zai:default")
+        // Look for a profile matching the provider (e.g. "openai:default")
         for (const [profileId, profile] of Object.entries(profiles)) {
           const p = profile as any;
           if (
@@ -283,8 +283,8 @@ function resolveFromEnv(): LlmConfig | null {
     return {
       baseUrl,
       apiKey: openaiKey,
-      model: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
-      reflectModel: process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+      model: process.env.OPENAI_MODEL ?? "gpt-5.4-nano",
+      reflectModel: process.env.OPENAI_MODEL ?? "gpt-5.4-nano",
       provider,
     };
   }
@@ -294,8 +294,8 @@ function resolveFromEnv(): LlmConfig | null {
     return {
       baseUrl: process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
       apiKey: anthropicKey,
-      model: "claude-sonnet-4-20250514",
-      reflectModel: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-6",
+      reflectModel: "claude-sonnet-4-6",
       provider: "anthropic",
     };
   }
@@ -305,8 +305,8 @@ function resolveFromEnv(): LlmConfig | null {
     return {
       baseUrl: "https://generativelanguage.googleapis.com/v1beta",
       apiKey: googleKey,
-      model: "gemini-2.0-flash",
-      reflectModel: "gemini-2.0-flash",
+      model: "gemini-2.5-flash",
+      reflectModel: "gemini-2.5-flash",
       provider: "google",
     };
   }
@@ -322,34 +322,24 @@ function getEnvKeyForProvider(provider: string): string | undefined {
       return process.env.ANTHROPIC_API_KEY;
     case "google":
       return process.env.GOOGLE_API_KEY;
-    case "zai":
-      return process.env.ZAI_API_KEY ?? process.env.LLM_API_KEY;
     default:
       return undefined;
   }
 }
 
-/** Default base URLs for all OC-supported providers (from OC gateway binary). */
+/**
+ * Default base URLs for first-class supported providers.
+ *
+ * For any other provider, set llmBaseUrl explicitly in your config or use
+ * an OpenAI-compatible endpoint. The detectProvider() function will treat
+ * unknown URLs as openai-compatible by default.
+ */
 const PROVIDER_BASE_URLS: Record<string, string> = {
   openai: "https://api.openai.com/v1",
   anthropic: "https://api.anthropic.com",
   google: "https://generativelanguage.googleapis.com/v1beta",
   ollama: "http://localhost:11434",
   openrouter: "https://openrouter.ai/api",
-  zai: "https://api.z.ai/api/anthropic",
-  groq: "https://api.groq.com/openai/v1",
-  deepseek: "https://api.deepseek.com",
-  mistral: "https://api.mistral.ai/v1",
-  together: "https://api.together.xyz/v1",
-  perplexity: "https://api.perplexity.ai",
-  nvidia: "https://integrate.api.nvidia.com/v1",
-  xai: "https://api.x.ai/v1",
-  venice: "https://api.venice.ai/api/v1",
-  minimax: "https://api.minimaxi.com/v1",
-  moonshot: "https://api.moonshot.ai/v1",
-  kimi: "https://api.kimi.com/coding",
-  chutes: "https://api.chutes.ai",
-  kilo: "https://api.kilo.ai/api/gateway",
 };
 
 function getDefaultUrlForProvider(provider: string): string {
@@ -602,7 +592,7 @@ export class LlmClient {
     if (this.config.provider === "ollama") {
       return this.completeOllama(model, prompt, maxTokens, timeoutMs);
     }
-    if (this.config.provider === "anthropic" || this.config.provider === "zai") {
+    if (this.config.provider === "anthropic") {
       return this.completeAnthropic(model, prompt, maxTokens, timeoutMs);
     }
     return this.completeOpenAiCompat(model, prompt, maxTokens, timeoutMs);
@@ -694,7 +684,7 @@ export class LlmClient {
   }
 
   /**
-   * Anthropic Messages API (/v1/messages). Used for Anthropic and z.ai.
+   * Anthropic Messages API (/v1/messages).
    * Auth via x-api-key header.
    */
   private async completeAnthropic(
@@ -745,8 +735,8 @@ export class LlmClient {
     timeoutMs: number
   ): Promise<string> {
     const baseUrl = this.config.baseUrl.replace(/\/$/, "");
-    // Some providers (z.ai) include version in base URL already
-    const hasVersion = /\/v\d+\/?$/.test(baseUrl) || baseUrl.includes("/paas/v");
+    // Some providers include the API version in the base URL already
+    const hasVersion = /\/v\d+\/?$/.test(baseUrl);
     const url = hasVersion
       ? `${baseUrl}/chat/completions`
       : `${baseUrl}/v1/chat/completions`;
@@ -772,10 +762,6 @@ export class LlmClient {
     if (resp.status === 429) this.handleRateLimit(resp);
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
-      // z.ai: "Insufficient balance" likely means wrong endpoint (coding vs paas)
-      if (text.includes("1113") || text.includes("Insufficient balance")) {
-        console.log(`[hicortex] LLM billing error. Check that llmBaseUrl matches your plan. Current: ${baseUrl}`);
-      }
       throw new Error(`LLM API error ${resp.status}: ${text}`);
     }
 

@@ -2,7 +2,7 @@
   "id": "hicortex",
   "name": "Hicortex — Long-term Memory That Learns",
   "description": "Your agents remember past decisions, avoid repeated mistakes, and get smarter every day. Nightly reflection generates actionable lessons that automatically update agent behavior.",
-  "version": "0.3.11",
+  "version": "0.4.5",
   "kind": "lifecycle",
   "skills": ["./skills/hicortex-memory", "./skills/hicortex-learn", "./skills/hicortex-activate"],
   "configSchema": {
@@ -10,7 +10,7 @@
     "properties": {
       "licenseKey": {
         "type": "string",
-        "description": "Hicortex license key (hctx-...). Leave empty for free tier (100 memory cap)."
+        "description": "Hicortex license key (hctx-...). Leave empty for free tier (250 memory cap)."
       },
       "llmBaseUrl": {
         "type": "string",

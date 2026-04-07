@@ -23,12 +23,12 @@ When invoked with `/learn <text>`, store the learning in long-term memory via hi
 ## Example
 
 ```
-/learn z.ai API uses Bearer auth on all endpoints, not x-api-key
+/learn always check provider docs before assuming an API uses the same auth scheme as OpenAI
 ```
 
 Becomes:
 ```
-hicortex_ingest(content="LEARNING: z.ai API uses Bearer auth on all three endpoints (paas, coding, anthropic). Not x-api-key. (2026-03-24)", project="global", memory_type="lesson")
+hicortex_ingest(content="LEARNING: always check provider docs before assuming an API uses the same auth scheme as OpenAI — header names and token formats vary widely (Bearer vs x-api-key vs custom). (2026-04-07)", project="global", memory_type="lesson")
 ```
 
 ## Rules
