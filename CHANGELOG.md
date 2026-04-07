@@ -3,6 +3,33 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.6] - 2026-04-07
+
+### Fixed
+- **Nightly data-loss bug** — when the distillation LLM was unreachable or
+  the required model was missing, the nightly pipeline would silently log
+  "0 memories extracted" for every session and then advance the `lastRun`
+  watermark anyway. Those sessions were permanently lost — they'd be older
+  than the new watermark next run and never retried.
+  - Root cause: `distillChunk` caught all LLM errors and returned an empty
+    array, making transient failures indistinguishable from legitimate
+    "nothing to extract" outcomes.
+  - Fix (5 parts):
+    1. `distillChunk` now throws on transient LLM errors; returns `[]` only
+       for legitimate empty results (NO_EXTRACT, empty response).
+    2. `distillSession` rethrows if ALL chunks fail; returns partial
+       results with a warning if some chunks succeed.
+    3. Nightly pipeline (both server + client mode) tracks `hadTransientFailure`
+       and only advances `lastRun` if every session was processed cleanly.
+    4. Server-mode adds per-session dedup (`source_session` check) before
+       distilling — makes retries idempotent, matches client-mode behaviour
+       which already had this via the server's `/ingest` endpoint.
+    5. Pre-flight health check on remote Ollama distill endpoints via a new
+       `probeOllamaModel` helper — verifies both reachability AND that the
+       required model is present in `/api/tags`. Aborts early with a clear
+       message if unreachable or model missing, avoiding minutes of timeouts.
+  - Added 7 regression tests for the new error-propagation contract.
+
 ## [0.4.5] - 2026-04-07
 
 ### Changed

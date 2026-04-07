@@ -249,16 +249,25 @@ export async function distillSession(
   // Use provided chunk size or default to no chunking
   const chunkSize = chunkSizeChars ?? MAX_TRANSCRIPT_CHARS;
 
-  // If transcript fits in one chunk, distill directly
+  // If transcript fits in one chunk, distill directly (errors propagate)
   if (transcript.length <= chunkSize) {
     return distillChunk(llm, transcript, projectName, date);
   }
 
-  // Chunk large transcripts and distill each segment
+  // Chunk large transcripts and distill each segment.
+  //
+  // Partial success policy:
+  //   - If SOME chunks succeed and SOME fail, return the partial results and
+  //     log a warning. The caller gets *something* and can decide whether
+  //     to count this as success.
+  //   - If ALL chunks fail, throw — no useful output, and the caller needs
+  //     to know this session hit a transient error.
   const chunks = splitIntoChunks(transcript, chunkSize);
   console.log(`[hicortex]     Chunking ${transcript.length} chars into ${chunks.length} segments`);
   const allEntries: string[] = [];
   const seen = new Set<string>();
+  let chunkFailures = 0;
+  let lastError: Error | null = null;
 
   for (let i = 0; i < chunks.length; i++) {
     console.log(`[hicortex]     Chunk ${i + 1}/${chunks.length} (${chunks[i].length} chars)`);
@@ -275,8 +284,21 @@ export async function distillSession(
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[hicortex]     Chunk ${i + 1} failed: ${msg}`);
-      // Continue with remaining chunks — partial extraction is better than none
+      chunkFailures++;
+      lastError = err instanceof Error ? err : new Error(msg);
     }
+  }
+
+  // If every chunk failed, the session wasn't actually processed. Throw so
+  // the nightly pipeline knows to retry this session next run.
+  if (chunkFailures === chunks.length) {
+    throw lastError ?? new Error("All distillation chunks failed");
+  }
+
+  if (chunkFailures > 0) {
+    console.warn(
+      `[hicortex]     Partial distillation: ${chunks.length - chunkFailures}/${chunks.length} chunks succeeded`
+    );
   }
 
   return allEntries;
@@ -284,6 +306,15 @@ export async function distillSession(
 
 /**
  * Distill a single chunk of conversation text.
+ *
+ * Behaviour contract:
+ *   - Returns `[]` for legitimate empty results (NO_EXTRACT, empty LLM response,
+ *     transcript produced no entries). These are terminal states — the chunk was
+ *     processed successfully, there's just nothing worth keeping.
+ *   - Throws for transient errors (LLM unreachable, HTTP 4xx/5xx, timeout, model
+ *     not found, rate limit). These MUST propagate so the nightly pipeline can
+ *     distinguish "nothing to extract" from "try again later" and avoid
+ *     advancing the last-run watermark past sessions it never actually processed.
  */
 async function distillChunk(
   llm: LlmClient,
@@ -293,19 +324,17 @@ async function distillChunk(
 ): Promise<string[]> {
   const prompt = distillation(projectName, date, transcript);
 
-  try {
-    const result = await llm.completeDistill(prompt);
-    if (!result) return [];
-    if (result === "NO_EXTRACT" || result.slice(0, 20).includes("NO_EXTRACT")) {
-      return [];
-    }
-
-    return parseDistilledEntries(result);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[hicortex] Distillation LLM error: ${msg}`);
+  // NOTE: Intentionally no try/catch here. Transient LLM errors (network
+  // failures, 4xx/5xx, model-not-found, timeouts) propagate up to the caller
+  // so the nightly pipeline can treat them as "retry later" instead of
+  // "processed successfully with zero extractions".
+  const result = await llm.completeDistill(prompt);
+  if (!result) return [];
+  if (result === "NO_EXTRACT" || result.slice(0, 20).includes("NO_EXTRACT")) {
     return [];
   }
+
+  return parseDistilledEntries(result);
 }
 
 /**
