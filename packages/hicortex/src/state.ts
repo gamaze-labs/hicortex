@@ -49,6 +49,8 @@ export interface HicortexState {
   lastConsolidated?: string;
   /** Last-known license tier (replaces tier.json + license-validated.txt). */
   tier?: PersistedTier;
+  /** Anonymous telemetry UUID — generated once, never linked to personal info. */
+  telemetryId?: string;
 }
 
 /**
