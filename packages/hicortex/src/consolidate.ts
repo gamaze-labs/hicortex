@@ -458,7 +458,8 @@ export async function runConsolidation(
   db: Database.Database,
   llm: LlmClient,
   embedFn: EmbedFn,
-  dryRun = false
+  dryRun = false,
+  skipReflection = false,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -509,14 +510,22 @@ export async function runConsolidation(
     );
 
     // Stage 2.5: Reflection
-    report.stages.reflection = await stageReflection(
-      db,
-      precheck.newMemories,
-      llm,
-      budget,
-      embedFn,
-      dryRun
-    );
+    if (skipReflection) {
+      report.stages.reflection = {
+        lessons_generated: 0,
+        skipped: true,
+        reason: "reflect_endpoint_offline",
+      };
+    } else {
+      report.stages.reflection = await stageReflection(
+        db,
+        precheck.newMemories,
+        llm,
+        budget,
+        embedFn,
+        dryRun
+      );
+    }
 
     // Stage 3: Link Discovery
     report.stages.links = await stageLinks(

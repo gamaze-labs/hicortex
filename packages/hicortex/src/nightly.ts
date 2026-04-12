@@ -14,6 +14,9 @@ import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import type Database from "better-sqlite3";
 
+let VERSION = "0.0.0";
+try { VERSION = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version; } catch {}
+
 import { initDb, resolveDbPath } from "./db.js";
 import { resolveLlmConfigForCC, LlmClient, findClaudeBinary, claudeCliConfig, preferOllamaForBatch, probeOllamaModel, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
@@ -26,6 +29,7 @@ import { injectLessons } from "./claude-md.js";
 import { initFeatures, lessonsLimit, memoryCapReached, maxMemoriesAllowed } from "./features.js";
 import { getLessonSelector } from "./extensions.js";
 import { loadState, updateState, migrateLegacyState } from "./state.js";
+import { isTelemetryEnabled, getTelemetryId, sendTelemetry } from "./telemetry.js";
 
 const HICORTEX_HOME = join(homedir(), ".hicortex");
 
@@ -263,8 +267,25 @@ export async function runNightly(options: {
 
     // Step 3: Consolidation
     if (!dryRun) {
+      // Pre-flight health check for the reflect endpoint.
+      // If reflectBaseUrl points to a remote Ollama and it's down (MBP offline),
+      // skip reflection entirely instead of waiting through 3 retries (~3.5 min).
+      // Scoring + linking + decay still run (they use the local model or don't need LLM).
+      let skipReflection = false;
+      if (llmConfig.reflectBaseUrl && (llmConfig.reflectProvider ?? llmConfig.provider) === "ollama") {
+        const reflectModel = llmConfig.reflectModel ?? llmConfig.model;
+        const health = await probeOllamaModel(llmConfig.reflectBaseUrl, reflectModel);
+        if (!health.ok) {
+          const reason = health.reason === "unreachable"
+            ? `reflect endpoint unreachable (${llmConfig.reflectBaseUrl})`
+            : `reflect model not loaded (${reflectModel} missing on ${llmConfig.reflectBaseUrl})`;
+          console.warn(`[hicortex] ${reason} — skipping reflection, scoring + linking will still run`);
+          skipReflection = true;
+        }
+      }
+
       console.log(`[hicortex] Running consolidation...`);
-      const report = await runConsolidation(db, llm, embed, dryRun);
+      const report = await runConsolidation(db, llm, embed, dryRun, skipReflection);
       console.log(
         `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
         (report.stages.reflection ? ` (${report.stages.reflection.lessons_generated} lessons)` : "")
@@ -298,6 +319,23 @@ export async function runNightly(options: {
     }
 
     console.log(`[hicortex] Nightly pipeline complete.`);
+
+    // Step 6: Anonymous telemetry (fire-and-forget, opt-out via config)
+    if (!dryRun && isTelemetryEnabled(savedConfig)) {
+      const agentType = piBatches.length > 0 && ccBatches.length > 0 ? "mixed"
+        : piBatches.length > 0 ? "pi"
+        : "cc";
+      await sendTelemetry({
+        id: getTelemetryId(stateDir),
+        v: VERSION,
+        mode: "server",
+        agent: agentType,
+        mem: storage.countMemories(db),
+        lessons: storage.getLessons(db, 365).length,
+        sessions: batches.length,
+        ok: !hadTransientFailure,
+      });
+    }
   } finally {
     db.close();
   }
@@ -502,6 +540,20 @@ async function runClientNightly(
     }
   }
   console.log(`[hicortex] Client nightly complete: ${memoriesIngested} memories from ${sessionsSent} sessions → ${serverUrl}`);
+
+  // Anonymous telemetry (fire-and-forget, opt-out via config)
+  if (!dryRun && isTelemetryEnabled(config)) {
+    await sendTelemetry({
+      id: getTelemetryId(HICORTEX_HOME),
+      v: VERSION,
+      mode: "client",
+      agent: "cc", // client mode is always CC-originated currently
+      mem: memoriesIngested,
+      lessons: 0, // client doesn't know lesson count
+      sessions: batches.length,
+      ok: !hadTransientFailure,
+    });
+  }
 }
 
 /**
