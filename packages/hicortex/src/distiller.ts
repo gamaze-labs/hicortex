@@ -6,6 +6,7 @@
 
 import type { LlmClient } from "./llm.js";
 import { distillation } from "./prompts.js";
+import { redact, type RedactionConfig } from "./redact.js";
 
 const MAX_TRANSCRIPT_CHARS = 80_000;
 const MIN_CONVERSATION_CHARS = 200;
@@ -193,9 +194,16 @@ function cleanMessageContent(text: string): string {
 }
 
 /**
- * Convert OpenClaw hook messages to a filtered transcript string.
+ * Convert session messages to a filtered transcript string.
+ * Handles OC hook format, CC JSONL, and Pi JSONL.
+ *
+ * If redactionConfig is provided (or defaults to enabled), secrets and PII
+ * are scrubbed from the final text BEFORE it reaches any LLM or storage.
  */
-export function extractConversationText(messages: unknown[]): string {
+export function extractConversationText(
+  messages: unknown[],
+  redactionConfig?: RedactionConfig,
+): string {
   const parts: string[] = [];
 
   for (const msg of messages) {
@@ -230,7 +238,17 @@ export function extractConversationText(messages: unknown[]): string {
     parts.push(`${role}: ${text}`);
   }
 
-  return parts.join("\n\n");
+  let result = parts.join("\n\n");
+
+  // Redact secrets and PII before the text reaches any LLM or storage.
+  // This is the last step — after all cleaning/filtering but before return.
+  const { text: redacted, count } = redact(result, redactionConfig);
+  if (count > 0) {
+    console.log(`[hicortex] Redacted ${count} secret(s) from transcript`);
+  }
+  result = redacted;
+
+  return result;
 }
 
 /**

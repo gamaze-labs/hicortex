@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.3] - 2026-04-12
+
+### Added
+- **Pre-ingestion redaction** (#78) — scrubs API keys, tokens, paths, and
+  generic secrets from transcripts BEFORE they reach the distillation LLM or
+  storage. 12 default patterns (Anthropic, OpenAI, Stripe, GitHub, Google,
+  AWS, Bearer, Hicortex, generic key=value, macOS paths, Linux paths).
+  Configurable via `redaction` in config.json. Opt-out: `redaction.enabled: false`.
+- **Contradiction detection** (#73) — during nightly reflection, each new
+  lesson candidate is checked against existing lessons via vector similarity.
+  If a semantically similar lesson exists (>0.80 cosine) and the LLM judges
+  them contradictory, the new lesson is suppressed. Prevents the "false
+  coherence" failure mode where wrong lessons reinforce themselves. Fully
+  autonomous, logged for audit.
+
 ## [0.5.0] - 2026-04-11
 
 ### Added

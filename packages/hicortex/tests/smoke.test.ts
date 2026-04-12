@@ -1336,3 +1336,154 @@ describe("probeOllamaModel", () => {
   // dependency-free. The two unreachable cases above cover the control flow
   // into the abort branch in nightly.ts.
 });
+
+// ---------------------------------------------------------------------------
+// Redaction (pre-ingestion secret scrubbing)
+// ---------------------------------------------------------------------------
+
+import { redact } from "../src/redact.js";
+
+describe("redact", () => {
+  it("redacts Anthropic API keys (sk-ant-...)", () => {
+    const { text, count } = redact("key is sk-ant-api03-abc123def456ghi789jkl012mno345");
+    expect(text).not.toContain("sk-ant-");
+    expect(text).toContain("[REDACTED]");
+    expect(count).toBe(1);
+  });
+
+  it("redacts OpenAI API keys (sk-proj-... and sk-...)", () => {
+    const r1 = redact("export OPENAI_API_KEY=sk-proj-abcdef1234567890abcdef1234567890");
+    expect(r1.text).not.toContain("sk-proj-");
+    expect(r1.count).toBeGreaterThanOrEqual(1);
+
+    const r2 = redact("key: sk-abcdefghijklmnopqrstuvwxyz1234567890");
+    expect(r2.text).not.toContain("sk-abcdefgh");
+    expect(r2.count).toBeGreaterThanOrEqual(1);
+  });
+
+  it("redacts Hicortex license keys (hctx-...)", () => {
+    const { text, count } = redact("License: hctx-2cca3dcf0d6254dd activated");
+    expect(text).not.toContain("hctx-2cca3dcf");
+    expect(text).toContain("[REDACTED]");
+    expect(count).toBe(1);
+  });
+
+  it("redacts GitHub PATs (ghp_...)", () => {
+    const { text, count } = redact("git clone https://ghp_ABCDEFghijklmnopqrstuvwxyz1234567890@github.com/repo");
+    expect(text).not.toContain("ghp_ABCDEF");
+    expect(count).toBe(1);
+  });
+
+  it("redacts GitHub OAuth tokens (gho_...)", () => {
+    const { text, count } = redact("token: gho_ABCDEFghijklmnopqrstuvwxyz1234567890");
+    expect(text).not.toContain("gho_ABCDEF");
+    expect(count).toBeGreaterThanOrEqual(1);
+  });
+
+  it("redacts Google API keys (AIza...)", () => {
+    const { text, count } = redact("GOOGLE_API_KEY=AIzaSyBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    expect(text).not.toContain("AIzaSyBcDeF");
+    expect(count).toBeGreaterThanOrEqual(1);
+  });
+
+  it("redacts AWS access keys (AKIA...)", () => {
+    const { text, count } = redact("aws_access_key_id = AKIAIOSFODNN7EXAMPLE");
+    expect(text).not.toContain("AKIAIOSFODNN");
+    expect(count).toBe(1);
+  });
+
+  it("redacts Bearer tokens", () => {
+    const { text, count } = redact('Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.abc.def');
+    expect(text).not.toContain("eyJhbGci");
+    expect(count).toBe(1);
+  });
+
+  it("redacts generic secret assignments (key=value, key: value)", () => {
+    const r1 = redact('password=super_secret_pass_123');
+    expect(r1.text).not.toContain("super_secret");
+    expect(r1.count).toBeGreaterThanOrEqual(1);
+
+    const r2 = redact('api_key: "sk_live_abcdef1234567890"');
+    expect(r2.text).not.toContain("sk_live_");
+    expect(r2.count).toBeGreaterThanOrEqual(1);
+
+    const r3 = redact('SECRET_KEY = "my-very-long-secret-value-here"');
+    expect(r3.text).not.toContain("my-very-long");
+    expect(r3.count).toBe(1);
+  });
+
+  it("redacts macOS absolute paths (/Users/<username>)", () => {
+    const { text, count } = redact("reading /Users/mattias/Development/secret-project/config.json");
+    expect(text).not.toContain("/Users/mattias");
+    expect(text).toContain("[REDACTED]");
+    expect(count).toBe(1);
+  });
+
+  it("redacts Linux absolute paths (/home/<username>)", () => {
+    const { text, count } = redact("deployed to /home/agents/Agents/raider/.env");
+    expect(text).not.toContain("/home/agents");
+    expect(text).toContain("[REDACTED]");
+    expect(count).toBe(1);
+  });
+
+  it("handles multiple secrets in one text", () => {
+    const text = `
+      OPENAI_API_KEY=sk-proj-abc123def456789012345678901234
+      ANTHROPIC_API_KEY=sk-ant-api03-xyz789abc012def345ghi
+      Reading /Users/mattias/.env
+      token: hctx-2cca3dcf0d6254dd
+    `;
+    const { text: redacted, count } = redact(text);
+    expect(count).toBeGreaterThanOrEqual(4);
+    expect(redacted).not.toContain("sk-proj-");
+    expect(redacted).not.toContain("sk-ant-");
+    expect(redacted).not.toContain("/Users/mattias");
+    expect(redacted).not.toContain("hctx-2cca3dcf");
+  });
+
+  it("does nothing when no secrets present", () => {
+    const { text, count } = redact("This is a normal conversation about deploying Node.js apps.");
+    expect(text).toBe("This is a normal conversation about deploying Node.js apps.");
+    expect(count).toBe(0);
+  });
+
+  it("respects enabled: false in config", () => {
+    const { text, count } = redact("key is sk-ant-api03-abc123def456ghi789jkl012", { enabled: false });
+    expect(text).toContain("sk-ant-api03-");
+    expect(count).toBe(0);
+  });
+
+  it("applies extra patterns from config", () => {
+    const { text, count } = redact("internal ref: MYCOMPANY-SECRET-12345", {
+      extraPatterns: ["MYCOMPANY-SECRET-\\d+"],
+    });
+    expect(text).not.toContain("MYCOMPANY-SECRET");
+    expect(count).toBe(1);
+  });
+
+  it("uses custom replacement string", () => {
+    const { text } = redact("key: sk-ant-api03-abc123def456ghi789jkl012mno", {
+      replacement: "***",
+    });
+    expect(text).toContain("***");
+    expect(text).not.toContain("[REDACTED]");
+  });
+
+  it("handles invalid extra pattern gracefully (no crash)", () => {
+    const { text } = redact("normal text", {
+      extraPatterns: ["[invalid regex("],
+    });
+    expect(text).toBe("normal text");
+  });
+
+  it("integrates with extractConversationText", () => {
+    const messages = [
+      { role: "user", content: "My API key is sk-proj-abcdef1234567890abcdef1234567890" },
+      { role: "assistant", content: "I see your key. Let me use it at /Users/mattias/project" },
+    ];
+    const text = extractConversationText(messages);
+    expect(text).not.toContain("sk-proj-");
+    expect(text).not.toContain("/Users/mattias");
+    expect(text).toContain("[REDACTED]");
+  });
+});
