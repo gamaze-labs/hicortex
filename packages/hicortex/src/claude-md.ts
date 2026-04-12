@@ -16,6 +16,8 @@ import type Database from "better-sqlite3";
 import * as storage from "./storage.js";
 import { lessonsLimit } from "./features.js";
 import { getLessonSelector } from "./extensions.js";
+import { loadState } from "./state.js";
+import type { ModuleIndex } from "./types.js";
 
 const START_MARKER = "<!-- HICORTEX-LEARNINGS:START -->";
 const END_MARKER = "<!-- HICORTEX-LEARNINGS:END -->";
@@ -40,11 +42,16 @@ export async function injectLessons(
   // Determine limits based on license
   const maxLessons = lessonsLimit();
 
+  // Load MODULE_INDEX from state for domain-aware selection
+  const state = loadState(options.stateDir);
+  const moduleIndex = state.moduleIndex;
+
   // --- Lessons ---
   const lessons = storage.getLessons(db, 30, options.project);
   const selected = await getLessonSelector().select(lessons, {
     maxLessons,
     project: options.project,
+    moduleIndex,
   });
 
   const lessonLines = selected.map((l) => {
@@ -57,7 +64,8 @@ export async function injectLessons(
   });
 
   // --- Memory Index ---
-  const projectIndex = buildProjectIndex(db);
+  const tokenBudget = readModuleIndexTokenBudget();
+  const indexLines = buildModuleIndex(db, tokenBudget, moduleIndex);
   const totalCount = storage.countMemories(db);
   const lessonCount = lessons.length;
   const sourceCount = countSources(db);
@@ -92,9 +100,9 @@ export async function injectLessons(
   }
 
   // Memory index
-  if (projectIndex.length > 0) {
+  if (indexLines.length > 0) {
     blockParts.push("", "### Memory Index");
-    blockParts.push(projectIndex.join(" | "));
+    blockParts.push(...indexLines);
     blockParts.push(
       `${totalCount} memories, ${lessonCount} lessons, ${sourceCount} agents. Search with \`hicortex_search\`.`
     );
@@ -131,10 +139,59 @@ export async function injectLessons(
   return { lessonsCount: selected.length, path: claudeMdPath };
 }
 
+const DEFAULT_MODULE_INDEX_TOKEN_BUDGET = 500;
+// BPE tokenizers average 3.5-4.5 chars/token for English prose. 4 is conservative.
+const CHARS_PER_TOKEN = 4;
+
 /**
- * Build compact project index: "hicortex: 18 | boat: 24 | health: 45"
+ * Read moduleIndexTokenBudget from config.json. Defaults to 500.
  */
-function buildProjectIndex(db: Database.Database): string[] {
+function readModuleIndexTokenBudget(): number {
+  try {
+    const configPath = join(homedir(), ".hicortex", "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf-8"));
+    return typeof config.moduleIndexTokenBudget === "number"
+      ? config.moduleIndexTokenBudget
+      : DEFAULT_MODULE_INDEX_TOKEN_BUDGET;
+  } catch {
+    return DEFAULT_MODULE_INDEX_TOKEN_BUDGET;
+  }
+}
+
+/**
+ * Build structured MODULE_INDEX block for injection.
+ * Uses domain-grouped format if MODULE_INDEX is available,
+ * falls back to flat "project: count" format otherwise.
+ */
+function buildModuleIndex(
+  db: Database.Database,
+  tokenBudget: number,
+  moduleIndex?: ModuleIndex,
+): string[] {
+  if (moduleIndex && moduleIndex.domains.length > 0) {
+    const charBudget = tokenBudget * CHARS_PER_TOKEN;
+    let charCount = 0;
+    const lines: string[] = [];
+
+    for (const domain of moduleIndex.domains) {
+      const kwStr = domain.keywords.length > 0
+        ? `: ${domain.keywords.join(", ")}`
+        : "";
+      const domainLine = `${domain.name} (${domain.memoryCount} memories, ${domain.lessonCount} lessons)${kwStr}`;
+      const projectLine = `  ${domain.projects.join(" | ")}`;
+
+      const blockChars = domainLine.length + projectLine.length + 2; // +2 for newlines
+      if (charCount + blockChars > charBudget && lines.length > 0) break;
+
+      lines.push(domainLine);
+      lines.push(projectLine);
+      charCount += blockChars;
+    }
+
+    return lines;
+  }
+
+  // Fallback: flat project index (OSS default)
   try {
     const rows = db
       .prepare(
@@ -143,7 +200,7 @@ function buildProjectIndex(db: Database.Database): string[] {
          GROUP BY project ORDER BY cnt DESC LIMIT 10`
       )
       .all() as Array<{ project: string; cnt: number }>;
-    return rows.map((r) => `${r.project}: ${r.cnt}`);
+    return [rows.map((r) => `${r.project}: ${r.cnt}`).join(" | ")];
   } catch {
     return [];
   }

@@ -5,13 +5,14 @@
  */
 
 import type Database from "better-sqlite3";
-import type { Memory, ConsolidationReport } from "./types.js";
+import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain } from "./types.js";
 import type { LlmClient } from "./llm.js";
 import type { EmbedFn } from "./retrieval.js";
 import { effectiveStrength } from "./retrieval.js";
 import * as storage from "./storage.js";
-import { importanceScoring, reflection } from "./prompts.js";
-import { memoryCapReached, maxMemoriesAllowed } from "./features.js";
+import { importanceScoring, reflection, domainCuration } from "./prompts.js";
+import { createHash } from "node:crypto";
+import { memoryCapReached, maxMemoriesAllowed, isPro } from "./features.js";
 import { loadState, updateState } from "./state.js";
 
 // Default config constants (matching Python config.py)
@@ -358,6 +359,163 @@ async function stageReflection(
 }
 
 // ---------------------------------------------------------------------------
+// Stage 2.7: Domain Curation (MODULE_INDEX)
+// ---------------------------------------------------------------------------
+
+async function stageDomainCuration(
+  db: Database.Database,
+  llm: LlmClient,
+  budget: BudgetTracker,
+  dryRun: boolean,
+  stateDir?: string,
+): Promise<{ curated: boolean; domains: number; reason?: string }> {
+  // Gather all projects with memory and lesson counts
+  const projectRows = db
+    .prepare(
+      `SELECT project, COUNT(*) as cnt FROM memories
+       WHERE project IS NOT NULL GROUP BY project ORDER BY cnt DESC`
+    )
+    .all() as Array<{ project: string; cnt: number }>;
+
+  if (projectRows.length === 0) {
+    return { curated: false, domains: 0, reason: "no_projects" };
+  }
+
+  const lessonRows = db
+    .prepare(
+      `SELECT project, COUNT(*) as cnt FROM memories
+       WHERE project IS NOT NULL AND memory_type = 'lesson'
+       GROUP BY project`
+    )
+    .all() as Array<{ project: string; cnt: number }>;
+  const lessonsByProject = new Map(lessonRows.map((r) => [r.project, r.cnt]));
+
+  // Cache check: skip if project set unchanged
+  const sortedNames = projectRows.map((r) => r.project).sort();
+  const projectSetHash = createHash("sha256")
+    .update(JSON.stringify(sortedNames))
+    .digest("hex");
+
+  const state = loadState(stateDir);
+  if (state.moduleIndex?.projectSetHash === projectSetHash) {
+    return { curated: false, domains: state.moduleIndex.domains.length, reason: "project_set_unchanged" };
+  }
+
+  const totalMemories = projectRows.reduce((s, r) => s + r.cnt, 0);
+  const totalLessons = lessonRows.reduce((s, r) => s + r.cnt, 0);
+
+  let domains: ModuleDomain[];
+
+  if (!isPro()) {
+    // OSS fallback: each project is its own domain
+    domains = projectRows.map((r) => ({
+      name: r.project,
+      projects: [r.project],
+      memoryCount: r.cnt,
+      lessonCount: lessonsByProject.get(r.project) ?? 0,
+      keywords: [],
+    }));
+  } else {
+    // Pro: LLM-curated domains
+    if (!budget.use("domain_curation")) {
+      return { curated: false, domains: 0, reason: "budget_exhausted" };
+    }
+
+    const projectLines = projectRows
+      .map((r) => `${r.project}: ${r.cnt} / ${lessonsByProject.get(r.project) ?? 0}`)
+      .join("\n");
+
+    try {
+      const raw = await llm.completeFast(domainCuration(projectLines), 1024);
+      const parsed = parseJsonLenient<unknown[]>(raw, []);
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        console.warn("[hicortex] Domain curation: LLM returned empty/invalid response, using fallback");
+        domains = projectRows.map((r) => ({
+          name: r.project,
+          projects: [r.project],
+          memoryCount: r.cnt,
+          lessonCount: lessonsByProject.get(r.project) ?? 0,
+          keywords: [],
+        }));
+      } else {
+        domains = [];
+        const assigned = new Set<string>();
+        const knownProjects = new Set(sortedNames);
+        for (const item of parsed) {
+          if (typeof item !== "object" || item === null) continue;
+          const d = item as Record<string, unknown>;
+          const name = String(d.name ?? "");
+          const projects = Array.isArray(d.projects)
+            ? (d.projects as unknown[]).map(String).filter((p) => !assigned.has(p) && knownProjects.has(p))
+            : [];
+          const keywords = Array.isArray(d.keywords)
+            ? (d.keywords as unknown[]).map(String).slice(0, 5)
+            : [];
+          if (!name || projects.length === 0) continue;
+          for (const p of projects) assigned.add(p);
+          const memoryCount = projects.reduce(
+            (s, p) => s + (projectRows.find((r) => r.project === p)?.cnt ?? 0), 0
+          );
+          const lessonCount = projects.reduce(
+            (s, p) => s + (lessonsByProject.get(p) ?? 0), 0
+          );
+          domains.push({ name, projects, memoryCount, lessonCount, keywords });
+        }
+        // Catch unassigned projects
+        const unassigned = sortedNames.filter((p) => !assigned.has(p));
+        if (unassigned.length > 0) {
+          const memoryCount = unassigned.reduce(
+            (s, p) => s + (projectRows.find((r) => r.project === p)?.cnt ?? 0), 0
+          );
+          const lessonCount = unassigned.reduce(
+            (s, p) => s + (lessonsByProject.get(p) ?? 0), 0
+          );
+          domains.push({ name: "Miscellaneous", projects: unassigned, memoryCount, lessonCount, keywords: [] });
+        }
+        // Sort by memoryCount desc
+        domains.sort((a, b) => b.memoryCount - a.memoryCount);
+      }
+    } catch (err) {
+      console.warn(`[hicortex] Domain curation LLM failed: ${err instanceof Error ? err.message : String(err)}`);
+      domains = projectRows.map((r) => ({
+        name: r.project,
+        projects: [r.project],
+        memoryCount: r.cnt,
+        lessonCount: lessonsByProject.get(r.project) ?? 0,
+        keywords: [],
+      }));
+    }
+  }
+
+  const moduleIndex: ModuleIndex = {
+    domains,
+    projectSetHash,
+    curatedAt: new Date().toISOString(),
+    totalMemories,
+    totalLessons,
+  };
+
+  if (!dryRun) {
+    // Persist MODULE_INDEX to state.json
+    updateState((s) => { s.moduleIndex = moduleIndex; }, stateDir);
+
+    // Batch-update domain column on memories
+    const updateStmt = db.prepare("UPDATE memories SET domain = ? WHERE project = ?");
+    const tx = db.transaction(() => {
+      for (const domain of domains) {
+        for (const project of domain.projects) {
+          updateStmt.run(domain.name, project);
+        }
+      }
+    });
+    tx();
+  }
+
+  console.log(`[hicortex] Domain curation: ${domains.length} domains from ${projectRows.length} projects`);
+  return { curated: true, domains: domains.length };
+}
+
+// ---------------------------------------------------------------------------
 // Stage 3: Link Discovery (vector similarity auto-link)
 // ---------------------------------------------------------------------------
 
@@ -495,6 +653,7 @@ export async function runConsolidation(
   embedFn: EmbedFn,
   dryRun = false,
   skipReflection = false,
+  stateDir?: string,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -562,6 +721,9 @@ export async function runConsolidation(
       );
     }
 
+    // Stage 2.7: Domain Curation
+    report.stages.domain_curation = await stageDomainCuration(db, llm, budget, dryRun, stateDir);
+
     // Stage 3: Link Discovery
     report.stages.links = await stageLinks(
       db,
@@ -582,7 +744,7 @@ export async function runConsolidation(
     updateState((s) => {
       s.lastConsolidated = new Date().toISOString();
       return s;
-    });
+    }, stateDir);
   }
 
   report.budget = budget.summary();

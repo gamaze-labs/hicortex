@@ -20,7 +20,7 @@ import type Database from "better-sqlite3";
 import { initDb, getStats, resolveDbPath } from "./db.js";
 import { resolveLlmConfigForCC, LlmClient, findClaudeBinary, claudeCliConfig, type LlmConfig } from "./llm.js";
 import { initFeatures, memoryCapReached, maxMemoriesAllowed, remoteIngestAllowed } from "./features.js";
-import { migrateLegacyState } from "./state.js";
+import { loadState, migrateLegacyState } from "./state.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import * as retrieval from "./retrieval.js";
@@ -222,6 +222,34 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // -- hicortex_index --
+  server.tool(
+    "hicortex_index",
+    "Get the knowledge domain index — shows what topics and projects are stored in memory, grouped by domain.",
+    {},
+    async () => {
+      const state = loadState(stateDir);
+      const moduleIndex = state.moduleIndex;
+      if (moduleIndex && moduleIndex.domains.length > 0) {
+        const text = moduleIndex.domains.map((d) =>
+          `**${d.name}** (${d.memoryCount} memories, ${d.lessonCount} lessons)\n` +
+          `  Projects: ${d.projects.join(", ")}` +
+          (d.keywords.length > 0 ? `\n  Keywords: ${d.keywords.join(", ")}` : "")
+        ).join("\n\n");
+        return { content: [{ type: "text" as const, text }] };
+      }
+      // Fallback: flat project counts
+      if (!db) return { content: [{ type: "text" as const, text: "No index available" }] };
+      const rows = db.prepare(
+        "SELECT project, COUNT(*) as cnt FROM memories WHERE project IS NOT NULL GROUP BY project ORDER BY cnt DESC LIMIT 20"
+      ).all() as Array<{ project: string; cnt: number }>;
+      const text = rows.length > 0
+        ? rows.map((r) => `${r.project}: ${r.cnt} memories`).join("\n")
+        : "No memories yet.";
+      return { content: [{ type: "text" as const, text }] };
+    }
+  );
+
   return server;
 }
 
@@ -403,6 +431,7 @@ export async function startServer(options: {
       const sourceCount = (db.prepare("SELECT COUNT(DISTINCT source_agent) as cnt FROM memories").get() as { cnt: number }).cnt;
       const lessonCount = lessons.length;
 
+      const state = loadState();
       res.json({
         lessons: lessons.map(l => ({
           content: l.content,
@@ -416,6 +445,7 @@ export async function startServer(options: {
           sourceCount,
           projects: projects.map(p => ({ name: p.project, count: p.cnt })),
         },
+        moduleIndex: state.moduleIndex ?? null,
       });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

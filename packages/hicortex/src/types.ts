@@ -15,6 +15,7 @@ export interface Memory {
   source_agent: string;
   source_session: string | null;
   project: string | null;
+  domain: string | null;
   privacy: "PUBLIC" | "WORK" | "PERSONAL" | "SENSITIVE";
   memory_type: "episode" | "lesson" | "fact" | "decision";
   updated_at: string | null;
@@ -68,6 +69,11 @@ export interface ConsolidationReport {
       skipped?: boolean;
       reason?: string;
     };
+    domain_curation?: {
+      curated: boolean;
+      domains: number;
+      reason?: string;
+    };
     links?: {
       auto_linked: number;
       failed: number;
@@ -110,6 +116,24 @@ export interface LicenseInfo {
   };
   email?: string;
   expires_at?: string;
+}
+
+/** A knowledge domain grouping related projects. */
+export interface ModuleDomain {
+  name: string;
+  projects: string[];
+  memoryCount: number;
+  lessonCount: number;
+  keywords: string[];
+}
+
+/** Auto-generated knowledge routing index, cached in state.json. */
+export interface ModuleIndex {
+  domains: ModuleDomain[];
+  projectSetHash: string;
+  curatedAt: string;
+  totalMemories: number;
+  totalLessons: number;
 }
 
 /** Options for inserting a memory. */

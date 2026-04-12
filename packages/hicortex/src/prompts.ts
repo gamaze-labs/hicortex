@@ -148,3 +148,27 @@ RULES:
 - If nothing worth extracting, output ONLY: "NO_EXTRACT"
 `;
 }
+
+/**
+ * Domain curation prompt. Groups projects into knowledge domains.
+ * Used during consolidation (Pro only, one call per nightly when projects change).
+ */
+export function domainCuration(projectLines: string): string {
+  return `You are a knowledge organizer. Given project names with memory and lesson counts, group them into logical knowledge DOMAINS (3-8 domains).
+
+PROJECTS (name: memories / lessons):
+${projectLines}
+
+For each domain, output a JSON object:
+- "name": Short domain label (2-4 words, Title Case)
+- "projects": Array of project names belonging to this domain
+- "keywords": 3-5 representative keywords for this domain
+
+Rules:
+- Every project must appear in exactly one domain
+- Projects with only 1-2 memories can go in a "Miscellaneous" domain
+- Prefer fewer domains over many tiny ones
+- Domain names should be descriptive and distinct
+
+Respond with ONLY a JSON array. No explanations.`;
+}

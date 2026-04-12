@@ -3,6 +3,32 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.6.0] - 2026-04-12
+
+### Added
+- **Knowledge domain routing (MODULE_INDEX)** — memories are automatically
+  grouped into knowledge domains during nightly consolidation. Pro users get
+  LLM-curated domains (one cheap batch call per nightly, only when projects
+  change); OSS users get project-based grouping.
+- **Domain-aware lesson injection** — the Memory Index section in CLAUDE.md /
+  EXPERIENCE.md is now structured by domain with memory counts, lesson counts,
+  and keywords. Replaces the flat `project: count` format.
+- **Domain-aware Pro selector** — lessons from the same knowledge domain as the
+  current project score 0.5 (previously 0.0 for non-exact matches). Exact
+  project match remains 1.0, global 0.3.
+- **`hicortex_index` MCP tool** — agents can query the knowledge domain index
+  to understand what topics are stored in memory before searching.
+- **Configurable injection token budget** — `moduleIndexTokenBudget` in
+  config.json controls how many tokens the domain index occupies in the
+  injection block. Default: 500.
+- Schema migration v3: `domain` column on memories table with index.
+
+### Changed
+- `/lessons` REST endpoint now includes `moduleIndex` in the response for
+  client-mode domain-aware injection.
+- `runConsolidation()` accepts optional `stateDir` parameter for consistent
+  state management across all stages.
+
 ## [0.5.3] - 2026-04-12
 
 ### Added
