@@ -18,7 +18,7 @@ maintained by [Gamaze](https://hicortex.gamaze.com).
 
 ```bash
 git clone https://github.com/gamaze-labs/hicortex.git
-cd hicortex/packages/openclaw-plugin
+cd hicortex/packages/hicortex
 npm install
 npm run build
 npm test

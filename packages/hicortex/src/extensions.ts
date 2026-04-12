@@ -244,3 +244,70 @@ export function getLessonSelector(): LessonSelector {
 export function getPromptStrategy(): PromptStrategy {
   return activeExtensions.prompts;
 }
+
+// ---------------------------------------------------------------------------
+// Pro package activation contract
+// ---------------------------------------------------------------------------
+
+/**
+ * The object passed to a Pro package's `activate()` function at boot.
+ * Pro packages receive this to register their extensions and access OSS
+ * runtime APIs they need.
+ *
+ * Design rationale: Pro code never STATICALLY imports from the OSS client.
+ * All runtime access is through this context object. This has two benefits:
+ *   1. Pro bundles are self-contained — they don't have `require("../...")`
+ *      calls that would break when the tarball is installed to
+ *      ~/.hicortex/pro/ at runtime.
+ *   2. Pro code can only access what the OSS client exposes here, so the
+ *      blast radius of a malicious/buggy Pro release is contained.
+ *
+ * Type-only imports of `LessonSelector`, `PromptStrategy` etc. in Pro code
+ * are fine — they're erased at compile time and produce no runtime imports.
+ */
+export interface ProActivationContext {
+  /** Register a lesson selector implementation. */
+  setSelector(selector: LessonSelector): void;
+  /** Register a prompt strategy implementation. */
+  setPrompts(prompts: PromptStrategy): void;
+  /** The version of the OSS host (from package.json). Pro can use this
+   *  to gate features against host compatibility. */
+  hostVersion: string;
+  /** Log through the OSS logging surface so Pro logs get the [hicortex]
+   *  prefix and unified formatting. */
+  log(message: string): void;
+}
+
+/**
+ * The shape Pro packages must export as their default export.
+ * See `packages/hicortex/src/pro/index.ts` for the reference impl.
+ */
+export interface ProPackage {
+  /** Called once at OSS boot if a Pro license is valid and the Pro
+   *  tarball has been downloaded + extracted. Should register extensions
+   *  via the context and return. Errors abort Pro activation but do not
+   *  abort the OSS host. */
+  activate(ctx: ProActivationContext): void | Promise<void>;
+}
+
+/**
+ * Build an activation context for a Pro package. Called from the Pro
+ * loader in features.ts / pro-loader.ts.
+ *
+ * Keep this function small — it's the ONLY surface a Pro package gets.
+ * Expanding it expands the attack surface, so add fields deliberately.
+ */
+export function createProActivationContext(hostVersion: string): ProActivationContext {
+  return {
+    setSelector(selector) {
+      activeExtensions = { ...activeExtensions, selector };
+    },
+    setPrompts(prompts) {
+      activeExtensions = { ...activeExtensions, prompts };
+    },
+    hostVersion,
+    log(message) {
+      console.log(`[hicortex][pro] ${message}`);
+    },
+  };
+}

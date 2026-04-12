@@ -206,10 +206,19 @@ export function extractConversationText(messages: unknown[]): string {
     if (SKIP_ENTRY_TYPES.has(String(m.type ?? ""))) continue;
     if (m.isSidechain) continue;
 
-    // Extract content — OpenClaw messages have content at top level;
-    // Python distiller format has message.content
-    const content =
-      m.content ?? (m.message as Record<string, unknown> | undefined)?.content;
+    // Extract the message role from whichever format we're dealing with:
+    //   OC hook:  m.role = "user" | "assistant"
+    //   CC JSONL:  m.type = "user" | "assistant"
+    //   Pi JSONL:  m.message.role = "user" | "assistant" | "toolResult"
+    const nestedMsg = m.message as Record<string, unknown> | undefined;
+    const msgRole = String(m.role ?? nestedMsg?.role ?? m.type ?? "");
+
+    // Skip tool results — they're noisy (file contents, command output) and
+    // add bulk without much extractable knowledge for distillation.
+    if (msgRole === "toolResult" || msgRole === "tool_result") continue;
+
+    // Extract content — OC has content at top level; CC/Pi have message.content
+    const content = m.content ?? nestedMsg?.content;
     if (content === undefined || content === null) continue;
 
     let text = extractTextFromContent(content);
@@ -217,7 +226,7 @@ export function extractConversationText(messages: unknown[]): string {
 
     if (text.length < 20) continue;
 
-    const role = m.role === "user" || m.type === "user" ? "USER" : "ASSISTANT";
+    const role = msgRole === "user" ? "USER" : "ASSISTANT";
     parts.push(`${role}: ${text}`);
   }
 
