@@ -573,10 +573,13 @@ async function injectLessonsFromServer(serverUrl: string, authToken?: string): P
   const data = await resp.json() as {
     lessons: Array<{ content: string; created_at: string; base_strength: number; access_count: number }>;
     index: { total: number; lessonCount: number; sourceCount: number; projects: Array<{ name: string; count: number }> };
+    moduleIndex?: import("./types.js").ModuleIndex;
   };
 
   const maxLessons = lessonsLimit();
-  const selected = await getLessonSelector().select(data.lessons, { maxLessons });
+  // Use moduleIndex from server response, fall back to local state
+  const moduleIndex = data.moduleIndex ?? loadState().moduleIndex;
+  const selected = await getLessonSelector().select(data.lessons, { maxLessons, moduleIndex });
 
   // Format lessons
   const lessonLines = selected.map((l) => {
@@ -588,8 +591,18 @@ async function injectLessonsFromServer(serverUrl: string, authToken?: string): P
     return `- ${title}${meta ? ` (${meta})` : ""}`;
   });
 
-  // Format project index
-  const projectIndex = data.index.projects.map(p => `${p.name}: ${p.count}`);
+  // Format module/project index
+  let indexLines: string[];
+  if (moduleIndex && moduleIndex.domains.length > 0) {
+    indexLines = [];
+    for (const domain of moduleIndex.domains) {
+      const kwStr = domain.keywords.length > 0 ? `: ${domain.keywords.join(", ")}` : "";
+      indexLines.push(`${domain.name} (${domain.memoryCount} memories, ${domain.lessonCount} lessons)${kwStr}`);
+      indexLines.push(`  ${domain.projects.join(" | ")}`);
+    }
+  } else {
+    indexLines = [data.index.projects.map(p => `${p.name}: ${p.count}`).join(" | ")];
+  }
 
   // Build block
   const START_MARKER = "<!-- HICORTEX-LEARNINGS:START -->";
@@ -613,9 +626,9 @@ async function injectLessonsFromServer(serverUrl: string, authToken?: string): P
     blockParts.push("- Lessons will appear here after the first nightly run");
   }
 
-  if (projectIndex.length > 0) {
+  if (indexLines.length > 0) {
     blockParts.push("", "### Memory Index");
-    blockParts.push(projectIndex.join(" | "));
+    blockParts.push(...indexLines);
     blockParts.push(
       `${data.index.total} memories, ${data.index.lessonCount} lessons, ${data.index.sourceCount} agents. Search with \`hicortex_search\`.`
     );

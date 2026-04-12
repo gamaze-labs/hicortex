@@ -27,7 +27,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { LicenseInfo } from "./types.js";
+import type { LicenseInfo, ModuleIndex } from "./types.js";
 
 const HICORTEX_HOME = join(homedir(), ".hicortex");
 const STATE_FILE = "state.json";
@@ -51,6 +51,8 @@ export interface HicortexState {
   tier?: PersistedTier;
   /** Anonymous telemetry UUID — generated once, never linked to personal info. */
   telemetryId?: string;
+  /** Cached MODULE_INDEX from domain curation (generated during consolidation). */
+  moduleIndex?: ModuleIndex;
 }
 
 /**

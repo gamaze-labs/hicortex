@@ -29,6 +29,8 @@
  *     when the first Pro use case demands it.
  */
 
+import type { ModuleIndex } from "./types.js";
+
 // ---------------------------------------------------------------------------
 // LessonSelector — picks which lessons to inject into agent context
 // ---------------------------------------------------------------------------
@@ -63,6 +65,8 @@ export interface LessonSelectorContext {
   agentId?: string;
   /** Optional: current task description, for relevance scoring (Pro). */
   currentTask?: string;
+  /** MODULE_INDEX for domain-aware lesson selection (Pro). */
+  moduleIndex?: ModuleIndex;
 }
 
 export interface LessonSelector {

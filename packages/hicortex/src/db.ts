@@ -243,6 +243,16 @@ const MIGRATIONS: Migration[] = [
       }
     },
   },
+  {
+    version: 3,
+    name: "add_domain",
+    up: (db) => {
+      if (!hasColumn(db, "memories", "domain")) {
+        db.exec("ALTER TABLE memories ADD COLUMN domain TEXT");
+      }
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain)");
+    },
+  },
 ];
 
 /**

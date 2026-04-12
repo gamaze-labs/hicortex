@@ -45,12 +45,13 @@ openclaw gateway restart
 
 ## Agent Tools (MCP)
 
-6 tools available via MCP:
+7 tools available via MCP:
 
 - **hicortex_search** — Semantic search across all stored memories
 - **hicortex_context** — Get recent decisions and project state
 - **hicortex_ingest** — Store a memory directly
 - **hicortex_lessons** — Get actionable lessons from reflection
+- **hicortex_index** — Get the knowledge domain index (what topics are stored)
 - **hicortex_update** — Fix incorrect memories (re-embeds on content change)
 - **hicortex_delete** — Remove memories with cascade cleanup
 
@@ -104,6 +105,9 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `reflectBaseUrl` | Separate Ollama instance for reflection |
 | `authToken` | Bearer token for endpoint auth |
 | `licenseKey` | License key for higher tiers |
+| `lessonTarget` | Injection target file (default: `~/.claude/CLAUDE.md`) |
+| `moduleIndexTokenBudget` | Max tokens for domain index in injection (default: 500) |
+| `telemetry` | Anonymous usage telemetry, `false` to opt out |
 
 Full docs: [hicortex.gamaze.com/docs/configuration.html](https://hicortex.gamaze.com/docs/configuration.html)
 

@@ -947,7 +947,7 @@ describe("schema versioning", () => {
   it("getSchemaVersion returns the latest applied migration version", () => {
     // After initDb, all migrations should have run
     const version = getSchemaVersion(db);
-    expect(version).toBeGreaterThanOrEqual(2); // we have v1 and v2 today
+    expect(version).toBeGreaterThanOrEqual(3); // v1 ingested_at, v2 updated_at, v3 domain
   });
 
   it("schema_version table exists with applied entries", () => {
@@ -1485,5 +1485,157 @@ describe("redact", () => {
     expect(text).not.toContain("sk-proj-");
     expect(text).not.toContain("/Users/mattias");
     expect(text).toContain("[REDACTED]");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MODULE_INDEX
+// ---------------------------------------------------------------------------
+
+import { loadState, saveState, updateState } from "../src/state.js";
+import type { ModuleIndex, ModuleDomain } from "../src/types.js";
+import { getSchemaVersion } from "../src/db.js";
+
+describe("MODULE_INDEX", () => {
+  describe("schema migration v3", () => {
+    it("creates the domain column on memories table", () => {
+      const cols = db
+        .prepare("PRAGMA table_info(memories)")
+        .all() as Array<{ name: string }>;
+      const colNames = cols.map((c) => c.name);
+      expect(colNames).toContain("domain");
+    });
+
+    it("creates the idx_memories_domain index", () => {
+      const indexes = db
+        .prepare("PRAGMA index_list(memories)")
+        .all() as Array<{ name: string }>;
+      const indexNames = indexes.map((i) => i.name);
+      expect(indexNames).toContain("idx_memories_domain");
+    });
+
+    it("schema version is at least 3", () => {
+      const version = getSchemaVersion(db);
+      expect(version).toBeGreaterThanOrEqual(3);
+    });
+  });
+
+  describe("domain column on memories", () => {
+    it("defaults to NULL on insert", () => {
+      const id = storage.insertMemory(db, "domain test memory", fakeEmbedding(99), {
+        project: "test-project",
+      });
+      const mem = storage.getMemory(db, id);
+      expect(mem).not.toBeNull();
+      expect(mem!.domain).toBeNull();
+      // Cleanup
+      storage.deleteMemory(db, id);
+    });
+
+    it("can be updated via updateMemory", () => {
+      const id = storage.insertMemory(db, "domain update test", fakeEmbedding(98), {
+        project: "test-project",
+      });
+      storage.updateMemory(db, id, { domain: "Test Domain" });
+      const mem = storage.getMemory(db, id);
+      expect(mem!.domain).toBe("Test Domain");
+      // Cleanup
+      storage.deleteMemory(db, id);
+    });
+  });
+
+  describe("state.json moduleIndex", () => {
+    const stateDir = join(TEST_DIR, "module-index-state");
+
+    it("persists and loads moduleIndex", () => {
+      mkdirSync(stateDir, { recursive: true });
+      const moduleIndex: ModuleIndex = {
+        domains: [
+          { name: "Dev Tools", projects: ["hicortex", "raider"], memoryCount: 80, lessonCount: 5, keywords: ["typescript", "mcp"] },
+          { name: "Health", projects: ["health"], memoryCount: 45, lessonCount: 8, keywords: ["exercise", "sleep"] },
+        ],
+        projectSetHash: "abc123",
+        curatedAt: "2026-04-12T00:00:00Z",
+        totalMemories: 125,
+        totalLessons: 13,
+      };
+      saveState({ moduleIndex }, stateDir);
+      const loaded = loadState(stateDir);
+      expect(loaded.moduleIndex).toBeDefined();
+      expect(loaded.moduleIndex!.domains).toHaveLength(2);
+      expect(loaded.moduleIndex!.domains[0].name).toBe("Dev Tools");
+      expect(loaded.moduleIndex!.projectSetHash).toBe("abc123");
+    });
+
+    it("updateState preserves moduleIndex", () => {
+      mkdirSync(stateDir, { recursive: true });
+      saveState({
+        moduleIndex: {
+          domains: [{ name: "Test", projects: ["a"], memoryCount: 1, lessonCount: 0, keywords: [] }],
+          projectSetHash: "hash1",
+          curatedAt: "2026-04-12T00:00:00Z",
+          totalMemories: 1,
+          totalLessons: 0,
+        },
+      }, stateDir);
+      updateState((s) => { s.lastNightly = "2026-04-12T00:00:00Z"; }, stateDir);
+      const loaded = loadState(stateDir);
+      expect(loaded.moduleIndex).toBeDefined();
+      expect(loaded.lastNightly).toBe("2026-04-12T00:00:00Z");
+    });
+  });
+
+  describe("Pro lesson selector domain-aware scoring", () => {
+    // Import the Pro selector directly for unit testing
+    // (it's in src/pro/ which is excluded from OSS build but available in tests)
+    it("scores 1.0 for exact project match", async () => {
+      const { proLessonSelector } = await import("../src/pro/selection.js");
+      const lessons = [
+        { content: "lesson A", project: "hicortex", created_at: "2026-04-12", base_strength: 0.8, access_count: 3 },
+      ];
+      const selected = proLessonSelector.select(lessons, { maxLessons: 5, project: "hicortex" });
+      expect(selected).toHaveLength(1);
+    });
+
+    it("scores 0.5 for same-domain project via moduleIndex", async () => {
+      const { proLessonSelector } = await import("../src/pro/selection.js");
+      const moduleIndex: ModuleIndex = {
+        domains: [
+          { name: "Dev Tools", projects: ["hicortex", "raider"], memoryCount: 100, lessonCount: 10, keywords: [] },
+        ],
+        projectSetHash: "test",
+        curatedAt: "2026-04-12T00:00:00Z",
+        totalMemories: 100,
+        totalLessons: 10,
+      };
+      const lessons = [
+        { content: "lesson from raider about deploy", project: "raider", created_at: "2026-04-12", base_strength: 0.8, access_count: 3 },
+        { content: "lesson from health about sleep", project: "health", created_at: "2026-04-12", base_strength: 0.9, access_count: 5 },
+      ];
+      // When selecting for "hicortex", "raider" lesson should rank higher (same domain = 0.5)
+      // than "health" lesson (different domain = 0.0) despite health having higher strength + access
+      const selected = proLessonSelector.select(lessons, {
+        maxLessons: 2,
+        project: "hicortex",
+        moduleIndex,
+      });
+      expect(selected).toHaveLength(2);
+      expect(selected[0].project).toBe("raider"); // same domain scores higher
+    });
+
+    it("falls back to 0.0 for unrelated projects without moduleIndex", async () => {
+      const { proLessonSelector } = await import("../src/pro/selection.js");
+      const lessons = [
+        { content: "lesson from raider", project: "raider", created_at: "2026-04-12", base_strength: 0.8, access_count: 3 },
+        { content: "lesson from global", project: "global", created_at: "2026-04-12", base_strength: 0.8, access_count: 3 },
+      ];
+      // Without moduleIndex, "global" (0.3) beats "raider" (0.0)
+      const selected = proLessonSelector.select(lessons, {
+        maxLessons: 2,
+        project: "hicortex",
+      });
+      expect(selected).toHaveLength(2);
+      expect(selected[0].project).toBe("global");
+    });
   });
 });

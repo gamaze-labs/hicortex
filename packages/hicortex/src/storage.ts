@@ -92,6 +92,7 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   "source_agent",
   "source_session",
   "project",
+  "domain",
   "privacy",
   "memory_type",
   "updated_at",
