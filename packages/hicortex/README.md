@@ -2,7 +2,7 @@
 
 Your agents learn from every session — successes and mistakes. Hicortex captures experiences, distills lessons, and applies them automatically. Connect multiple agents to shared memory and they improve together, overnight.
 
-Works with **Claude Code** (primary), **OpenClaw** (in-process plugin), and any MCP-compatible agent.
+Works with **Claude Code**, **Pi**, **OpenClaw**, and any MCP-compatible agent.
 
 **Website:** [hicortex.gamaze.com](https://hicortex.gamaze.com) · **Docs:** [hicortex.gamaze.com/docs](https://hicortex.gamaze.com/docs/)
 
@@ -39,8 +39,8 @@ openclaw gateway restart
 
 | When | What | How |
 |------|------|-----|
-| Agent start | Recent lessons injected into context | CLAUDE.md block / OC hook |
-| Agent end | Conversation captured | CC: nightly transcript scan / OC: hook |
+| Agent start | Recent lessons injected into context | CLAUDE.md / EXPERIENCE.md / OC hook |
+| Agent end | Conversation captured | CC + Pi: nightly transcript scan / OC: hook |
 | Nightly | Distill → score → reflect → link → inject | Automatic pipeline |
 
 ## Agent Tools (MCP)
@@ -159,7 +159,7 @@ Canonical location: `~/.hicortex/hicortex.db`. Existing OC installations at `~/.
 ## Development
 
 ```bash
-cd packages/openclaw-plugin
+cd packages/hicortex
 npm install
 npm run build
 npm test

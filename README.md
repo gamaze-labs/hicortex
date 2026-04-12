@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
 
-**Self-improving long-term memory for AI agents.** Capture sessions, distill lessons overnight, inject them on the next run. Works with Claude Code, OpenClaw, and any MCP-compatible agent.
+**Self-improving long-term memory for AI agents.** Capture sessions, distill lessons overnight, inject them on the next run. Works with **Claude Code**, **Pi**, **OpenClaw**, and any MCP-compatible agent.
 
 Named after the **hippo**campus (fast encoding) and neo**cortex** (slow consolidation) — the two brain systems that turn fleeting experiences into lasting knowledge.
 
@@ -21,6 +21,25 @@ For multi-machine setups, point clients at a shared server:
 ```bash
 npx @gamaze/hicortex init --server https://your-server.example.com
 ```
+
+### Pi agents
+
+Pi agents connect via [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter). Add to `~/.pi/agent/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "hicortex": {
+      "url": "http://localhost:8787/sse",
+      "auth": "bearer",
+      "bearerTokenEnv": "HICORTEX_TOKEN",
+      "lifecycle": "keep-alive"
+    }
+  }
+}
+```
+
+The nightly pipeline auto-detects Pi sessions at `~/.pi/agent/sessions/` alongside CC sessions. Set `lessonTarget` in `~/.hicortex/config.json` to inject lessons into your agent's learning file (e.g., `.pi/EXPERIENCE.md`) instead of the default `~/.claude/CLAUDE.md`.
 
 Full docs: [hicortex.gamaze.com/docs](https://hicortex.gamaze.com/docs/)
 
@@ -65,7 +84,7 @@ Plus skills: `/learn` to save explicit learnings.
 - **TypeScript**, Node.js 18+
 - **better-sqlite3** + **sqlite-vec** + FTS5 (semantic + full-text search in one DB)
 - **@huggingface/transformers** (bge-small-en-v1.5 ONNX, runs on CPU)
-- **MCP protocol** over HTTP/SSE (Claude Code, OpenClaw, any MCP client)
+- **MCP protocol** over HTTP/SSE (Claude Code, Pi, OpenClaw, any MCP client)
 - **Multi-provider LLM** — Ollama, Claude CLI, OpenAI, Anthropic, Google, OpenRouter, or any OpenAI-compatible endpoint
 - **Auto-detects** Ollama models, Claude CLI, API keys during setup
 
@@ -102,7 +121,7 @@ See [hicortex.gamaze.com](https://hicortex.gamaze.com) for pricing and Pro featu
 ## Project layout
 
 ```
-packages/openclaw-plugin/    The npm package (@gamaze/hicortex)
+packages/hicortex/    The npm package (@gamaze/hicortex)
   src/                       TypeScript source
     cli.ts                   CLI entry: server, init, nightly, status, uninstall
     init.ts                  Interactive setup wizard
@@ -128,7 +147,7 @@ packages/openclaw-plugin/    The npm package (@gamaze/hicortex)
 
 ```bash
 git clone https://github.com/gamaze-labs/hicortex.git
-cd hicortex/packages/openclaw-plugin
+cd hicortex/packages/hicortex
 npm install
 npm run build
 npm test

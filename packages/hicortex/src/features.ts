@@ -55,6 +55,7 @@ function persistTier(stateDir: string, info: LicenseInfo): void {
 export async function initFeatures(
   licenseKey: string | undefined,
   stateDir: string = DEFAULT_STATE_DIR,
+  hostVersion: string = "0.0.0",
 ): Promise<void> {
   if (initialized) return;
   initialized = true;
@@ -67,7 +68,7 @@ export async function initFeatures(
     currentFeatures = FREE_FEATURES;
   }
 
-  // Step 2: No key → free tier, done
+  // Step 2: No key → free tier, done. Pro loader is only run for paid tiers.
   if (!licenseKey) return;
 
   // Step 3: Validate
@@ -94,6 +95,20 @@ export async function initFeatures(
       .catch(() => {
         // Keep persisted features
       });
+  }
+
+  // Step 4: If the current tier is paid, try to load the Pro extension bundle.
+  // This is best-effort — if loading fails (network, missing tarball, bad
+  // extraction, Pro package throws on activate), OSS defaults remain in effect
+  // and the host keeps running. No user-visible crash.
+  if (isPro()) {
+    try {
+      const { loadPro } = await import("./pro-loader.js");
+      await loadPro(licenseKey, stateDir, hostVersion);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[hicortex][pro] Pro loader failed to import: ${msg}`);
+    }
   }
 }
 

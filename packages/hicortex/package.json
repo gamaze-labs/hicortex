@@ -1,6 +1,6 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.4.6",
+  "version": "0.5.0",
   "description": "Human-like memory for self-improving AI agents. Automatic capturing, nightly reflection, and cross-agent learning. Works with Claude Code and OpenClaw.",
   "main": "dist/index.js",
   "bin": {
@@ -50,12 +50,12 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/gamaze-labs/hicortex.git",
-    "directory": "packages/openclaw-plugin"
+    "directory": "packages/hicortex"
   },
   "bugs": {
     "url": "https://github.com/gamaze-labs/hicortex/issues"
   },
-  "author": "Mattias Hansson",
+  "author": "Aironic Ventures Ltd.",
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
     "@modelcontextprotocol/sdk": "^1.28.0",

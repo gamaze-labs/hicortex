@@ -21,6 +21,7 @@ import * as storage from "./storage.js";
 import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
 import { runConsolidation } from "./consolidate.js";
 import { readCcTranscripts } from "./transcript-reader.js";
+import { readPiTranscripts } from "./pi-transcript-reader.js";
 import { injectLessons } from "./claude-md.js";
 import { initFeatures, lessonsLimit, memoryCapReached, maxMemoriesAllowed } from "./features.js";
 import { getLessonSelector } from "./extensions.js";
@@ -149,16 +150,20 @@ export async function runNightly(options: {
       : llmConfig.distillModel ?? "";
     console.log(`[hicortex] LLM: ${llmConfig.provider}/${llmConfig.model}${distillInfo ? `, distill: ${distillInfo}` : ""}`);
 
-    // Step 1: Read new CC transcripts
+    // Step 1: Read new transcripts (CC + Pi)
     const since = readLastRun();
-    console.log(`[hicortex] Reading CC transcripts since ${since.toISOString()}`);
+    console.log(`[hicortex] Reading transcripts since ${since.toISOString()}`);
 
-    const batches = readCcTranscripts(since);
-    console.log(`[hicortex] Found ${batches.length} new session(s)`);
+    const ccBatches = readCcTranscripts(since);
+    const piBatches = readPiTranscripts(since);
+    const batches = [...ccBatches, ...piBatches];
+    if (ccBatches.length > 0) console.log(`[hicortex] Found ${ccBatches.length} CC session(s)`);
+    if (piBatches.length > 0) console.log(`[hicortex] Found ${piBatches.length} Pi session(s)`);
+    console.log(`[hicortex] Total: ${batches.length} new session(s)`);
 
     if (batches.length === 0 && !dryRun) {
       // Still run consolidation — there may be unscored memories from OC
-      console.log(`[hicortex] No new CC transcripts. Running consolidation only.`);
+      console.log(`[hicortex] No new transcripts. Running consolidation only.`);
     }
 
     // Step 2: Distill each session
@@ -266,10 +271,15 @@ export async function runNightly(options: {
       );
     }
 
-    // Step 4: Inject lessons into CLAUDE.md
+    // Step 4: Inject lessons into the target file (CLAUDE.md or EXPERIENCE.md
+    // or custom path — configurable via lessonTarget in config.json)
     if (!dryRun) {
-      const injection = await injectLessons(db, { stateDir });
-      console.log(`[hicortex] CLAUDE.md updated: ${injection.lessonsCount} lessons at ${injection.path}`);
+      const lessonTarget = savedConfig?.lessonTarget as string | undefined;
+      const injection = await injectLessons(db, {
+        claudeMdPath: lessonTarget,
+        stateDir,
+      });
+      console.log(`[hicortex] Lessons updated: ${injection.lessonsCount} lessons at ${injection.path}`);
     }
 
     // Step 5: Update last-run timestamp

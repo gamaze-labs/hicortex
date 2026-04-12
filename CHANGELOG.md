@@ -3,6 +3,50 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] - 2026-04-11
+
+### Added
+- **Pi agent support** — first-class support for the Pi coding agent framework.
+  - New Pi transcript reader (`pi-transcript-reader.ts`) reads session JSONL from
+    `~/.pi/agent/sessions/` in Pi's v3 format (session, model_change, message
+    with role: user/assistant/toolResult, custom events).
+  - Nightly pipeline auto-detects Pi sessions alongside CC sessions — both are
+    processed in the same run, stored in the same DB, share the same lessons.
+  - MCP tools work via `pi-mcp-adapter` connecting to `http://localhost:8787/sse`.
+  - Pi agents receive lessons via a configurable injection target (see below).
+- **Configurable lesson injection target** — new `lessonTarget` field in
+  `~/.hicortex/config.json`. Set it to your agent's learning file path
+  (e.g., `.pi/EXPERIENCE.md` for Pi agents) instead of the default
+  `~/.claude/CLAUDE.md`. The injection uses the same managed block pattern
+  (`<!-- HICORTEX-LEARNINGS:START -->`) and is idempotent.
+- **Pro extension infrastructure** — the OSS client can now download, verify,
+  and dynamically load commercial Pro extension packages at runtime.
+  - `ProActivationContext` interface in `extensions.ts` — narrow API that Pro
+    packages receive at boot to register their extensions.
+  - `pro-loader.ts` — downloads Pro tarball from the license API, verifies
+    sha256, extracts to `~/.hicortex/pro/`, dynamic-imports and activates.
+  - Fails soft — if Pro download/load/activation fails, OSS defaults apply
+    and the host keeps running without a crash.
+- **Pro tarball distribution endpoints** on the license API (`web/api/app.py`):
+  - `GET /api/pro/meta` — returns `{ version, sha256, url }` for the latest
+    Pro release. Requires a valid paid license key.
+  - `GET /api/pro/download?v=<version>` — streams the tarball with Bearer auth
+    and rate limiting (10/min per IP).
+  - Path-traversal protection on version string + resolved-path containment check.
+- **Release tooling** — `scripts/release-pro.sh` builds, packs, and (optionally)
+  deploys Pro tarballs to the VPS.
+
+### Changed
+- Package directory renamed: `packages/openclaw-plugin/` → `packages/hicortex/`.
+  The npm package name (`@gamaze/hicortex`) is unchanged.
+- `extractConversationText` now correctly detects user/assistant roles from
+  Pi's `message.role` field (previously only checked CC's `entry.type`).
+- `toolResult` / `tool_result` entries are now skipped during distillation —
+  tool output (file listings, JSON state, command output) is noisy bulk that
+  adds nothing to knowledge extraction.
+- Copyright updated to Aironic Ventures Ltd. (the legal entity behind Gamaze)
+  in both the MIT LICENSE and package.json.
+
 ## [0.4.6] - 2026-04-07
 
 ### Fixed
