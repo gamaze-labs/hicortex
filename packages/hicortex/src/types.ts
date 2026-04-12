@@ -63,6 +63,7 @@ export interface ConsolidationReport {
     };
     reflection?: {
       lessons_generated: number;
+      contradictions_suppressed?: number;
       failed?: boolean;
       skipped?: boolean;
       reason?: string;

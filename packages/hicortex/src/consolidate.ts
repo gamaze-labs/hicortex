@@ -303,14 +303,49 @@ async function stageReflection(
           break;
         }
         const embedding = await embedFn(content);
-        storage.insertMemory(db, content, embedding, {
-          sourceAgent: "hicortex/reflection",
-          project,
-          memoryType: "lesson",
-          baseStrength: baseStrength[severity] ?? 0.8,
-          privacy: "WORK",
-        });
-        generated++;
+
+        // Contradiction check: find semantically similar existing lessons.
+        // If a very similar lesson exists, ask the LLM whether the new one
+        // contradicts it. If yes, suppress the new lesson to prevent the
+        // "false coherence" failure mode (wrong lessons reinforcing themselves).
+        const similarLessons = storage.vectorSearch(db, embedding, 3)
+          .filter((n) => {
+            const sim = 1.0 - n.distance;
+            return sim > 0.80 && n.memory_type === "lesson";
+          });
+
+        let contradicted = false;
+        if (similarLessons.length > 0 && budget.use("contradiction_check")) {
+          const existingText = similarLessons[0].content.slice(0, 300);
+          const newText = content.slice(0, 300);
+          try {
+            const verdict = await llm.completeFast(
+              `Two lessons from an AI memory system. Do they CONTRADICT each other (opposite advice on the same topic)?\n\n` +
+              `EXISTING: ${existingText}\n\nNEW: ${newText}\n\n` +
+              `Answer ONLY "yes" or "no". If the new lesson updates/refines the existing one (not contradicts), answer "no".`,
+              16,
+            );
+            if (verdict.toLowerCase().trim().startsWith("yes")) {
+              contradicted = true;
+              console.log(
+                `[hicortex] Lesson suppressed (contradicts existing): "${lessonText.slice(0, 80)}"`,
+              );
+            }
+          } catch {
+            // LLM call failed — don't suppress, store the lesson
+          }
+        }
+
+        if (!contradicted) {
+          storage.insertMemory(db, content, embedding, {
+            sourceAgent: "hicortex/reflection",
+            project,
+            memoryType: "lesson",
+            baseStrength: baseStrength[severity] ?? 0.8,
+            privacy: "WORK",
+          });
+          generated++;
+        }
       } catch {
         // Failed to store lesson
       }
