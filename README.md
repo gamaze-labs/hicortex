@@ -66,7 +66,7 @@ Memories decay slower the more important and frequently used they are, strengthe
 
 ## MCP tools
 
-Six MCP tools your agent can call:
+Seven MCP tools your agent can call:
 
 | Tool | Purpose |
 |------|---------|
@@ -74,6 +74,7 @@ Six MCP tools your agent can call:
 | `hicortex_context` | Recent decisions + project state for the current session |
 | `hicortex_ingest`  | Store a memory directly |
 | `hicortex_lessons` | Actionable lessons from nightly reflection |
+| `hicortex_index`   | Knowledge domain index — what topics are stored |
 | `hicortex_update`  | Fix incorrect memories (re-embeds on content change) |
 | `hicortex_delete`  | Remove memories with cascade cleanup |
 
