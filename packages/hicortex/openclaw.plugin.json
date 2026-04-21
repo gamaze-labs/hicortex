@@ -2,7 +2,7 @@
   "id": "hicortex",
   "name": "Hicortex — Long-term Memory That Learns",
   "description": "Your agents remember past decisions, avoid repeated mistakes, and get smarter every day. Nightly reflection generates actionable lessons that automatically update agent behavior.",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "kind": "lifecycle",
   "skills": ["./skills/hicortex-memory", "./skills/hicortex-learn", "./skills/hicortex-activate"],
   "configSchema": {

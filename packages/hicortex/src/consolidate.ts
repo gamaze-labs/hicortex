@@ -6,11 +6,12 @@
 
 import type Database from "better-sqlite3";
 import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain } from "./types.js";
+import { VALID_RELATIONSHIP_TYPES } from "./types.js";
 import type { LlmClient } from "./llm.js";
 import type { EmbedFn } from "./retrieval.js";
 import { effectiveStrength } from "./retrieval.js";
 import * as storage from "./storage.js";
-import { importanceScoring, reflection, domainCuration } from "./prompts.js";
+import { importanceScoring, reflection, domainCuration, edgeClassification } from "./prompts.js";
 import { createHash } from "node:crypto";
 import { memoryCapReached, maxMemoriesAllowed, isPro } from "./features.js";
 import { louvainCommunities, detectHubs } from "./graph.js";
@@ -555,17 +556,38 @@ async function stageDomainCuration(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3: Link Discovery (vector similarity auto-link)
+// Stage 3: Link Discovery (vector similarity auto-link + LLM classification)
 // ---------------------------------------------------------------------------
+
+/** A candidate link discovered by vector similarity, pending classification. */
+interface LinkCandidate {
+  source: Memory;
+  target: Memory & { distance: number };
+  similarity: number;
+  heuristicType: string;
+}
+
+/** Batch size for LLM edge classification calls. */
+const EDGE_CLASSIFICATION_BATCH_SIZE = 8;
+
+/** Valid relationship type set for fast lookup. */
+const VALID_REL_SET = new Set<string>(VALID_RELATIONSHIP_TYPES as unknown as string[]);
 
 async function stageLinks(
   db: Database.Database,
   memories: Memory[],
   embedFn: EmbedFn,
-  dryRun: boolean
-): Promise<{ auto_linked: number; failed: number }> {
+  dryRun: boolean,
+  llm: LlmClient,
+  budget: BudgetTracker,
+): Promise<{ auto_linked: number; llm_classified?: number; heuristic_fallback?: number; failed: number }> {
   let autoLinked = 0;
+  let llmClassified = 0;
+  let heuristicFallback = 0;
   let failed = 0;
+
+  // Phase A: Discovery — collect candidates via vector similarity
+  const candidates: LinkCandidate[] = [];
 
   for (const mem of memories) {
     try {
@@ -575,17 +597,8 @@ async function stageLinks(
       for (const neighbor of neighbors) {
         const similarity = 1.0 - neighbor.distance;
         if (similarity > CONSOLIDATE_LINK_THRESHOLD) {
-          const relationship = classifyRelationship(mem, neighbor, similarity);
-          if (!dryRun) {
-            try {
-              storage.addLink(db, mem.id, neighbor.id, relationship, similarity);
-              autoLinked++;
-            } catch {
-              failed++;
-            }
-          } else {
-            autoLinked++;
-          }
+          const heuristicType = classifyRelationship(mem, neighbor, similarity);
+          candidates.push({ source: mem, target: neighbor, similarity, heuristicType });
         }
       }
     } catch {
@@ -593,7 +606,73 @@ async function stageLinks(
     }
   }
 
-  return { auto_linked: autoLinked, failed };
+  if (candidates.length === 0) {
+    return { auto_linked: 0, llm_classified: 0, heuristic_fallback: 0, failed };
+  }
+
+  // Phase B: LLM batch classification
+  // Build batches and classify with LLM where budget allows
+  const classifiedTypes: string[] = new Array(candidates.length);
+
+  for (let i = 0; i < candidates.length; i += EDGE_CLASSIFICATION_BATCH_SIZE) {
+    const batch = candidates.slice(i, i + EDGE_CLASSIFICATION_BATCH_SIZE);
+
+    // Attempt LLM classification if budget allows
+    if (budget.use("edge_classification")) {
+      try {
+        const pairsBlock = batch.map((c, idx) => {
+          const srcContent = c.source.content.slice(0, 200);
+          const tgtContent = c.target.content.slice(0, 200);
+          return `[${idx}] SOURCE: ${c.source.memory_type} | ${c.source.project ?? "global"} | ${srcContent}\n    TARGET: ${c.target.memory_type} | ${c.target.project ?? "global"} | ${tgtContent}\n    similarity: ${c.similarity.toFixed(2)}`;
+        }).join("\n\n");
+
+        const prompt = edgeClassification(pairsBlock);
+        const raw = await llm.completeFast(prompt, 512);
+        const parsed = parseJsonLenient<string[]>(raw, []);
+
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          for (let j = 0; j < batch.length; j++) {
+            const llmType = parsed[j];
+            if (typeof llmType === "string" && VALID_REL_SET.has(llmType)) {
+              classifiedTypes[i + j] = llmType;
+              llmClassified++;
+            } else {
+              // Invalid type from LLM — fall back to heuristic
+              classifiedTypes[i + j] = batch[j].heuristicType;
+              heuristicFallback++;
+            }
+          }
+          continue;
+        }
+      } catch {
+        // LLM call failed — fall through to heuristic for this batch
+      }
+    }
+
+    // Budget exhausted or LLM failed — use heuristic for entire batch
+    for (let j = 0; j < batch.length; j++) {
+      classifiedTypes[i + j] = batch[j].heuristicType;
+      heuristicFallback++;
+    }
+  }
+
+  // Phase C: Store all classified links
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    const relationship = classifiedTypes[i];
+    if (!dryRun) {
+      try {
+        storage.addLink(db, c.source.id, c.target.id, relationship, c.similarity);
+        autoLinked++;
+      } catch {
+        failed++;
+      }
+    } else {
+      autoLinked++;
+    }
+  }
+
+  return { auto_linked: autoLinked, llm_classified: llmClassified, heuristic_fallback: heuristicFallback, failed };
 }
 
 /**
@@ -799,12 +878,14 @@ export async function runConsolidation(
     // Stage 2.7: Domain Curation
     report.stages.domain_curation = await stageDomainCuration(db, llm, budget, dryRun, stateDir);
 
-    // Stage 3: Link Discovery
+    // Stage 3: Link Discovery (with LLM-assisted edge classification)
     report.stages.links = await stageLinks(
       db,
       precheck.newMemories,
       embedFn,
-      dryRun
+      dryRun,
+      llm,
+      budget,
     );
 
     // Stage 3.5: Hub Detection — boost highly-connected memories

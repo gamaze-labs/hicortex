@@ -3,6 +3,16 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.1] - 2026-04-21
+
+### Added
+- **LLM-assisted edge classification** (#92) — new semantic relationship types
+  (CONTRADICTS, SUPERSEDES, DEPENDS_ON, CAUSED_BY, VALIDATES) alongside existing
+  heuristic types. Batched LLM classification (8 pairs/call) with per-pair
+  heuristic fallback on failure or budget exhaustion.
+- **Relationship filter** on `hicortex_graph` MCP tool — filter neighbors by
+  edge type (e.g., `relationship: "CONTRADICTS"`).
+
 ## [0.7.0] - 2026-04-21
 
 ### Added

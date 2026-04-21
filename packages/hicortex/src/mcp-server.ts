@@ -261,15 +261,16 @@ function createMcpServer(): McpServer {
       target_id: z.string().optional().describe("Target memory ID (required for path operation)"),
       limit: z.coerce.number().optional().describe("Max results (default 10)"),
       domain: z.string().optional().describe("Filter hubs by domain"),
+      relationship: z.string().optional().describe("Filter neighbors by relationship type (e.g., CONTRADICTS, SUPERSEDES, derives)"),
     },
-    async ({ operation, id, target_id, limit: resultLimit, domain: filterDomain }) => {
+    async ({ operation, id, target_id, limit: resultLimit, domain: filterDomain, relationship: filterRelationship }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
       try {
         if (operation === "neighbors") {
           if (!id) return { content: [{ type: "text" as const, text: "id is required for neighbors operation" }], isError: true };
           const resolvedId = resolveMemoryId(db, id);
           if (!resolvedId) return { content: [{ type: "text" as const, text: `Memory not found: ${id}` }], isError: true };
-          const neighbors = getNeighbors(db, resolvedId, resultLimit ?? 10);
+          const neighbors = getNeighbors(db, resolvedId, resultLimit ?? 10, filterRelationship);
           if (neighbors.length === 0) return { content: [{ type: "text" as const, text: "No connected memories found." }] };
           const text = neighbors.map((n) =>
             `[${n.direction}] ${n.relationship} (${n.strength.toFixed(2)})\n  ${n.id.slice(0, 8)} | ${n.project ?? "global"} | ${n.content}`
