@@ -45,13 +45,14 @@ openclaw gateway restart
 
 ## Agent Tools (MCP)
 
-7 tools available via MCP:
+8 tools available via MCP:
 
 - **hicortex_search** — Semantic search across all stored memories
 - **hicortex_context** — Get recent decisions and project state
 - **hicortex_ingest** — Store a memory directly
 - **hicortex_lessons** — Get actionable lessons from reflection
 - **hicortex_index** — Get the knowledge domain index (what topics are stored)
+- **hicortex_graph** — Graph traversal: neighbors, hubs, shortest paths
 - **hicortex_update** — Fix incorrect memories (re-embeds on content change)
 - **hicortex_delete** — Remove memories with cascade cleanup
 

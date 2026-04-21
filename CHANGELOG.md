@@ -3,6 +3,22 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.7.0] - 2026-04-21
+
+### Added
+- **Graph-based community detection** (#88) — Louvain algorithm discovers
+  knowledge domains from the memory link graph. Zero LLM cost, runs during
+  consolidation. OSS users now get meaningful domain clustering instead of
+  the flat project=domain fallback.
+- **Hub node detection + strength boost** (#89) — memories with link count
+  above 2x median (minimum 3) get a +0.1 base_strength boost during
+  consolidation. Foundational insights surface higher in lesson selection.
+- **`hicortex_graph` MCP tool** (#91) — three graph traversal operations:
+  `neighbors` (connected memories), `hubs` (most connected nodes, filterable
+  by domain), `path` (shortest path between two memories via BFS).
+- New `graph.ts` module: pure-JS Louvain community detection, hub detection,
+  neighbor query, shortest path. No external dependencies.
+
 ## [0.6.0] - 2026-04-12
 
 ### Added

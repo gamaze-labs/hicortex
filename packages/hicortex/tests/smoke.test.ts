@@ -1639,3 +1639,116 @@ describe("MODULE_INDEX", () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Graph Analysis
+// ---------------------------------------------------------------------------
+
+import { louvainCommunities, detectHubs, getNeighbors, shortestPath } from "../src/graph.js";
+
+describe("graph analysis", () => {
+  // Set up a small graph for testing
+  let memIds: string[];
+
+  beforeAll(() => {
+    // Insert 6 memories across 2 projects
+    memIds = [];
+    for (let i = 0; i < 6; i++) {
+      const id = storage.insertMemory(
+        db,
+        `Graph test memory ${i} for ${i < 3 ? "alpha" : "beta"} project`,
+        fakeEmbedding(200 + i),
+        { project: i < 3 ? "alpha" : "beta", sourceAgent: "test-graph" }
+      );
+      memIds.push(id);
+    }
+    // Create links: 0-1, 0-2, 1-2 (alpha cluster), 3-4, 3-5, 4-5 (beta cluster), 2-3 (bridge)
+    storage.addLink(db, memIds[0], memIds[1], "relates_to", 0.8);
+    storage.addLink(db, memIds[0], memIds[2], "relates_to", 0.7);
+    storage.addLink(db, memIds[1], memIds[2], "derives", 0.6);
+    storage.addLink(db, memIds[3], memIds[4], "relates_to", 0.8);
+    storage.addLink(db, memIds[3], memIds[5], "extends", 0.7);
+    storage.addLink(db, memIds[4], memIds[5], "relates_to", 0.6);
+    storage.addLink(db, memIds[2], memIds[3], "relates_to", 0.3);
+  });
+
+  describe("louvainCommunities", () => {
+    it("detects communities in the graph", () => {
+      const result = louvainCommunities(db);
+      expect(result.nodeCount).toBe(6);
+      expect(result.edgeCount).toBe(7);
+      expect(result.communities.length).toBeGreaterThanOrEqual(1);
+      // All 6 nodes should be in some community
+      const allMembers = result.communities.flatMap((c) => c.members);
+      expect(allMembers.length).toBe(6);
+    });
+
+    it("returns empty for graph with no links", () => {
+      // Create a temp DB with no links
+      const tmpDb = initDb(join(TEST_DIR, "empty-graph.db"));
+      const result = louvainCommunities(tmpDb);
+      expect(result.communities).toHaveLength(0);
+      expect(result.nodeCount).toBe(0);
+      tmpDb.close();
+    });
+  });
+
+  describe("detectHubs", () => {
+    it("finds highly-connected nodes", () => {
+      // In our test graph, nodes 0,2,3 each have 3 links
+      const hubs = detectHubs(db, 1.5, 3);
+      expect(hubs.length).toBeGreaterThanOrEqual(1);
+      for (const hub of hubs) {
+        expect(hub.linkCount).toBeGreaterThanOrEqual(3);
+        expect(hub.content).toBeTruthy();
+      }
+    });
+
+    it("returns empty when no hubs exist", () => {
+      const hubs = detectHubs(db, 100, 100); // impossibly high threshold
+      expect(hubs).toHaveLength(0);
+    });
+  });
+
+  describe("getNeighbors", () => {
+    it("returns connected memories", () => {
+      const neighbors = getNeighbors(db, memIds[0]);
+      expect(neighbors.length).toBeGreaterThanOrEqual(2);
+      const neighborIds = neighbors.map((n) => n.id);
+      expect(neighborIds).toContain(memIds[1]);
+      expect(neighborIds).toContain(memIds[2]);
+    });
+
+    it("includes relationship and direction", () => {
+      const neighbors = getNeighbors(db, memIds[0]);
+      for (const n of neighbors) {
+        expect(n.relationship).toBeTruthy();
+        expect(["outgoing", "incoming"]).toContain(n.direction);
+        expect(n.content).toBeTruthy();
+      }
+    });
+  });
+
+  describe("shortestPath", () => {
+    it("finds path between connected nodes", () => {
+      const path = shortestPath(db, memIds[0], memIds[5]);
+      expect(path).not.toBeNull();
+      expect(path!.length).toBeGreaterThanOrEqual(2);
+      expect(path![0]).toBe(memIds[0]);
+      expect(path![path!.length - 1]).toBe(memIds[5]);
+    });
+
+    it("finds direct path between neighbors", () => {
+      const path = shortestPath(db, memIds[0], memIds[1]);
+      expect(path).toEqual([memIds[0], memIds[1]]);
+    });
+
+    it("returns null for disconnected nodes", () => {
+      // Insert an isolated memory
+      const isolated = storage.insertMemory(db, "Isolated node", fakeEmbedding(300), {});
+      const path = shortestPath(db, memIds[0], isolated);
+      expect(path).toBeNull();
+      storage.deleteMemory(db, isolated);
+    });
+  });
+});

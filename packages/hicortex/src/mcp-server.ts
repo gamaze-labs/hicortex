@@ -23,6 +23,7 @@ import { initFeatures, memoryCapReached, maxMemoriesAllowed, remoteIngestAllowed
 import { loadState, migrateLegacyState } from "./state.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
+import { getNeighbors, shortestPath, detectHubs } from "./graph.js";
 import * as retrieval from "./retrieval.js";
 import { scheduleConsolidation } from "./consolidate.js";
 import { injectSeedLesson } from "./seed-lesson.js";
@@ -247,6 +248,65 @@ function createMcpServer(): McpServer {
         ? rows.map((r) => `${r.project}: ${r.cnt} memories`).join("\n")
         : "No memories yet.";
       return { content: [{ type: "text" as const, text }] };
+    }
+  );
+
+  // -- hicortex_graph --
+  server.tool(
+    "hicortex_graph",
+    "Query the memory knowledge graph — find connected memories, hub nodes, or paths between memories.",
+    {
+      operation: z.enum(["neighbors", "hubs", "path"]).describe("Graph operation to perform"),
+      id: z.string().optional().describe("Memory ID (required for neighbors and path operations)"),
+      target_id: z.string().optional().describe("Target memory ID (required for path operation)"),
+      limit: z.coerce.number().optional().describe("Max results (default 10)"),
+      domain: z.string().optional().describe("Filter hubs by domain"),
+    },
+    async ({ operation, id, target_id, limit: resultLimit, domain: filterDomain }) => {
+      if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
+      try {
+        if (operation === "neighbors") {
+          if (!id) return { content: [{ type: "text" as const, text: "id is required for neighbors operation" }], isError: true };
+          const resolvedId = resolveMemoryId(db, id);
+          if (!resolvedId) return { content: [{ type: "text" as const, text: `Memory not found: ${id}` }], isError: true };
+          const neighbors = getNeighbors(db, resolvedId, resultLimit ?? 10);
+          if (neighbors.length === 0) return { content: [{ type: "text" as const, text: "No connected memories found." }] };
+          const text = neighbors.map((n) =>
+            `[${n.direction}] ${n.relationship} (${n.strength.toFixed(2)})\n  ${n.id.slice(0, 8)} | ${n.project ?? "global"} | ${n.content}`
+          ).join("\n\n");
+          return { content: [{ type: "text" as const, text }] };
+        }
+
+        if (operation === "hubs") {
+          let hubs = detectHubs(db);
+          if (filterDomain) {
+            hubs = hubs.filter((h) => h.domain === filterDomain || h.project === filterDomain);
+          }
+          if (hubs.length === 0) return { content: [{ type: "text" as const, text: "No hub memories found." }] };
+          const text = hubs.slice(0, resultLimit ?? 10).map((h) =>
+            `**${h.id.slice(0, 8)}** (${h.linkCount} links) | ${h.domain ?? h.project ?? "global"}\n  ${h.content}`
+          ).join("\n\n");
+          return { content: [{ type: "text" as const, text }] };
+        }
+
+        if (operation === "path") {
+          if (!id || !target_id) return { content: [{ type: "text" as const, text: "id and target_id are required for path operation" }], isError: true };
+          const fromId = resolveMemoryId(db, id);
+          const toId = resolveMemoryId(db, target_id);
+          if (!fromId || !toId) return { content: [{ type: "text" as const, text: "One or both memory IDs not found" }], isError: true };
+          const path = shortestPath(db, fromId, toId);
+          if (!path) return { content: [{ type: "text" as const, text: "No path found between these memories." }] };
+          const text = path.map((nodeId, i) => {
+            const mem = storage.getMemory(db!, nodeId);
+            return `${i + 1}. ${nodeId.slice(0, 8)} | ${mem?.project ?? "?"} | ${mem?.content.slice(0, 150) ?? "?"}`;
+          }).join("\n");
+          return { content: [{ type: "text" as const, text: `Path (${path.length} hops):\n${text}` }] };
+        }
+
+        return { content: [{ type: "text" as const, text: `Unknown operation: ${operation}` }], isError: true };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: `Graph query failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+      }
     }
   );
 
