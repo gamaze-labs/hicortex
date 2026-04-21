@@ -74,6 +74,10 @@ export interface ConsolidationReport {
       domains: number;
       reason?: string;
     };
+    hub_boost?: {
+      hubs_found: number;
+      boosted: number;
+    };
     links?: {
       auto_linked: number;
       failed: number;

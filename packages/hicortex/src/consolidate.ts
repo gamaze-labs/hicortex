@@ -13,6 +13,7 @@ import * as storage from "./storage.js";
 import { importanceScoring, reflection, domainCuration } from "./prompts.js";
 import { createHash } from "node:crypto";
 import { memoryCapReached, maxMemoriesAllowed, isPro } from "./features.js";
+import { louvainCommunities, detectHubs } from "./graph.js";
 import { loadState, updateState } from "./state.js";
 
 // Default config constants (matching Python config.py)
@@ -407,14 +408,52 @@ async function stageDomainCuration(
   let domains: ModuleDomain[];
 
   if (!isPro()) {
-    // OSS fallback: each project is its own domain
-    domains = projectRows.map((r) => ({
-      name: r.project,
-      projects: [r.project],
-      memoryCount: r.cnt,
-      lessonCount: lessonsByProject.get(r.project) ?? 0,
-      keywords: [],
-    }));
+    // OSS: Louvain community detection on the memory_links graph (zero LLM cost)
+    const graph = louvainCommunities(db);
+    if (graph.communities.length > 1 && graph.edgeCount >= 5) {
+      // Map communities to domains by finding the dominant project in each
+      // Pre-load all memory→project mappings in one query (avoids N+1)
+      const allProjectRows = db
+        .prepare("SELECT id, project FROM memories WHERE project IS NOT NULL")
+        .all() as Array<{ id: string; project: string }>;
+      const memProject = new Map(allProjectRows.map((r) => [r.id, r.project]));
+
+      domains = [];
+      for (const comm of graph.communities) {
+        const projectCounts = new Map<string, number>();
+        for (const memId of comm.members) {
+          const proj = memProject.get(memId);
+          if (proj) {
+            projectCounts.set(proj, (projectCounts.get(proj) ?? 0) + 1);
+          }
+        }
+        const projects = [...projectCounts.keys()];
+        if (projects.length === 0) continue;
+        // Name domain after the dominant project or combine top 2
+        const sorted = [...projectCounts.entries()].sort((a, b) => b[1] - a[1]);
+        const name = sorted.length >= 2 && sorted[1][1] > sorted[0][1] * 0.3
+          ? `${sorted[0][0]} + ${sorted[1][0]}`
+          : sorted[0][0];
+        const memoryCount = projects.reduce(
+          (s, p) => s + (projectRows.find((r) => r.project === p)?.cnt ?? 0), 0
+        );
+        const lessonCount = projects.reduce(
+          (s, p) => s + (lessonsByProject.get(p) ?? 0), 0
+        );
+        domains.push({ name, projects, memoryCount, lessonCount, keywords: [] });
+      }
+      domains.sort((a, b) => b.memoryCount - a.memoryCount);
+      console.log(`[hicortex] Louvain clustering: ${graph.communities.length} communities, modularity ${graph.modularity.toFixed(3)}`);
+    } else {
+      // Not enough edges for meaningful clustering — fall back to project=domain
+      domains = projectRows.map((r) => ({
+        name: r.project,
+        projects: [r.project],
+        memoryCount: r.cnt,
+        lessonCount: lessonsByProject.get(r.project) ?? 0,
+        keywords: [],
+      }));
+    }
   } else {
     // Pro: LLM-curated domains
     if (!budget.use("domain_curation")) {
@@ -591,6 +630,42 @@ function classifyRelationship(
 }
 
 // ---------------------------------------------------------------------------
+// Stage 3.5: Hub Detection & Strength Boost
+// ---------------------------------------------------------------------------
+
+const HUB_BOOST = 0.1;
+const HUB_STRENGTH_CAP = 1.0;
+
+function stageHubBoost(
+  db: Database.Database,
+  dryRun: boolean,
+): { hubs_found: number; boosted: number } {
+  const hubs = detectHubs(db);
+  if (hubs.length === 0) return { hubs_found: 0, boosted: 0 };
+
+  let boosted = 0;
+  if (!dryRun) {
+    const stmt = db.prepare(
+      "UPDATE memories SET base_strength = MIN(?, base_strength + ?) WHERE id = ? AND base_strength < ?"
+    );
+    const tx = db.transaction(() => {
+      for (const hub of hubs) {
+        const result = stmt.run(HUB_STRENGTH_CAP, HUB_BOOST, hub.id, HUB_STRENGTH_CAP);
+        if (result.changes > 0) boosted++;
+      }
+    });
+    tx();
+  } else {
+    boosted = hubs.length;
+  }
+
+  if (hubs.length > 0) {
+    console.log(`[hicortex] Hub detection: ${hubs.length} hubs found, ${boosted} boosted (+${HUB_BOOST})`);
+  }
+  return { hubs_found: hubs.length, boosted };
+}
+
+// ---------------------------------------------------------------------------
 // Stage 4: Decay & Prune
 // ---------------------------------------------------------------------------
 
@@ -731,6 +806,9 @@ export async function runConsolidation(
       embedFn,
       dryRun
     );
+
+    // Stage 3.5: Hub Detection — boost highly-connected memories
+    report.stages.hub_boost = stageHubBoost(db, dryRun);
 
     // Stage 4: Decay & Prune
     report.stages.decay_prune = stageDecayPrune(db, dryRun);
