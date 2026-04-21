@@ -262,16 +262,24 @@ export function getNeighbors(
   db: Database.Database,
   memoryId: string,
   limit = 10,
+  relationship?: string,
 ): GraphNeighbor[] {
-  const rows = db
-    .prepare(
-      `SELECT source_id, target_id, relationship, strength
+  let sql = `SELECT source_id, target_id, relationship, strength
        FROM memory_links
-       WHERE source_id = ? OR target_id = ?
-       ORDER BY strength DESC
-       LIMIT ?`
-    )
-    .all(memoryId, memoryId, limit) as Array<{
+       WHERE (source_id = ? OR target_id = ?)`;
+  const params: unknown[] = [memoryId, memoryId];
+
+  if (relationship) {
+    sql += ` AND relationship = ?`;
+    params.push(relationship);
+  }
+
+  sql += ` ORDER BY strength DESC LIMIT ?`;
+  params.push(limit);
+
+  const rows = db
+    .prepare(sql)
+    .all(...params) as Array<{
       source_id: string; target_id: string; relationship: string; strength: number;
     }>;
 

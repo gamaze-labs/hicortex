@@ -30,6 +30,15 @@ export interface MemoryLink {
   created_at: string;
 }
 
+/** All valid relationship types for memory links.
+ *  lowercase = heuristic (legacy), UPPER_SNAKE_CASE = LLM-classified (v0.7+). */
+export const VALID_RELATIONSHIP_TYPES = [
+  "derives", "updates", "extends", "relates_to",
+  "CONTRADICTS", "SUPERSEDES", "DEPENDS_ON", "CAUSED_BY", "VALIDATES",
+] as const;
+
+export type RelationshipType = typeof VALID_RELATIONSHIP_TYPES[number];
+
 /** A search result with scoring metadata. */
 export interface MemorySearchResult {
   id: string;
@@ -80,6 +89,8 @@ export interface ConsolidationReport {
     };
     links?: {
       auto_linked: number;
+      llm_classified?: number;
+      heuristic_fallback?: number;
       failed: number;
     };
     decay_prune?: {
