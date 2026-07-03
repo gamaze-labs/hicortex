@@ -18,15 +18,15 @@ import { z } from "zod";
 import type Database from "better-sqlite3";
 
 import { initDb, getStats, resolveDbPath } from "./db.js";
-import { resolveLlmConfigForCC, LlmClient, findClaudeBinary, claudeCliConfig, type LlmConfig } from "./llm.js";
-import { initFeatures, memoryCapReached, maxMemoriesAllowed, remoteIngestAllowed } from "./features.js";
+import { resolveExplicitLlmConfig, LlmClient, findClaudeBinary, claudeCliConfig, resolveDistillFallback, type LlmConfig } from "./llm.js";
+import { initFeatures } from "./features.js";
 import { loadState, migrateLegacyState } from "./state.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import { getNeighbors, shortestPath, detectHubs } from "./graph.js";
 import * as retrieval from "./retrieval.js";
-import { scheduleConsolidation } from "./consolidate.js";
 import { injectSeedLesson } from "./seed-lesson.js";
+import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
 import type { MemorySearchResult } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -35,8 +35,17 @@ import type { MemorySearchResult } from "./types.js";
 
 let db: Database.Database | null = null;
 let llm: LlmClient | null = null;
-let cancelConsolidation: (() => void) | null = null;
+// llmConfig is module-level so the /distill handler can call resolveDistillFallback
+// without having to read config on every request. null when no LLM is configured.
+let llmConfig: LlmConfig | null = null;
+// distillFallbackMode controls whether a failed remote distill endpoint causes an
+// immediate abort ("strict", default) or a fallback to the base model ("local").
+let distillFallbackMode: "strict" | "local" = "strict";
 let stateDir = "";
+
+// Cache detectChunkSize results keyed by "<provider>/<model>@<baseUrl>" so we
+// probe each endpoint once per server boot rather than once per /distill request.
+const chunkSizeCache = new Map<string, number>();
 
 let VERSION = "0.3.x";
 try {
@@ -104,17 +113,6 @@ function createMcpServer(): McpServer {
     },
     async ({ content, project, memory_type }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
-      if (memoryCapReached(storage.countMemories(db))) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `Free tier limit reached (${maxMemoriesAllowed()} memories). ` +
-              `Your existing memories and lessons still work — search and recall are unaffected. ` +
-              `New memories won't be saved until you upgrade.\n\n` +
-              `Upgrade for unlimited usage: https://hicortex.gamaze.com/`
-          }],
-        };
-      }
       try {
         const embedding = await embed(content);
         const id = storage.insertMemory(db, content, embedding, {
@@ -321,7 +319,6 @@ function createMcpServer(): McpServer {
 export async function startServer(options: {
   port?: number;
   host?: string;
-  consolidateHour?: number;
   dbPath?: string;
   licenseKey?: string;
 } = {}): Promise<void> {
@@ -334,21 +331,18 @@ export async function startServer(options: {
   db = initDb(dbPath);
   stateDir = require("node:path").dirname(dbPath);
 
-  // LLM config: check config.json first, then env vars, then claude CLI
+  // LLM config: explicit config only — no silent harness auto-detection.
+  // Named backends (claude-cli, ollama) → immediate config; everything else
+  // goes through resolveExplicitLlmConfig which requires a user-chosen provider.
+  // If nothing is configured: start recall-only with an unmissable warning.
   const savedConfig = readConfigFile(stateDir);
-  let llmConfig;
   if (savedConfig?.llmBackend === "claude-cli") {
     const claudePath = findClaudeBinary();
     if (claudePath) {
       llmConfig = claudeCliConfig(claudePath);
     } else {
-      console.warn("[hicortex] claude-cli configured but claude binary not found, falling back");
-      llmConfig = resolveLlmConfigForCC({
-        llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
-        llmApiKey: savedConfig?.llmApiKey as string | undefined,
-        llmModel: savedConfig?.llmModel as string | undefined,
-        reflectModel: savedConfig?.reflectModel as string | undefined,
-      });
+      console.warn("[hicortex] claude-cli configured but claude binary not found — LLM disabled");
+      llmConfig = null;
     }
   } else if (savedConfig?.llmBackend === "ollama") {
     // Ollama: no API key needed, default to localhost:11434
@@ -358,38 +352,58 @@ export async function startServer(options: {
       model: (savedConfig.llmModel as string) ?? "qwen3.5:4b",
       reflectModel: (savedConfig.reflectModel as string) ?? (savedConfig.llmModel as string) ?? "qwen3.5:4b",
       provider: "ollama",
-    } satisfies LlmConfig;
+    };
   } else {
-    llmConfig = resolveLlmConfigForCC({
+    llmConfig = resolveExplicitLlmConfig({
       llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
       llmApiKey: savedConfig?.llmApiKey as string | undefined,
       llmModel: savedConfig?.llmModel as string | undefined,
       reflectModel: savedConfig?.reflectModel as string | undefined,
     });
   }
-  // Apply optional distill endpoint (e.g. remote Ollama with faster model)
-  if (savedConfig?.distillModel) {
-    llmConfig.distillModel = savedConfig.distillModel as string;
+
+  if (llmConfig) {
+    // Apply optional distill endpoint (e.g. remote Ollama with faster model)
+    if (savedConfig?.distillModel) {
+      llmConfig.distillModel = savedConfig.distillModel as string;
+    }
+    if (savedConfig?.distillBaseUrl) {
+      llmConfig.distillBaseUrl = savedConfig.distillBaseUrl as string;
+      llmConfig.distillApiKey = (savedConfig.distillApiKey as string | undefined) ?? llmConfig.apiKey;
+      llmConfig.distillProvider = (savedConfig.distillProvider as string | undefined) ?? llmConfig.provider;
+    }
+    // Apply separate reflect endpoint if configured (e.g. remote Ollama with larger model)
+    if (savedConfig?.reflectBaseUrl) {
+      llmConfig.reflectBaseUrl = savedConfig.reflectBaseUrl as string;
+      llmConfig.reflectApiKey = (savedConfig.reflectApiKey as string | undefined) ?? llmConfig.apiKey;
+      llmConfig.reflectProvider = (savedConfig.reflectProvider as string | undefined) ?? llmConfig.provider;
+    }
+    // distillFallback: "strict" (default) aborts on remote failure so the session
+    // is retried next run. "local" restores 0.9.0 fallback-to-base-model behavior.
+    const df = savedConfig?.distillFallback as string | undefined;
+    distillFallbackMode = df === "local" ? "local" : "strict";
+    llm = new LlmClient(llmConfig);
+    const distillInfo = llmConfig.distillBaseUrl
+      ? `${llmConfig.distillProvider}/${llmConfig.distillModel}@${llmConfig.distillBaseUrl}`
+      : llmConfig.distillModel ? llmConfig.distillModel : "";
+    const reflectInfo = llmConfig.reflectBaseUrl
+      ? `${llmConfig.reflectProvider}/${llmConfig.reflectModel}@${llmConfig.reflectBaseUrl}`
+      : llmConfig.reflectModel;
+    console.log(`[hicortex] LLM fast: ${llmConfig.provider}/${llmConfig.model}${distillInfo ? `, distill: ${distillInfo}` : ""}, reflect: ${reflectInfo}`);
+  } else {
+    llm = null;
+    console.warn("");
+    console.warn("╔══════════════════════════════════════════════════════════════╗");
+    console.warn("║  NO LLM CONFIGURED — running in recall-only mode            ║");
+    console.warn("║                                                              ║");
+    console.warn("║  search / lessons / context: ENABLED                        ║");
+    console.warn("║  /distill (capture) and consolidation: DISABLED             ║");
+    console.warn("║                                                              ║");
+    console.warn("║  To enable capture, run:                                    ║");
+    console.warn("║    npx @gamaze/hicortex init                                ║");
+    console.warn("╚══════════════════════════════════════════════════════════════╝");
+    console.warn("");
   }
-  if (savedConfig?.distillBaseUrl) {
-    llmConfig.distillBaseUrl = savedConfig.distillBaseUrl as string;
-    llmConfig.distillApiKey = (savedConfig.distillApiKey as string | undefined) ?? llmConfig.apiKey;
-    llmConfig.distillProvider = (savedConfig.distillProvider as string | undefined) ?? llmConfig.provider;
-  }
-  // Apply separate reflect endpoint if configured (e.g. remote Ollama with larger model)
-  if (savedConfig?.reflectBaseUrl) {
-    llmConfig.reflectBaseUrl = savedConfig.reflectBaseUrl as string;
-    llmConfig.reflectApiKey = (savedConfig.reflectApiKey as string | undefined) ?? llmConfig.apiKey;
-    llmConfig.reflectProvider = (savedConfig.reflectProvider as string | undefined) ?? llmConfig.provider;
-  }
-  llm = new LlmClient(llmConfig);
-  const distillInfo = llmConfig.distillBaseUrl
-    ? `${llmConfig.distillProvider}/${llmConfig.distillModel}@${llmConfig.distillBaseUrl}`
-    : llmConfig.distillModel ? llmConfig.distillModel : "";
-  const reflectInfo = llmConfig.reflectBaseUrl
-    ? `${llmConfig.reflectProvider}/${llmConfig.reflectModel}@${llmConfig.reflectBaseUrl}`
-    : llmConfig.reflectModel;
-  console.log(`[hicortex] LLM fast: ${llmConfig.provider}/${llmConfig.model}${distillInfo ? `, distill: ${distillInfo}` : ""}, reflect: ${reflectInfo}`);
 
   // One-time migration of legacy state files (no-op if state.json exists)
   migrateLegacyState(stateDir);
@@ -404,10 +418,6 @@ export async function startServer(options: {
     console.log(`[hicortex] License key configured`);
   }
 
-  // Schedule nightly consolidation
-  const consolidateHour = options.consolidateHour ?? 2;
-  cancelConsolidation = scheduleConsolidation(db, llm, embed, consolidateHour);
-
   // Seed lesson on first run
   await injectSeedLesson(db);
 
@@ -421,15 +431,22 @@ export async function startServer(options: {
     `${Math.round(stats.db_size_bytes / 1024)} KB`
   );
 
-  // Auth token: from config, env var, or default (always-on baseline security)
-  const DEFAULT_AUTH_TOKEN = "hctx-default-token";
+  // Auth token: from config file or HICORTEX_AUTH_TOKEN env var.
+  // No hardcoded default — each server install generates its own token via init.
+  // Localhost connections bypass auth regardless (unchanged).
   const authToken = (savedConfig?.authToken as string | undefined)
-    ?? process.env.HICORTEX_AUTH_TOKEN
-    ?? DEFAULT_AUTH_TOKEN;
+    ?? process.env.HICORTEX_AUTH_TOKEN;
+  if (!authToken) {
+    console.warn(
+      "[hicortex] WARNING: no authToken configured — remote connections will be rejected " +
+      "(localhost still works). Run `npx @gamaze/hicortex init` to generate a token."
+    );
+  }
 
   // Express app
   const app = express();
-  app.use(express.json());
+  // Raise the body limit — whole-session denoised transcripts exceed the 100 kB default.
+  app.use(express.json({ limit: "25mb" }));
 
   // CORS: must be before auth so preflight OPTIONS requests get proper headers
   app.use((req, res, next) => {
@@ -448,18 +465,26 @@ export async function startServer(options: {
     next();
   });
 
-  // Optional bearer token auth (skip for /health, OPTIONS, and localhost)
-  if (authToken) {
-    console.log(`[hicortex] Bearer token auth enabled`);
-    app.use((req, res, next) => {
-      if (req.path === "/health") return next();
-      const ip = req.ip ?? req.socket.remoteAddress ?? "";
-      if (ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return next();
-      const auth = req.headers.authorization;
-      if (auth === `Bearer ${authToken}`) return next();
-      res.status(401).json({ error: "Unauthorized" });
+  // Bearer token auth — ALWAYS installed, fail-closed. /health, OPTIONS, and
+  // localhost bypass. With no token configured, remote requests are REJECTED
+  // (not open): the default bind is 0.0.0.0, so "no token = no auth" would
+  // expose the whole memory store to the network.
+  console.log(
+    authToken
+      ? `[hicortex] Bearer token auth enabled`
+      : `[hicortex] No auth token configured — remote access DISABLED (localhost only). Run init to generate a token.`
+  );
+  app.use((req, res, next) => {
+    if (req.path === "/health") return next();
+    const ip = req.ip ?? req.socket.remoteAddress ?? "";
+    if (ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return next();
+    if (authToken && req.headers.authorization === `Bearer ${authToken}`) return next();
+    res.status(401).json({
+      error: authToken
+        ? "Unauthorized"
+        : "No auth token configured on this server — run `npx @gamaze/hicortex init` on the server, then connect with its token.",
     });
-  }
+  });
 
   // SSE transport management — each connection gets its own McpServer instance
   const transports = new Map<string, SSEServerTransport>();
@@ -473,7 +498,7 @@ export async function startServer(options: {
       memories: s.memories,
       links: s.links,
       db_size_kb: Math.round(s.db_size_bytes / 1024),
-      llm: `${llmConfig.provider}/${llmConfig.model}`,
+      llm: llmConfig ? `${llmConfig.provider}/${llmConfig.model}` : "not configured",
     });
   });
 
@@ -517,17 +542,6 @@ export async function startServer(options: {
   app.post("/ingest", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
 
-    // Pro license blocks remote ingest (upgrade to Team for multi-client)
-    const ip = req.ip ?? req.socket.remoteAddress ?? "";
-    const isLocal = ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1";
-    if (!isLocal && !remoteIngestAllowed()) {
-      res.status(403).json({
-        error: "Pro license is single-machine. Upgrade to Team for multi-client remote ingestion.",
-        upgrade: "https://hicortex.gamaze.com/",
-      });
-      return;
-    }
-
     const { content, source_agent, project, memory_type, privacy, source_session, session_date } = req.body ?? {};
 
     if (!content || typeof content !== "string") {
@@ -552,12 +566,6 @@ export async function startServer(options: {
       }
     }
 
-    // License check
-    if (memoryCapReached(storage.countMemories(db))) {
-      res.status(429).json({ error: "Memory limit reached", limit: maxMemoriesAllowed() });
-      return;
-    }
-
     try {
       const embedding = await embed(content);
       const id = storage.insertMemory(db, content, embedding, {
@@ -571,6 +579,306 @@ export async function startServer(options: {
       res.status(201).json({ id, message: "Memory ingested" });
     } catch (err) {
       res.status(500).json({ error: "Ingestion failed", message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // REST /search — semantic search over the memory store.
+  // Common recall path for adapters (Hermes prefetch, CC push-hook). Stateless GET.
+  app.get("/search", async (req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    const query = typeof req.query.query === "string" ? req.query.query.trim() : "";
+    if (!query) { res.status(400).json({ error: "Missing 'query'" }); return; }
+    const limit = req.query.limit ? Number(req.query.limit) : 5;
+    const project = typeof req.query.project === "string" && req.query.project ? req.query.project : undefined;
+    const privacy = typeof req.query.privacy === "string" && req.query.privacy
+      ? req.query.privacy.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined;
+    try {
+      const results = await retrieval.retrieve(db, embed, query, { limit, project, privacy });
+      res.json({ results });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // REST /context — recent context memories, optionally filtered by project.
+  app.get("/context", (req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    const project = typeof req.query.project === "string" && req.query.project ? req.query.project : undefined;
+    const limit = req.query.limit ? Number(req.query.limit) : 10;
+    const privacy = typeof req.query.privacy === "string" && req.query.privacy
+      ? req.query.privacy.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined;
+    try {
+      const results = retrieval.searchContext(db, { project, limit, privacy });
+      res.json({ results });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // REST /distill — canonical capture endpoint (0.9.0+).
+  // Every machine (including the server itself) POSTs denoised session text here.
+  // The server distills, embeds, stores. Body limit: 25 MB (raised at app init).
+  //
+  // Accepts text (string, preferred nightly path) OR messages (array, legacy).
+  // Performs session-level dedup when session_id is present without segment_id.
+  // Uses cached detectChunkSize per endpoint so the probe runs once per boot.
+  app.post("/distill", async (req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    if (!llm || !llmConfig) { res.status(503).json({ error: "No LLM configured — run npx @gamaze/hicortex init. Session will be retried." }); return; }
+
+    const { text, messages, source_agent, project, session_id, segment_id, session_date, privacy } = req.body ?? {};
+
+    // Resolve the conversation text from either the pre-denoised string or raw messages array.
+    let conversationText: string;
+    if (typeof text === "string" && text.length > 0) {
+      conversationText = text;
+    } else if (Array.isArray(messages) && messages.length > 0) {
+      conversationText = extractConversationText(messages);
+    } else {
+      res.status(400).json({ error: "Provide either 'text' (string) or 'messages' (array)" });
+      return;
+    }
+
+    // Session-level dedup: when session_id is present and this is a whole-session
+    // POST (no segment_id), skip if any chunk of this session is already stored.
+    if (session_id && !segment_id) {
+      // Escape LIKE wildcards — Hermes ids contain "_" (e.g. 20260701_045744_...).
+      const likePrefix = `${(session_id as string).replace(/[\\%_]/g, (m) => "\\" + m)}#%`;
+      const existing = (db.prepare(
+        "SELECT COUNT(*) as c FROM memories WHERE source_session = ? OR source_session LIKE ? ESCAPE '\\'"
+      ).get(session_id, likePrefix) as { c: number });
+      if (existing.c > 0) {
+        res.status(200).json({ skipped: true, existing_count: existing.c });
+        return;
+      }
+    }
+
+    // Pre-flight the distill endpoint. In strict mode (default) a failed remote
+    // probe returns "abort" immediately without mutating llmConfig — the nightly
+    // watermark stays put so the session is re-shipped next run. In "local" mode
+    // the config is mutated to fall back to the base model.
+    const cfg = llmConfig;
+    const distillFallbackStatus = await resolveDistillFallback(cfg, distillFallbackMode);
+    if (distillFallbackStatus === "abort") {
+      res.status(503).json({ error: "Distill endpoint unavailable — session will be retried next run" });
+      return;
+    }
+
+    // Cache detectChunkSize per endpoint so we probe at most once per server boot.
+    const effectiveProvider = cfg.distillProvider ?? cfg.provider;
+    const effectiveModel = cfg.distillModel ?? cfg.model;
+    const effectiveBaseUrl = cfg.distillBaseUrl ?? cfg.baseUrl;
+    const cacheKey = `${effectiveProvider}/${effectiveModel}@${effectiveBaseUrl}`;
+    if (!chunkSizeCache.has(cacheKey)) {
+      chunkSizeCache.set(cacheKey, await detectChunkSize(effectiveProvider, effectiveModel, effectiveBaseUrl));
+    }
+    const chunkSize = chunkSizeCache.get(cacheKey)!;
+
+    const date = typeof session_date === "string" && session_date ? session_date : new Date().toISOString().slice(0, 10);
+
+    // Per-entry idempotency prefix for the legacy segment_id path.
+    const sourcePrefix = session_id
+      ? `${session_id as string}${segment_id ? `#${segment_id as string}` : ""}`
+      : undefined;
+
+    try {
+      const entries = await distillSession(llm, conversationText, project ?? "unknown", date, chunkSize);
+      const ids: string[] = [];
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        if (typeof entry !== "string" || !entry.trim()) continue;
+        const embedding = await embed(entry);
+        const id = storage.insertMemory(db, entry, embedding, {
+          sourceAgent: source_agent ?? "unknown",
+          // Per-chunk key: "<session_id>#<i>". The prefix matches the nightly
+          // dedup check above, so a re-run of the same session is fully idempotent.
+          sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
+          project: project ?? undefined,
+          memoryType: "episode",
+          privacy: privacy ?? "WORK",
+          createdAt: new Date(date).toISOString(),
+        });
+        ids.push(id);
+      }
+      res.status(201).json({ ids, distilled: ids.length });
+    } catch (err) {
+      res.status(500).json({ error: "Distillation failed", message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // REST /update — update a memory (and re-embed when content changes).
+  //
+  // NOTE for #124: this endpoint returns the clean {updated: true, id} JSON
+  // shape that the future /viz surface can consume directly — no MCP wrapping.
+  // -------------------------------------------------------------------------
+  app.post("/update", async (req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    const { id, content, project, memory_type, privacy } = req.body ?? {};
+    if (!id || typeof id !== "string") {
+      res.status(400).json({ error: "Missing or invalid 'id' field" });
+      return;
+    }
+
+    const fullId = resolveMemoryId(db, id);
+    if (!fullId) {
+      res.status(404).json({ error: `Memory not found: ${id}` });
+      return;
+    }
+
+    const fields: Record<string, unknown> = {};
+    if (content !== undefined) fields.content = content;
+    if (project !== undefined) fields.project = project;
+    if (memory_type !== undefined) fields.memory_type = memory_type;
+    if (privacy !== undefined) fields.privacy = privacy;
+
+    if (Object.keys(fields).length === 0) {
+      res.status(400).json({ error: "No fields to update" });
+      return;
+    }
+
+    const validTypes = ["episode", "lesson", "fact", "decision"];
+    if (memory_type !== undefined && !validTypes.includes(memory_type)) {
+      res.status(400).json({ error: `Invalid memory_type: ${memory_type}` });
+      return;
+    }
+
+    try {
+      storage.updateMemory(db, fullId, fields);
+
+      // Re-embed when content changes
+      if (content !== undefined) {
+        const embedding = await embed(content);
+        db.prepare("DELETE FROM memory_vectors WHERE id = ?").run(fullId);
+        db.prepare("INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)").run(
+          fullId,
+          Buffer.from(embedding.buffer)
+        );
+      }
+
+      res.json({ updated: true, id: fullId });
+    } catch (err) {
+      res.status(500).json({ error: "Update failed", message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // REST /delete — permanently delete a memory and its links.
+  //
+  // NOTE for #124: returns {deleted: true, id} — clean JSON for future /viz.
+  // -------------------------------------------------------------------------
+  app.post("/delete", async (req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    const { id } = req.body ?? {};
+    if (!id || typeof id !== "string") {
+      res.status(400).json({ error: "Missing or invalid 'id' field" });
+      return;
+    }
+
+    const fullId = resolveMemoryId(db, id);
+    if (!fullId) {
+      res.status(404).json({ error: `Memory not found: ${id}` });
+      return;
+    }
+
+    try {
+      storage.deleteMemory(db, fullId);
+      res.json({ deleted: true, id: fullId });
+    } catch (err) {
+      res.status(500).json({ error: "Delete failed", message: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // REST /index — knowledge domain index (same payload as hicortex_index MCP).
+  //
+  // NOTE for #124: this is the JSON surface that /viz will later consume.
+  // Keep the response shape clean: {domains} or {projects} fallback.
+  // -------------------------------------------------------------------------
+  app.get("/index", (_req, res) => {
+    try {
+      const state = loadState(stateDir);
+      const moduleIndex = state.moduleIndex;
+      if (moduleIndex && moduleIndex.domains && moduleIndex.domains.length > 0) {
+        res.json({ domains: moduleIndex.domains });
+        return;
+      }
+      // Fallback: flat project counts when moduleIndex is not yet built
+      if (!db) { res.json({ domains: [] }); return; }
+      const rows = db.prepare(
+        "SELECT project, COUNT(*) as cnt FROM memories WHERE project IS NOT NULL GROUP BY project ORDER BY cnt DESC LIMIT 20"
+      ).all() as Array<{ project: string; cnt: number }>;
+      res.json({ projects: rows.map((r) => ({ name: r.project, count: r.cnt })) });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // REST /graph — knowledge graph query (same operations as hicortex_graph MCP).
+  //
+  // Supported ops: neighbors, hubs, path
+  //   GET /graph?op=neighbors&id=<id>&limit=10&relationship=<rel>
+  //   GET /graph?op=hubs&limit=10&domain=<domain>
+  //   GET /graph?op=path&id=<from>&target_id=<to>
+  //
+  // NOTE for #124 (/viz): this endpoint IS the JSON surface that /viz will
+  // reuse for its graph visualisation. The response shape is intentionally
+  // clean ({results} for neighbors/path, {hubs} for hubs) so /viz can consume
+  // it without transformation. Do not add MCP-style text formatting here.
+  // -------------------------------------------------------------------------
+  app.get("/graph", (req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    const op = typeof req.query.op === "string" ? req.query.op : "";
+    const VALID_OPS = ["neighbors", "hubs", "path"];
+    if (!VALID_OPS.includes(op)) {
+      res.status(400).json({ error: `Invalid op: must be one of ${VALID_OPS.join(", ")}` });
+      return;
+    }
+
+    const rawLimit = req.query.limit ? Number(req.query.limit) : undefined;
+    const resultLimit = rawLimit && Number.isFinite(rawLimit) ? rawLimit : 10;
+    const filterDomain = typeof req.query.domain === "string" && req.query.domain ? req.query.domain : undefined;
+    const filterRelationship = typeof req.query.relationship === "string" && req.query.relationship ? req.query.relationship : undefined;
+
+    try {
+      if (op === "neighbors") {
+        const idParam = typeof req.query.id === "string" ? req.query.id : "";
+        if (!idParam) { res.status(400).json({ error: "id is required for neighbors operation" }); return; }
+        const resolvedId = resolveMemoryId(db, idParam);
+        if (!resolvedId) { res.status(404).json({ error: `Memory not found: ${idParam}` }); return; }
+        const neighbors = getNeighbors(db, resolvedId, resultLimit, filterRelationship);
+        res.json({ results: neighbors });
+        return;
+      }
+
+      if (op === "hubs") {
+        let hubs = detectHubs(db);
+        if (filterDomain) {
+          hubs = hubs.filter((h) => h.domain === filterDomain || h.project === filterDomain);
+        }
+        res.json({ hubs: hubs.slice(0, resultLimit) });
+        return;
+      }
+
+      if (op === "path") {
+        const fromParam = typeof req.query.id === "string" ? req.query.id : "";
+        const toParam = typeof req.query.target_id === "string" ? req.query.target_id : "";
+        if (!fromParam || !toParam) {
+          res.status(400).json({ error: "id and target_id are required for path operation" });
+          return;
+        }
+        const fromId = resolveMemoryId(db, fromParam);
+        const toId = resolveMemoryId(db, toParam);
+        if (!fromId || !toId) { res.status(404).json({ error: "One or both memory IDs not found" }); return; }
+        const path = shortestPath(db, fromId, toId);
+        res.json({ path: path ?? null });
+        return;
+      }
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
@@ -631,10 +939,6 @@ export async function startServer(options: {
   // Graceful shutdown
   const shutdown = () => {
     console.log("[hicortex] Shutting down...");
-    if (cancelConsolidation) {
-      cancelConsolidation();
-      cancelConsolidation = null;
-    }
     for (const transport of transports.values()) {
       transport.close().catch(() => {});
     }

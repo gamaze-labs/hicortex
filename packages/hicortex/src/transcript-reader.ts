@@ -17,7 +17,27 @@ export interface TranscriptBatch {
   projectName: string;
   date: string; // ISO date of last entry
   entries: unknown[]; // Raw JSONL entries — fed to extractConversationText()
+  /**
+   * Optional source-agent label (e.g. "hermes/lenny"). When set, the nightly
+   * pipeline uses it verbatim for provenance instead of the default
+   * `claude-code/<project>`. Lets per-harness readers stamp their own origin.
+   */
+  sourceAgent?: string;
 }
+
+/**
+ * Cheap pre-filter: skip CC session FILES with fewer than this many raw JSONL
+ * lines/entries — they're degenerate (aborted/empty) and not worth parsing.
+ *
+ * This is deliberately NOT the "is there meaningful content" gate. That is the
+ * post-denoise `transcript.length < MIN_CONVERSATION_CHARS` (200) check in
+ * nightly.ts, which measures actual conversation after tool/system noise is
+ * stripped. Raw entry count is a lossy proxy — a dense 2-message exchange can
+ * be very meaningful — so it's used only as a degenerate-file floor here, and
+ * intentionally NOT applied to the Hermes reader (which lets the 200-char
+ * content gate decide, so short dense sessions aren't dropped on count).
+ */
+export const MIN_TRANSCRIPT_ENTRIES = 4;
 
 const CC_PROJECTS_DIR = join(homedir(), ".claude", "projects");
 
@@ -98,7 +118,7 @@ function parseTranscriptFile(
   }
 
   const lines = raw.split("\n").filter((l) => l.trim());
-  if (lines.length < 4) return null; // Too short to be meaningful
+  if (lines.length < MIN_TRANSCRIPT_ENTRIES) return null; // degenerate/empty file
 
   const entries: unknown[] = [];
   let lastTimestamp = "";
@@ -115,7 +135,7 @@ function parseTranscriptFile(
     }
   }
 
-  if (entries.length < 4) return null;
+  if (entries.length < MIN_TRANSCRIPT_ENTRIES) return null;
 
   // Extract session ID from filename (UUID.jsonl)
   const sessionId = basename(filePath, ".jsonl");

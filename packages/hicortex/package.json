@@ -1,7 +1,7 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.7.1",
-  "description": "Human-like memory for self-improving AI agents. Automatic capturing, nightly reflection, and cross-agent learning. Works with Claude Code and OpenClaw.",
+  "version": "0.10.0",
+  "description": "Self-learning memory for AI agents — experience captured automatically, distilled into lessons overnight, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, and Pi.",
   "main": "dist/index.js",
   "bin": {
     "hicortex": "dist/cli.js"
@@ -26,6 +26,7 @@
   "files": [
     "dist/",
     "skills/",
+    "hermes-plugin/",
     "openclaw.plugin.json",
     "README.md"
   ],
@@ -33,7 +34,8 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run build"
+    "prepack": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/",
+    "prepublishOnly": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
@@ -45,7 +47,7 @@
   "engines": {
     "node": ">=18"
   },
-  "license": "MIT",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "homepage": "https://hicortex.gamaze.com",
   "repository": {
     "type": "git",

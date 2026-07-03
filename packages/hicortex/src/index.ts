@@ -1,39 +1,116 @@
 /**
- * Hicortex OpenClaw Plugin — Long-term Memory That Learns.
+ * Hicortex OpenClaw Plugin — Long-term Memory That Learns. (0.10.0)
  *
- * Pure in-process plugin: no sidecar, no HTTP. Uses better-sqlite3 + sqlite-vec
- * for storage, @huggingface/transformers for embeddings, and multi-provider LLM
- * for distillation and consolidation.
+ * Thin-client model: the plugin requires a Hicortex server (co-located at
+ * http://127.0.0.1:8787 by default, or a remote URL via `serverUrl` config).
+ * No local database, no local LLM, no embedder, no consolidation scheduler.
+ *
+ * Install once: `openclaw plugins install @gamaze/hicortex`
+ * Run server:   `npx @gamaze/hicortex init`
+ *
+ * Responsibilities (recall-only adapter, like the Hermes plugin):
+ *   - before_agent_start  → GET /lessons (fail-soft, 3s timeout) → inject context
+ *   - Tools               → HTTP proxies to /search, /context, /ingest, /lessons
+ *
+ * CAPTURE IS NOT THIS PLUGIN'S JOB. OpenClaw persists sessions at
+ * ~/.openclaw/agents/<agentId>/sessions/*.jsonl in the Pi v3 format; the
+ * machine's Hicortex nightly reads them via oc-transcript-reader.ts —
+ * canonical nightly-from-logs, same as CC JSONL and Hermes state.db.
  */
 
-import { join } from "node:path";
-import type Database from "better-sqlite3";
-import { initDb, getStats, resolveDbPath } from "./db.js";
-import { initFeatures, lessonsLimit, memoryCapReached, maxMemoriesAllowed } from "./features.js";
+import { initFeatures, lessonsLimit } from "./features.js";
 import { getLessonSelector } from "./extensions.js";
-import { migrateLegacyState } from "./state.js";
-import { resolveLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
+import { loadState } from "./state.js";
 import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { homedir } from "node:os";
-import { embed } from "./embedder.js";
-import * as storage from "./storage.js";
-import { injectSeedLesson } from "./seed-lesson.js";
-import * as retrieval from "./retrieval.js";
-import { extractConversationText, distillSession } from "./distiller.js";
-import {
-  runConsolidation,
-  scheduleConsolidation,
-} from "./consolidate.js";
-import type { HicortexConfig, MemorySearchResult } from "./types.js";
+import type { HicortexConfig, MemorySearchResult, ModuleIndex } from "./types.js";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SERVER_URL = "http://127.0.0.1:8787";
+const LESSONS_TIMEOUT_MS = 3000;
+const HICORTEX_HOME = join(homedir(), ".hicortex");
 
 // ---------------------------------------------------------------------------
 // Module state — initialized in registerService.start()
 // ---------------------------------------------------------------------------
 
-let db: Database.Database | null = null;
-let llm: LlmClient | null = null;
-let cancelConsolidation: (() => void) | null = null;
-let stateDir = "";
+let serverUrl = DEFAULT_SERVER_URL;
+let authToken: string | undefined;
+let hicortexHome = HICORTEX_HOME;
+
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+
+function authHeaders(): Record<string, string> {
+  return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
+
+async function serverGet<T>(path: string, timeoutMs: number): Promise<T | null> {
+  try {
+    const resp = await fetch(`${serverUrl}${path}`, {
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!resp.ok) return null;
+    return await resp.json() as T;
+  } catch {
+    return null;
+  }
+}
+
+async function serverPost<T>(
+  path: string,
+  body: unknown,
+  timeoutMs: number,
+): Promise<{ ok: boolean; status: number; data: T | null }> {
+  try {
+    const resp = await fetch(`${serverUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    let data: T | null = null;
+    try { data = await resp.json() as T; } catch { /* non-JSON body */ }
+    return { ok: resp.ok, status: resp.status, data };
+  } catch (err) {
+    return { ok: false, status: 0, data: null };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Shared response type for /lessons API
+// ---------------------------------------------------------------------------
+
+interface LessonsApiResponse {
+  lessons: Array<{ content: string; created_at: string; base_strength: number; access_count: number }>;
+  index: { total: number; lessonCount: number; sourceCount: number; projects: Array<{ name: string; count: number }> };
+  moduleIndex?: ModuleIndex;
+}
+
+// ---------------------------------------------------------------------------
+// Tool result formatter
+// ---------------------------------------------------------------------------
+
+function formatToolResults(
+  results: MemorySearchResult[],
+): { content: Array<{ type: string; text: string }> } {
+  if (results.length === 0) {
+    return { content: [{ type: "text", text: "No memories found." }] };
+  }
+  const text = results
+    .map(
+      (r) =>
+        `[${r.memory_type}] (score: ${r.score.toFixed(3)}, strength: ${r.effective_strength.toFixed(3)}) ${r.content.slice(0, 500)}`,
+    )
+    .join("\n\n");
+  return { content: [{ type: "text", text }] };
+}
 
 // ---------------------------------------------------------------------------
 // Plugin export
@@ -41,238 +118,112 @@ let stateDir = "";
 
 export default {
   id: "hicortex",
-  name: "Hicortex \u2014 Long-term Memory That Learns",
+  name: "Hicortex — Long-term Memory That Learns",
   kind: "lifecycle" as const,
 
   register(api: any) {
     // -----------------------------------------------------------------------
-    // Background service: init DB, embedder, LLM, consolidation timer
+    // Background service: resolve config, verify server, init features
     // -----------------------------------------------------------------------
     api.registerService({
       id: "hicortex-service",
 
       async start(ctx: any) {
         const config = (ctx.config ?? {}) as HicortexConfig;
-        stateDir = ctx.stateDir ?? join(process.env.HOME ?? "~", ".hicortex");
         const log = ctx.logger
           ? (msg: string) => ctx.logger.info(msg)
           : console.log;
 
-        // Resolve database path (handles migration from legacy OC location)
-        const dbPath = resolveDbPath(config.dbPath);
-        log(`[hicortex] Initializing database at ${dbPath}`);
-        db = initDb(dbPath);
+        // Resolve server URL and auth token from plugin config
+        serverUrl = (config.serverUrl ?? DEFAULT_SERVER_URL).replace(/\/+$/, "");
+        authToken = config.authToken;
+        // Use stateDir from context so tests can redirect state writes
+        hicortexHome = ctx.stateDir ?? HICORTEX_HOME;
 
-        // Auto-configure LLM: resolve → test → persist
-        const llmConfig = await autoConfigureLlm(config, log);
-        llm = new LlmClient(llmConfig);
-        log(
-          `[hicortex] LLM: ${llmConfig.provider}/${llmConfig.model} ` +
-            `(reflect: ${llmConfig.reflectModel})`
-        );
+        log(`[hicortex] Thin-client mode — server: ${serverUrl}`);
 
-        // One-time migration of legacy state files (no-op if state.json exists)
-        migrateLegacyState(stateDir);
+        // License: init feature cache (only needs licenseKey, no DB access)
+        await initFeatures(config.licenseKey, hicortexHome);
 
-        // License: init feature cache (sync after this returns)
-        await initFeatures(config.licenseKey, stateDir);
+        // Verify server reachability at startup (non-fatal — warn only)
+        try {
+          const resp = await fetch(`${serverUrl}/health`, {
+            signal: AbortSignal.timeout(5000),
+          });
+          if (resp.ok) {
+            const data = await resp.json() as Record<string, unknown>;
+            log(`[hicortex] Server OK: v${data.version}, ${data.memories} memories`);
+          } else {
+            log(`[hicortex] Server returned HTTP ${resp.status} — capture and tools may fail`);
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log(
+            `[hicortex] WARNING: Server unreachable at ${serverUrl}: ${msg}. ` +
+            `Run \`npx @gamaze/hicortex init\` to start the server. ` +
+            `Capture and tool calls will fail until the server is available.`,
+          );
+        }
 
-        // Schedule nightly consolidation
-        const consolidateHour = config.consolidateHour ?? 2;
-        cancelConsolidation = scheduleConsolidation(
-          db,
-          llm,
-          embed,
-          consolidateHour
-        );
-
-        // Seed the bootstrap lesson on first run
-        await injectSeedLesson(db, log);
-
-        // Auto-add tools to tools.allow if using a restrictive profile
         ensureToolsAllowed(log);
-
-        // Log stats
-        const stats = getStats(db, dbPath);
-        log(
-          `[hicortex] Ready: ${stats.memories} memories, ${stats.links} links, ` +
-            `${Math.round(stats.db_size_bytes / 1024)} KB`
-        );
       },
 
       async stop() {
-        if (cancelConsolidation) {
-          cancelConsolidation();
-          cancelConsolidation = null;
-        }
-        if (db) {
-          db.close();
-          db = null;
-        }
-        llm = null;
+        // Nothing to clean up — no DB, no LLM, no timer
       },
     });
 
     // -----------------------------------------------------------------------
-    // Hook: before_agent_start — inject lessons into agent context
+    // Hook: before_agent_start — fetch lessons from server (fail-soft)
     // -----------------------------------------------------------------------
     api.on(
       "before_agent_start",
       async (
-        event: { prompt: string },
-        ctx: { agentId?: string; project?: string }
+        _event: { prompt: string },
+        ctx: { agentId?: string; project?: string },
       ) => {
-        if (!db) return {};
-
         try {
-          const lessons = storage.getLessons(db, 7, ctx.project);
-          if (lessons.length === 0) return {};
+          // One fetch — build context and check cap from the same response.
+          const data = await serverGet<LessonsApiResponse>("/lessons", LESSONS_TIMEOUT_MS);
+          if (!data || !data.lessons || data.lessons.length === 0) return {};
 
           const maxLessons = lessonsLimit();
-          const selected = await getLessonSelector().select(lessons, {
+          const state = loadState(hicortexHome);
+          const moduleIndex = data.moduleIndex ?? state.moduleIndex;
+          const selected = await getLessonSelector().select(data.lessons, {
             maxLessons,
             project: ctx.project,
-            agentId: ctx.agentId,
+            moduleIndex,
           });
+          if (selected.length === 0) return {};
 
           const formatted = selected.map((l) => {
-            // Extract just the lesson text from the structured content
-            const match = l.content.match(/## Lesson: (.+)/);
-            return match ? `- ${match[1]}` : `- ${l.content.slice(0, 200)}`;
+            const titleMatch = l.content.match(/## Lesson: (.+)/);
+            const typeMatch = l.content.match(/\*\*Type:\*\* (\w+)/);
+            const severityMatch = l.content.match(/\*\*Severity:\*\* (\w+)/);
+            const title = titleMatch ? titleMatch[1] : l.content.slice(0, 150);
+            const meta = [severityMatch?.[1], typeMatch?.[1]].filter(Boolean).join(", ");
+            return `- ${title}${meta ? ` (${meta})` : ""}`;
           });
 
-          let context =
+          const context =
             `\n\n## Hicortex Lessons (auto-injected from long-term memory)\n` +
             `These are actionable lessons learned from past sessions:\n\n` +
             formatted.join("\n") +
             "\n";
 
-          // Daily friendly reminder when at memory cap
-          const memCount = storage.countMemories(db!);
-          if (memoryCapReached(memCount)) {
-            context +=
-              `\n---\nHicortex free tier: ${maxMemoriesAllowed()} memories stored. ` +
-              `New memories can no longer be saved, and your agent has stopped learning and self-improving from new sessions. ` +
-              `Existing memories, lessons, and search still work. ` +
-              `Upgrade for unlimited usage: https://hicortex.gamaze.com/ ` +
-              `— after purchase, tell me your key and I'll activate it for you.\n`;
-          }
-
           return { appendSystemContext: context };
         } catch {
+          // Fail-soft — a broken lessons fetch must not block the agent
           return {};
         }
-      }
+      },
     );
 
     // -----------------------------------------------------------------------
-    // Hook: agent_end — distill conversation into memories
+    // Tools — HTTP proxies to server REST API
     // -----------------------------------------------------------------------
-    api.on(
-      "agent_end",
-      async (
-        event: {
-          messages: unknown[];
-          success: boolean;
-          durationMs?: number;
-        },
-        ctx: { agentId?: string; sessionKey?: string; project?: string }
-      ) => {
-        if (!db || !llm) return;
-        if (!event.success || event.messages.length < 4) return;
 
-        try {
-          const transcript = extractConversationText(event.messages);
-          if (transcript.length < 200) return;
-
-          const date = new Date().toISOString().slice(0, 10);
-          const projectName = ctx.project ?? "unknown";
-          const sourceAgent = `openclaw/${ctx.agentId ?? "unknown"}`;
-
-          const entries = await distillSession(
-            llm,
-            transcript,
-            projectName,
-            date
-          );
-
-          if (entries.length === 0) return;
-
-          // Check license cap
-          if (memoryCapReached(storage.countMemories(db!))) {
-            console.warn(
-              `[hicortex] Free tier limit reached (${maxMemoriesAllowed()} memories). ` +
-                `Search and lessons still work, but new memories won't be saved. ` +
-                `Upgrade for unlimited usage: https://hicortex.gamaze.com/`
-            );
-            return;
-          }
-
-          // Embed and ingest each entry
-          for (const entry of entries) {
-            try {
-              const embedding = await embed(entry);
-              storage.insertMemory(db!, entry, embedding, {
-                sourceAgent,
-                sourceSession: ctx.sessionKey,
-                project: projectName,
-                privacy: "WORK",
-                memoryType: "episode",
-              });
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              console.error(`[hicortex] Failed to ingest entry: ${msg}`);
-            }
-          }
-        } catch {
-          // Non-fatal — session capture failing shouldn't break the agent
-        }
-      }
-    );
-
-    // -----------------------------------------------------------------------
-    // Hook: session_end — check if consolidation is overdue
-    // -----------------------------------------------------------------------
-    api.on(
-      "session_end",
-      async (
-        event: { sessionId: string; messageCount: number },
-        _ctx: any
-      ) => {
-        if (!db || !llm || event.messageCount < 4) return;
-
-        // Opportunistic consolidation if no nightly run in 48h
-        try {
-          const { readFileSync: readFs } = await import("node:fs");
-          const { join: joinPath } = await import("node:path");
-          const { homedir: homeDir } = await import("node:os");
-          const lastPath = joinPath(
-            homeDir(),
-            ".hicortex",
-            "last-consolidated.txt"
-          );
-          const lastTs = readFs(lastPath, "utf-8").trim();
-          const lastDate = new Date(lastTs);
-          const hoursSince =
-            (Date.now() - lastDate.getTime()) / (1000 * 60 * 60);
-
-          if (hoursSince > 48) {
-            console.log(
-              "[hicortex] Consolidation overdue — triggering now"
-            );
-            runConsolidation(db!, llm!, embed).catch((err) => {
-              console.error("[hicortex] Opportunistic consolidation failed:", err);
-            });
-          }
-        } catch {
-          // No timestamp file — first run, consolidation will happen on schedule
-        }
-      }
-    );
-
-    // -----------------------------------------------------------------------
-    // Tools — registered as factory functions per OC plugin API
-    // -----------------------------------------------------------------------
     api.registerTool(
       (_ctx: any) => ({
         name: "hicortex_search",
@@ -288,19 +239,22 @@ export default {
           required: ["query"],
         },
         async execute(_callId: any, args: any, _ctx: any) {
-          if (!db) return { error: "Hicortex not initialized" };
           try {
-            const results = await retrieval.retrieve(db, embed, args.query, {
-              limit: args.limit,
-              project: args.project,
-            });
-            return formatToolResults(results);
+            const params = new URLSearchParams({ query: args.query });
+            if (args.limit) params.set("limit", String(args.limit));
+            if (args.project) params.set("project", args.project);
+            const data = await serverGet<{ results: MemorySearchResult[] }>(
+              `/search?${params}`,
+              10000,
+            );
+            if (!data) return { error: "Search failed: server unreachable" };
+            return formatToolResults(data.results ?? []);
           } catch (err) {
             return { error: `Search failed: ${err instanceof Error ? err.message : String(err)}` };
           }
         },
       }),
-      { name: "hicortex_search" }
+      { name: "hicortex_search" },
     );
 
     api.registerTool(
@@ -315,20 +269,24 @@ export default {
             limit: { type: "number", description: "Max results (default 10)" },
           },
         },
-        execute(_callId: any, args: any, _ctx: any) {
-          if (!db) return { error: "Hicortex not initialized" };
+        async execute(_callId: any, args: any, _ctx: any) {
           try {
-            const results = retrieval.searchContext(db, {
-              project: args?.project,
-              limit: args?.limit,
-            });
-            return formatToolResults(results);
+            const params = new URLSearchParams();
+            if (args?.project) params.set("project", args.project);
+            if (args?.limit) params.set("limit", String(args.limit));
+            const qs = params.toString();
+            const data = await serverGet<{ results: MemorySearchResult[] }>(
+              `/context${qs ? `?${qs}` : ""}`,
+              10000,
+            );
+            if (!data) return { error: "Context search failed: server unreachable" };
+            return formatToolResults(data.results ?? []);
           } catch (err) {
             return { error: `Context search failed: ${err instanceof Error ? err.message : String(err)}` };
           }
         },
       }),
-      { name: "hicortex_context" }
+      { name: "hicortex_context" },
     );
 
     api.registerTool(
@@ -350,33 +308,29 @@ export default {
           required: ["content"],
         },
         async execute(_callId: any, args: any, context: any) {
-          if (!db) return { error: "Hicortex not initialized" };
-          if (memoryCapReached(storage.countMemories(db))) {
-            return {
-              content: [{
-                type: "text",
-                text: `Free tier limit reached (${maxMemoriesAllowed()} memories). ` +
-                  `Your existing memories and lessons still work — search and recall are unaffected. ` +
-                  `New memories won't be saved until you upgrade.\n\n` +
-                  `Upgrade for unlimited usage: https://hicortex.gamaze.com/`
-              }],
-            };
-          }
           try {
-            const embedding = await embed(args.content);
-            const id = storage.insertMemory(db, args.content, embedding, {
-              sourceAgent: `openclaw/${context?.agentId ?? "manual"}`,
-              project: args.project,
-              memoryType: args.memory_type ?? "episode",
-              privacy: "WORK",
-            });
+            const result = await serverPost<{ id?: string; error?: string }>(
+              "/ingest",
+              {
+                content: args.content,
+                source_agent: `openclaw/${context?.agentId ?? "manual"}`,
+                project: args.project,
+                memory_type: args.memory_type ?? "episode",
+                privacy: "WORK",
+              },
+              15000,
+            );
+            if (!result.ok) {
+              return { error: `Ingest failed: ${result.data?.error ?? `HTTP ${result.status}`}` };
+            }
+            const id = result.data?.id ?? "unknown";
             return { content: [{ type: "text", text: `Memory stored (id: ${id.slice(0, 8)})` }] };
           } catch (err) {
             return { error: `Ingest failed: ${err instanceof Error ? err.message : String(err)}` };
           }
         },
       }),
-      { name: "hicortex_ingest" }
+      { name: "hicortex_ingest" },
     );
 
     api.registerTool(
@@ -387,16 +341,16 @@ export default {
         parameters: {
           type: "object",
           properties: {
-            days: { type: "number", description: "Look back N days (default 7)" },
-            project: { type: "string", description: "Filter by project name" },
+            project: { type: "string", description: "Filter by project name (optional)" },
           },
         },
-        execute(_callId: any, args: any, _ctx: any) {
-          if (!db) return { error: "Hicortex not initialized" };
+        async execute(_callId: any, args: any, _ctx: any) {
           try {
-            const lessons = storage.getLessons(db, args.days ?? 7, args.project);
+            const data = await serverGet<LessonsApiResponse>("/lessons", LESSONS_TIMEOUT_MS);
+            if (!data) return { error: "Lessons fetch failed: server unreachable" };
+            const lessons = data.lessons ?? [];
             if (lessons.length === 0) {
-              return { content: [{ type: "text", text: "No lessons found for the specified period." }] };
+              return { content: [{ type: "text", text: "No lessons found." }] };
             }
             const text = lessons.map((l) => `- ${l.content.slice(0, 500)}`).join("\n");
             return { content: [{ type: "text", text }] };
@@ -405,7 +359,75 @@ export default {
           }
         },
       }),
-      { name: "hicortex_lessons" }
+      { name: "hicortex_lessons" },
+    );
+
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "hicortex_index",
+        description:
+          "Get the knowledge domain index — shows what topics and projects are stored in memory, grouped by domain.",
+        parameters: {
+          type: "object",
+          properties: {},
+        },
+        async execute(_callId: any, _args: any, _ctx: any) {
+          try {
+            const data = await serverGet<{ domains?: unknown[]; projects?: unknown[] }>(
+              "/index",
+              10000,
+            );
+            if (!data) return { error: "Index fetch failed: server unreachable" };
+            return { content: [{ type: "text", text: JSON.stringify(data) }] };
+          } catch (err) {
+            return { error: `Index fetch failed: ${err instanceof Error ? err.message : String(err)}` };
+          }
+        },
+      }),
+      { name: "hicortex_index" },
+    );
+
+    api.registerTool(
+      (_ctx: any) => ({
+        name: "hicortex_graph",
+        description:
+          "Query the memory knowledge graph — find connected memories, hub nodes, or paths between memories.",
+        parameters: {
+          type: "object",
+          properties: {
+            operation: {
+              type: "string",
+              enum: ["neighbors", "hubs", "path"],
+              description: "Graph operation to perform",
+            },
+            id: { type: "string", description: "Memory ID (required for neighbors and path operations)" },
+            target_id: { type: "string", description: "Target memory ID (required for path operation)" },
+            limit: { type: "number", description: "Max results (default 10)" },
+            domain: { type: "string", description: "Filter hubs by domain" },
+            relationship: { type: "string", description: "Filter neighbors by relationship type (e.g., CONTRADICTS, SUPERSEDES, derives)" },
+          },
+          required: ["operation"],
+        },
+        async execute(_callId: any, args: any, _ctx: any) {
+          try {
+            const params = new URLSearchParams({ op: args.operation });
+            if (args.id) params.set("id", args.id);
+            if (args.target_id) params.set("target_id", args.target_id);
+            if (args.limit) params.set("limit", String(args.limit));
+            if (args.domain) params.set("domain", args.domain);
+            if (args.relationship) params.set("relationship", args.relationship);
+            const data = await serverGet<Record<string, unknown>>(
+              `/graph?${params}`,
+              10000,
+            );
+            if (!data) return { error: "Graph query failed: server unreachable" };
+            return { content: [{ type: "text", text: JSON.stringify(data) }] };
+          } catch (err) {
+            return { error: `Graph query failed: ${err instanceof Error ? err.message : String(err)}` };
+          }
+        },
+      }),
+      { name: "hicortex_graph" },
     );
 
     api.registerTool(
@@ -419,40 +441,40 @@ export default {
             id: { type: "string", description: "Memory ID (from search results, first 8 chars or full UUID)" },
             content: { type: "string", description: "New content text" },
             project: { type: "string", description: "New project name" },
-            memory_type: { type: "string", enum: ["episode", "lesson", "fact", "decision"], description: "New memory type" },
+            memory_type: {
+              type: "string",
+              enum: ["episode", "lesson", "fact", "decision"],
+              description: "New memory type",
+            },
           },
           required: ["id"],
         },
         async execute(_callId: any, args: any, _ctx: any) {
-          if (!db) return { error: "Hicortex not initialized" };
           try {
-            const fullId = resolveMemoryId(db, args.id);
-            if (!fullId) return { error: `Memory not found: ${args.id}` };
-
-            const fields: Record<string, unknown> = {};
-            if (args.content !== undefined) fields.content = args.content;
-            if (args.project !== undefined) fields.project = args.project;
-            if (args.memory_type !== undefined) fields.memory_type = args.memory_type;
-
-            if (Object.keys(fields).length === 0) return { error: "No fields to update" };
-
-            storage.updateMemory(db, fullId, fields);
-
-            if (args.content !== undefined) {
-              const embedding = await embed(args.content);
-              db.prepare("DELETE FROM memory_vectors WHERE id = ?").run(fullId);
-              db.prepare("INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)").run(
-                fullId, Buffer.from(embedding.buffer)
-              );
+            const result = await serverPost<{ updated?: boolean; id?: string; error?: string }>(
+              "/update",
+              {
+                id: args.id,
+                content: args.content,
+                project: args.project,
+                memory_type: args.memory_type,
+              },
+              15000,
+            );
+            if (result.status === 404) {
+              return { error: `Memory not found: ${args.id}` };
             }
-
-            return { content: [{ type: "text", text: `Memory updated (id: ${fullId.slice(0, 8)})` }] };
+            if (!result.ok) {
+              return { error: `Update failed: ${result.data?.error ?? `HTTP ${result.status}`}` };
+            }
+            const id = result.data?.id ?? args.id;
+            return { content: [{ type: "text", text: `Memory updated (id: ${String(id).slice(0, 8)})` }] };
           } catch (err) {
             return { error: `Update failed: ${err instanceof Error ? err.message : String(err)}` };
           }
         },
       }),
-      { name: "hicortex_update" }
+      { name: "hicortex_update" },
     );
 
     api.registerTool(
@@ -467,20 +489,26 @@ export default {
           },
           required: ["id"],
         },
-        execute(_callId: any, args: any, _ctx: any) {
-          if (!db) return { error: "Hicortex not initialized" };
+        async execute(_callId: any, args: any, _ctx: any) {
           try {
-            const fullId = resolveMemoryId(db, args.id);
-            if (!fullId) return { error: `Memory not found: ${args.id}` };
-
-            storage.deleteMemory(db, fullId);
-            return { content: [{ type: "text", text: `Memory deleted (id: ${fullId.slice(0, 8)})` }] };
+            const result = await serverPost<{ deleted?: boolean; id?: string; error?: string }>(
+              "/delete",
+              { id: args.id },
+              15000,
+            );
+            if (result.status === 404) {
+              return { error: `Memory not found: ${args.id}` };
+            }
+            if (!result.ok) {
+              return { error: `Delete failed: ${result.data?.error ?? `HTTP ${result.status}`}` };
+            }
+            return { content: [{ type: "text", text: `Memory deleted (id: ${String(args.id).slice(0, 8)})` }] };
           } catch (err) {
             return { error: `Delete failed: ${err instanceof Error ? err.message : String(err)}` };
           }
         },
       }),
-      { name: "hicortex_delete" }
+      { name: "hicortex_delete" },
     );
   },
 };
@@ -489,103 +517,13 @@ export default {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function resolveMemoryId(database: import("better-sqlite3").Database, idPrefix: string): string | null {
-  if (idPrefix.length >= 36) {
-    const row = database.prepare("SELECT id FROM memories WHERE id = ?").get(idPrefix) as { id: string } | undefined;
-    return row?.id ?? null;
-  }
-  const rows = database.prepare("SELECT id FROM memories WHERE id LIKE ?").all(`${idPrefix}%`) as { id: string }[];
-  if (rows.length === 1) return rows[0].id;
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Auto-configure LLM: resolve config → test connection → persist if new
-// ---------------------------------------------------------------------------
-
-async function autoConfigureLlm(
-  pluginConfig: HicortexConfig,
-  log: (msg: string) => void
-): Promise<LlmConfig> {
-  // Step 1: Resolve LLM config from all sources
-  const llmConfig = resolveLlmConfig({
-    llmBaseUrl: pluginConfig.llmBaseUrl,
-    llmApiKey: pluginConfig.llmApiKey,
-    llmModel: pluginConfig.llmModel,
-    reflectModel: pluginConfig.reflectModel,
-  });
-
-  // Step 2: Test the connection
-  log(`[hicortex] Testing LLM connection: ${llmConfig.provider}/${llmConfig.model} @ ${llmConfig.baseUrl}`);
-  const testClient = new LlmClient(llmConfig);
-  try {
-    const response = await testClient.completeFast("Respond with just the word OK", 10);
-    if (response && response.length > 0) {
-      log(`[hicortex] LLM connection verified`);
-      // Step 3: Persist to OC config so future startups skip detection
-      persistProviderConfig(llmConfig, log);
-      return llmConfig;
-    }
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    log(`[hicortex] LLM test failed (${llmConfig.baseUrl}): ${msg}`);
-  }
-
-  // Step 4: Fall back — return the config anyway, log instructions
-  log(
-    `[hicortex] WARNING: Could not verify LLM connection. ` +
-    `Distillation and consolidation may fail. ` +
-    `To fix: add models.providers.${llmConfig.provider}.baseUrl to ~/.openclaw/openclaw.json ` +
-    `or set llmBaseUrl in the hicortex plugin config.`
-  );
-  return llmConfig;
-}
-
-/**
- * Persist verified provider config to openclaw.json so future startups
- * skip detection and go straight to the verified URL.
- */
-function persistProviderConfig(llmConfig: LlmConfig, log: (msg: string) => void): void {
-  try {
-    const configPath = join(homedir(), ".openclaw", "openclaw.json");
-    const raw = readFileSync(configPath, "utf-8");
-    const config = JSON.parse(raw);
-
-    // Check if baseUrl already stored for this provider
-    const existing = config?.models?.providers?.[llmConfig.provider]?.baseUrl;
-    if (existing === llmConfig.baseUrl) return; // Already persisted
-
-    // Write the provider config
-    if (!config.models) config.models = {};
-    if (!config.models.providers) config.models.providers = {};
-    if (!config.models.providers[llmConfig.provider]) {
-      config.models.providers[llmConfig.provider] = {};
-    }
-    const prov = config.models.providers[llmConfig.provider];
-    prov.baseUrl = llmConfig.baseUrl;
-    // OC requires a models array — preserve existing or add the active model
-    if (!prov.models || !Array.isArray(prov.models)) {
-      prov.models = [{
-        id: llmConfig.model,
-        name: llmConfig.model,
-        input: ["text"],
-        contextWindow: 128000,
-        maxTokens: 8192,
-      }];
-    }
-
-    writeFileSync(configPath, JSON.stringify(config, null, 2));
-    log(`[hicortex] Persisted LLM config: ${llmConfig.provider} → ${llmConfig.baseUrl}`);
-  } catch {
-    // Non-fatal — config works in memory even if we can't persist
-  }
-}
-
 const HICORTEX_TOOLS = [
   "hicortex_search",
   "hicortex_context",
   "hicortex_ingest",
   "hicortex_lessons",
+  "hicortex_index",
+  "hicortex_graph",
   "hicortex_update",
   "hicortex_delete",
 ];
@@ -604,7 +542,7 @@ function ensureToolsAllowed(log: (msg: string) => void): void {
     if (!Array.isArray(config.tools.allow)) config.tools.allow = [];
 
     const missing = HICORTEX_TOOLS.filter(
-      (t) => !config.tools.allow.includes(t)
+      (t) => !config.tools.allow.includes(t),
     );
     if (missing.length === 0) return;
 
@@ -612,25 +550,6 @@ function ensureToolsAllowed(log: (msg: string) => void): void {
     writeFileSync(configPath, JSON.stringify(config, null, 2));
     log(`[hicortex] Added tools to allow list: ${missing.join(", ")}`);
   } catch {
-    // Non-fatal
+    // Non-fatal — openclaw.json may not exist in test environments
   }
-}
-
-function formatToolResults(
-  results: MemorySearchResult[]
-): { content: Array<{ type: string; text: string }> } {
-  if (results.length === 0) {
-    return {
-      content: [{ type: "text", text: "No memories found." }],
-    };
-  }
-
-  const text = results
-    .map(
-      (r) =>
-        `[${r.memory_type}] (score: ${r.score.toFixed(3)}, strength: ${r.effective_strength.toFixed(3)}) ${r.content.slice(0, 500)}`
-    )
-    .join("\n\n");
-
-  return { content: [{ type: "text", text }] };
 }

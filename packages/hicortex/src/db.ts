@@ -253,6 +253,30 @@ const MIGRATIONS: Migration[] = [
       db.exec("CREATE INDEX IF NOT EXISTS idx_memories_domain ON memories(domain)");
     },
   },
+  {
+    version: 4,
+    name: "unique_source_session",
+    up: (db) => {
+      // De-duplicate any pre-existing source_session values (e.g. from the
+      // /ingest + /distill race before this migration): keep the oldest row per
+      // source_session, NULL the rest so they lose their dedup key (the memory
+      // itself is preserved). Then add a UNIQUE partial index so the server can
+      // idempotently re-distill a segment without double-inserting.
+      db.exec(`
+        UPDATE memories SET source_session = NULL
+        WHERE rowid NOT IN (
+          SELECT MIN(rowid) FROM memories
+          WHERE source_session IS NOT NULL
+          GROUP BY source_session
+        )
+        AND source_session IS NOT NULL
+      `);
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_source_session_unique
+          ON memories(source_session) WHERE source_session IS NOT NULL
+      `);
+    },
+  },
 ];
 
 /**

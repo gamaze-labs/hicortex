@@ -1,0 +1,51 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'npm dist-tag (latest | next)'
+        required: true
+        default: 'next'
+        type: choice
+        options:
+          - next
+          - latest
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: packages/hicortex
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Pin npm to a version that supports Trusted Publishing
+        run: npm install -g npm@latest
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack tarball
+        run: npm pack
+
+      - name: Publish tarball
+        run: |
+          TAG="${{ github.event.inputs.tag || 'latest' }}"
+          npm publish gamaze-hicortex-*.tgz --tag "$TAG" --access public

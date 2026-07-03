@@ -1,0 +1,12 @@
+name: hicortex
+version: 0.4.0
+description: "Self-learning memory for Hermes agents — every session is distilled into lessons overnight, and your agent wakes up wiser. Injects fresh lessons each turn and exposes the full 8-tool memory surface (search, context, ingest, lessons, index, graph, update, delete) via a shared Hicortex server. Stdlib-only."
+pip_dependencies: []
+hooks: []
+requires_env:
+  - name: HICORTEX_URL
+    description: "Hicortex server URL. Leave empty for a local server (http://127.0.0.1:8787)."
+    secret: false
+  - name: HICORTEX_AUTH_TOKEN
+    description: "Auth token from the Hicortex server — run `hicortex status` on the server to see it. Leave empty when the server runs on this machine (localhost bypasses auth)."
+    secret: true

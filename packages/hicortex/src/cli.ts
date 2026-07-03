@@ -5,8 +5,9 @@
  * Commands:
  *   server     Start the MCP HTTP/SSE server (persistent daemon)
  *   init       Detect existing setup and configure for CC/OC
- *   nightly    Run distill + consolidate + inject lessons (manual trigger)
- *              nightly --status  Show nightly pipeline health check
+ *   nightly    Run capture + consolidate (manual trigger)
+ *              nightly --capture-only  Capture only, skip consolidation
+ *              nightly --status        Show nightly pipeline health check
  *   status     Show config, DB stats, adapter status
  *   uninstall  Clean removal of CC integration
  */
@@ -52,8 +53,9 @@ switch (command) {
       });
     } else {
       const dryRun = args.includes("--dry-run");
+      const captureOnly = args.includes("--capture-only");
       import("./nightly.js").then(({ runNightly }) => {
-        runNightly({ dryRun }).catch((err) => {
+        runNightly({ dryRun, captureOnly }).catch((err) => {
           console.error("[hicortex] Nightly pipeline failed:", err);
           process.exit(1);
         });
@@ -80,24 +82,40 @@ switch (command) {
     });
     break;
 
+  case "lessons-context":
+    // CC SessionStart hook: fetch lessons from the configured server and print
+    // a Markdown block to stdout. Fail-soft — any error = silent exit 0 so a
+    // broken hook never blocks a CC session.
+    import("./lessons-context.js").then(({ fetchLessonsContext }) => {
+      fetchLessonsContext()
+        .then((block) => {
+          if (block) process.stdout.write(block + "\n");
+          process.exit(0);
+        })
+        .catch(() => process.exit(0));
+    }).catch(() => process.exit(0));
+    break;
+
   default:
     console.log(`Hicortex — Human-like memory for self-improving AI agents
 
 Usage: hicortex <command> [options]
 
 Commands:
-  server     Start the MCP HTTP/SSE server (server mode)
-  init       Set up Hicortex (server mode, local DB + daemon)
-  init --server <url>  Set up as client (remote server, local distillation)
-  nightly    Run nightly distill + consolidate + inject
-  status     Show current configuration and stats
-  uninstall  Remove CC integration (preserves DB)
+  server          Start the MCP HTTP/SSE server (server mode)
+  init            Set up Hicortex (server mode, local DB + daemon)
+  init --server <url>  Set up as client (remote server)
+  nightly         Run nightly denoise + capture + consolidate
+  lessons-context Fetch lessons and print Markdown to stdout (CC SessionStart hook)
+  status          Show current configuration and stats
+  uninstall       Remove CC integration (preserves DB)
 
 Options:
   server --port <n>    Port (default: 8787)
   server --host <h>    Host (default: 127.0.0.1)
-  nightly --dry-run    Preview without changes
-  nightly --status     Show nightly pipeline health
+  nightly --dry-run         Preview without changes
+  nightly --capture-only    Capture only, skip consolidation (safe to run multiple times/day)
+  nightly --status          Show nightly pipeline health
 
 Examples:
   npx @gamaze/hicortex server

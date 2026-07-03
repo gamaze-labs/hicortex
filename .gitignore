@@ -4,3 +4,5 @@ data/
 __pycache__/
 *.pyc
 .DS_Store
+# prepack build artifact — hermes-plugin/ is bundled from ../../hermes-plugin/hicortex
+packages/hicortex/hermes-plugin/

@@ -13,7 +13,7 @@ import { effectiveStrength } from "./retrieval.js";
 import * as storage from "./storage.js";
 import { importanceScoring, reflection, domainCuration, edgeClassification } from "./prompts.js";
 import { createHash } from "node:crypto";
-import { memoryCapReached, maxMemoriesAllowed, isPro } from "./features.js";
+import { isPro } from "./features.js";
 import { louvainCommunities, detectHubs } from "./graph.js";
 import { loadState, updateState } from "./state.js";
 
@@ -296,15 +296,6 @@ async function stageReflection(
       };
 
       try {
-        // Check memory cap before storing lesson
-        if (memoryCapReached(storage.countMemories(db))) {
-          console.log(
-            `[hicortex] Free tier limit (${maxMemoriesAllowed()} memories). ` +
-            `Existing memories and lessons still work. New lessons won't be saved. ` +
-            `Upgrade for unlimited usage: https://hicortex.gamaze.com/`
-          );
-          break;
-        }
         const embedding = await embedFn(content);
 
         // Contradiction check: find semantically similar existing lessons.
