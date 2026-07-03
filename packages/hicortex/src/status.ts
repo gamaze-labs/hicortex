@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import { resolveDbPath } from "./db.js";
+import { getValidatedLicense } from "./features.js";
 
 const HICORTEX_HOME = join(homedir(), ".hicortex");
 const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
@@ -36,14 +37,30 @@ export async function runStatus(): Promise<void> {
     }
   }
 
-  // License
+  // Config: license key + auth token
   const configPath = join(HICORTEX_HOME, "config.json");
   let licenseKey = "";
+  let savedAuthToken = "";
+  let isClientMode = false;
   try {
     const config = JSON.parse(readFileSync(configPath, "utf-8"));
     licenseKey = config.licenseKey ?? "";
+    savedAuthToken = config.authToken ?? "";
+    isClientMode = config.mode === "client";
   } catch { /* no config */ }
-  console.log(`License:      ${licenseKey ? "configured" : "free tier (250 memories)"}`);
+  const validated = getValidatedLicense();
+  if (validated?.valid && validated.tier) {
+    console.log(`License:      ${validated.tier} (licensed)`);
+  } else if (licenseKey) {
+    console.log(`License:      key configured (not yet validated)`);
+  } else {
+    console.log(`License:      noncommercial (no key)`);
+  }
+  if (!isClientMode && savedAuthToken) {
+    console.log(`Auth token:   ${savedAuthToken}  (clients connect with this token)`);
+  } else if (!isClientMode && !savedAuthToken) {
+    console.log(`Auth token:   not configured (run: npx @gamaze/hicortex init)`);
+  }
 
   console.log();
 

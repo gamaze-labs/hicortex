@@ -6,12 +6,30 @@
  * installed. The model is lazy-loaded on first call.
  */
 
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+
 export const EMBEDDING_DIMENSIONS = 384;
 const MODEL_NAME = "Xenova/bge-small-en-v1.5";
 
 // Pipeline is lazy-loaded on first use
 let pipeline: any = null;
 let initPromise: Promise<void> | null = null;
+
+/**
+ * Resolve the directory where @huggingface/transformers caches model weights.
+ *
+ * Exported as a pure function so it can be unit-tested without mocking the
+ * dynamic import. The default (`~/.hicortex/models`) is stable across package
+ * upgrades and writable by the installing user even under global npm installs
+ * (where the package dir is root-owned).
+ *
+ * @param home Override for the user home directory (used in tests).
+ */
+export function resolveModelCacheDir(home?: string): string {
+  return join(home ?? homedir(), ".hicortex", "models");
+}
 
 /**
  * Initialize the embedding pipeline (called lazily on first embed call).
@@ -29,6 +47,18 @@ async function ensureInit(): Promise<void> {
       // Dynamic import — package may not be installed (it's optional)
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const transformers = await (Function('return import("@huggingface/transformers")')() as Promise<any>);
+
+      // Point the model cache at a stable user-writable directory so the
+      // ~130 MB weights survive package upgrades and work under global installs
+      // (the package dir is root-owned; defaulting to it causes EACCES).
+      const cacheDir = resolveModelCacheDir();
+      mkdirSync(cacheDir, { recursive: true });
+      const env = transformers.env ?? (transformers as any).default?.env;
+      if (env) {
+        env.cacheDir = cacheDir;
+      }
+      console.log(`[hicortex] Model cache: ${cacheDir}`);
+
       const pipelineFn =
         transformers.pipeline ?? (transformers as any).default?.pipeline;
       if (!pipelineFn) {

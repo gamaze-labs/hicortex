@@ -31,7 +31,13 @@ function rowToMemory(row: Record<string, unknown>): Memory {
 // ---------------------------------------------------------------------------
 
 /**
- * Insert a memory and its vector embedding. Returns the generated UUID.
+ * Insert a memory and its vector embedding. Returns the memory's UUID.
+ *
+ * Idempotent on `sourceSession`: if a memory with that source_session already
+ * exists (UNIQUE index from migration v4), the insert is skipped and the
+ * EXISTING memory's id is returned (no vector re-insert). This lets `/ingest`
+ * and `/distill` safely retry a segment without double-inserting. Callers that
+ * omit sourceSession (NULL — nightly distillation, tests) never collide.
  */
 export function insertMemory(
   db: Database.Database,
@@ -42,31 +48,45 @@ export function insertMemory(
   const id = randomUUID();
   const ts = opts.createdAt ?? nowIso();
   const ingestedTs = nowIso();
+  const sourceSession = opts.sourceSession ?? null;
 
-  db.prepare(
-    `INSERT INTO memories
-     (id, content, base_strength, last_accessed, access_count,
-      created_at, ingested_at, source_agent, source_session, project,
-      privacy, memory_type)
-     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    id,
-    content,
-    opts.baseStrength ?? 0.5,
-    ts,
-    ts,
-    ingestedTs,
-    opts.sourceAgent ?? "default",
-    opts.sourceSession ?? null,
-    opts.project ?? null,
-    opts.privacy ?? "WORK",
-    opts.memoryType ?? "episode"
-  );
+  const result = db
+    .prepare(
+      `INSERT OR IGNORE INTO memories
+       (id, content, base_strength, last_accessed, access_count,
+        created_at, ingested_at, source_agent, source_session, project,
+        privacy, memory_type)
+       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      id,
+      content,
+      opts.baseStrength ?? 0.5,
+      ts,
+      ts,
+      ingestedTs,
+      opts.sourceAgent ?? "default",
+      sourceSession,
+      opts.project ?? null,
+      opts.privacy ?? "WORK",
+      opts.memoryType ?? "episode"
+    );
 
-  db.prepare(
-    "INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)"
-  ).run(id, embedToBlob(embedding));
+  if (result.changes > 0) {
+    // New row — store its vector.
+    db.prepare(
+      "INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)"
+    ).run(id, embedToBlob(embedding));
+    return id;
+  }
 
+  // Collision on UNIQUE source_session — return the existing memory's id.
+  if (sourceSession) {
+    const existing = db
+      .prepare("SELECT id FROM memories WHERE source_session = ?")
+      .get(sourceSession) as { id: string } | undefined;
+    if (existing) return existing.id;
+  }
   return id;
 }
 

@@ -1,15 +1,15 @@
 /**
- * Centralized feature gating — single source of truth for tier-dependent values.
+ * Feature gating — all gates removed as of 0.10.0.
  *
- * Why this exists:
- *   - getFeatures() in license.ts was sync but validateLicense was async, creating
- *     a race where Pro users got free-tier features during the validation window.
- *   - License checks were scattered across 8+ call sites with subtly different
- *     handling (e.g., consolidate.ts:308 had a dynamic import in a hot loop to
- *     dodge a circular import).
+ * Personal and noncommercial use is fully featured under the
+ * PolyForm Noncommercial License. Commercial use requires a per-seat
+ * license (see COMMERCIAL.md). There is no technical feature gating;
+ * the license key's only remaining role is the "licensed to <org>"
+ * display in `hicortex status`.
  *
- * All feature decisions now flow through this module. Call initFeatures() once at
- * process boot before serving any requests; sync getters become deterministic.
+ * The functions below are kept as trivial wrappers so call sites
+ * compile without churn. They will be removed entirely in a future
+ * cleanup pass once callers have been audited.
  */
 
 import { join } from "node:path";
@@ -20,129 +20,95 @@ import type { LicenseInfo } from "./types.js";
 
 const DEFAULT_STATE_DIR = join(homedir(), ".hicortex");
 
-const FREE_FEATURES: LicenseInfo["features"] = {
+// A single canonical "full" feature set — no tiers.
+const FULL_FEATURES: LicenseInfo["features"] = {
   reflection: true,
   vectorSearch: true,
-  maxMemories: 250,
+  maxMemories: -1,
   crossAgent: true,
   remoteIngest: true,
 };
 
-let currentFeatures: LicenseInfo["features"] = FREE_FEATURES;
+let currentFeatures: LicenseInfo["features"] = FULL_FEATURES;
 let initialized = false;
+// Validated license info for display purposes only (no feature gating).
+let validatedLicenseInfo: LicenseInfo | null = null;
 
 function persistTier(stateDir: string, info: LicenseInfo): void {
   updateState((s) => {
     s.tier = {
       tier: info.tier,
       validatedAt: new Date().toISOString(),
-      features: info.features,
+      features: FULL_FEATURES,
     };
     return s;
   }, stateDir);
 }
 
 /**
- * Initialize the feature cache. Call ONCE at process boot before any feature
- * gating queries. Race fix:
- *   1. Synchronously load persisted tier from disk (instant, deterministic)
- *   2. If no persisted tier and we have a key, AWAIT first validation
- *   3. If persisted tier exists, kick off background re-validation
- *
- * After this returns, sync getters (isPro, lessonsLimit, etc.) are deterministic
- * and reflect the user's actual tier — no more "free during validation window".
+ * Initialize license display. Call ONCE at process boot.
+ * No feature gates are applied regardless of the validation result.
  */
 export async function initFeatures(
   licenseKey: string | undefined,
   stateDir: string = DEFAULT_STATE_DIR,
-  hostVersion: string = "0.0.0",
+  _hostVersion: string = "0.0.0",
 ): Promise<void> {
   if (initialized) return;
   initialized = true;
 
-  // Step 1: Load persisted tier from state.json (instant)
-  const persisted = loadState(stateDir).tier;
-  if (persisted) {
-    currentFeatures = persisted.features;
-  } else {
-    currentFeatures = FREE_FEATURES;
-  }
+  currentFeatures = FULL_FEATURES;
 
-  // Step 2: No key → free tier, done. Pro loader is only run for paid tiers.
   if (!licenseKey) return;
 
-  // Step 3: Validate
-  if (!persisted) {
-    // First-time: AWAIT validation so the very first request sees the right tier
-    try {
-      const info = await validateLicense(licenseKey, stateDir);
-      currentFeatures = info.features;
-      if (info.valid) {
-        persistTier(stateDir, info);
-      }
-    } catch {
-      // Validation failed (network, etc.) — stay on free
+  // Validate the key for display purposes only — a failure keeps the server
+  // fully functional.
+  try {
+    const info = await validateLicense(licenseKey, stateDir);
+    validatedLicenseInfo = info;
+    if (info.valid) {
+      persistTier(stateDir, info);
     }
-  } else {
-    // Already have a persisted tier; re-validate in background
-    validateLicense(licenseKey, stateDir)
-      .then((info) => {
-        currentFeatures = info.features;
-        if (info.valid) {
-          persistTier(stateDir, info);
-        }
-      })
-      .catch(() => {
-        // Keep persisted features
-      });
-  }
-
-  // Step 4: If the current tier is paid, try to load the Pro extension bundle.
-  // This is best-effort — if loading fails (network, missing tarball, bad
-  // extraction, Pro package throws on activate), OSS defaults remain in effect
-  // and the host keeps running. No user-visible crash.
-  if (isPro()) {
-    try {
-      const { loadPro } = await import("./pro-loader.js");
-      await loadPro(licenseKey, stateDir, hostVersion);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[hicortex][pro] Pro loader failed to import: ${msg}`);
-    }
+  } catch {
+    // Non-fatal — continue fully functional without a validated display tier
   }
 }
 
+/** Returns the validated license info if a key was supplied and validated. */
+export function getValidatedLicense(): LicenseInfo | null {
+  return validatedLicenseInfo;
+}
+
 // ---------------------------------------------------------------------------
-// Public API — sync getters used everywhere in the codebase
+// Public API — kept for call-site compatibility; all return "fully unlocked"
 // ---------------------------------------------------------------------------
 
-/** Are we on a paid tier (Pro, Team, Lifetime)? */
+/** Always false — no memory cap. */
 export function isPro(): boolean {
-  return currentFeatures.maxMemories === -1;
+  return true;
 }
 
-/** Memory count cap. -1 = unlimited (paid). */
+/** Always -1 (unlimited). */
 export function maxMemoriesAllowed(): number {
-  return currentFeatures.maxMemories;
+  return -1;
 }
 
-/** Has the memory cap been hit? Pass current count from caller. */
-export function memoryCapReached(currentCount: number): boolean {
-  const max = maxMemoriesAllowed();
-  return max > 0 && currentCount >= max;
+/** Always false — no cap is ever reached. */
+export function memoryCapReached(_currentCount: number): boolean {
+  return false;
 }
 
-/** Number of lessons to inject into CLAUDE.md / before_agent_start. */
+/** Always 20. */
 export function lessonsLimit(): number {
-  return isPro() ? 20 : 10;
+  return 20;
 }
 
-/** Is remote /ingest allowed? Free + Team yes, Pro (single-machine) no. */
+/** Always true — remote ingest is always allowed. */
 export function remoteIngestAllowed(): boolean {
-  return currentFeatures.remoteIngest !== false;
+  return true;
 }
 
-/** Direct read of the underlying features (for callers that need the full record). */
+/** Direct read of the underlying features record. */
 export function getCurrentFeatures(): LicenseInfo["features"] {
   return currentFeatures;
 }

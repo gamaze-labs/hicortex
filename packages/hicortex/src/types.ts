@@ -110,11 +110,21 @@ export interface ConsolidationReport {
 /** Plugin configuration from openclaw.plugin.json configSchema. */
 export interface HicortexConfig {
   licenseKey?: string;
+  /** Hicortex server URL. Defaults to http://127.0.0.1:8787 (co-located server). */
+  serverUrl?: string;
+  /** Bearer token for the Hicortex server. Localhost bypasses auth by default. */
+  authToken?: string;
+  /** @deprecated Use the Hicortex server for distillation and consolidation. */
   llmBaseUrl?: string;
+  /** @deprecated Use the Hicortex server for distillation and consolidation. */
   llmApiKey?: string;
+  /** @deprecated Use the Hicortex server for distillation and consolidation. */
   llmModel?: string;
+  /** @deprecated Use the Hicortex server for distillation and consolidation. */
   reflectModel?: string;
+  /** @deprecated Consolidation is owned by the server nightly. */
   consolidateHour?: number;
+  /** @deprecated The OC plugin no longer opens its own database. */
   dbPath?: string;
 }
 

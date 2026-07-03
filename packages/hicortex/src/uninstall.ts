@@ -83,7 +83,35 @@ export async function runUninstall(): Promise<void> {
   }
   console.log("  ✓ Removed /learn and /hicortex-activate commands");
 
-  // 4. Remove CLAUDE.md block
+  // 4. Remove SessionStart hook (JSON merge — filter out entries containing "lessons-context")
+  try {
+    const raw = readFileSync(CC_SETTINGS, "utf-8");
+    const settings = JSON.parse(raw) as Record<string, unknown>;
+    const hooks = settings.hooks as Record<string, unknown> | undefined;
+    const sessionStart = hooks && Array.isArray(hooks.SessionStart) ? hooks.SessionStart as Array<unknown> : null;
+    if (hooks && sessionStart) {
+      const before = sessionStart.length;
+      const filtered = sessionStart.filter((entry) => {
+        if (typeof entry !== "object" || entry === null) return true;
+        const e = entry as Record<string, unknown>;
+        if (Array.isArray(e.hooks)) {
+          return !e.hooks.some((h: unknown) => {
+            if (typeof h !== "object" || h === null) return false;
+            const hook = h as Record<string, unknown>;
+            return typeof hook.command === "string" && hook.command.includes("lessons-context");
+          });
+        }
+        return true;
+      });
+      if (filtered.length < before) {
+        hooks.SessionStart = filtered;
+        writeFileSync(CC_SETTINGS, JSON.stringify(settings, null, 2));
+        console.log("  ✓ Removed SessionStart lessons-context hook");
+      }
+    }
+  } catch { /* no settings file or parse error — nothing to remove */ }
+
+  // 5. Remove CLAUDE.md block (old static block from pre-0.9.0; may still exist on upgrades)
   if (removeLessonsBlock(CLAUDE_MD)) {
     console.log("  ✓ Removed Hicortex Learnings block from CLAUDE.md");
   }

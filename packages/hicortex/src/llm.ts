@@ -1,27 +1,18 @@
 /**
  * Multi-provider LLM client for consolidation and distillation.
  *
- * Resolution for OC adapter (resolveLlmConfig):
- *   1. Plugin config (llmBaseUrl, llmApiKey, llmModel)
- *   2. ~/.openclaw/openclaw.json agents.defaults.model.primary
- *   3. Environment vars: OPENAI_API_KEY, ANTHROPIC_API_KEY, GOOGLE_API_KEY
- *   4. Fallback: Ollama at http://localhost:11434
+ * Resolution (resolveExplicitLlmConfig):
+ *   1. Explicit config-file overrides (llmBaseUrl + llmApiKey + llmModel)
+ *   2. Hicortex-specific env vars (HICORTEX_LLM_BASE_URL + HICORTEX_LLM_API_KEY + HICORTEX_LLM_MODEL)
+ *   Returns null when nothing explicit is set — no silent defaults.
  *
- * Resolution for CC adapter (resolveLlmConfigForCC):
- *   1. Explicit env vars (HICORTEX_LLM_BASE_URL + HICORTEX_LLM_API_KEY + HICORTEX_LLM_MODEL)
- *   2. ANTHROPIC_API_KEY → Claude Haiku (cheap, CC users always have this)
- *   3. OPENAI_API_KEY → gpt-5.4-nano
- *   4. GOOGLE_API_KEY → gemini-2.5-flash
- *   5. Claude CLI fallback (uses subscription, no API key needed)
- *   6. Fallback: Ollama at http://localhost:11434
+ * Explicit backends (handled by call sites before resolveExplicitLlmConfig):
+ *   - llmBackend: "claude-cli" → claudeCliConfig()
+ *   - llmBackend: "ollama"     → explicit ollama LlmConfig
  *
  * Supports any OpenAI-compatible endpoint plus first-class support for
  * OpenAI, Anthropic, Google, Ollama, OpenRouter, and Claude CLI.
  */
-
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { homedir } from "node:os";
 
 export interface LlmConfig {
   baseUrl: string;
@@ -42,60 +33,24 @@ export interface LlmConfig {
 }
 
 /**
- * Resolve LLM configuration from plugin config, OpenClaw config, env vars, or Ollama fallback.
+ * Resolve LLM configuration from explicit config-file overrides or
+ * Hicortex-specific env vars only. Returns null when nothing explicit is set.
+ *
+ * Call sites (mcp-server, nightly) handle the named backends (claude-cli,
+ * ollama) before reaching this function. Only call this for the "other
+ * provider" / API-key case where no named backend is in config.json.
+ *
+ * NO implicit fallbacks: ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY
+ * alone in the environment do NOT configure an LLM — the user must have
+ * chosen a provider via `npx @gamaze/hicortex init`.
  */
-export function resolveLlmConfig(pluginConfig?: {
+export function resolveExplicitLlmConfig(overrides?: {
   llmBaseUrl?: string;
   llmApiKey?: string;
   llmModel?: string;
   reflectModel?: string;
-}): LlmConfig {
-  // 1. Plugin config
-  if (pluginConfig?.llmBaseUrl && pluginConfig?.llmApiKey) {
-    const provider = detectProvider(pluginConfig.llmBaseUrl);
-    return {
-      baseUrl: pluginConfig.llmBaseUrl,
-      apiKey: pluginConfig.llmApiKey,
-      model: pluginConfig.llmModel ?? "qwen3.5:4b",
-      reflectModel: pluginConfig.reflectModel ?? pluginConfig.llmModel ?? "qwen3.5:cloud",
-      provider,
-    };
-  }
-
-  // 2. OpenClaw config file
-  const ocConfig = readOpenClawConfig();
-  if (ocConfig) {
-    return ocConfig;
-  }
-
-  // 3. Environment variables
-  const envConfig = resolveFromEnv();
-  if (envConfig) {
-    return envConfig;
-  }
-
-  // 4. Fallback: Ollama
-  return {
-    baseUrl: "http://localhost:11434",
-    apiKey: "",
-    model: "qwen3.5:4b",
-    reflectModel: "qwen3.5:cloud",
-    provider: "ollama",
-  };
-}
-
-/**
- * Resolve LLM configuration for Claude Code (no OC config file).
- * Uses env vars only — CC users always have ANTHROPIC_API_KEY.
- * Defaults to Haiku for distillation/scoring (~$0.50/mo).
- */
-export function resolveLlmConfigForCC(overrides?: {
-  llmBaseUrl?: string;
-  llmApiKey?: string;
-  llmModel?: string;
-  reflectModel?: string;
-}): LlmConfig {
-  // 1. Explicit overrides (from config file or CLI args)
+}): LlmConfig | null {
+  // 1. Explicit config-file overrides (both baseUrl and apiKey required)
   if (overrides?.llmBaseUrl && overrides?.llmApiKey) {
     const provider = detectProvider(overrides.llmBaseUrl);
     return {
@@ -107,7 +62,7 @@ export function resolveLlmConfigForCC(overrides?: {
     };
   }
 
-  // 2. Hicortex-specific env vars
+  // 2. Hicortex-specific env vars (both base URL and API key required)
   const hcBaseUrl = process.env.HICORTEX_LLM_BASE_URL;
   const hcApiKey = process.env.HICORTEX_LLM_API_KEY;
   const hcModel = process.env.HICORTEX_LLM_MODEL;
@@ -122,56 +77,15 @@ export function resolveLlmConfigForCC(overrides?: {
     };
   }
 
-  // 3. Standard API key env vars (CC users almost always have ANTHROPIC_API_KEY)
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  if (anthropicKey) {
-    return {
-      baseUrl: process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
-      apiKey: anthropicKey,
-      model: "claude-haiku-4-5-20251001",
-      reflectModel: "claude-sonnet-4-6",
-      provider: "anthropic",
-    };
-  }
-
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (openaiKey) {
-    const baseUrl = process.env.OPENAI_BASE_URL ?? "https://api.openai.com";
-    return {
-      baseUrl,
-      apiKey: openaiKey,
-      model: "gpt-5.4-nano",
-      reflectModel: "gpt-5.4-nano",
-      provider: detectProvider(baseUrl),
-    };
-  }
-
-  const googleKey = process.env.GOOGLE_API_KEY;
-  if (googleKey) {
-    return {
-      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-      apiKey: googleKey,
-      model: "gemini-2.5-flash",
-      reflectModel: "gemini-2.5-flash",
-      provider: "google",
-    };
-  }
-
-  // 4. Claude CLI fallback (subscription users)
-  const claudePath = findClaudeBinary();
-  if (claudePath) {
-    return claudeCliConfig(claudePath);
-  }
-
-  // 5. Ollama fallback (truly last resort)
-  return {
-    baseUrl: "http://localhost:11434",
-    apiKey: "",
-    model: "qwen3.5:4b",
-    reflectModel: "qwen3.5:4b",
-    provider: "ollama",
-  };
+  // Nothing explicit — caller decides what to do (recall-only mode, loud warning, etc.)
+  return null;
 }
+
+/**
+ * @deprecated Use resolveExplicitLlmConfig. This alias exists only to ease
+ * the transition for any lingering call sites — remove after 0.10.0 ships.
+ */
+export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
 
 function detectProvider(
   url: string
@@ -182,168 +96,6 @@ function detectProvider(
   if (u.includes("openrouter")) return "openrouter";
   if (u.includes("googleapis") || u.includes("generativelanguage")) return "google";
   return "openai";
-}
-
-function readOpenClawConfig(): LlmConfig | null {
-  try {
-    const configPath = join(homedir(), ".openclaw", "openclaw.json");
-    const raw = readFileSync(configPath, "utf-8");
-    const config = JSON.parse(raw);
-    const primary = config?.agents?.defaults?.model?.primary;
-    if (!primary) return null;
-
-    // primary format is "provider/model" (e.g. "openai/gpt-5", "anthropic/claude-sonnet-4-6")
-    if (typeof primary === "string" && (primary.includes("/") || primary.includes(":"))) {
-      const sep = primary.includes("/") ? "/" : ":";
-      const [providerHint, ...rest] = primary.split(sep);
-      const model = rest.join(sep);
-      // Accept any provider name — if it's in our URL map, we know it
-      const hint = providerHint.toLowerCase();
-      const provider = (hint in PROVIDER_BASE_URLS ? hint : "openai") as LlmConfig["provider"];
-
-      // Resolve base URL: OC config → per-agent models.json → built-in defaults
-      const baseUrl =
-        readOcProviderBaseUrl(config, providerHint) ??
-        getDefaultUrlForProvider(provider);
-
-      // Resolve API key: OC auth-profiles.json → env vars
-      const apiKey =
-        readOcAuthKey(providerHint) ??
-        getEnvKeyForProvider(provider);
-
-      if (!apiKey && provider !== "ollama") return null;
-
-      return {
-        baseUrl,
-        apiKey: apiKey ?? "",
-        model,
-        reflectModel: model,
-        provider,
-      };
-    }
-  } catch {
-    // Config file doesn't exist or is invalid
-  }
-  return null;
-}
-
-/**
- * Read provider base URL from openclaw.json → models.providers.<name>.baseUrl
- */
-function readOcProviderBaseUrl(config: any, provider: string): string | undefined {
-  const providerConfig = config?.models?.providers?.[provider];
-  if (providerConfig?.baseUrl) return providerConfig.baseUrl;
-  return undefined;
-}
-
-
-/**
- * Read API key from OC's per-agent auth-profiles.json.
- * Scans all agent dirs for a matching provider profile.
- */
-function readOcAuthKey(provider: string): string | undefined {
-  try {
-    const { readdirSync } = require("node:fs") as typeof import("node:fs");
-    const agentsDir = join(homedir(), ".openclaw", "agents");
-    const agents = readdirSync(agentsDir);
-
-    for (const agentId of agents) {
-      try {
-        const authPath = join(agentsDir, agentId, "agent", "auth-profiles.json");
-        const raw = readFileSync(authPath, "utf-8");
-        const auth = JSON.parse(raw);
-        const profiles = auth?.profiles ?? {};
-
-        // Look for a profile matching the provider (e.g. "openai:default")
-        for (const [profileId, profile] of Object.entries(profiles)) {
-          const p = profile as any;
-          if (
-            p?.provider === provider ||
-            profileId.startsWith(`${provider}:`)
-          ) {
-            if (p?.key) return p.key as string;
-          }
-        }
-      } catch {
-        // Skip agents without auth
-      }
-    }
-  } catch {
-    // No agents dir
-  }
-  return undefined;
-}
-
-function resolveFromEnv(): LlmConfig | null {
-  const openaiKey = process.env.OPENAI_API_KEY;
-  const openaiBaseUrl = process.env.OPENAI_BASE_URL;
-  if (openaiKey) {
-    const baseUrl = openaiBaseUrl ?? "https://api.openai.com";
-    const provider = detectProvider(baseUrl);
-    return {
-      baseUrl,
-      apiKey: openaiKey,
-      model: process.env.OPENAI_MODEL ?? "gpt-5.4-nano",
-      reflectModel: process.env.OPENAI_MODEL ?? "gpt-5.4-nano",
-      provider,
-    };
-  }
-
-  const anthropicKey = process.env.ANTHROPIC_API_KEY;
-  if (anthropicKey) {
-    return {
-      baseUrl: process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com",
-      apiKey: anthropicKey,
-      model: "claude-sonnet-4-6",
-      reflectModel: "claude-sonnet-4-6",
-      provider: "anthropic",
-    };
-  }
-
-  const googleKey = process.env.GOOGLE_API_KEY;
-  if (googleKey) {
-    return {
-      baseUrl: "https://generativelanguage.googleapis.com/v1beta",
-      apiKey: googleKey,
-      model: "gemini-2.5-flash",
-      reflectModel: "gemini-2.5-flash",
-      provider: "google",
-    };
-  }
-
-  return null;
-}
-
-function getEnvKeyForProvider(provider: string): string | undefined {
-  switch (provider) {
-    case "openai":
-      return process.env.OPENAI_API_KEY;
-    case "anthropic":
-      return process.env.ANTHROPIC_API_KEY;
-    case "google":
-      return process.env.GOOGLE_API_KEY;
-    default:
-      return undefined;
-  }
-}
-
-/**
- * Default base URLs for first-class supported providers.
- *
- * For any other provider, set llmBaseUrl explicitly in your config or use
- * an OpenAI-compatible endpoint. The detectProvider() function will treat
- * unknown URLs as openai-compatible by default.
- */
-const PROVIDER_BASE_URLS: Record<string, string> = {
-  openai: "https://api.openai.com/v1",
-  anthropic: "https://api.anthropic.com",
-  google: "https://generativelanguage.googleapis.com/v1beta",
-  ollama: "http://localhost:11434",
-  openrouter: "https://openrouter.ai/api",
-};
-
-function getDefaultUrlForProvider(provider: string): string {
-  return PROVIDER_BASE_URLS[provider.toLowerCase()] ?? "https://api.openai.com/v1";
 }
 
 
@@ -425,7 +177,7 @@ export async function probeOllama(
  *   - `ok: false, reason: "unreachable"` — network failure or non-2xx.
  *   - `ok: false, reason: "model_missing"` — endpoint is up but the
  *     model isn't listed (the exact case that caused data loss when
- *     mhac-pro's Ollama didn't have the distill model loaded).
+ *     a remote Ollama box didn't have the distill model loaded).
  *
  * Matches on exact name OR name prefix ("qwen3.5:35b" matches "qwen3.5:35b-a3b").
  */
@@ -450,28 +202,76 @@ export async function probeOllamaModel(
 }
 
 /**
- * For batch operations (nightly pipeline), prefer Ollama when available.
- * Claude CLI has strict rate limits that kill batch distillation.
- * Falls back to the provided config if Ollama is unreachable.
+ * Resolve the distillation endpoint before a /distill request.
+ *
+ * @param config  LlmConfig (mutated in "local" mode when fallback is used)
+ * @param mode
+ *   "strict" (default) — when a separate distillBaseUrl is configured and its
+ *     Ollama probe fails, return "abort" immediately WITHOUT mutating config.
+ *     The session is not distilled now; the nightly watermark is not advanced,
+ *     so the session is re-shipped on the next run (harness stores retain raw
+ *     for 30–90 days — the retry IS the queue). Prefer this to producing
+ *     low-quality memories from a weak fallback model.
+ *   "local" — legacy 0.9.0 behaviour: fall back to the base endpoint (local
+ *     Ollama or API provider) when the remote is down. Mutates config IN PLACE
+ *     to repoint distill* at the fallback.
+ *
+ * Returns:
+ *   "ok"       — remote distill endpoint healthy, or no separate endpoint set
+ *   "fellback" — ("local" mode only) remote down; distill redirected to base
+ *   "abort"    — remote down and fallback not allowed (strict) or both down (local)
  */
-export async function preferOllamaForBatch(
-  resolved: LlmConfig,
-  ollamaBaseUrl = "http://localhost:11434"
-): Promise<LlmConfig> {
-  // Only override claude-cli (which has rate limits)
-  if (resolved.provider !== "claude-cli") return resolved;
+export async function resolveDistillFallback(
+  config: LlmConfig,
+  mode: "strict" | "local" = "strict",
+): Promise<"ok" | "fellback" | "abort"> {
+  const distillProvider = config.distillProvider ?? config.provider;
+  // Only a remote Ollama distill endpoint can go unreachable mid-run; API
+  // providers are cloud-reachable and need no fallback.
+  if (!config.distillBaseUrl || distillProvider !== "ollama") return "ok";
 
-  const model = await probeOllama(ollamaBaseUrl);
-  if (!model) return resolved;
+  const distillModel = config.distillModel ?? config.model;
+  const remote = await probeOllamaModel(config.distillBaseUrl, distillModel);
+  if (remote.ok) return "ok";
 
-  return {
-    ...resolved,
-    baseUrl: ollamaBaseUrl,
-    apiKey: "",
-    model,
-    reflectModel: resolved.reflectModel ?? model,
-    provider: "ollama",
-  };
+  const reason =
+    remote.reason === "unreachable"
+      ? `remote distill endpoint unreachable (${config.distillBaseUrl})`
+      : `remote distill model not loaded (${distillModel} on ${config.distillBaseUrl})`;
+
+  if (mode === "strict") {
+    // Do not mutate config. Log once and let the caller return 503 so the
+    // nightly watermark stays put and the session is retried next run.
+    console.error(
+      `[hicortex] ABORT: ${reason} — session will be retried next run`,
+    );
+    return "abort";
+  }
+
+  // "local" mode: fall back to the base endpoint.
+  // If the base is Ollama, verify it is actually up before committing;
+  // if the base is an API provider, it is cloud-reachable.
+  if (config.provider === "ollama") {
+    const local = await probeOllamaModel(config.baseUrl, config.model);
+    if (!local.ok) {
+      console.error(
+        `[hicortex] ABORT: ${reason}, and local fallback (${config.model} on ${config.baseUrl}) also unavailable — retry next run`,
+      );
+      return "abort";
+    }
+    config.distillBaseUrl = config.baseUrl;
+  } else {
+    // Base is an API provider — route distill through it (no separate baseUrl).
+    config.distillBaseUrl = undefined;
+  }
+  config.distillModel = config.model;
+  config.distillProvider = config.provider;
+  config.distillApiKey = config.apiKey;
+  console.warn(
+    `[hicortex] ${reason} — falling back to base endpoint for distillation ` +
+      `(${config.provider}/${config.model}). Lower quality, but capture continues.`,
+  );
+  return "fellback";
 }
 
 // ---------------------------------------------------------------------------

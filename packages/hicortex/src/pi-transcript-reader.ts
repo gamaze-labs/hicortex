@@ -36,6 +36,7 @@ export interface TranscriptBatch {
   projectName: string;
   date: string;
   entries: unknown[];
+  sourceAgent?: string; // optional provenance label (matches transcript-reader.ts)
 }
 
 const DEFAULT_PI_SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
