@@ -53,6 +53,19 @@ export interface HicortexState {
   telemetryId?: string;
   /** Cached MODULE_INDEX from domain curation (generated during consolidation). */
   moduleIndex?: ModuleIndex;
+  /**
+   * Resume cursor for `hicortex relink` — highest memories.rowid whose batch
+   * has been fully committed. Absent/0 = never run (or reset). Cleared is not
+   * required on completion; a finished run simply leaves the cursor at the
+   * max rowid processed.
+   */
+  relinkCursor?: number;
+  /**
+   * Resume cursor for `hicortex classify-domains` — highest memories.rowid
+   * whose batch has been fully committed. Absent/0 = never run (or reset).
+   * Same discipline as relinkCursor.
+   */
+  domainCursor?: number;
 }
 
 /**
@@ -186,6 +199,50 @@ export function migrateLegacyState(stateDir: string = HICORTEX_HOME): boolean {
   }
 
   return false;
+}
+
+const STALE_THRESHOLD_HOURS = 30;
+
+export interface LastNightlyInfo {
+  /** Raw timestamp string as stored. */
+  timestamp: string;
+  /** True when the stored value is not a parseable date. */
+  invalid: boolean;
+  ageHours?: number;
+  /** Human age, e.g. "just now", "5h ago", "2d ago". */
+  ageStr?: string;
+  /** True when older than the missed-a-night threshold (30h). */
+  stale?: boolean;
+}
+
+/**
+ * Last nightly run for status display, shared by `hicortex status` and
+ * `hicortex nightly --status`. Read-only: prefers state.json but falls
+ * back to the pre-migration nightly-last-run.txt so upgraded installs
+ * report correctly before their first nightly performs the migration.
+ * Returns null when no run has ever been recorded.
+ */
+export function describeLastNightly(
+  stateDir: string = HICORTEX_HOME,
+): LastNightlyInfo | null {
+  const ts =
+    loadState(stateDir).lastNightly ??
+    readLegacyText(stateDir, "nightly-last-run.txt");
+  if (!ts) return null;
+  const d = new Date(ts);
+  if (isNaN(d.getTime())) return { timestamp: ts, invalid: true };
+  const ageHours = Math.round((Date.now() - d.getTime()) / (60 * 60 * 1000));
+  const ageStr =
+    ageHours < 1 ? "just now" :
+    ageHours < 24 ? `${ageHours}h ago` :
+    `${Math.round(ageHours / 24)}d ago`;
+  return {
+    timestamp: ts,
+    invalid: false,
+    ageHours,
+    ageStr,
+    stale: ageHours > STALE_THRESHOLD_HOURS,
+  };
 }
 
 function readLegacyText(stateDir: string, name: string): string | null {

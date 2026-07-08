@@ -9,9 +9,10 @@ on:
       tag:
         description: 'npm dist-tag (latest | next)'
         required: true
-        default: 'next'
+        default: 'rc'
         type: choice
         options:
+          - rc
           - next
           - latest
 
@@ -26,9 +27,9 @@ jobs:
       run:
         working-directory: packages/hicortex
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
@@ -42,10 +43,18 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Test
+        run: npm test
+
       - name: Pack tarball
         run: npm pack
 
       - name: Publish tarball
         run: |
-          TAG="${{ github.event.inputs.tag || 'latest' }}"
+          # Tag pushes publish to `rc` by default — nobody follows rc, so a
+          # release is validated from the registry before `next`/`latest` are
+          # moved (deliberate dist-tag step; see issue #119 flow). Use
+          # workflow_dispatch with tag=latest/next only for explicit promotion
+          # publishes of a NEW version.
+          TAG="${{ github.event.inputs.tag || 'rc' }}"
           npm publish gamaze-hicortex-*.tgz --tag "$TAG" --access public

@@ -2,7 +2,7 @@
 
 Your agents learn from every session — successes and mistakes. Hicortex captures experiences, distills lessons, and applies them automatically. Connect multiple agents to shared memory and they improve together, overnight.
 
-Works with **Claude Code**, **Hermes**, **OpenClaw**, **Pi**, and any MCP-compatible agent.
+Works with **Hermes**, **OpenClaw**, **Claude Code**, **Pi**, and any MCP-compatible agent.
 
 **Website:** [hicortex.gamaze.com](https://hicortex.gamaze.com) · **Docs:** [hicortex.gamaze.com/docs](https://hicortex.gamaze.com/docs/)
 
@@ -14,6 +14,8 @@ npx @gamaze/hicortex init
 
 Detects available LLM candidates (Ollama models, Claude CLI, API keys from env/Hermes/.env/Claude Code settings/OpenClaw), presents a numbered list, and asks you to choose. Installs a persistent MCP server daemon and registers with Claude Code. One command.
 
+Init also scaffolds five editable default [memory domains](#memory-domains--tags) (Work, Personal, People, Health, Finance) in `~/.hicortex/config.json`. Domain classification activates automatically once an LLM is configured — no extra setup.
+
 ## Install — Client Mode (multi-client)
 
 ```bash
@@ -21,6 +23,21 @@ npx @gamaze/hicortex init --server https://your-server.example.com
 ```
 
 Connects to a remote Hicortex server. No local database or local LLM needed. The nightly job denoises sessions locally (no LLM — just strips tool noise), then POSTs the denoised text to the server. The server distills, embeds, and stores. Raw session content never leaves the machine.
+
+## Install — Hermes
+
+The Hermes plugin is a recall-only adapter: it injects fresh lessons every turn and exposes the full 8-tool memory surface, backed by a Hicortex server (local or remote). Capture happens automatically — the server machine's nightly job reads each Hermes profile's `state.db`.
+
+```bash
+# 1. Install the plugin (prompts for server URL + auth token; leave empty for a local server)
+hermes plugins install gamaze-labs/hicortex-hermes-plugin
+
+# 2. Activate it as the memory provider, then restart your gateway
+hermes memory setup hicortex
+hermes gateway restart
+```
+
+Find the server's auth token with `hicortex status` on the server machine.
 
 ## Install — OpenClaw
 
@@ -51,6 +68,43 @@ The plugin connects to `http://127.0.0.1:8787` by default. For a remote server, 
 | Agent start | Recent lessons fetched fresh and injected into context | CC SessionStart hook (calls `hicortex lessons-context`) / Hermes plugin prefetch / OC `before_agent_start` hook |
 | Nightly | Denoise sessions → POST /distill → server distills + embeds + stores → consolidate (score, reflect, link, decay) | Automatic pipeline — no manual steps |
 
+## Memory Domains & Tags
+
+Domains are your top-level memory spheres — the handful of areas your life or work actually splits into. Every memory gets **multiple weighted tags** from your domain list plus one **primary** domain, so a memory that spans areas (a work project that touches your finances) lives in both instead of being forced into one bin. Domains drive the knowledge index, graph coloring, and lesson selection.
+
+`hicortex init` scaffolds five generic defaults: **Work, Personal, People, Health, Finance**. They are a starting point, not a taxonomy — edit them to match how *you* think. Life areas or project/topic areas both work. Your existing list is never overwritten by init.
+
+Edit `~/.hicortex/config.json` on the server machine:
+
+```json
+{
+  "domains": [
+    { "name": "Work", "description": "Your job and professional life — employer, clients, workstreams" },
+    { "name": "Personal", "description": "Private life — home, hobbies, everyday matters" },
+    { "name": "People", "description": "Relationships — family, friends, social life, network" },
+    { "name": "Health", "description": "Fitness, wellbeing, medical" },
+    { "name": "Finance", "description": "Money — budgeting, spending, investing" }
+  ]
+}
+```
+
+A richer example — including a `compartment: true` work/life firewall and a custom `weakPrimaryFloor` — ships as `domains.example.json` in the package.
+
+**How classification works:** the LLM decides only *which* of your domains apply to a memory — never weights or rankings. The weight of each tag is derived from your own data: each domain builds a prototype from the memories already in it, and a tag's weight is how strongly the memory's embedding matches that prototype. The primary domain is picked deterministically from those weights, and everything is recomputed each nightly, so your categories drift with your data instead of going stale. Memories that genuinely fit nothing get a weak association when they are close enough to some domain — and otherwise fade away over time. No junk drawer, no "Unsorted" pile.
+
+`weakPrimaryFloor` (config, default 0.45) sets how close a no-fit memory must be to its nearest domain to earn that weak association instead of fading.
+
+**Backfill an existing corpus** (server mode, needs `domains` in config):
+
+```bash
+npx @gamaze/hicortex classify-domains              # classify unfiled/stale memories
+npx @gamaze/hicortex classify-domains --all        # reclassify every memory
+npx @gamaze/hicortex classify-domains --batch 100  # memories per batch (default: 200)
+npx @gamaze/hicortex classify-domains --reset      # restart from the beginning (ignore saved cursor)
+```
+
+The run is resumable — interrupt it any time and it continues where it stopped. New memories are classified automatically by the nightly; the backfill is only needed once for a pre-existing corpus or after you reshape your domain list.
+
 ## Agent Tools (MCP)
 
 8 tools available via MCP:
@@ -75,6 +129,7 @@ npx @gamaze/hicortex init --server <url>       # Set up client mode
 npx @gamaze/hicortex nightly                   # Run distill + consolidate (full nightly)
 npx @gamaze/hicortex nightly --capture-only    # Capture only, skip consolidation (safe for sub-daily runs)
 npx @gamaze/hicortex nightly --dry-run         # Preview without changes
+npx @gamaze/hicortex classify-domains          # Backfill domain tags over the corpus (see Memory Domains & Tags)
 npx @gamaze/hicortex status                    # Show config, DB stats
 npx @gamaze/hicortex uninstall                 # Remove CC integration (keeps DB)
 ```
@@ -116,6 +171,8 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `reflectBaseUrl` | Separate Ollama instance for reflection (server mode) |
 | `authToken` | Bearer token for endpoint auth. Generated on first `init` in server mode. Find the active token with `hicortex status` or in `~/.hicortex/config.json`. |
 | `licenseKey` | Commercial license key (optional; for display in `hicortex status`) |
+| `domains` | Your memory domain list (`[{name, description}]`). Scaffolded by `init`; edit freely — see [Memory Domains & Tags](#memory-domains--tags) |
+| `weakPrimaryFloor` | Minimum similarity for a no-fit memory to keep a weak domain association (default: 0.45) |
 | `moduleIndexTokenBudget` | Max tokens for domain index in lessons context (default: 500) |
 | `nightlyHour` | Local hour (0–23) for the nightly job installed by `init` (defaults: client 2, server 3). Applied on fresh installs; existing schedules are never overwritten |
 | `telemetry` | Anonymous usage telemetry, `false` to opt out |

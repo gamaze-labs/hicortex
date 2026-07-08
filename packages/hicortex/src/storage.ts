@@ -6,6 +6,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { Memory, MemoryLink, InsertMemoryOptions } from "./types.js";
+import { derivePrimary, type WeightedTag } from "./schema-prototypes.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -159,7 +160,7 @@ export function strengthenMemory(
 }
 
 /**
- * Delete a memory, its vector, and all its links.
+ * Delete a memory, its vector, its tags, and all its links.
  */
 export function deleteMemory(
   db: Database.Database,
@@ -168,8 +169,112 @@ export function deleteMemory(
   db.prepare(
     "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?"
   ).run(memoryId, memoryId);
+  db.prepare("DELETE FROM memory_tags WHERE memory_id = ?").run(memoryId);
   db.prepare("DELETE FROM memory_vectors WHERE id = ?").run(memoryId);
   db.prepare("DELETE FROM memories WHERE id = ?").run(memoryId);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-tag classification (feat/memory-tags)
+// ---------------------------------------------------------------------------
+
+/** Options for setMemoryTags (graded-schema spec 2026-07-07). */
+export interface SetMemoryTagsOptions {
+  /**
+   * Per-tag association weights (cosine vs the domain prototype), computed by
+   * schema-prototypes.computeTagWeights. A missing/null entry stores NULL
+   * (repaired by the next nightly recompute).
+   */
+  weights?: Record<string, number | null>;
+  /**
+   * Compartment domain names (DomainDef.compartment === true): a tagged
+   * compartment domain becomes the primary regardless of weights.
+   */
+  compartments?: Set<string>;
+}
+
+/**
+ * Set a memory's classification tags (graded schema model).
+ *
+ * `tags` is the ORDERED tag set from the classifier (most-relevant first —
+ * the order is persisted via insertion/rowid order and breaks exact-weight
+ * ties). The `memory_tags` sidecar rows for this memory are REPLACED; each
+ * row stores its association weight (NULL when not yet computed).
+ *
+ * The PRIMARY (memories.domain) is DERIVED here — never passed in by the LLM:
+ * compartment override first, else argmax weight, else first tag (all-null
+ * weights). The whole update is one transaction so domain, tag set, and
+ * weights never diverge.
+ *
+ * @returns the derived primary written to memories.domain
+ */
+export function setMemoryTags(
+  db: Database.Database,
+  memoryId: string,
+  tags: string[],
+  options: SetMemoryTagsOptions = {}
+): string {
+  // Dedup preserving first (most-relevant) occurrence; defensive — the
+  // classifier already dedups.
+  const unique = Array.from(new Set(tags));
+  if (unique.length === 0) {
+    throw new Error("setMemoryTags: empty tag set (callers must pass >= 1 tag)");
+  }
+
+  const weighted: WeightedTag[] = unique.map((tag) => ({
+    tag,
+    weight: options.weights?.[tag] ?? null,
+  }));
+  const primary = derivePrimary(weighted, options.compartments ?? new Set());
+
+  const setDomain = db.prepare("UPDATE memories SET domain = ? WHERE id = ?");
+  const clearTags = db.prepare("DELETE FROM memory_tags WHERE memory_id = ?");
+  const insertTag = db.prepare(
+    "INSERT OR IGNORE INTO memory_tags (memory_id, tag, weight) VALUES (?, ?, ?)"
+  );
+
+  const tx = db.transaction(() => {
+    setDomain.run(primary, memoryId);
+    clearTags.run(memoryId);
+    // Insert in LLM order — rowid order IS the persisted relevance order.
+    // schema-prototypes.ts refreshPrimaries depends on this (ORDER BY mt.rowid
+    // as the argmax tiebreak): any future bulk writer of memory_tags MUST
+    // insert most-relevant-first or tiebreak ordering silently corrupts.
+    for (const w of weighted) insertTag.run(memoryId, w.tag, w.weight);
+  });
+  tx();
+  return primary;
+}
+
+/**
+ * Get a memory's tag set (the full multi-label set, including the primary).
+ * Returns tags sorted alphabetically for stable output; empty array if none.
+ */
+export function getMemoryTags(
+  db: Database.Database,
+  memoryId: string
+): string[] {
+  const rows = db
+    .prepare("SELECT tag FROM memory_tags WHERE memory_id = ? ORDER BY tag")
+    .all(memoryId) as Array<{ tag: string }>;
+  return rows.map((r) => r.tag);
+}
+
+/**
+ * Get a memory's tags WITH weights, ordered by weight descending (NULL
+ * weights last, in insertion/relevance order). Empty array if none.
+ */
+export function getMemoryTagsWeighted(
+  db: Database.Database,
+  memoryId: string
+): Array<{ tag: string; weight: number | null }> {
+  const rows = db
+    .prepare(
+      `SELECT tag, weight FROM memory_tags WHERE memory_id = ?
+       ORDER BY (weight IS NULL) ASC, weight DESC, rowid ASC`
+    )
+    .all(memoryId) as Array<{ tag: string; weight: number | null }>;
+  return rows;
 }
 
 // ---------------------------------------------------------------------------

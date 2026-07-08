@@ -19,8 +19,29 @@ import type { Memory, MemorySearchResult } from "./types.js";
 import * as storage from "./storage.js";
 
 const BASE_DECAY = 0.0005;
-const DEFAULT_GRAPH_DISTANCE = 0.5;
+/**
+ * Placeholder L2 distance for candidates that have no measured vector
+ * distance (FTS-only hits and graph-discovered neighbors). Chosen so that
+ * l2ToCosine(1.0) = 0.5 — a neutral mid-scale similarity. Before the #145
+ * fix the value was 0.5 on the accidental 1−L2 scale, which also yielded
+ * similarity 0.5; keeping 0.5 under the corrected formula would have jumped
+ * these candidates to cosine 0.875, outranking most true vector matches.
+ */
+const DEFAULT_GRAPH_DISTANCE = 1.0;
 const RRF_K = 60;
+
+/**
+ * Convert an L2 distance (as returned by sqlite-vec's vec0 `distance`) to
+ * cosine similarity. Valid because our embeddings are L2-normalized
+ * (embedder.ts, `normalize: true`): for unit vectors, d² = 2 − 2·cos,
+ * hence cos = 1 − d²/2. Exact anchors: d=0 → 1, d=√2 → 0, d=2 → −1.
+ *
+ * Lives here (the dependency-root of the scoring code) and is re-exported
+ * by consolidate.ts so pre-#145 importers keep working.
+ */
+export function l2ToCosine(distance: number): number {
+  return 1 - (distance * distance) / 2;
+}
 
 // ---------------------------------------------------------------------------
 // Timestamp parsing
@@ -82,15 +103,25 @@ export function effectiveStrength(
 
 /**
  * Return a composite relevance score in [0, 1] for a candidate memory.
+ * Exported for exact-value tests of the similarity component (#145).
  */
-function computeScore(
+export function computeScore(
   memory: Memory,
   distance: number,
   connectionCount: number,
   maxConnections: number,
   now: Date
 ): number {
-  const similarity = Math.max(0, 1.0 - distance);
+  // TRUE cosine similarity (#145). The old `1 − distance` compressed real
+  // cosines (cos 0.8 scored 0.37) and the 0-clamp at that scale flattened
+  // everything below cos 0.5 to exactly 0, killing mid-relevance
+  // discrimination. The clamp stays at 0 — a negative cosine means truly
+  // unrelated — but now at the correct scale. NOTE: the similarity values
+  // roughly DOUBLE for related content on the new scale; the blend weights
+  // below are deliberately unchanged in this pass so the before/after
+  // retrieval comparison is measured, not guessed. Rebalancing the weights
+  // is a data-driven follow-up if the eval shows it is needed.
+  const similarity = Math.max(0, l2ToCosine(distance));
   const effStrength = effectiveStrength(
     memory.base_strength ?? 0.5,
     memory.last_accessed,

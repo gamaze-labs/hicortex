@@ -8,6 +8,7 @@ import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import { resolveDbPath } from "./db.js";
 import { getValidatedLicense } from "./features.js";
+import { describeLastNightly } from "./state.js";
 
 const HICORTEX_HOME = join(homedir(), ".hicortex");
 const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
@@ -128,25 +129,16 @@ export async function runStatus(): Promise<void> {
   }
 
   // Last nightly run
-  const lastRunPath = join(HICORTEX_HOME, "nightly-last-run.txt");
-  try {
-    const ts = readFileSync(lastRunPath, "utf-8").trim();
-    const lastRun = new Date(ts);
-    if (isNaN(lastRun.getTime())) {
-      console.log(`  Last run:   ${ts} (invalid timestamp)`);
-    } else {
-      const STALE_THRESHOLD_HOURS = 30;
-      const ageHours = Math.round((Date.now() - lastRun.getTime()) / (60 * 60 * 1000));
-      const ageStr = ageHours < 1 ? "just now" : ageHours < 24 ? `${ageHours}h ago` : `${Math.round(ageHours / 24)}d ago`;
-      console.log(`  Last run:   ${ts} (${ageStr})`);
-
-      // Show staleness warning if missed a night
-      if (ageHours > STALE_THRESHOLD_HOURS) {
-        console.log(`  ⚠ Nightly pipeline hasn't run in ${ageHours}h. Check: hicortex nightly --dry-run`);
-      }
-    }
-  } catch {
+  const lastRun = describeLastNightly();
+  if (!lastRun) {
     console.log("  Last run:   never (run: hicortex nightly)");
+  } else if (lastRun.invalid) {
+    console.log(`  Last run:   ${lastRun.timestamp} (invalid timestamp)`);
+  } else {
+    console.log(`  Last run:   ${lastRun.timestamp} (${lastRun.ageStr})`);
+    if (lastRun.stale) {
+      console.log(`  ⚠ Nightly pipeline hasn't run in ${lastRun.ageHours}h. Check: hicortex nightly --dry-run`);
+    }
   }
 
   // Distillation stats (if DB exists)

@@ -20,11 +20,13 @@ let VERSION = "0.0.0";
 try { VERSION = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version; } catch {}
 
 import { initDb, resolveDbPath } from "./db.js";
-import { resolveExplicitLlmConfig, LlmClient, findClaudeBinary, claudeCliConfig, probeOllamaModel, type LlmConfig } from "./llm.js";
+import { resolveSavedLlmConfig, resolveClassifyProbeTarget, LlmClient, probeOllamaModel, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import { extractConversationText } from "./distiller.js";
 import { runConsolidation } from "./consolidate.js";
+import { parseConfigDomains } from "./domain-classify.js";
+import { resolveWeakPrimaryFloor } from "./nofit.js";
 import { readCcTranscripts } from "./transcript-reader.js";
 import { readHermesSessions } from "./hermes-transcript-reader.js";
 import { readPiTranscripts } from "./pi-transcript-reader.js";
@@ -112,35 +114,11 @@ export async function runNightly(options: {
     // is handled by the running daemon over /distill — no local distill LLM needed.
     // No LLM → capture loop still runs (sessions POST to /distill, which will 503
     // transient-fail and hold the watermark), but consolidation is skipped.
-    let llmConfig: LlmConfig | null = null;
-    if (savedConfig?.llmBackend === "claude-cli") {
-      const claudePath = findClaudeBinary();
-      if (claudePath) {
-        llmConfig = claudeCliConfig(claudePath);
-      } else {
-        console.warn("[hicortex] claude-cli configured but binary not found — consolidation skipped");
-      }
-    } else if (savedConfig?.llmBackend === "ollama") {
-      llmConfig = {
-        baseUrl: (savedConfig.llmBaseUrl as string | undefined) ?? "http://localhost:11434",
-        apiKey: "",
-        model: (savedConfig.llmModel as string) ?? "qwen3.5:4b",
-        reflectModel: (savedConfig.reflectModel as string) ?? (savedConfig.llmModel as string) ?? "qwen3.5:4b",
-        provider: "ollama",
-      };
-    } else {
-      llmConfig = resolveExplicitLlmConfig({
-        llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
-        llmApiKey: savedConfig?.llmApiKey as string | undefined,
-        llmModel: savedConfig?.llmModel as string | undefined,
-        reflectModel: savedConfig?.reflectModel as string | undefined,
-      });
+    const resolved = resolveSavedLlmConfig(savedConfig);
+    if (resolved.reason === "claude_binary_missing") {
+      console.warn("[hicortex] claude-cli configured but binary not found — consolidation skipped");
     }
-    if (llmConfig && savedConfig?.reflectBaseUrl) {
-      llmConfig.reflectBaseUrl = savedConfig.reflectBaseUrl as string;
-      llmConfig.reflectApiKey = (savedConfig.reflectApiKey as string | undefined) ?? llmConfig.apiKey;
-      llmConfig.reflectProvider = (savedConfig.reflectProvider as string | undefined) ?? llmConfig.provider;
-    }
+    const llmConfig: LlmConfig | null = resolved.config;
     const llm = llmConfig ? new LlmClient(llmConfig) : null;
 
     // Step 1: Read new transcripts (CC + Hermes + Pi + OpenClaw)
@@ -261,8 +239,45 @@ export async function runNightly(options: {
           }
         }
 
+        // Content-based domain classification (config-owned `domains`) uses
+        // the classify tier (classifyModel/classifyBaseUrl) when configured,
+        // else the reflect tier. Pre-flight the endpoint classification will
+        // ACTUALLY use (resolveClassifyProbeTarget is the shared source of
+        // truth with `hicortex classify-domains`). If it is down, content
+        // classification is NOT ready this run (strict — skip, don't fall
+        // back). When no `domains` list is configured, this is inert and the
+        // legacy project-grouping path runs.
+        const cfgDomains = parseConfigDomains(savedConfig);
+        let contentDomainsReady = true;
+        if (cfgDomains) {
+          const classifyTarget = resolveClassifyProbeTarget(llmConfig);
+          if (classifyTarget?.tier === "reflect") {
+            // Classification rides the reflect endpoint — reuse the probe above.
+            contentDomainsReady = !skipReflection;
+          } else if (classifyTarget) {
+            const health = await probeOllamaModel(classifyTarget.baseUrl, classifyTarget.model);
+            if (!health.ok) {
+              const reason = health.reason === "unreachable"
+                ? `classify endpoint unreachable (${classifyTarget.baseUrl})`
+                : `classify model not loaded (${classifyTarget.model} missing on ${classifyTarget.baseUrl})`;
+              console.warn(`[hicortex] ${reason}`);
+              contentDomainsReady = false;
+            }
+          }
+          // classifyTarget === null → base endpoint or API provider, no probe.
+          if (!contentDomainsReady) {
+            console.warn(
+              "[hicortex] content-domain classification skipped — classification endpoint offline (strict)",
+            );
+          }
+        }
+
         console.log(`[hicortex] Running consolidation...`);
-        const report = await runConsolidation(db, llm, embed, dryRun, skipReflection);
+        const report = await runConsolidation(db, llm, embed, dryRun, skipReflection, undefined, {
+          domains: cfgDomains,
+          contentDomainsReady,
+          weakPrimaryFloor: resolveWeakPrimaryFloor(savedConfig),
+        });
         console.log(
           `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
           (report.stages.reflection ? ` (${report.stages.reflection.lessons_generated} lessons)` : "")

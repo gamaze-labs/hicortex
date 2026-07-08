@@ -6,21 +6,81 @@
 
 import type Database from "better-sqlite3";
 import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain } from "./types.js";
-import { VALID_RELATIONSHIP_TYPES } from "./types.js";
 import type { LlmClient } from "./llm.js";
 import type { EmbedFn } from "./retrieval.js";
-import { effectiveStrength } from "./retrieval.js";
+import { effectiveStrength, l2ToCosine } from "./retrieval.js";
 import * as storage from "./storage.js";
-import { importanceScoring, reflection, domainCuration, edgeClassification } from "./prompts.js";
+import { importanceScoring, reflection, domainCuration } from "./prompts.js";
 import { createHash } from "node:crypto";
 import { isPro } from "./features.js";
 import { louvainCommunities, detectHubs } from "./graph.js";
 import { loadState, updateState } from "./state.js";
+import {
+  classifyMemoryTags,
+  domainSetHash,
+  type DomainDef,
+} from "./domain-classify.js";
+import {
+  compartmentSet,
+  computeDomainPrototypes,
+  computeTagWeights,
+  recomputeAllTagWeights,
+  refreshPrimaries,
+} from "./schema-prototypes.js";
+import {
+  DEFAULT_WEAK_PRIMARY_FLOOR,
+  applyNoAssociationDecay,
+  applyWeakPrimary,
+  resolveNoFit,
+} from "./nofit.js";
 
 // Default config constants (matching Python config.py)
 const CONSOLIDATE_MAX_LLM_CALLS = 200;
 const CONSOLIDATE_PRUNE_MIN_AGE_DAYS = 90;
-const CONSOLIDATE_LINK_THRESHOLD = 0.55;
+/**
+ * Minimum COSINE similarity for a link candidate.
+ *
+ * Calibration (2026-07): measured top-10 neighbor cosine histogram on the
+ * 2945-memory production corpus (bedrock). Typical top-1 neighbor cosine:
+ * median 0.823, p10 0.743, p90 0.902. Threshold 0.75 combined with the
+ * top-3 cap yields ≈ 2.2 candidate links/memory. The previous value (0.55)
+ * lived on an accidental 1−L2 scale where it required cosine > 0.90 — a
+ * near-duplicate detector that linked only 12% of memories.
+ */
+export const CONSOLIDATE_LINK_THRESHOLD = 0.75;
+/** Max link candidates kept per memory (highest-cosine neighbors first). */
+export const CONSOLIDATE_LINK_TOP_K = 3;
+/**
+ * Minimum COSINE similarity for a CROSS-PROJECT link candidate.
+ *
+ * A 672-link audit (17 LLM judges, 2026-07) found cross-project links were 65%
+ * wrong-link vs 6% for same-project, and that strength (cosine) predicts quality
+ * (wrong-link 42% → 6% across strength quartiles). Cross-project pairs must clear
+ * a much higher bar than the same-project 0.75 to survive discovery. Same-project
+ * links keep CONSOLIDATE_LINK_THRESHOLD (0.75).
+ */
+export const CROSS_PROJECT_LINK_THRESHOLD = 0.8;
+
+/**
+ * l2ToCosine moved to retrieval.ts (#145) — consolidate.ts already imports
+ * from retrieval, so retrieval is the circular-dependency-safe home.
+ * Re-exported here so pre-#145 importers and tests keep working unchanged.
+ */
+export { l2ToCosine } from "./retrieval.js";
+
+/**
+ * Minimum TRUE cosine similarity between a new lesson and an existing one
+ * for the existing lesson to count as a contradiction-check candidate
+ * (stageReflection). 0.80 = "strongly similar lesson" — the original intent.
+ * Before #145 the check was `1 − L2 > 0.80`, which required cosine > 0.98,
+ * so lesson-contradiction suppression effectively never fired.
+ */
+export const REFLECTION_CONTRADICTION_MIN_COSINE = 0.8;
+
+/** True when an L2 neighbor distance clears the contradiction-check bar. */
+export function isContradictionCandidate(distance: number): boolean {
+  return l2ToCosine(distance) > REFLECTION_CONTRADICTION_MIN_COSINE;
+}
 
 // ---------------------------------------------------------------------------
 // BudgetTracker
@@ -302,11 +362,13 @@ async function stageReflection(
         // If a very similar lesson exists, ask the LLM whether the new one
         // contradicts it. If yes, suppress the new lesson to prevent the
         // "false coherence" failure mode (wrong lessons reinforcing themselves).
+        // TRUE cosine > 0.80 (#145): the old `1 − n.distance > 0.80` sat on
+        // the accidental 1−L2 scale and required cosine > 0.98 — the check
+        // effectively never fired. See isContradictionCandidate.
         const similarLessons = storage.vectorSearch(db, embedding, 3)
-          .filter((n) => {
-            const sim = 1.0 - n.distance;
-            return sim > 0.80 && n.memory_type === "lesson";
-          });
+          .filter(
+            (n) => isContradictionCandidate(n.distance) && n.memory_type === "lesson"
+          );
 
         let contradicted = false;
         if (similarLessons.length > 0 && budget.use("contradiction_check")) {
@@ -352,7 +414,188 @@ async function stageReflection(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2.7: Domain Curation (MODULE_INDEX)
+// Stage 2.7a: Content-based Domain Classification (config-owned domains)
+// ---------------------------------------------------------------------------
+//
+// Active ONLY when config.json carries a `domains` list. Each memory is filed
+// into one configured life-sphere by its CONTENT (via the reflect model),
+// replacing the project-grouping path. Only NULL or stale-domain rows are
+// (re)classified, so re-runs are cheap and a config change re-files affected
+// rows. moduleIndex becomes {configured domains + live per-domain counts} so
+// /index and the lesson selector keep working.
+
+/**
+ * Rebuild moduleIndex from the configured domain set + live DB counts, and
+ * persist it. Shared by the nightly stage and `hicortex classify-domains`.
+ * `projects` is left empty (content domains don't map to projects); the lesson
+ * selector's same-domain boost instead keys off memory.domain directly (it
+ * still reads the field). Descriptions are carried through for /index.
+ */
+export function rebuildContentModuleIndex(
+  db: Database.Database,
+  domains: DomainDef[],
+  stateDir?: string,
+): { domains: number } {
+  const memRows = db
+    .prepare(
+      `SELECT domain, COUNT(*) AS cnt FROM memories WHERE domain IS NOT NULL GROUP BY domain`,
+    )
+    .all() as Array<{ domain: string; cnt: number }>;
+  const lessonRows = db
+    .prepare(
+      `SELECT domain, COUNT(*) AS cnt FROM memories
+       WHERE domain IS NOT NULL AND memory_type = 'lesson' GROUP BY domain`,
+    )
+    .all() as Array<{ domain: string; cnt: number }>;
+  const memByDomain = new Map(memRows.map((r) => [r.domain, r.cnt]));
+  const lessonByDomain = new Map(lessonRows.map((r) => [r.domain, r.cnt]));
+
+  const moduleDomains: ModuleDomain[] = domains.map((d) => ({
+    name: d.name,
+    projects: [],
+    memoryCount: memByDomain.get(d.name) ?? 0,
+    lessonCount: lessonByDomain.get(d.name) ?? 0,
+    keywords: [],
+    description: d.description,
+  }));
+
+  const totalMemories = moduleDomains.reduce((s, d) => s + d.memoryCount, 0);
+  const totalLessons = moduleDomains.reduce((s, d) => s + d.lessonCount, 0);
+
+  const moduleIndex: ModuleIndex = {
+    domains: moduleDomains,
+    projectSetHash: domainSetHash(domains),
+    curatedAt: new Date().toISOString(),
+    totalMemories,
+    totalLessons,
+    mode: "content",
+  };
+  updateState((s) => { s.moduleIndex = moduleIndex; }, stateDir);
+  return { domains: moduleDomains.length };
+}
+
+async function stageContentDomains(
+  db: Database.Database,
+  domains: DomainDef[],
+  llm: LlmClient,
+  budget: BudgetTracker,
+  embedFn: EmbedFn,
+  dryRun: boolean,
+  stateDir?: string,
+  weakPrimaryFloor: number = DEFAULT_WEAK_PRIMARY_FLOOR,
+): Promise<{
+  curated: boolean;
+  domains: number;
+  classified?: number;
+  prototypes?: number;
+  weights_recomputed?: number;
+  primaries_updated?: number;
+  weak_primary?: number;
+  no_association_decayed?: number;
+  reason?: string;
+}> {
+  // Rows needing (re)classification:
+  //   - domain IS NULL (never classified), OR
+  //   - domain NOT IN the current vocabulary (a rename/removal re-files), OR
+  //   - no memory_tags rows yet (single-domain memories from feat/content-domains
+  //     that have a primary but no tag set — backfill them to multi-tag).
+  const placeholders = domains.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT id, content, project FROM memories
+       WHERE domain IS NULL
+          OR domain NOT IN (${placeholders})
+          OR id NOT IN (SELECT DISTINCT memory_id FROM memory_tags)`,
+    )
+    .all(...domains.map((d) => d.name)) as Array<{
+      id: string;
+      content: string;
+      project: string | null;
+    }>;
+
+  if (dryRun) {
+    return { curated: false, domains: domains.length, classified: 0, reason: `dry_run (${rows.length} would classify)` };
+  }
+
+  const getEmbedFn = async () => embedFn;
+  const compartments = compartmentSet(domains);
+  let classified = 0;
+  let weakPrimary = 0;
+  let noAssociationDecayed = 0;
+
+  if (rows.length > 0) {
+    // Prototypes at run start — newly classified memories get their weights
+    // from the CURRENT prototypes (the post-classification recompute below
+    // refreshes everything from the updated tag sets anyway).
+    const { prototypes: startPrototypes } = await computeDomainPrototypes(db, domains, getEmbedFn);
+
+    for (const row of rows) {
+      if (budget.exhausted || !budget.use("content_domain")) {
+        console.warn(`[hicortex] content-domain: budget exhausted after ${classified} classified`);
+        break;
+      }
+      // classifyMemoryTags returns null ONLY on infra error (throws after retry) —
+      // skip that memory, leaving domain/tags/strength untouched so a later
+      // run retries it (issue #150: never file or decay on infra errors).
+      const result = await classifyMemoryTags(row.content, row.project, domains, llm);
+      if (result === null) {
+        console.warn(`[hicortex] content-domain: infra error classifying ${row.id} — skipped (will retry)`);
+        continue;
+      }
+      if (result.tags.length === 0) {
+        // Genuine no-fit (owner amendment 07.07): weak primary from the
+        // prototype argmax when it clears the floor, else accelerated decay.
+        // Each row appears exactly once in `rows`, so a run never
+        // double-halves.
+        const resolution = resolveNoFit(db, row.id, domains, startPrototypes, weakPrimaryFloor);
+        if (resolution.kind === "weak_primary") {
+          applyWeakPrimary(db, row.id, resolution.domain, resolution.weight, compartments);
+          weakPrimary++;
+        } else {
+          applyNoAssociationDecay(db, row.id);
+          noAssociationDecayed++;
+        }
+        continue;
+      }
+      const weights = computeTagWeights(db, row.id, result.tags, startPrototypes);
+      storage.setMemoryTags(db, row.id, result.tags, { weights, compartments });
+      classified++;
+    }
+  }
+
+  // Graded-schema reconsolidation pass — runs EVERY nightly, including when
+  // nothing new was classified: prototypes drift with the data, so weights and
+  // derived primaries must follow (spec: "recomputed for ALL memory_tags rows
+  // each nightly"). Order: prototypes (from the post-classification tag sets)
+  // → all weights → derived primaries → moduleIndex counts from the refreshed
+  // primaries. No LLM calls — embeddings only.
+  const { prototypes, stats } = await computeDomainPrototypes(db, domains, getEmbedFn);
+  const { updated: weightsRecomputed } = recomputeAllTagWeights(db, prototypes);
+  const { updated: primariesUpdated } = refreshPrimaries(db, domains);
+  const seeded = stats.filter((s) => s.seeded).length;
+
+  const { domains: domainCount } = rebuildContentModuleIndex(db, domains, stateDir);
+  console.log(
+    `[hicortex] Graded tags: ${classified} classified, ${weakPrimary} weak-primary, ` +
+      `${noAssociationDecayed} no-association decayed, ${prototypes.size} prototypes ` +
+      `(${seeded} description-seeded), ${weightsRecomputed} weights recomputed, ` +
+      `${primariesUpdated} primaries updated, ${domainCount} domains indexed`,
+  );
+  return {
+    curated: rows.length > 0,
+    domains: domainCount,
+    classified,
+    prototypes: prototypes.size,
+    weights_recomputed: weightsRecomputed,
+    primaries_updated: primariesUpdated,
+    weak_primary: weakPrimary,
+    no_association_decayed: noAssociationDecayed,
+    ...(rows.length === 0 ? { reason: "nothing_stale" } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2.7b: Domain Curation (MODULE_INDEX) — project grouping (legacy path)
 // ---------------------------------------------------------------------------
 
 async function stageDomainCuration(
@@ -547,22 +790,107 @@ async function stageDomainCuration(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3: Link Discovery (vector similarity auto-link + LLM classification)
+// Stage 3: Link Discovery (vector similarity auto-link + heuristic typing)
 // ---------------------------------------------------------------------------
+//
+// LLM edge classification is RETIRED (2026-07). A 672-link audit (17 LLM
+// judges) found only 31% of typed links overall were correct/defensible, and
+// the LLM-classified UPPERCASE types were near-useless: CONTRADICTS 4%,
+// SUPERSEDES 29%, DEPENDS_ON 26%, CAUSED_BY 24%, VALIDATES 44%. The lowercase
+// heuristics `updates`/`derives` were also weak (~31%). Only `extends` (57%)
+// and `relates_to` (53%) held up, so the pipeline now emits ONLY those two.
+//
+// The UPPERCASE types remain in VALID_RELATIONSHIP_TYPES (types.ts) so old data
+// still validates — they are RETIRED, not deleted. Classification via an LLM
+// may return only once a future classifier passes the audit harness at >= 70%
+// acceptable. Do NOT re-enable LLM classification without that evidence.
 
 /** A candidate link discovered by vector similarity, pending classification. */
-interface LinkCandidate {
+export interface LinkCandidate {
   source: Memory;
   target: Memory & { distance: number };
   similarity: number;
   heuristicType: string;
 }
 
-/** Batch size for LLM edge classification calls. */
-const EDGE_CLASSIFICATION_BATCH_SIZE = 8;
+/**
+ * Discovery: find link candidates for one memory given its embedding.
+ * Top-10 vector neighbors (excluding self), keep the CONSOLIDATE_LINK_TOP_K
+ * highest-cosine neighbors above CONSOLIDATE_LINK_THRESHOLD, pre-compute the
+ * heuristic relationship type.
+ *
+ * Shared between the nightly `stageLinks` (which embeds via embedFn) and
+ * `hicortex relink` (which reuses stored embeddings from memory_vectors).
+ */
+export function discoverLinkCandidates(
+  db: Database.Database,
+  mem: Memory,
+  embedding: Float32Array,
+): LinkCandidate[] {
+  const neighbors = storage.vectorSearch(db, embedding, 10, [mem.id]);
+  const candidates: LinkCandidate[] = [];
 
-/** Valid relationship type set for fast lookup. */
-const VALID_REL_SET = new Set<string>(VALID_RELATIONSHIP_TYPES as unknown as string[]);
+  // vectorSearch orders by L2 distance ascending (`ORDER BY distance` in
+  // storage.ts), and cosine is monotonically decreasing in L2 distance for
+  // normalized vectors — so iterating in order and stopping at TOP_K keeps
+  // exactly the highest-cosine neighbors.
+  for (const neighbor of neighbors) {
+    if (candidates.length >= CONSOLIDATE_LINK_TOP_K) break;
+    // sqlite-vec vec0 `distance` is L2, not a similarity. Embeddings are
+    // L2-normalized (embedder.ts, normalize: true), so cos = 1 − d²/2.
+    // The old `1 − distance` formula silently required cosine > 0.90.
+    const similarity = l2ToCosine(neighbor.distance);
+
+    // Cross-project guard (2026-07 audit): cross-project links were 65%
+    // wrong-link vs 6% same-project. A candidate whose source/target belong to
+    // DIFFERENT projects must clear the higher CROSS_PROJECT_LINK_THRESHOLD;
+    // same-project keeps CONSOLIDATE_LINK_THRESHOLD. A memory with no project
+    // (null) is treated as same-project — the guard only fires on two distinct
+    // non-null project names.
+    const crossProject =
+      mem.project != null &&
+      neighbor.project != null &&
+      mem.project !== neighbor.project;
+    const threshold = crossProject
+      ? CROSS_PROJECT_LINK_THRESHOLD
+      : CONSOLIDATE_LINK_THRESHOLD;
+
+    if (similarity > threshold) {
+      const heuristicType = classifyRelationship(mem, neighbor, similarity);
+      candidates.push({ source: mem, target: neighbor, similarity, heuristicType });
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * Classification: assign a relationship type to each candidate link.
+ *
+ * HEURISTIC-ONLY (2026-07). LLM edge classification was retired after the
+ * 672-link audit (see the Stage 3 header) found the LLM-classified UPPERCASE
+ * types near-useless (CONTRADICTS 4% acceptable). Every candidate now takes its
+ * pre-computed `heuristicType` (only `extends` or `relates_to` — see
+ * classifyRelationship). No LLM call is made.
+ *
+ * Signature stability: `llm` and `budget` are RETAINED but intentionally
+ * ignored so the callers (nightly `stageLinks`, `hicortex relink`) and the
+ * tests that import this need no change to their call sites. The return shape
+ * is unchanged; `llmClassified` is always 0 now and `heuristicFallback` counts
+ * every candidate. Do NOT re-add an LLM path here without a classifier that
+ * passes the audit harness at >= 70% acceptable.
+ *
+ * Shared between the nightly `stageLinks` and `hicortex relink`.
+ * Returns one relationship type per candidate (same order as input).
+ */
+export async function classifyLinkCandidates(
+  candidates: LinkCandidate[],
+  _llm: LlmClient | null,
+  _budget: BudgetTracker,
+): Promise<{ types: string[]; llmClassified: number; heuristicFallback: number }> {
+  const types = candidates.map((c) => c.heuristicType);
+  return { types, llmClassified: 0, heuristicFallback: candidates.length };
+}
 
 async function stageLinks(
   db: Database.Database,
@@ -573,8 +901,6 @@ async function stageLinks(
   budget: BudgetTracker,
 ): Promise<{ auto_linked: number; llm_classified?: number; heuristic_fallback?: number; failed: number }> {
   let autoLinked = 0;
-  let llmClassified = 0;
-  let heuristicFallback = 0;
   let failed = 0;
 
   // Phase A: Discovery — collect candidates via vector similarity
@@ -583,15 +909,7 @@ async function stageLinks(
   for (const mem of memories) {
     try {
       const embedding = await embedFn(mem.content);
-      const neighbors = storage.vectorSearch(db, embedding, 10, [mem.id]);
-
-      for (const neighbor of neighbors) {
-        const similarity = 1.0 - neighbor.distance;
-        if (similarity > CONSOLIDATE_LINK_THRESHOLD) {
-          const heuristicType = classifyRelationship(mem, neighbor, similarity);
-          candidates.push({ source: mem, target: neighbor, similarity, heuristicType });
-        }
-      }
+      candidates.push(...discoverLinkCandidates(db, mem, embedding));
     } catch {
       failed++;
     }
@@ -601,51 +919,9 @@ async function stageLinks(
     return { auto_linked: 0, llm_classified: 0, heuristic_fallback: 0, failed };
   }
 
-  // Phase B: LLM batch classification
-  // Build batches and classify with LLM where budget allows
-  const classifiedTypes: string[] = new Array(candidates.length);
-
-  for (let i = 0; i < candidates.length; i += EDGE_CLASSIFICATION_BATCH_SIZE) {
-    const batch = candidates.slice(i, i + EDGE_CLASSIFICATION_BATCH_SIZE);
-
-    // Attempt LLM classification if budget allows
-    if (budget.use("edge_classification")) {
-      try {
-        const pairsBlock = batch.map((c, idx) => {
-          const srcContent = c.source.content.slice(0, 200);
-          const tgtContent = c.target.content.slice(0, 200);
-          return `[${idx}] SOURCE: ${c.source.memory_type} | ${c.source.project ?? "global"} | ${srcContent}\n    TARGET: ${c.target.memory_type} | ${c.target.project ?? "global"} | ${tgtContent}\n    similarity: ${c.similarity.toFixed(2)}`;
-        }).join("\n\n");
-
-        const prompt = edgeClassification(pairsBlock);
-        const raw = await llm.completeFast(prompt, 512);
-        const parsed = parseJsonLenient<string[]>(raw, []);
-
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          for (let j = 0; j < batch.length; j++) {
-            const llmType = parsed[j];
-            if (typeof llmType === "string" && VALID_REL_SET.has(llmType)) {
-              classifiedTypes[i + j] = llmType;
-              llmClassified++;
-            } else {
-              // Invalid type from LLM — fall back to heuristic
-              classifiedTypes[i + j] = batch[j].heuristicType;
-              heuristicFallback++;
-            }
-          }
-          continue;
-        }
-      } catch {
-        // LLM call failed — fall through to heuristic for this batch
-      }
-    }
-
-    // Budget exhausted or LLM failed — use heuristic for entire batch
-    for (let j = 0; j < batch.length; j++) {
-      classifiedTypes[i + j] = batch[j].heuristicType;
-      heuristicFallback++;
-    }
-  }
+  // Phase B: LLM batch classification (heuristic fallback inside)
+  const { types: classifiedTypes, llmClassified, heuristicFallback } =
+    await classifyLinkCandidates(candidates, llm, budget);
 
   // Phase C: Store all classified links
   for (let i = 0; i < candidates.length; i++) {
@@ -667,31 +943,31 @@ async function stageLinks(
 }
 
 /**
- * Classify the relationship between two memories based on type, temporal ordering, and similarity.
+ * Classify the relationship between two memories.
+ *
+ * TWO-LABEL heuristic (2026-07). The 672-link audit (see the Stage 3 header)
+ * showed only `extends` (57% acceptable) and `relates_to` (53%) held up; the
+ * emitted vocabulary is collapsed to exactly those two. The retired labels
+ * `updates` and `derives` (~31% acceptable) and all UPPERCASE LLM types are no
+ * longer produced. They remain in VALID_RELATIONSHIP_TYPES so pre-existing rows
+ * still validate.
+ *
+ * Rule: same-project (both projects non-null and equal) AND higher cosine
+ * (> CONSOLIDATE_LINK_THRESHOLD) → `extends`; everything else → `relates_to`.
+ *
+ * `similarity` is COSINE similarity (see l2ToCosine); the CONSOLIDATE_LINK_THRESHOLD
+ * boundary from the l2ToCosine calibration is preserved.
  */
-function classifyRelationship(
+export function classifyRelationship(
   source: Memory,
   target: Memory,
   similarity: number
 ): string {
-  // Lesson derived from episode(s)
-  if (source.memory_type === "lesson" && target.memory_type === "episode") return "derives";
-  if (target.memory_type === "lesson" && source.memory_type === "episode") return "derives";
-
-  // Same type + very high similarity + different timestamps → newer updates older
-  if (
-    source.memory_type === target.memory_type &&
-    similarity > 0.8 &&
-    source.created_at !== target.created_at
-  ) {
-    return "updates";
-  }
-
-  // Same project, moderate similarity → extends
+  // Same project + above the link threshold → extends
   if (
     source.project && target.project &&
     source.project === target.project &&
-    similarity > 0.55 && similarity <= 0.8
+    similarity > CONSOLIDATE_LINK_THRESHOLD
   ) {
     return "extends";
   }
@@ -792,6 +1068,29 @@ function stageDecayPrune(
 /**
  * Run the full consolidation pipeline. Returns a structured report.
  */
+/**
+ * Options controlling how the domain-assignment stage runs.
+ *
+ * When `domains` is a non-empty list, the pipeline uses content-based
+ * classification (config-owned) INSTEAD of project grouping — provided the
+ * classification endpoint (classify tier when configured, else reflect) passed
+ * pre-flight (`contentDomainsReady`). If that endpoint is unreachable, the
+ * caller sets `contentDomainsReady: false` and the stage is SKIPPED entirely
+ * (strict — no fall-back to a weak model or to project grouping). When
+ * `domains` is absent/empty, the legacy project-grouping curation runs
+ * unchanged.
+ */
+export interface DomainStageOptions {
+  domains?: DomainDef[] | null;
+  contentDomainsReady?: boolean;
+  /**
+   * Weak-primary floor for the no-fit path (see nofit.ts). Resolved by the
+   * caller from config (`weakPrimaryFloor`); defaults to
+   * DEFAULT_WEAK_PRIMARY_FLOOR when absent.
+   */
+  weakPrimaryFloor?: number;
+}
+
 export async function runConsolidation(
   db: Database.Database,
   llm: LlmClient,
@@ -799,6 +1098,7 @@ export async function runConsolidation(
   dryRun = false,
   skipReflection = false,
   stateDir?: string,
+  domainOptions?: DomainStageOptions,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -866,8 +1166,28 @@ export async function runConsolidation(
       );
     }
 
-    // Stage 2.7: Domain Curation
-    report.stages.domain_curation = await stageDomainCuration(db, llm, budget, dryRun, stateDir);
+    // Stage 2.7: Domain assignment.
+    // Content-based (config-owned domains) REPLACES project grouping when a
+    // domain list is configured AND the reflect endpoint passed pre-flight.
+    // If the list is configured but the reflect endpoint is down, SKIP the
+    // stage (strict) — do not fall back to project grouping.
+    const cfgDomains = domainOptions?.domains;
+    if (cfgDomains && cfgDomains.length > 0) {
+      if (domainOptions?.contentDomainsReady === false) {
+        report.stages.domain_curation = {
+          curated: false,
+          domains: cfgDomains.length,
+          reason: "reflect_endpoint_offline",
+        };
+      } else {
+        report.stages.domain_curation = await stageContentDomains(
+          db, cfgDomains, llm, budget, embedFn, dryRun, stateDir,
+          domainOptions?.weakPrimaryFloor ?? DEFAULT_WEAK_PRIMARY_FLOOR,
+        );
+      }
+    } else {
+      report.stages.domain_curation = await stageDomainCuration(db, llm, budget, dryRun, stateDir);
+    }
 
     // Stage 3: Link Discovery (with LLM-assisted edge classification)
     report.stages.links = await stageLinks(
@@ -930,6 +1250,11 @@ const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 /**
  * Schedule the consolidation pipeline to run nightly.
  * Returns a cleanup function to cancel the timer.
+ *
+ * NOTE: currently unused (nightly.ts drives consolidation directly). Any future
+ * caller MUST read config.domains and thread `domainOptions` into runConsolidation
+ * when content domains are configured — otherwise it silently falls back to the
+ * legacy project-grouping path even when a domain list is set.
  */
 export function scheduleConsolidation(
   db: Database.Database,

@@ -23,6 +23,7 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomBytes } from "node:crypto";
 import { removeLessonsBlock } from "./claude-md.js";
+import type { DomainDef } from "./types.js";
 
 const HICORTEX_HOME = join(homedir(), ".hicortex");
 const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
@@ -755,6 +756,56 @@ export function persistAuthToken(configPath: string): { token: string; generated
 }
 
 /**
+ * Generic default memory domains scaffolded by server-mode init (issue #150).
+ * Deliberately broad, high-level spheres — an editable STARTING POINT, not a
+ * taxonomy. Users narrow or replace them to match how THEY think (life areas
+ * or project/topic areas both work). There is NO fallback category: a no-fit
+ * memory is handled automatically by the weak-primary floor + decay lifecycle
+ * (see nofit.ts) — never by a catch-all domain.
+ */
+export const GENERIC_DEFAULT_DOMAINS: DomainDef[] = [
+  { name: "Work", description: "Your job and professional life — employer, clients, workstreams" },
+  { name: "Personal", description: "Private life — home, hobbies, everyday matters" },
+  { name: "People", description: "Relationships — family, friends, social life, network" },
+  { name: "Health", description: "Fitness, wellbeing, medical" },
+  { name: "Finance", description: "Money — budgeting, spending, investing" },
+];
+
+/**
+ * Scaffold the generic default `domains` list into config.json (server mode).
+ *
+ * Non-clobber (same philosophy as persistAuthToken): only writes when the
+ * config has NO `domains` key at all. An existing key — even an empty array —
+ * is user-owned and is never touched. Upgrading installs that re-run init get
+ * the scaffold too (they have no `domains` key yet); installs that never
+ * re-run init keep the legacy project-grouping behaviour.
+ *
+ * Prints its own hint lines (tested); returns whether it wrote the scaffold.
+ * Exported for testability.
+ */
+export function scaffoldDefaultDomains(configPath: string): { scaffolded: boolean } {
+  let config: Record<string, unknown> = {};
+  try {
+    config = JSON.parse(readFileSync(configPath, "utf-8"));
+  } catch { /* new file */ }
+
+  if ("domains" in config) {
+    console.log("  ✓ Memory domains already configured — leaving your list as-is");
+    return { scaffolded: false };
+  }
+
+  config.domains = GENERIC_DEFAULT_DOMAINS;
+  mkdirSync(dirname(configPath), { recursive: true });
+  writeFileSync(configPath, JSON.stringify(config, null, 2));
+
+  const names = GENERIC_DEFAULT_DOMAINS.map((d) => d.name).join(", ");
+  console.log(`  ✓ Memory domains scaffolded in ${configPath}`);
+  console.log(`    Defaults: ${names}. Edit the \`domains\` list to match how YOU think —`);
+  console.log(`    they can be life areas OR project/topic areas (see domains.example.json in the package).`);
+  return { scaffolded: true };
+}
+
+/**
  * Determine the npm package specifier for the daemon.
  * Uses tag-based resolution so restarts pick up new versions automatically.
  *
@@ -1076,6 +1127,13 @@ export async function runInit(options: { serverUrl?: string } = {}): Promise<voi
   } else {
     console.log(`  ✓ Auth token already configured`);
   }
+
+  // Scaffold the generic default memory domains (server mode only — domains
+  // live in the server's config; a client's memories are classified by the
+  // server). Non-clobber: an existing `domains` key is never touched.
+  // Classification activates automatically once an LLM is configured; until
+  // then domains sit inert (strict-skip path).
+  scaffoldDefaultDomains(configPath);
 
   // Install the nightly job (capture via localhost /distill + consolidation).
   // Without it a server-mode install never captures or consolidates — the

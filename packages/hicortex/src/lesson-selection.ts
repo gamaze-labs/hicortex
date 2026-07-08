@@ -76,12 +76,22 @@ function projectMatch(
   lesson: SelectableLesson,
   targetProject: string | null | undefined,
   moduleIndex?: ModuleIndex,
+  targetDomainName?: string | null,
 ): number {
-  if (!lesson.project) return 0.0;
   if (targetProject && lesson.project === targetProject) return 1.0;
   if (lesson.project === "global") return 0.3;
 
-  // Domain-aware: same domain = 0.5
+  // Content-mode same-domain boost: when the caller knows the current
+  // life-sphere domain, a lesson filed into the SAME domain scores 0.5.
+  // This is the content-classification analogue of the project-grouping
+  // moduleIndex boost below. Keyed on lesson.domain directly (no project map).
+  if (targetDomainName && lesson.domain && lesson.domain === targetDomainName) {
+    return 0.5;
+  }
+
+  if (!lesson.project) return 0.0;
+
+  // Project-grouping same-domain boost: same domain via moduleIndex = 0.5.
   if (targetProject && moduleIndex) {
     const targetDomain = moduleIndex.domains.find((d) =>
       d.projects.includes(targetProject)
@@ -142,7 +152,7 @@ export const domainAwareLessonSelector: LessonSelector = {
 
     // Score every lesson
     const scored = lessons.map((lesson) => {
-      const pMatch = projectMatch(lesson, ctx.project, ctx.moduleIndex);
+      const pMatch = projectMatch(lesson, ctx.project, ctx.moduleIndex, ctx.domain);
       const rScore = recencyScore(lesson, now);
       const sScore = lesson.base_strength ?? 0.5;
       const aScore = accessAffinity(lesson);
