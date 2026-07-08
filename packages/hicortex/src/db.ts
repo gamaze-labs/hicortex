@@ -277,6 +277,76 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    name: "rescale_link_strength_to_cosine",
+    up: (db) => {
+      // memory_links.strength was stored on an accidental 1−L2 scale
+      // (consolidate.ts computed similarity as `1 − distance`, where distance
+      // is sqlite-vec's L2 distance). Embeddings are L2-normalized, so the
+      // true cosine is 1 − d²/2; with old = 1 − d this rewrites to
+      //   cosine = 1 − (1 − old)² / 2.
+      // LLM-classified links also stored the candidate similarity as
+      // strength, so the rewrite applies to ALL rows. Guarded to strengths in
+      // (0, 1] — the only range the old formula could have written above the
+      // link threshold (values are 0.55–0.8 in practice); anything outside is
+      // left untouched. The rewrite is NOT self-idempotent: it must run
+      // exactly once, which the schema_version gate in migrate() guarantees
+      // (up() and the version-row insert share one transaction).
+      db.exec(`
+        UPDATE memory_links
+        SET strength = 1.0 - ((1.0 - strength) * (1.0 - strength)) / 2.0
+        WHERE strength > 0 AND strength <= 1
+      `);
+    },
+  },
+  {
+    version: 6,
+    name: "add_memory_tags",
+    up: (db) => {
+      // Multi-tag classification (feat/memory-tags). `memories.domain` keeps its
+      // meaning as the PRIMARY tag; this sidecar table carries the full label
+      // set (including the primary). Sidecar (not a virtual-table column) per
+      // the migration rules above. FK → memories(id); deletes cascade in code
+      // (storage.deleteMemory) since foreign_keys pragma is on but existing rows
+      // predate the constraint. Idempotent: IF NOT EXISTS on table + index.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_tags (
+          memory_id TEXT NOT NULL,
+          tag TEXT NOT NULL,
+          PRIMARY KEY (memory_id, tag),
+          FOREIGN KEY (memory_id) REFERENCES memories(id)
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag)");
+    },
+  },
+  {
+    version: 7,
+    name: "graded_tag_weights",
+    up: (db) => {
+      // Graded schema membership (spec 2026-07-07): every tag assignment gets a
+      // derived association weight = cosine(memory embedding, domain prototype).
+      // NULL until the first prototype/weight computation runs (nightly stage or
+      // classification-time write). Guarded with hasColumn for idempotency
+      // across partially-migrated databases.
+      if (!hasColumn(db, "memory_tags", "weight")) {
+        db.exec("ALTER TABLE memory_tags ADD COLUMN weight REAL");
+      }
+      // Domain prototypes: L2-normalized centroid of member embeddings (or the
+      // embedded config description as a cold-start seed when member_count < 5).
+      // Sidecar table, NOT a vec0 virtual table — prototypes are point-read by
+      // name, never KNN-searched (see the virtual-table rule above).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS domain_prototypes (
+          domain TEXT PRIMARY KEY,
+          embedding BLOB,
+          member_count INTEGER,
+          updated_at TIMESTAMP
+        )
+      `);
+    },
+  },
 ];
 
 /**

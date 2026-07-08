@@ -404,7 +404,7 @@ export default {
             target_id: { type: "string", description: "Target memory ID (required for path operation)" },
             limit: { type: "number", description: "Max results (default 10)" },
             domain: { type: "string", description: "Filter hubs by domain" },
-            relationship: { type: "string", description: "Filter neighbors by relationship type (e.g., CONTRADICTS, SUPERSEDES, derives)" },
+            relationship: { type: "string", description: "Filter neighbors by relationship type (e.g., extends, relates_to; legacy data may also have CONTRADICTS, SUPERSEDES, updates)" },
           },
           required: ["operation"],
         },

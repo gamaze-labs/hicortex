@@ -23,7 +23,8 @@ import { initFeatures } from "./features.js";
 import { loadState, migrateLegacyState } from "./state.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
-import { getNeighbors, shortestPath, detectHubs } from "./graph.js";
+import { getNeighbors, shortestPath, detectHubs, exportGraph, EXPORT_DEFAULT_LIMIT } from "./graph.js";
+import { createAuthMiddleware, vizHandler, vizVendorHandler } from "./viz.js";
 import * as retrieval from "./retrieval.js";
 import { injectSeedLesson } from "./seed-lesson.js";
 import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
@@ -230,11 +231,17 @@ function createMcpServer(): McpServer {
       const state = loadState(stateDir);
       const moduleIndex = state.moduleIndex;
       if (moduleIndex && moduleIndex.domains.length > 0) {
-        const text = moduleIndex.domains.map((d) =>
-          `**${d.name}** (${d.memoryCount} memories, ${d.lessonCount} lessons)\n` +
-          `  Projects: ${d.projects.join(", ")}` +
-          (d.keywords.length > 0 ? `\n  Keywords: ${d.keywords.join(", ")}` : "")
-        ).join("\n\n");
+        const text = moduleIndex.domains.map((d) => {
+          const head = `**${d.name}** (${d.memoryCount} memories, ${d.lessonCount} lessons)`;
+          // Content-based domains carry a description and no projects; legacy
+          // project-grouping domains carry a project list + keywords.
+          if (d.description && d.projects.length === 0) {
+            return `${head}\n  ${d.description}`;
+          }
+          return head +
+            (d.projects.length > 0 ? `\n  Projects: ${d.projects.join(", ")}` : "") +
+            (d.keywords.length > 0 ? `\n  Keywords: ${d.keywords.join(", ")}` : "");
+        }).join("\n\n");
         return { content: [{ type: "text" as const, text }] };
       }
       // Fallback: flat project counts
@@ -259,7 +266,7 @@ function createMcpServer(): McpServer {
       target_id: z.string().optional().describe("Target memory ID (required for path operation)"),
       limit: z.coerce.number().optional().describe("Max results (default 10)"),
       domain: z.string().optional().describe("Filter hubs by domain"),
-      relationship: z.string().optional().describe("Filter neighbors by relationship type (e.g., CONTRADICTS, SUPERSEDES, derives)"),
+      relationship: z.string().optional().describe("Filter neighbors by relationship type (e.g., extends, relates_to; legacy data may also have CONTRADICTS, SUPERSEDES, updates)"),
     },
     async ({ operation, id, target_id, limit: resultLimit, domain: filterDomain, relationship: filterRelationship }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
@@ -469,22 +476,14 @@ export async function startServer(options: {
   // localhost bypass. With no token configured, remote requests are REJECTED
   // (not open): the default bind is 0.0.0.0, so "no token = no auth" would
   // expose the whole memory store to the network.
+  // Extracted to viz.ts (createAuthMiddleware) so the middleware is
+  // unit-testable; includes the narrow GET /viz?token= browser handoff (#124).
   console.log(
     authToken
       ? `[hicortex] Bearer token auth enabled`
       : `[hicortex] No auth token configured — remote access DISABLED (localhost only). Run init to generate a token.`
   );
-  app.use((req, res, next) => {
-    if (req.path === "/health") return next();
-    const ip = req.ip ?? req.socket.remoteAddress ?? "";
-    if (ip === "127.0.0.1" || ip === "::1" || ip === "::ffff:127.0.0.1") return next();
-    if (authToken && req.headers.authorization === `Bearer ${authToken}`) return next();
-    res.status(401).json({
-      error: authToken
-        ? "Unauthorized"
-        : "No auth token configured on this server — run `npx @gamaze/hicortex init` on the server, then connect with its token.",
-    });
-  });
+  app.use(createAuthMiddleware(authToken));
 
   // SSE transport management — each connection gets its own McpServer instance
   const transports = new Map<string, SSEServerTransport>();
@@ -794,15 +793,28 @@ export async function startServer(options: {
   // -------------------------------------------------------------------------
   // REST /index — knowledge domain index (same payload as hicortex_index MCP).
   //
-  // NOTE for #124: this is the JSON surface that /viz will later consume.
-  // Keep the response shape clean: {domains} or {projects} fallback.
+  // NOTE (#124): /viz consumes this JSON surface. Keep the response shape
+  // clean: {domains} or {projects} fallback.
   // -------------------------------------------------------------------------
   app.get("/index", (_req, res) => {
     try {
       const state = loadState(stateDir);
       const moduleIndex = state.moduleIndex;
       if (moduleIndex && moduleIndex.domains && moduleIndex.domains.length > 0) {
-        res.json({ domains: moduleIndex.domains });
+        // domains[].memoryCount = PRIMARY-tag counts (unchanged). tagCounts is
+        // additive: total assignments per tag across memory_tags (multi-label
+        // breadth, incl. secondary tags). Absent when no tags exist yet.
+        let tagCounts: Record<string, number> | undefined;
+        if (db) {
+          const tagRows = db.prepare(
+            "SELECT tag, COUNT(*) as cnt FROM memory_tags GROUP BY tag ORDER BY cnt DESC",
+          ).all() as Array<{ tag: string; cnt: number }>;
+          if (tagRows.length > 0) {
+            tagCounts = {};
+            for (const r of tagRows) tagCounts[r.tag] = r.cnt;
+          }
+        }
+        res.json(tagCounts ? { domains: moduleIndex.domains, tagCounts } : { domains: moduleIndex.domains });
         return;
       }
       // Fallback: flat project counts when moduleIndex is not yet built
@@ -819,27 +831,31 @@ export async function startServer(options: {
   // -------------------------------------------------------------------------
   // REST /graph — knowledge graph query (same operations as hicortex_graph MCP).
   //
-  // Supported ops: neighbors, hubs, path
+  // Supported ops: neighbors, hubs, path, export
   //   GET /graph?op=neighbors&id=<id>&limit=10&relationship=<rel>
   //   GET /graph?op=hubs&limit=10&domain=<domain>
   //   GET /graph?op=path&id=<from>&target_id=<to>
+  //   GET /graph?op=export&domain=&type=&tag=&minStrength=&limit=  (#124: /viz data;
+  //     tag= filters to nodes CARRYING the tag at any weight — graded-schema spec)
   //
-  // NOTE for #124 (/viz): this endpoint IS the JSON surface that /viz will
-  // reuse for its graph visualisation. The response shape is intentionally
-  // clean ({results} for neighbors/path, {hubs} for hubs) so /viz can consume
-  // it without transformation. Do not add MCP-style text formatting here.
+  // NOTE (#124): this endpoint is the JSON surface consumed by /viz — op=export
+  // returns the full {nodes, edges, domains, types, meta} payload the page
+  // renders. The response shapes are intentionally clean ({results} for
+  // neighbors/path, {hubs} for hubs) — do not add MCP-style text formatting.
   // -------------------------------------------------------------------------
   app.get("/graph", (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     const op = typeof req.query.op === "string" ? req.query.op : "";
-    const VALID_OPS = ["neighbors", "hubs", "path"];
+    const VALID_OPS = ["neighbors", "hubs", "path", "export"];
     if (!VALID_OPS.includes(op)) {
       res.status(400).json({ error: `Invalid op: must be one of ${VALID_OPS.join(", ")}` });
       return;
     }
 
     const rawLimit = req.query.limit ? Number(req.query.limit) : undefined;
-    const resultLimit = rawLimit && Number.isFinite(rawLimit) ? rawLimit : 10;
+    // Floor + minimum 1: negative/fractional values would otherwise reach SQL
+    // LIMIT (negative = unlimited in SQLite; fractional = binding error).
+    const resultLimit = rawLimit && Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.floor(rawLimit) : 10;
     const filterDomain = typeof req.query.domain === "string" && req.query.domain ? req.query.domain : undefined;
     const filterRelationship = typeof req.query.relationship === "string" && req.query.relationship ? req.query.relationship : undefined;
 
@@ -877,10 +893,56 @@ export async function startServer(options: {
         res.json({ path: path ?? null });
         return;
       }
+
+      if (op === "export") {
+        const filterType = typeof req.query.type === "string" && req.query.type ? req.query.type : undefined;
+        const filterTag = typeof req.query.tag === "string" && req.query.tag ? req.query.tag : undefined;
+        let minStrength: number | undefined;
+        if (req.query.minStrength !== undefined) {
+          const v = Number(req.query.minStrength);
+          if (!Number.isFinite(v) || v < 0 || v > 1) {
+            res.status(400).json({ error: "minStrength must be a number between 0 and 1" });
+            return;
+          }
+          minStrength = v;
+        }
+        // Export has its own default (EXPORT_DEFAULT_LIMIT) — the shared
+        // resultLimit default of 10 is for neighbors/hubs. exportGraph clamps
+        // to EXPORT_MAX_LIMIT.
+        const exportLimit = rawLimit && Number.isFinite(rawLimit) ? rawLimit : EXPORT_DEFAULT_LIMIT;
+        res.json(exportGraph(db, {
+          domain: filterDomain,
+          type: filterType,
+          tag: filterTag,
+          minStrength,
+          limit: exportLimit,
+        }));
+        return;
+      }
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
+
+  // -------------------------------------------------------------------------
+  // GET /viz — knowledge-graph visualization page (#124).
+  //
+  // Self-contained HTML (inline CSS/JS, zero external requests) served from
+  // assets/viz.html. Fetches /graph?op=export from its own origin. The page
+  // SHELL is public (exempted in createAuthMiddleware, like /health — it
+  // carries no data); the /graph data fetch is bearer-only. The page collects
+  // the token client-side: ?token= URL param (stripped on load) or an in-page
+  // prompt on 401, persisted in localStorage.
+  // -------------------------------------------------------------------------
+  app.get("/viz", vizHandler());
+
+  // GET /viz/vendor/:file — pinned renderer bundles for the /viz page (#139).
+  //
+  // STRICT allowlist (VIZ_VENDOR_FILES in viz.ts): only the exact vendored
+  // filenames are served; everything else is 404. Public like the /viz shell
+  // (static third-party code from the npm tarball, no data) — the exemption
+  // lives in createAuthMiddleware next to the /viz one.
+  app.get("/viz/vendor/:file", vizVendorHandler());
 
   // SSE endpoint — each connection gets its own McpServer + transport
   app.get("/sse", async (req, res) => {
@@ -921,6 +983,7 @@ export async function startServer(options: {
     console.log(`[hicortex] MCP server listening on http://${host}:${port}`);
     console.log(`[hicortex] SSE endpoint: http://${host}:${port}/sse`);
     console.log(`[hicortex] Health: http://${host}:${port}/health`);
+    console.log(`[hicortex] Graph viz: http://${host}:${port}/viz`);
   });
 
   server.on("error", (err: NodeJS.ErrnoException) => {

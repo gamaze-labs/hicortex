@@ -173,31 +173,8 @@ Rules:
 Respond with ONLY a JSON array. No explanations.`;
 }
 
-/**
- * Edge classification prompt. Presents memory pairs and asks the LLM to
- * choose the most specific relationship type for each.
- */
-export function edgeClassification(pairsBlock: string): string {
-  return `You are a memory graph analyst. Classify the relationship between each memory pair.
-
-VALID RELATIONSHIP TYPES:
-- derives: A lesson or fact was derived from episodes (lesson ← episode)
-- updates: A newer memory updates/replaces an older one on the same topic
-- extends: Memory adds detail to another within the same project
-- relates_to: Generic association (use ONLY when no specific type fits)
-- CONTRADICTS: Memories give opposite advice or conflicting information
-- SUPERSEDES: One memory fully replaces another (stronger than "updates")
-- DEPENDS_ON: One memory's validity requires the other (prerequisite)
-- CAUSED_BY: One event/decision directly caused the other
-- VALIDATES: One memory confirms or provides evidence for the other
-
-Choose the MOST SPECIFIC type. Prefer specific types over "relates_to".
-
-MEMORY PAIRS:
-${pairsBlock}
-
-Respond with ONLY a JSON array of relationship type strings, one per pair, in order.
-Example for 3 pairs: ["CAUSED_BY", "extends", "VALIDATES"]
-
-No explanations. Just the JSON array.`;
-}
+// edgeClassification prompt REMOVED (2026-07). LLM edge classification is
+// retired: the 672-link audit found the LLM-classified UPPERCASE relationship
+// types near-useless (CONTRADICTS 4% acceptable). Linking is now heuristic-only
+// (extends/relates_to) in consolidate.ts. A classification prompt may return
+// only when a future classifier passes the audit harness at >= 70% acceptable.

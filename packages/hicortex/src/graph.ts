@@ -11,6 +11,7 @@
 
 import type Database from "better-sqlite3";
 import type { MemoryLink } from "./types.js";
+import { effectiveStrength } from "./retrieval.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -302,6 +303,228 @@ export function getNeighbors(
   }
 
   return results;
+}
+
+// ---------------------------------------------------------------------------
+// Full graph export (for GET /graph?op=export — the /viz page, #124)
+// ---------------------------------------------------------------------------
+
+// Default shows the whole graph for corpora up to 5k memories (owner request
+// 05.07 — the strongest-500 default hid most edges). Payload note: nodes carry
+// content up to 4000 chars, so 5k nodes can be a several-MB JSON response —
+// acceptable on localhost/LAN, which is the /viz deployment model.
+export const EXPORT_DEFAULT_LIMIT = 5000;
+export const EXPORT_MAX_LIMIT = 10000;
+
+export interface VizNode {
+  id: string;
+  label: string;          // first line of content, ~80 chars
+  content: string;        // truncated to 4000 chars (detail panel)
+  memory_type: string | null;
+  domain: string | null;  // derived PRIMARY tag — the node colour (graded-schema spec)
+  tags: string[];         // full multi-label set incl. primary, ORDERED by weight desc
+  tagWeights: number[];   // parallel to tags — association weights, rounded 4dp (0 = unknown/NULL)
+  project: string | null;
+  strength: number;       // effective (decayed) strength, not base_strength
+  linkCount: number;
+  isHub: boolean;
+  created_at: string | null;
+}
+
+export interface VizEdge {
+  source: string;
+  target: string;
+  relationship: string;
+  strength: number;
+}
+
+export interface VizGraph {
+  nodes: VizNode[];
+  edges: VizEdge[];
+  domains: string[];      // distinct across the WHOLE DB (filter dropdowns)
+  types: string[];        // distinct across the WHOLE DB (filter dropdowns)
+  meta: { total: number; shown: number; edgeCount: number };
+}
+
+export interface ExportGraphOptions {
+  domain?: string;
+  type?: string;          // memory_type
+  /**
+   * "Everything touching X" (graded-schema spec): keep only nodes CARRYING the
+   * tag, any weight. A node with no memory_tags rows counts as carrying its
+   * `domain` (mirrors the payload's tags fallback). Unlike `domain`, which
+   * matches only the derived primary.
+   */
+  tag?: string;
+  minStrength?: number;   // 0..1, applied to EFFECTIVE strength
+  limit?: number;         // default 5000, hard max 10000
+}
+
+/** First non-empty line of content, capped at 80 chars. */
+function makeLabel(content: string): string {
+  const firstLine = content.split("\n").find((l) => l.trim().length > 0) ?? content;
+  return firstLine.trim().slice(0, 80);
+}
+
+/**
+ * Assemble the full node/edge payload for the /viz page.
+ *
+ * Nodes are ranked by effective (decayed) strength and capped at `limit`.
+ * Edges include only links where BOTH endpoints made the cut.
+ * Link counts come from one aggregate query over memory_links (no per-row
+ * queries) and feed both the effectiveStrength hardening term and the
+ * per-node linkCount field.
+ */
+export function exportGraph(
+  db: Database.Database,
+  options: ExportGraphOptions = {},
+): VizGraph {
+  const limit = Math.min(
+    Math.max(Math.floor(options.limit ?? EXPORT_DEFAULT_LIMIT), 1),
+    EXPORT_MAX_LIMIT,
+  );
+  const now = new Date();
+
+  // Per-memory link counts — single aggregate query (same shape as detectHubs)
+  const linkCountRows = db
+    .prepare(
+      `SELECT id, COUNT(*) as cnt FROM (
+         SELECT source_id AS id FROM memory_links
+         UNION ALL
+         SELECT target_id AS id FROM memory_links
+       ) GROUP BY id`
+    )
+    .all() as Array<{ id: string; cnt: number }>;
+  const linkCounts = new Map(linkCountRows.map((r) => [r.id, r.cnt]));
+
+  // Candidate memories — domain/type filters pushed into SQL
+  let sql =
+    `SELECT id, content, memory_type, domain, project, base_strength,
+            last_accessed, access_count, created_at
+     FROM memories`;
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (options.domain) { where.push("domain = ?"); params.push(options.domain); }
+  if (options.type) { where.push("memory_type = ?"); params.push(options.type); }
+  if (options.tag) {
+    // Tag match (any weight) OR the domain fallback for never-multi-tagged
+    // rows — consistent with the tags payload fallback below.
+    where.push(
+      `(id IN (SELECT memory_id FROM memory_tags WHERE tag = ?)
+        OR (domain = ? AND id NOT IN (SELECT DISTINCT memory_id FROM memory_tags)))`,
+    );
+    params.push(options.tag, options.tag);
+  }
+  if (where.length > 0) sql += ` WHERE ${where.join(" AND ")}`;
+
+  const rows = db.prepare(sql).all(...params) as Array<{
+    id: string;
+    content: string;
+    memory_type: string | null;
+    domain: string | null;
+    project: string | null;
+    base_strength: number | null;
+    last_accessed: string | null;
+    access_count: number | null;
+    created_at: string | null;
+  }>;
+
+  const hubIds = new Set(detectHubs(db).map((h) => h.id));
+
+  // Score, filter on effective strength, rank, cap
+  const scored = rows.map((row) => {
+    const linkCount = linkCounts.get(row.id) ?? 0;
+    const strength = effectiveStrength(
+      row.base_strength ?? 0.5,
+      row.last_accessed,
+      now,
+      { accessCount: row.access_count ?? 0, linkCount },
+    );
+    return { row, strength, linkCount };
+  });
+
+  const filtered = options.minStrength !== undefined
+    ? scored.filter((s) => s.strength >= options.minStrength!)
+    : scored;
+
+  filtered.sort((a, b) => b.strength - a.strength);
+  const top = filtered.slice(0, limit);
+
+  // Multi-label tags (graded-schema spec) — fetch only for the capped node
+  // set. One query keyed on the included ids; grouped into per-node parallel
+  // arrays ORDERED BY WEIGHT DESC (NULL weights last, in insertion/relevance
+  // order). The derived primary remains on `domain` (the colour); `tags` is
+  // the full set, `tagWeights` the parallel association weights (rounded 4dp;
+  // 0 for NULL/not-yet-computed).
+  const topIds = top.map((t) => t.row.id);
+  const tagsByMemory = new Map<string, Array<{ tag: string; weight: number | null }>>();
+  if (topIds.length > 0) {
+    const idPlaceholders = topIds.map(() => "?").join(", ");
+    const tagRows = db
+      .prepare(
+        `SELECT memory_id, tag, weight FROM memory_tags
+         WHERE memory_id IN (${idPlaceholders})
+         ORDER BY memory_id, (weight IS NULL) ASC, weight DESC, rowid ASC`,
+      )
+      .all(...topIds) as Array<{ memory_id: string; tag: string; weight: number | null }>;
+    for (const r of tagRows) {
+      const arr = tagsByMemory.get(r.memory_id);
+      const entry = { tag: r.tag, weight: r.weight };
+      if (arr) arr.push(entry);
+      else tagsByMemory.set(r.memory_id, [entry]);
+    }
+  }
+
+  const nodes: VizNode[] = top.map(({ row, strength, linkCount }) => {
+    const weighted = tagsByMemory.get(row.id)
+      ?? (row.domain ? [{ tag: row.domain, weight: null }] : []);
+    return {
+      id: row.id,
+      label: makeLabel(row.content),
+      content: row.content.slice(0, 4000),
+      memory_type: row.memory_type,
+      domain: row.domain,
+      tags: weighted.map((w) => w.tag),
+      tagWeights: weighted.map((w) => (w.weight == null ? 0 : Math.round(w.weight * 10000) / 10000)),
+      project: row.project,
+      strength: Math.round(strength * 10000) / 10000,
+      linkCount,
+      isHub: hubIds.has(row.id),
+      created_at: row.created_at,
+    };
+  });
+
+  // Edges — only where both endpoints are in the included set
+  const included = new Set(nodes.map((n) => n.id));
+  const linkRows = db
+    .prepare("SELECT source_id, target_id, relationship, strength FROM memory_links")
+    .all() as Array<{ source_id: string; target_id: string; relationship: string; strength: number }>;
+  const edges: VizEdge[] = linkRows
+    .filter((l) => included.has(l.source_id) && included.has(l.target_id))
+    .map((l) => ({
+      source: l.source_id,
+      target: l.target_id,
+      relationship: l.relationship,
+      strength: l.strength,
+    }));
+
+  // Filter dropdown values — distinct across the WHOLE DB, not the shown subset
+  const domains = (db
+    .prepare("SELECT DISTINCT domain FROM memories WHERE domain IS NOT NULL AND domain != '' ORDER BY domain")
+    .all() as Array<{ domain: string }>).map((r) => r.domain);
+  const types = (db
+    .prepare("SELECT DISTINCT memory_type FROM memories WHERE memory_type IS NOT NULL AND memory_type != '' ORDER BY memory_type")
+    .all() as Array<{ memory_type: string }>).map((r) => r.memory_type);
+
+  const total = (db.prepare("SELECT COUNT(*) as cnt FROM memories").get() as { cnt: number }).cnt;
+
+  return {
+    nodes,
+    edges,
+    domains,
+    types,
+    meta: { total, shown: nodes.length, edgeCount: edges.length },
+  };
 }
 
 // ---------------------------------------------------------------------------

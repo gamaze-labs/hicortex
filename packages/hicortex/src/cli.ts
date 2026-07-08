@@ -8,6 +8,7 @@
  *   nightly    Run capture + consolidate (manual trigger)
  *              nightly --capture-only  Capture only, skip consolidation
  *              nightly --status        Show nightly pipeline health check
+ *   relink     Resumable link-discovery pass over the entire corpus (issue #143)
  *   status     Show config, DB stats, adapter status
  *   uninstall  Clean removal of CC integration
  */
@@ -64,6 +65,58 @@ switch (command) {
     break;
   }
 
+  case "relink": {
+    const args = process.argv.slice(3);
+    const intFlag = (name: string): number | undefined => {
+      const idx = args.indexOf(name);
+      if (idx === -1) return undefined;
+      const val = parseInt(args[idx + 1], 10);
+      if (isNaN(val)) {
+        console.error(`[hicortex] relink: ${name} requires an integer value`);
+        process.exit(1);
+      }
+      return val;
+    };
+    const relinkOptions = {
+      dryRun: args.includes("--dry-run"),
+      reset: args.includes("--reset"),
+      batchSize: intFlag("--batch"),
+    };
+    import("./relink.js").then(({ runRelink }) => {
+      runRelink(relinkOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] Relink failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
+  case "classify-domains": {
+    const args = process.argv.slice(3);
+    const intFlag = (name: string): number | undefined => {
+      const idx = args.indexOf(name);
+      if (idx === -1) return undefined;
+      const val = parseInt(args[idx + 1], 10);
+      if (isNaN(val)) {
+        console.error(`[hicortex] classify-domains: ${name} requires an integer value`);
+        process.exit(1);
+      }
+      return val;
+    };
+    const classifyOptions = {
+      all: args.includes("--all"),
+      reset: args.includes("--reset"),
+      batchSize: intFlag("--batch"),
+    };
+    import("./classify-domains.js").then(({ runClassifyDomains }) => {
+      runClassifyDomains(classifyOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] classify-domains failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
   case "status":
     import("./status.js").then(({ runStatus }) => {
       runStatus().catch((err) => {
@@ -104,8 +157,12 @@ Usage: hicortex <command> [options]
 Commands:
   server          Start the MCP HTTP/SSE server (server mode)
   init            Set up Hicortex (server mode, local DB + daemon)
+                  Scaffolds 5 editable default memory domains (Work, Personal,
+                  People, Health, Finance) in ~/.hicortex/config.json
   init --server <url>  Set up as client (remote server)
   nightly         Run nightly denoise + capture + consolidate
+  relink          Resumable link-discovery pass over the ENTIRE corpus (server mode)
+  classify-domains  Backfill content-based domain tags over the corpus (server mode, needs config.domains)
   lessons-context Fetch lessons and print Markdown to stdout (CC SessionStart hook)
   status          Show current configuration and stats
   uninstall       Remove CC integration (preserves DB)
@@ -116,6 +173,12 @@ Options:
   nightly --dry-run         Preview without changes
   nightly --capture-only    Capture only, skip consolidation (safe to run multiple times/day)
   nightly --status          Show nightly pipeline health
+  relink --dry-run          Discovery + counts only, zero writes, cursor untouched
+  relink --batch <n>        Memories per batch (default: 200)
+  relink --reset            Restart from the beginning (ignore saved cursor)
+  classify-domains --all    Reclassify every memory (default: only NULL/stale-domain rows)
+  classify-domains --batch <n>  Memories per batch (default: 200)
+  classify-domains --reset  Restart from the beginning (ignore saved cursor)
 
 Examples:
   npx @gamaze/hicortex server

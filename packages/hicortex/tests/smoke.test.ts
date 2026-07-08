@@ -10,7 +10,8 @@ import { mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from "node
 import { randomUUID } from "node:crypto";
 import { initDb, getStats, resolveDbPath } from "../src/db.js";
 import * as storage from "../src/storage.js";
-import { effectiveStrength, retrieve, searchContext } from "../src/retrieval.js";
+import { effectiveStrength, retrieve, searchContext, computeScore, l2ToCosine } from "../src/retrieval.js";
+import type { Memory } from "../src/types.js";
 import { BudgetTracker, parseJsonLenient, msUntilHour } from "../src/consolidate.js";
 import { extractConversationText } from "../src/distiller.js";
 import { resolveExplicitLlmConfig, resolveLlmConfigForCC, resolveDistillFallback } from "../src/llm.js";
@@ -1371,7 +1372,9 @@ describe("schema versioning", () => {
   it("getSchemaVersion returns the latest applied migration version", () => {
     // After initDb, all migrations should have run
     const version = getSchemaVersion(db);
-    expect(version).toBeGreaterThanOrEqual(4); // v1 ingested_at, v2 updated_at, v3 domain, v4 unique_source_session
+    // v1 ingested_at, v2 updated_at, v3 domain, v4 unique_source_session,
+    // v5 rescale_link_strength_to_cosine
+    expect(version).toBeGreaterThanOrEqual(5);
   });
 
   it("migration v4 created the UNIQUE partial index on source_session", () => {
@@ -1461,6 +1464,64 @@ describe("schema versioning", () => {
     db.prepare("DELETE FROM memories WHERE source_agent = ?").run("test-esc");
   });
 
+  it("migration v5 rescales old 1−L2 link strengths to cosine, exactly once", () => {
+    const dir = join(TEST_DIR, `mig5-${randomUUID().slice(0, 6)}`);
+    mkdirSync(dir, { recursive: true });
+    const dbPath = join(dir, "mig5.db");
+    let mdb = initDb(dbPath);
+
+    const idA = storage.insertMemory(mdb, "migration v5 link source", fakeEmbedding(950), {
+      sourceAgent: "test-v5",
+    });
+    const idB = storage.insertMemory(mdb, "migration v5 link target", fakeEmbedding(951), {
+      sourceAgent: "test-v5",
+    });
+    // Old-scale strengths (1−L2): the range the pre-fix code actually wrote
+    storage.addLink(mdb, idA, idB, "relates_to", 0.55);
+    storage.addLink(mdb, idB, idA, "updates", 0.8);
+    // Guard check: strength outside (0, 1] must be left untouched
+    mdb
+      .prepare(
+        "INSERT INTO memory_links (source_id, target_id, relationship, strength, created_at) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(idA, idA, "relates_to", 0, new Date().toISOString());
+
+    // Rewind: make v5 pending again, as on a DB created before the fix. Delete
+    // v5 AND every later migration row so MAX(version) drops below 5 and the
+    // migrate() gate (version > currentVersion) re-runs v5. Later migrations
+    // (v6 memory_tags) are idempotent (IF NOT EXISTS), so re-applying them is a
+    // no-op — only v5's one-shot rescale is under test here.
+    mdb.prepare("DELETE FROM schema_version WHERE version >= 5").run();
+    mdb.close();
+
+    // Reopen → migrate() applies v5 and rescales: cos = 1 − (1 − old)² / 2
+    mdb = initDb(dbPath);
+    const read = () =>
+      mdb
+        .prepare(
+          "SELECT source_id, target_id, strength FROM memory_links ORDER BY source_id, target_id",
+        )
+        .all() as Array<{ source_id: string; target_id: string; strength: number }>;
+    const byPair = (rows: ReturnType<typeof read>, s: string, t: string) =>
+      rows.find((r) => r.source_id === s && r.target_id === t)!.strength;
+
+    const after = read();
+    expect(byPair(after, idA, idB)).toBeCloseTo(0.89875, 12); // 1 − 0.45²/2
+    expect(byPair(after, idB, idA)).toBeCloseTo(0.98, 12); // 1 − 0.2²/2
+    expect(byPair(after, idA, idA)).toBe(0); // guard: untouched
+
+    // Idempotency: reopening runs migrate() again, but the schema_version
+    // gate skips v5 — values must be byte-identical, not double-converted.
+    mdb.close();
+    mdb = initDb(dbPath);
+    const again = read();
+    expect(byPair(again, idA, idB)).toBe(byPair(after, idA, idB));
+    expect(byPair(again, idB, idA)).toBe(byPair(after, idB, idA));
+    expect(byPair(again, idA, idA)).toBe(0);
+    expect(getSchemaVersion(mdb)).toBeGreaterThanOrEqual(5);
+    mdb.close();
+  });
+
   it("schema_version table exists with applied entries", () => {
     const rows = db
       .prepare("SELECT version, name, applied_at FROM schema_version ORDER BY version")
@@ -1510,6 +1571,7 @@ import {
   saveState,
   updateState,
   migrateLegacyState,
+  describeLastNightly,
   type HicortexState,
   type PersistedTier,
 } from "../src/state.js";
@@ -1520,6 +1582,47 @@ describe("state", () => {
     mkdirSync(d, { recursive: true });
     return d;
   }
+
+  describe("describeLastNightly", () => {
+    it("returns null when neither state.json nor legacy file exists", () => {
+      const dir = freshDir("dln-none");
+      expect(describeLastNightly(dir)).toBeNull();
+    });
+
+    it("reads lastNightly from state.json", () => {
+      const dir = freshDir("dln-state");
+      const ts = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+      saveState({ lastNightly: ts }, dir);
+      const info = describeLastNightly(dir);
+      expect(info?.timestamp).toBe(ts);
+      expect(info?.invalid).toBe(false);
+      expect(info?.ageStr).toBe("2h ago");
+      expect(info?.stale).toBe(false);
+    });
+
+    it("falls back to legacy nightly-last-run.txt when state.json has no lastNightly", () => {
+      const dir = freshDir("dln-legacy");
+      const ts = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+      writeFileSync(join(dir, "nightly-last-run.txt"), ts + "\n");
+      const info = describeLastNightly(dir);
+      expect(info?.timestamp).toBe(ts);
+      expect(info?.stale).toBe(false);
+    });
+
+    it("flags invalid timestamps without throwing", () => {
+      const dir = freshDir("dln-invalid");
+      saveState({ lastNightly: "not-a-date" }, dir);
+      const info = describeLastNightly(dir);
+      expect(info?.invalid).toBe(true);
+    });
+
+    it("marks runs older than 30h as stale", () => {
+      const dir = freshDir("dln-stale");
+      const ts = new Date(Date.now() - 40 * 60 * 60 * 1000).toISOString();
+      saveState({ lastNightly: ts }, dir);
+      expect(describeLastNightly(dir)?.stale).toBe(true);
+    });
+  });
 
   describe("loadState / saveState", () => {
     it("returns empty state when file doesn't exist", () => {
@@ -2244,54 +2347,26 @@ describe("graph analysis", () => {
 // ---------------------------------------------------------------------------
 
 import { VALID_RELATIONSHIP_TYPES } from "../src/types.js";
-import { edgeClassification } from "../src/prompts.js";
 
 describe("relationship types", () => {
-  it("VALID_RELATIONSHIP_TYPES contains all 9 expected types", () => {
+  it("VALID_RELATIONSHIP_TYPES retains all 9 types (uppercase RETIRED, not deleted)", () => {
+    // The five UPPERCASE types and lowercase updates/derives are RETIRED from
+    // the pipeline (heuristic linking now emits only extends/relates_to — see
+    // the 2026-07 link-classification audit), but they remain valid so old
+    // rows still validate. They may return only when a future classifier
+    // passes the audit harness at >= 70% acceptable.
     expect(VALID_RELATIONSHIP_TYPES).toHaveLength(9);
     // Heuristic types (lowercase)
     expect(VALID_RELATIONSHIP_TYPES).toContain("derives");
     expect(VALID_RELATIONSHIP_TYPES).toContain("updates");
     expect(VALID_RELATIONSHIP_TYPES).toContain("extends");
     expect(VALID_RELATIONSHIP_TYPES).toContain("relates_to");
-    // LLM-classified types (UPPER_SNAKE_CASE)
+    // Retired LLM-classified types (UPPER_SNAKE_CASE) — kept for old data
     expect(VALID_RELATIONSHIP_TYPES).toContain("CONTRADICTS");
     expect(VALID_RELATIONSHIP_TYPES).toContain("SUPERSEDES");
     expect(VALID_RELATIONSHIP_TYPES).toContain("DEPENDS_ON");
     expect(VALID_RELATIONSHIP_TYPES).toContain("CAUSED_BY");
     expect(VALID_RELATIONSHIP_TYPES).toContain("VALIDATES");
-  });
-
-  it("edgeClassification generates valid prompt with pair formatting", () => {
-    const pairsBlock = [
-      `[0] SOURCE: lesson | hicortex | Always validate input before processing...\n    TARGET: episode | hicortex | Fixed the validation bug in the parser...\n    similarity: 0.72`,
-      `[1] SOURCE: decision | global | Migrated to TypeScript for type safety...\n    TARGET: fact | global | TypeScript adoption improved code quality...\n    similarity: 0.65`,
-    ].join("\n\n");
-
-    const prompt = edgeClassification(pairsBlock);
-
-    // Verify structure
-    expect(prompt).toContain("VALID RELATIONSHIP TYPES:");
-    expect(prompt).toContain("CONTRADICTS");
-    expect(prompt).toContain("SUPERSEDES");
-    expect(prompt).toContain("DEPENDS_ON");
-    expect(prompt).toContain("CAUSED_BY");
-    expect(prompt).toContain("VALIDATES");
-    expect(prompt).toContain("derives");
-    expect(prompt).toContain("relates_to");
-    // Verify pairs are present
-    expect(prompt).toContain("[0] SOURCE: lesson | hicortex");
-    expect(prompt).toContain("[1] SOURCE: decision | global");
-    expect(prompt).toContain("similarity: 0.72");
-    expect(prompt).toContain("similarity: 0.65");
-    // Verify output format instruction
-    expect(prompt).toContain("JSON array of relationship type strings");
-  });
-
-  it("edgeClassification prompt emphasizes specificity over relates_to", () => {
-    const prompt = edgeClassification("[0] SOURCE: lesson | x | a\n    TARGET: episode | x | b\n    similarity: 0.6");
-    expect(prompt).toContain("MOST SPECIFIC");
-    expect(prompt).toContain('Prefer specific types over "relates_to"');
   });
 });
 
@@ -2301,14 +2376,13 @@ describe("relationship types", () => {
 
 import { LlmClient, type LlmConfig } from "../src/llm.js";
 
-describe("stageLinks LLM classification", () => {
-  // We need to test the consolidation stageLinks function with mock LLMs.
-  // stageLinks is not exported directly, so we test via runConsolidation.
-  // However, to isolate the link classification behaviour we'll use
-  // a focused approach: insert memories, run consolidation with a mock LLM,
-  // then verify the link relationship types stored in the DB.
+describe("stageLinks heuristic classification", () => {
+  // LLM edge classification is retired (2026-07 audit). Linking is now
+  // heuristic-only: same-project + above-threshold → extends, else relates_to.
+  // stageLinks is not exported directly, so we drive it via runConsolidation.
+  // The mock LLM still serves the importance-scoring stage; its graph-analyst
+  // branch is never reached anymore (classifyLinkCandidates ignores the LLM).
 
-  // Create a minimal mock LlmClient by extending the real class
   function createMockLlm(handler: (prompt: string) => string): LlmClient {
     const config: LlmConfig = {
       baseUrl: "http://mock:11434",
@@ -2318,7 +2392,6 @@ describe("stageLinks LLM classification", () => {
       provider: "ollama",
     };
     const client = new LlmClient(config);
-    // Override the private complete method by replacing the public methods
     (client as any).completeFast = async (prompt: string, _maxTokens?: number): Promise<string> => {
       return handler(prompt);
     };
@@ -2327,20 +2400,17 @@ describe("stageLinks LLM classification", () => {
     return client;
   }
 
-  it("uses LLM-classified types when LLM returns valid types", async () => {
-    // Import runConsolidation
+  it("emits extends for same-project high-similarity pairs (never an LLM/uppercase type)", async () => {
     const { runConsolidation } = await import("../src/consolidate.js");
     const { updateState } = await import("../src/state.js");
 
-    // Setup: clean state dir
-    const stDir = join(TEST_DIR, `links-llm-${randomUUID().slice(0, 6)}`);
+    const stDir = join(TEST_DIR, `links-heuristic-${randomUUID().slice(0, 6)}`);
     mkdirSync(stDir, { recursive: true });
-    // Reset lastConsolidated so precheck passes
     updateState((s) => { s.lastConsolidated = undefined; return s; }, stDir);
 
-    // Insert two related memories with very similar embeddings so they become candidates
+    // Identical embeddings → cosine 1.0, same project → extends.
     const embed1 = fakeEmbedding(500);
-    const embed2 = new Float32Array(embed1); // identical = max similarity
+    const embed2 = new Float32Array(embed1);
 
     const id1 = storage.insertMemory(db, "Always validate user input before processing database queries", embed1, {
       sourceAgent: "test-llm",
@@ -2353,25 +2423,21 @@ describe("stageLinks LLM classification", () => {
       memoryType: "episode",
     });
 
-    // Mock LLM: return importance scores for scoring prompt, VALIDATES for all edge pairs
+    // Even if the (dead) graph-analyst branch were somehow hit, it would try to
+    // return VALIDATES — the heuristic-only path must still store extends.
     const mockLlm = createMockLlm((prompt: string) => {
       if (prompt.includes("memory importance scorer")) {
-        // Count the number of [N] entries in the prompt to return right number of scores
         const count = (prompt.match(/\[\d+\]/g) || []).length;
         return JSON.stringify(new Array(count).fill(0.7));
       }
       if (prompt.includes("memory graph analyst")) {
-        // Count pair entries to return right number of classifications
         const count = (prompt.match(/\[\d+\] SOURCE:/g) || []).length;
         return JSON.stringify(new Array(count).fill("VALIDATES"));
       }
       return "[]";
     });
 
-    const embedFn = async (_text: string): Promise<Float32Array> => {
-      // Return similar embeddings for all content to trigger link discovery
-      return fakeEmbedding(500);
-    };
+    const embedFn = async (_text: string): Promise<Float32Array> => fakeEmbedding(500);
 
     const report = await runConsolidation(db, mockLlm, embedFn, false, true, stDir);
 
@@ -2379,26 +2445,24 @@ describe("stageLinks LLM classification", () => {
     expect(report.stages.links).toBeDefined();
     expect(report.stages.links!.auto_linked).toBeGreaterThan(0);
 
-    // Check that LLM classification was used
-    expect(report.stages.links!.llm_classified).toBeGreaterThan(0);
+    // LLM classification is retired — never used.
+    expect(report.stages.links!.llm_classified).toBe(0);
+    expect(report.stages.links!.heuristic_fallback).toBeGreaterThan(0);
 
-    // Verify the link type stored in DB — all should be VALIDATES since the mock
-    // always returns VALIDATES for edge classification
     const links = storage.getLinks(db, id1, "both");
     const linkToId2 = links.find(l => l.target_id === id2 || l.source_id === id2);
     expect(linkToId2).toBeDefined();
-    expect(linkToId2!.relationship).toBe("VALIDATES");
+    expect(linkToId2!.relationship).toBe("extends");
 
-    // Cleanup
     storage.deleteMemory(db, id1);
     storage.deleteMemory(db, id2);
   });
 
-  it("falls back to heuristic types when LLM returns garbage", async () => {
+  it("only ever stores extends or relates_to (retired types never emitted)", async () => {
     const { runConsolidation } = await import("../src/consolidate.js");
     const { updateState } = await import("../src/state.js");
 
-    const stDir = join(TEST_DIR, `links-fallback-${randomUUID().slice(0, 6)}`);
+    const stDir = join(TEST_DIR, `links-twolabel-${randomUUID().slice(0, 6)}`);
     mkdirSync(stDir, { recursive: true });
     updateState((s) => { s.lastConsolidated = undefined; return s; }, stDir);
 
@@ -2416,14 +2480,14 @@ describe("stageLinks LLM classification", () => {
       memoryType: "episode",
     });
 
-    // Mock LLM that returns garbage for edge classification
     const mockLlm = createMockLlm((prompt: string) => {
       if (prompt.includes("memory importance scorer")) {
         const count = (prompt.match(/\[\d+\]/g) || []).length;
         return JSON.stringify(new Array(count).fill(0.6));
       }
+      // Would-be uppercase output; must be ignored by the heuristic-only path.
       if (prompt.includes("memory graph analyst")) {
-        return "I think they are related because databases are cool!";
+        return JSON.stringify(["CONTRADICTS"]);
       }
       return "[]";
     });
@@ -2434,28 +2498,22 @@ describe("stageLinks LLM classification", () => {
 
     expect(report.status).toBe("completed");
     expect(report.stages.links).toBeDefined();
+    expect(report.stages.links!.llm_classified).toBe(0);
 
-    // Links should still be created using heuristic fallback
-    if (report.stages.links!.auto_linked > 0) {
-      expect(report.stages.links!.heuristic_fallback).toBeGreaterThan(0);
-
-      // Verify heuristic types are valid
-      const links = storage.getLinks(db, id1, "both");
-      for (const link of links) {
-        expect(["derives", "updates", "extends", "relates_to"]).toContain(link.relationship);
-      }
+    const links = storage.getLinks(db, id1, "both");
+    for (const link of links) {
+      expect(["extends", "relates_to"]).toContain(link.relationship);
     }
 
-    // Cleanup
     storage.deleteMemory(db, id1);
     storage.deleteMemory(db, id2);
   });
 
-  it("uses heuristic when budget is exhausted", async () => {
-    const { runConsolidation, BudgetTracker } = await import("../src/consolidate.js");
+  it("report still carries llm_classified (always 0) and heuristic_fallback fields", async () => {
+    const { runConsolidation } = await import("../src/consolidate.js");
     const { updateState } = await import("../src/state.js");
 
-    const stDir = join(TEST_DIR, `links-budget-${randomUUID().slice(0, 6)}`);
+    const stDir = join(TEST_DIR, `links-fields-${randomUUID().slice(0, 6)}`);
     mkdirSync(stDir, { recursive: true });
     updateState((s) => { s.lastConsolidated = undefined; return s; }, stDir);
 
@@ -2473,33 +2531,24 @@ describe("stageLinks LLM classification", () => {
       memoryType: "episode",
     });
 
-    // LLM that would return valid types — but budget will be used up on importance scoring
     const mockLlm = createMockLlm((prompt: string) => {
       if (prompt.includes("memory importance scorer")) {
         const count = (prompt.match(/\[\d+\]/g) || []).length;
         return JSON.stringify(new Array(count).fill(0.5));
-      }
-      if (prompt.includes("memory graph analyst")) {
-        const count = (prompt.match(/\[\d+\] SOURCE:/g) || []).length;
-        return JSON.stringify(new Array(count).fill("CAUSED_BY"));
       }
       return "[]";
     });
 
     const embedFn = async (_text: string): Promise<Float32Array> => fakeEmbedding(700);
 
-    // Run with budget of 1 — importance scoring will use it, leaving none for links
-    // We can't directly control budget in runConsolidation, but we verify that
-    // when links DO get heuristic fallback, the report shows it correctly.
     const report = await runConsolidation(db, mockLlm, embedFn, false, true, stDir);
 
     expect(report.status).toBe("completed");
     expect(report.stages.links).toBeDefined();
-    // The report should have the new fields
     expect(report.stages.links).toHaveProperty("llm_classified");
     expect(report.stages.links).toHaveProperty("heuristic_fallback");
+    expect(report.stages.links!.llm_classified).toBe(0);
 
-    // Cleanup
     storage.deleteMemory(db, id1);
     storage.deleteMemory(db, id2);
   });
@@ -2987,5 +3036,65 @@ describe("lessons-context project derivation (#128)", () => {
     const source = readFileSync(new URL("../src/lessons-context.ts", import.meta.url), "utf-8");
     expect(source).toContain("basename(process.cwd())");
     expect(source).toMatch(/select\(data\.lessons, \{ maxLessons, moduleIndex, project \}\)/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #145: computeScore similarity component uses TRUE cosine (1 − d²/2)
+// ---------------------------------------------------------------------------
+
+describe("computeScore similarity component uses true cosine (#145)", () => {
+  // A memory constructed so every non-similarity component is deterministic:
+  //   effectiveStrength → 0   (base_strength 0 → floor 0, base 0)
+  //   connScore         → 0   (connectionCount 0)
+  //   recency           → 1   (created_at = now → contributes exactly 0.1)
+  // ⇒ score = similarity * 0.4 + 0.1, so similarity = (score − 0.1) / 0.4.
+  const isolate = (distance: number): number => {
+    const now = new Date();
+    const mem = {
+      id: "sim-test",
+      content: "x",
+      base_strength: 0,
+      last_accessed: now.toISOString(),
+      access_count: 0,
+      created_at: now.toISOString(),
+    } as unknown as Memory;
+    const score = computeScore(mem, distance, 0, 0, now);
+    return (score - 0.1) / 0.4;
+  };
+
+  it("d=0 → similarity 1 (identical vectors)", () => {
+    expect(isolate(0)).toBeCloseTo(1.0, 12);
+  });
+
+  it("d=√0.5 (≈0.7071) → similarity 0.75", () => {
+    expect(isolate(Math.sqrt(0.5))).toBeCloseTo(0.75, 12);
+  });
+
+  it("d=1 → similarity 0.5 — NOT zero (the old 1−d formula flattened it to 0)", () => {
+    // The old `max(0, 1 − distance)` gave exactly 0 here, erasing all
+    // mid-relevance discrimination below cos 0.5. True cosine is 0.5.
+    expect(isolate(1)).toBeCloseTo(0.5, 12);
+  });
+
+  it("d=√2 → similarity 0 (orthogonal vectors)", () => {
+    expect(isolate(Math.SQRT2)).toBeCloseTo(0, 12);
+  });
+
+  it("d=2 → similarity clamped to 0 (negative cosine = truly unrelated)", () => {
+    expect(isolate(2)).toBeCloseTo(0, 12);
+  });
+
+  it("cos 0.8 content scores ≈0.8, not the old compressed 0.37", () => {
+    // d for true cosine 0.8: d = √(2·(1−0.8)) = √0.4 ≈ 0.6325.
+    const d = Math.sqrt(0.4);
+    expect(isolate(d)).toBeCloseTo(0.8, 12);
+    // Old formula would have produced 1 − 0.6325 ≈ 0.37 — the compression #145 fixes.
+    expect(1 - d).toBeCloseTo(0.3675, 3);
+  });
+
+  it("retrieval.l2ToCosine and the consolidate re-export are the same function", async () => {
+    const consolidate = await import("../src/consolidate.js");
+    expect(consolidate.l2ToCosine).toBe(l2ToCosine);
   });
 });

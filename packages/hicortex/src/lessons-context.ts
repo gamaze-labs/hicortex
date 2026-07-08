@@ -95,7 +95,7 @@ export async function fetchLessonsContext(): Promise<string | null> {
     for (const domain of moduleIndex.domains) {
       const kwStr = domain.keywords.length > 0 ? `: ${domain.keywords.join(", ")}` : "";
       parts.push(`${domain.name} (${domain.memoryCount} memories, ${domain.lessonCount} lessons)${kwStr}`);
-      parts.push(`  ${domain.projects.join(" | ")}`);
+      if (domain.projects.length > 0) parts.push(`  ${domain.projects.join(" | ")}`);
     }
     parts.push(`${index.total} memories, ${index.lessonCount} lessons, ${index.sourceCount} agents. Search with \`hicortex_search\`.`);
   } else if (index.projects.length > 0) {

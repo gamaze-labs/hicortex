@@ -79,3 +79,9 @@ The **licensor** is the individual or entity offering these terms, and the **sof
 Note: Versions of this software published to npm at version ≤ 0.7.1 were released
 under the MIT License and remain MIT-licensed. The PolyForm Noncommercial License
 applies to all versions from 0.10.0 onward.
+
+Note: This repository vendors third-party MIT-licensed browser libraries
+(three.js, 3d-force-graph, force-graph) under `packages/hicortex/assets/vendor/`.
+Those files remain under their original licenses — see
+`packages/hicortex/THIRD_PARTY_NOTICES.md` for versions, copyrights, and full
+license texts.

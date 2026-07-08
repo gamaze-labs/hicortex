@@ -30,6 +30,21 @@ export interface LlmConfig {
   reflectBaseUrl?: string;
   reflectApiKey?: string;
   reflectProvider?: string;
+  /**
+   * Optional separate model for memory tag classification (defaults to the
+   * reflect tier when unset — zero behavior change for existing installs).
+   * Chosen after an A/B benchmark where a dedicated classifier model
+   * materially outperformed the reflect model on this task.
+   */
+  classifyModel?: string;
+  /**
+   * Optional separate endpoint for classification. When only classifyModel is
+   * set, the classify model runs on the reflect endpoint (or the base endpoint
+   * when no reflect endpoint is configured).
+   */
+  classifyBaseUrl?: string;
+  classifyApiKey?: string;
+  classifyProvider?: string;
 }
 
 /**
@@ -86,6 +101,111 @@ export function resolveExplicitLlmConfig(overrides?: {
  * the transition for any lingering call sites — remove after 0.10.0 ships.
  */
 export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
+
+/**
+ * Resolve an LlmConfig from a saved ~/.hicortex/config.json object.
+ *
+ * This is the SINGLE config path used by pipeline runs (nightly consolidation
+ * and `hicortex relink`): named backends (claude-cli, ollama) first, then the
+ * explicit-config/env fallthrough via resolveExplicitLlmConfig, then the
+ * reflect endpoint overlay. Extracted verbatim from nightly.ts — behavior
+ * is identical to the pre-0.11 inline block.
+ *
+ * Returns `reason: "claude_binary_missing"` when claude-cli is configured but
+ * the binary can't be found, so callers can log a context-specific message.
+ */
+export function resolveSavedLlmConfig(
+  savedConfig: Record<string, unknown> | null,
+): { config: LlmConfig | null; reason?: "claude_binary_missing" } {
+  let llmConfig: LlmConfig | null = null;
+
+  if (savedConfig?.llmBackend === "claude-cli") {
+    const claudePath = findClaudeBinary();
+    if (claudePath) {
+      llmConfig = claudeCliConfig(claudePath);
+    } else {
+      return { config: null, reason: "claude_binary_missing" };
+    }
+  } else if (savedConfig?.llmBackend === "ollama") {
+    llmConfig = {
+      baseUrl: (savedConfig.llmBaseUrl as string | undefined) ?? "http://localhost:11434",
+      apiKey: "",
+      model: (savedConfig.llmModel as string) ?? "qwen3.5:4b",
+      reflectModel: (savedConfig.reflectModel as string) ?? (savedConfig.llmModel as string) ?? "qwen3.5:4b",
+      provider: "ollama",
+    };
+  } else {
+    llmConfig = resolveExplicitLlmConfig({
+      llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
+      llmApiKey: savedConfig?.llmApiKey as string | undefined,
+      llmModel: savedConfig?.llmModel as string | undefined,
+      reflectModel: savedConfig?.reflectModel as string | undefined,
+    });
+  }
+
+  if (llmConfig && savedConfig?.reflectBaseUrl) {
+    llmConfig.reflectBaseUrl = savedConfig.reflectBaseUrl as string;
+    llmConfig.reflectApiKey = (savedConfig.reflectApiKey as string | undefined) ?? llmConfig.apiKey;
+    llmConfig.reflectProvider = (savedConfig.reflectProvider as string | undefined) ?? llmConfig.provider;
+  }
+
+  // Optional classify tier (memory tag classification). Same overlay pattern
+  // as distillModel/distillBaseUrl: when absent, completeClassify falls back
+  // to the reflect tier — zero behavior change for existing installs.
+  if (llmConfig && savedConfig?.classifyModel) {
+    llmConfig.classifyModel = savedConfig.classifyModel as string;
+  }
+  if (llmConfig && savedConfig?.classifyBaseUrl) {
+    llmConfig.classifyBaseUrl = savedConfig.classifyBaseUrl as string;
+    llmConfig.classifyApiKey = (savedConfig.classifyApiKey as string | undefined) ?? llmConfig.apiKey;
+    llmConfig.classifyProvider = (savedConfig.classifyProvider as string | undefined) ?? llmConfig.provider;
+  }
+
+  return { config: llmConfig };
+}
+
+/**
+ * Endpoint + model that memory tag classification will ACTUALLY use, for
+ * pre-flight probing. Pure function — the single source of truth shared by
+ * the nightly's contentDomainsReady gate and `hicortex classify-domains`.
+ *
+ * Mirrors LlmClient.completeClassify's routing:
+ *   - classify tier configured (classifyModel and/or classifyBaseUrl) →
+ *     classifyBaseUrl ?? reflectBaseUrl, classifyModel ?? reflectModel
+ *   - classify tier absent → the reflect tier (reflectBaseUrl/reflectModel),
+ *     exactly what completeReflect uses
+ *
+ * Returns null when no probe applies: only a SEPARATE Ollama endpoint can go
+ * unreachable mid-run (API providers are cloud-reachable; the base endpoint
+ * is not pre-flighted anywhere, matching distill/reflect behavior).
+ *
+ * `tier` tells callers which configuration produced the target — "reflect"
+ * means the classification probe is identical to the reflect-stage probe and
+ * its result can be reused.
+ */
+export function resolveClassifyProbeTarget(
+  config: LlmConfig,
+): { tier: "classify" | "reflect"; baseUrl: string; model: string } | null {
+  const classifyConfigured = Boolean(config.classifyModel || config.classifyBaseUrl);
+
+  if (classifyConfigured) {
+    const baseUrl = config.classifyBaseUrl ?? config.reflectBaseUrl;
+    const model = config.classifyModel ?? config.reflectModel;
+    const provider = config.classifyBaseUrl
+      ? (config.classifyProvider ?? config.provider)
+      : (config.reflectProvider ?? config.provider); // riding the reflect endpoint
+    if (baseUrl && provider === "ollama") {
+      return { tier: "classify", baseUrl, model };
+    }
+    return null; // base endpoint or API provider — no probe
+  }
+
+  // Classify tier absent — classification delegates to completeReflect.
+  if (config.reflectBaseUrl && (config.reflectProvider ?? config.provider) === "ollama") {
+    return { tier: "reflect", baseUrl: config.reflectBaseUrl, model: config.reflectModel ?? config.model };
+  }
+  return null;
+}
 
 function detectProvider(
   url: string
@@ -360,6 +480,47 @@ export class LlmClient {
       );
     }
     return this.complete(this.config.distillModel ?? this.config.model, prompt, maxTokens, 900_000);
+  }
+
+  /**
+   * Classification-tier completion (memory tag classification).
+   *
+   * Routing (same "optional dedicated model+baseUrl with fallback" pattern as
+   * completeDistill; Ollama calls inherit think:false via completeOllama):
+   *   - Neither classifyModel nor classifyBaseUrl set → delegate to
+   *     completeReflect (exactly the pre-classify-tier behavior).
+   *   - classifyBaseUrl set → that endpoint, model classifyModel ?? reflectModel.
+   *   - Only classifyModel set → the classify model on the reflect endpoint
+   *     when one is configured, else on the base endpoint.
+   */
+  async completeClassify(prompt: string, maxTokens = 8192): Promise<string> {
+    if (!this.config.classifyModel && !this.config.classifyBaseUrl) {
+      return this.completeReflect(prompt, maxTokens);
+    }
+    const model = this.config.classifyModel ?? this.config.reflectModel;
+    if (this.config.classifyBaseUrl) {
+      return this.completeWithOverride(
+        this.config.classifyBaseUrl,
+        this.config.classifyApiKey ?? this.config.apiKey,
+        this.config.classifyProvider ?? this.config.provider,
+        model,
+        prompt,
+        maxTokens,
+        900_000,
+      );
+    }
+    if (this.config.reflectBaseUrl) {
+      return this.completeWithOverride(
+        this.config.reflectBaseUrl,
+        this.config.reflectApiKey ?? this.config.apiKey,
+        this.config.reflectProvider ?? this.config.provider,
+        model,
+        prompt,
+        maxTokens,
+        900_000,
+      );
+    }
+    return this.complete(model, prompt, maxTokens, 900_000);
   }
 
   /**

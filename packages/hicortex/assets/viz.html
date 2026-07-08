@@ -1,0 +1,1128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hicortex — knowledge graph</title>
+<!--
+  Hicortex knowledge-graph visualization (#124, redesigned in #139).
+  3D force-directed view by default (3d-force-graph + three.js), 2D toggle
+  (force-graph). All renderer bundles are vendored and served same-origin by
+  this daemon from /viz/vendor/ — zero external requests, works offline.
+  Versions + licenses: THIRD_PARTY_NOTICES.md in the package.
+  Data source: GET /graph?op=export on this server (same origin, bearer-only).
+
+  Script loading order (guaranteed by the HTML spec — module scripts and
+  deferred classic scripts execute in document order after parsing, before
+  DOMContentLoaded):
+    1. inline module: imports vendored three, publishes window.THREE
+    2. 3d-force-graph.min.js (UMD, deferred) — picks up window.THREE so the
+       page's sprite code and the renderer share ONE three instance
+    3. force-graph.min.js (UMD, deferred)
+    4. DOMContentLoaded → boot() from the main inline script below
+-->
+<script type="module">
+  import * as THREE from "/viz/vendor/three.module.min.js";
+  window.THREE = THREE;
+</script>
+<script src="/viz/vendor/3d-force-graph.min.js" defer></script>
+<script src="/viz/vendor/force-graph.min.js" defer></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #161a23;
+    --panel-border: #262c3a;
+    --text: #d5dae4;
+    --text-dim: #8b93a5;
+    --accent: #5b9dd9;
+    --danger: #e05555;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+
+  /* ---- graph containers (full-viewport, panels float above) ---- */
+  #graph-3d, #graph-2d { position: fixed; inset: 0; }
+  #graph-2d { display: none; }
+  body.mode-2d #graph-3d { display: none; }
+  body.mode-2d #graph-2d { display: block; }
+
+  /* ---- top bar ---- */
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0;
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 12px;
+    background: rgba(22, 26, 35, 0.94);
+    border-bottom: 1px solid var(--panel-border);
+    z-index: 10;
+  }
+  #topbar h1 { font-size: 14px; font-weight: 600; white-space: nowrap; }
+  #meta { color: var(--text-dim); margin-left: auto; white-space: nowrap; }
+
+  /* ---- left control panel ---- */
+  #panel {
+    position: fixed; top: 46px; left: 12px; width: 236px;
+    background: rgba(22, 26, 35, 0.94);
+    border: 1px solid var(--panel-border); border-radius: 8px;
+    padding: 12px; z-index: 10;
+    max-height: calc(100vh - 70px); overflow-y: auto;
+  }
+  #panel h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-dim); margin: 14px 0 6px;
+  }
+  #panel h2:first-child { margin-top: 0; }
+  #panel .row { display: flex; align-items: center; gap: 6px; margin: 5px 0; color: var(--text-dim); }
+  #panel .row > label:first-child { flex: none; width: 78px; }
+  #panel select, #panel input[type="number"], #panel input[type="text"] {
+    flex: 1; min-width: 0;
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 3px 6px; font: inherit;
+  }
+  #panel input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
+  #panel .val { flex: none; width: 34px; text-align: right; font-variant-numeric: tabular-nums; }
+  #panel button {
+    background: var(--accent); color: #0b0d12; font: inherit; font-weight: 600;
+    border: none; border-radius: 4px; padding: 5px 12px; cursor: pointer;
+  }
+  #panel button:hover { filter: brightness(1.1); }
+  #panel button.secondary { background: var(--panel-border); color: var(--text); }
+  #apply { width: 100%; margin-top: 4px; }
+
+  /* ---- iOS-style 2D/3D switch ---- */
+  .switch { position: relative; display: inline-block; width: 40px; height: 22px; flex: none; }
+  .switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+  .switch .knob {
+    position: absolute; inset: 0; cursor: pointer;
+    background: var(--panel-border); border-radius: 22px; transition: background 0.15s;
+  }
+  .switch .knob::before {
+    content: ""; position: absolute; width: 18px; height: 18px; left: 2px; top: 2px;
+    background: var(--text); border-radius: 50%; transition: transform 0.15s;
+  }
+  .switch input:checked + .knob { background: var(--accent); }
+  .switch input:checked + .knob::before { transform: translateX(18px); }
+  .switch input:focus-visible + .knob { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .mode-label { color: var(--text-dim); }
+  .mode-label.active { color: var(--text); font-weight: 600; }
+
+  /* ---- per-control tooltips (data-tip, CSS-only, 0.4s hover delay) ---- */
+  [data-tip] { position: relative; }
+  [data-tip]::after {
+    content: attr(data-tip);
+    position: absolute; left: 0; top: calc(100% + 6px); z-index: 30; width: 220px;
+    background: rgba(15, 17, 23, 0.97); border: 1px solid var(--panel-border);
+    border-radius: 5px; padding: 6px 8px;
+    color: var(--text); font-size: 11.5px; line-height: 1.4; font-weight: 400;
+    white-space: normal; pointer-events: none;
+    opacity: 0; visibility: hidden;
+    transition: opacity 0.12s ease 0s, visibility 0s linear 0.5s;
+  }
+  [data-tip]:hover::after {
+    opacity: 1; visibility: visible;
+    transition-delay: 0.4s, 0.4s;
+  }
+  /* Rows near the panel bottom open their tooltip upward — #panel scrolls
+     (overflow-y: auto), which would clip a downward tooltip at the edge. */
+  .tip-up[data-tip]::after { top: auto; bottom: calc(100% + 6px); }
+
+  #panel .hint {
+    margin-top: 12px; border-top: 1px solid var(--panel-border); padding-top: 8px;
+    color: var(--text-dim); font-size: 11.5px; line-height: 1.4;
+  }
+
+  /* ---- zoom controls (bottom-right) ---- */
+  #zoomctl {
+    position: fixed; bottom: 12px; right: 12px; z-index: 9;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  #zoomctl button {
+    width: 34px; height: 34px; font-size: 17px; line-height: 1;
+    background: rgba(22, 26, 35, 0.94); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 6px; cursor: pointer;
+  }
+  #zoomctl button:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---- legend (bottom-right, above detail toggle area) ---- */
+  #legend {
+    position: fixed; bottom: 12px; left: 12px;
+    background: rgba(22, 26, 35, 0.94);
+    border: 1px solid var(--panel-border); border-radius: 6px;
+    padding: 10px 12px; max-width: 236px; z-index: 9;
+    max-height: 34vh; overflow-y: auto;
+  }
+  #legend h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); margin: 6px 0 4px; }
+  #legend h2:first-child { margin-top: 0; }
+  .legend-row { display: flex; align-items: center; gap: 7px; padding: 1.5px 0; color: var(--text-dim); }
+  .legend-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .legend-line { width: 22px; height: 0; flex: none; border-top-width: 2px; }
+  .legend-halo { box-shadow: 0 0 0 2.5px rgba(255,255,255,0.55); }
+
+  /* ---- detail panel ---- */
+  #detail {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 380px; max-width: 90vw;
+    background: var(--panel); border-left: 1px solid var(--panel-border);
+    z-index: 15; display: none; flex-direction: column;
+  }
+  #detail.open { display: flex; }
+  #detail header {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 14px 14px 10px; border-bottom: 1px solid var(--panel-border);
+  }
+  #detail header h2 { font-size: 14px; flex: 1; word-break: break-word; }
+  #detail-close {
+    background: none; border: none; color: var(--text-dim);
+    font-size: 18px; cursor: pointer; line-height: 1; padding: 0 2px;
+  }
+  #detail-close:hover { color: var(--text); }
+  #detail-meta { padding: 10px 14px; border-bottom: 1px solid var(--panel-border); }
+  #detail-meta div { display: flex; gap: 8px; padding: 1.5px 0; }
+  #detail-meta dt { color: var(--text-dim); width: 90px; flex: none; }
+  #detail-meta dd { word-break: break-word; }
+  #detail-content {
+    padding: 12px 14px; overflow-y: auto; flex: 1;
+    white-space: pre-wrap; word-break: break-word; font-size: 12.5px; color: var(--text);
+  }
+
+  /* ---- overlays: token prompt / status ---- */
+  #overlay {
+    position: fixed; inset: 0; display: none; z-index: 30;
+    align-items: center; justify-content: center;
+    background: rgba(15, 17, 23, 0.85);
+  }
+  #overlay.open { display: flex; }
+  #overlay .box {
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 8px; padding: 22px; max-width: 420px; text-align: center;
+  }
+  #overlay .box h2 { font-size: 15px; margin-bottom: 8px; }
+  #overlay .box p { color: var(--text-dim); margin-bottom: 12px; }
+  #overlay .box code { background: var(--bg); padding: 1px 5px; border-radius: 3px; }
+  #overlay input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 6px 8px; font: inherit; margin-bottom: 10px;
+  }
+  #overlay button {
+    background: var(--accent); color: #0b0d12; font: inherit; font-weight: 600;
+    border: none; border-radius: 4px; padding: 6px 16px; cursor: pointer;
+  }
+  #overlay .err { color: var(--danger); margin-top: 8px; display: none; }
+
+  #status {
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    color: var(--text-dim); z-index: 5; display: none; text-align: center;
+    max-width: 420px;
+  }
+
+  /* graph tooltips (both renderers use .graph-tooltip / .scene-tooltip) */
+  .graph-tooltip, .scene-tooltip {
+    font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    background: rgba(15, 17, 23, 0.96) !important;
+    color: #d5dae4 !important;
+    border: 1px solid #262c3a; border-radius: 5px;
+    padding: 6px 8px !important; max-width: 340px;
+  }
+</style>
+</head>
+<body>
+<div id="graph-3d"></div>
+<div id="graph-2d"></div>
+
+<div id="topbar">
+  <h1>Hicortex — knowledge graph</h1>
+  <span id="meta"></span>
+</div>
+
+<div id="panel">
+  <h2>Filters</h2>
+  <div class="row" data-tip="Show only memories from one knowledge domain. Node colors match domains (see legend)."><label for="f-domain">Domain</label>
+    <select id="f-domain"><option value="">all</option></select>
+  </div>
+  <div class="row" data-tip="Show only one memory type (episode, lesson, fact…)."><label for="f-type">Type</label>
+    <select id="f-type"><option value="">all</option></select>
+  </div>
+  <div class="row" data-tip="Hide memories weaker than this. Strength decays over time and grows with use and links — node size shows it."><label for="f-strength">Min strength</label>
+    <input type="range" id="f-strength" min="0" max="1" step="0.05" value="0">
+    <span class="val" id="f-strength-val">0.00</span>
+  </div>
+  <div class="row" data-tip="How many memories to load, strongest first (server cap: 10000)."><label for="f-limit">Node limit</label>
+    <input type="number" id="f-limit" min="1" max="10000" value="5000">
+  </div>
+  <button id="apply" data-tip="Reload the graph from the server with these filters.">Apply</button>
+
+  <h2>View</h2>
+  <div class="row" data-tip="Switch between 3D and 2D rendering of the same graph. Drag to rotate (3D) or pan (2D), scroll to zoom.">
+    <label for="mode-switch">View</label>
+    <span class="mode-label" id="mode-label-2d">2D</span>
+    <label class="switch"><input type="checkbox" id="mode-switch" checked><span class="knob"></span></label>
+    <span class="mode-label active" id="mode-label-3d">3D</span>
+  </div>
+  <div class="row" data-tip="Generic links (similarity, extends, relates to) weaker than this are hidden to reduce clutter. Specific relationships (updates, supersedes, contradicts…) are always shown."><label for="v-simcut">Weak links</label>
+    <input type="range" id="v-simcut" min="0" max="1" step="0.05" value="0.55">
+    <span class="val" id="v-simcut-val">0.55</span>
+  </div>
+  <div class="row tip-up" data-tip="Share of the strongest memories that keep permanent labels. Hubs are always labeled; the rest appear as you zoom in."><label for="v-labels">Label density</label>
+    <input type="range" id="v-labels" min="0" max="1" step="0.05" value="0.15">
+    <span class="val" id="v-labels-val">15%</span>
+  </div>
+
+  <h2>Search</h2>
+  <div class="row tip-up" data-tip="Highlight memories matching this text; everything else dims. Clear to reset.">
+    <input type="text" id="search" placeholder="highlight matching nodes…">
+  </div>
+
+  <div class="hint">Click a node to read the memory. White halo = hub.</div>
+</div>
+
+<div id="zoomctl">
+  <button id="zoom-in" title="Zoom in (or scroll / pinch on the graph)">+</button>
+  <button id="zoom-out" title="Zoom out">&minus;</button>
+  <button id="zoom-fit" title="Fit the whole graph in view">&#x26F6;</button>
+</div>
+
+<div id="legend">
+  <h2>Domains</h2>
+  <div id="legend-domains"></div>
+  <h2>Node</h2>
+  <div class="legend-row"><span class="legend-dot" style="background:#8b93a5; width:6px; height:6px;"></span> weak memory</div>
+  <div class="legend-row"><span class="legend-dot" style="background:#8b93a5; width:13px; height:13px;"></span> strong memory</div>
+  <div class="legend-row"><span class="legend-dot legend-halo" style="background:#8b93a5;"></span> hub (highly linked)</div>
+  <h2>Links</h2>
+  <div id="legend-edges"></div>
+</div>
+
+<aside id="detail">
+  <header>
+    <h2 id="detail-title"></h2>
+    <button id="detail-close" title="Close (Esc)">&times;</button>
+  </header>
+  <dl id="detail-meta"></dl>
+  <div id="detail-content"></div>
+</aside>
+
+<div id="overlay">
+  <div class="box">
+    <h2>Authentication required</h2>
+    <p>This server requires a token for remote access.
+       Run <code>hicortex status</code> on the server to get the token.</p>
+    <input type="password" id="token-input" placeholder="hctx-…" autocomplete="off">
+    <button id="token-submit">Connect</button>
+    <div class="err" id="token-err">Still unauthorized — check the token.</div>
+  </div>
+</div>
+
+<div id="status"></div>
+
+<script>
+"use strict";
+(function () {
+  // =========================================================================
+  // Auth token handling — unchanged from #124: URL ?token= handoff (stripped
+  // from history immediately), localStorage persistence, in-page 401 prompt.
+  // The token is only ever sent as an Authorization header on /graph fetches.
+  // =========================================================================
+  var token = null;
+  (function initToken() {
+    var params = new URLSearchParams(window.location.search);
+    var fromUrl = params.get("token");
+    if (fromUrl) {
+      token = fromUrl;
+      try { localStorage.setItem("hicortexToken", fromUrl); } catch (e) { /* private mode */ }
+      // Strip the token from the URL immediately — no token in history/bookmarks.
+      params.delete("token");
+      var qs = params.toString();
+      history.replaceState(null, "", window.location.pathname + (qs ? "?" + qs : ""));
+    } else {
+      try { token = localStorage.getItem("hicortexToken"); } catch (e) { token = null; }
+    }
+  })();
+
+  // =========================================================================
+  // DOM references
+  // =========================================================================
+  var el3d = document.getElementById("graph-3d");
+  var el2d = document.getElementById("graph-2d");
+  var detail = document.getElementById("detail");
+  var detailTitle = document.getElementById("detail-title");
+  var detailMeta = document.getElementById("detail-meta");
+  var detailContent = document.getElementById("detail-content");
+  var overlay = document.getElementById("overlay");
+  var statusEl = document.getElementById("status");
+  var metaEl = document.getElementById("meta");
+  var selDomain = document.getElementById("f-domain");
+  var selType = document.getElementById("f-type");
+  var rngStrength = document.getElementById("f-strength");
+  var rngStrengthVal = document.getElementById("f-strength-val");
+  var inpLimit = document.getElementById("f-limit");
+  var rngSimCut = document.getElementById("v-simcut");
+  var rngSimCutVal = document.getElementById("v-simcut-val");
+  var rngLabels = document.getElementById("v-labels");
+  var rngLabelsVal = document.getElementById("v-labels-val");
+  var inpSearch = document.getElementById("search");
+  var modeSwitch = document.getElementById("mode-switch");
+  var modeLabel2d = document.getElementById("mode-label-2d");
+  var modeLabel3d = document.getElementById("mode-label-3d");
+
+  // Reflect the current mode in the switch + side labels (checked = 3D).
+  function syncModeControl() {
+    modeSwitch.checked = mode === "3d";
+    modeLabel3d.classList.toggle("active", mode === "3d");
+    modeLabel2d.classList.toggle("active", mode === "2d");
+  }
+
+  function showStatus(msg) { statusEl.textContent = msg; statusEl.style.display = "block"; }
+  function hideStatus() { statusEl.style.display = "none"; }
+
+  // The built-in hover tooltips (nodeLabel/linkLabel) render HTML — escape
+  // every piece of memory-derived text that goes into them. Everything else
+  // in the page uses textContent only (pinned security property).
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  // =========================================================================
+  // Visual encodings — same in both views
+  // =========================================================================
+  var PALETTE = [
+    "#5b9dd9", "#e0a545", "#5fbf77", "#d96b6b", "#a07ee0", "#4fc3c3",
+    "#e07ab8", "#b3c04a", "#e08a52", "#7a8ee0", "#5fae9a", "#c9c9c9"
+  ];
+  function hashStr(s) {
+    var h = 5381;
+    for (var i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+    return h;
+  }
+  function domainColor(domain) {
+    if (!domain) return "#6b7385"; // no-domain gray
+    return PALETTE[hashStr(domain) % PALETTE.length];
+  }
+  // Edge styling: dash only where the renderer supports it (2D); the 3D view
+  // is color-only for typed edges (accepted in #139).
+  // The full relationship taxonomy the server can emit (types.ts
+  // VALID_RELATIONSHIP_TYPES): lowercase heuristic types from the linking
+  // stage's classifier + uppercase LLM-classified types. In practice the
+  // lowercase generics (extends, relates_to) dominate the live data.
+  var EDGE_STYLES = {
+    similarity:  { color: "rgba(139,147,165,0.30)", color3d: "#3a4150", width: 1,   dash: [] },
+    extends:     { color: "rgba(139,147,165,0.35)", color3d: "#4a5468", width: 1,   dash: [] },
+    relates_to:  { color: "rgba(139,165,150,0.35)", color3d: "#4a6058", width: 1,   dash: [] },
+    updates:     { color: "#3fb8b0", color3d: "#3fb8b0", width: 1.4, dash: [] },
+    derives:     { color: "#8fbf5f", color3d: "#8fbf5f", width: 1.4, dash: [] },
+    CONTRADICTS: { color: "#e05555", color3d: "#e05555", width: 1.6, dash: [5, 4] },
+    SUPERSEDES:  { color: "#e0913f", color3d: "#e0913f", width: 1.6, dash: [] },
+    DEPENDS_ON:  { color: "#5b9dd9", color3d: "#5b9dd9", width: 1.6, dash: [] },
+    CAUSED_BY:   { color: "#a07ee0", color3d: "#a07ee0", width: 1.6, dash: [] },
+    VALIDATES:   { color: "#5fbf77", color3d: "#5fbf77", width: 1.6, dash: [] }
+  };
+  var EDGE_FALLBACK = { color: "rgba(139,147,165,0.4)", color3d: "#565e70", width: 1.2, dash: [] };
+  function edgeStyle(rel) { return EDGE_STYLES[rel] || EDGE_FALLBACK; }
+
+  // Generic "these two are broadly related" links — high-volume, low-signal.
+  // The weak-links slider thresholds these; specific types always show.
+  var GENERIC_RELS = { similarity: true, extends: true, relates_to: true };
+
+  var REL_LABELS = {
+    similarity: "similarity", extends: "extends", relates_to: "relates to",
+    updates: "updates", derives: "derives",
+    CONTRADICTS: "contradicts", SUPERSEDES: "supersedes",
+    DEPENDS_ON: "depends on", CAUSED_BY: "caused by", VALIDATES: "validates"
+  };
+
+  var DIM_NODE = "#262c3a";
+  var DIM_EDGE_2D = "rgba(38,44,58,0.35)";
+  var DIM_EDGE_3D = "#1c202a";
+
+  function nodeVal(n) {
+    var s = Math.max(0, Math.min(1, n.strength || 0));
+    var v = 1 + s * 7; // volume/area units — renderers turn this into radius
+    return n.isHub ? v * 1.6 : v;
+  }
+  function labelText(n) { return (n.label || "").slice(0, 40); }
+
+  // Edge legend — rebuilt per fetch from the relationship types actually
+  // present in the data, so it never lists types the graph doesn't show.
+  function buildEdgeLegend(edges) {
+    var host = document.getElementById("legend-edges");
+    host.innerHTML = "";
+    var present = {};
+    (edges || []).forEach(function (e) { present[e.relationship] = true; });
+    // Stable order: EDGE_STYLES declaration order, unknown types appended
+    var types = Object.keys(EDGE_STYLES).filter(function (t) { return present[t]; });
+    Object.keys(present).forEach(function (t) {
+      if (!EDGE_STYLES[t]) types.push(t);
+    });
+    if (types.length === 0) {
+      var none = document.createElement("div");
+      none.className = "legend-row";
+      none.appendChild(document.createTextNode("no links loaded"));
+      host.appendChild(none);
+      return;
+    }
+    types.forEach(function (t) {
+      var st = edgeStyle(t);
+      var row = document.createElement("div");
+      row.className = "legend-row";
+      var line = document.createElement("span");
+      line.className = "legend-line";
+      line.style.borderTopStyle = st.dash.length ? "dashed" : "solid";
+      line.style.borderTopColor = st.color;
+      row.appendChild(line);
+      row.appendChild(document.createTextNode(REL_LABELS[t] || t));
+      host.appendChild(row);
+    });
+  }
+
+  // =========================================================================
+  // State
+  // =========================================================================
+  var raw = { nodes: [], edges: [], domains: [], types: [], meta: { total: 0, shown: 0, edgeCount: 0 } };
+  var mode = "3d";
+  try { if (localStorage.getItem("hicortexVizMode") === "2d") mode = "2d"; } catch (e) { /* ignore */ }
+  var graph3d = null;       // ForceGraph3D instance (lazy)
+  var graph2d = null;       // ForceGraph instance (lazy)
+  var dataVersion = 0;      // bumped on every server refetch
+  var appliedVersion = { "3d": -1, "2d": -1 };  // which dataVersion each renderer holds
+  var labeledIds = {};      // id -> true: always-visible label (hubs + top strength)
+  var searchTerm = "";
+  var matchIds = null;      // null = no active search; {} = active match set
+  var selectedNode = null;
+  var graphRadius = 300;    // rough world-space radius, used for 3D label fade
+
+  function simCut() { return parseFloat(rngSimCut.value); }
+
+  function isMatch(id) { return matchIds === null || matchIds[id] === true; }
+
+  // =========================================================================
+  // Data fetch (server refetch on Apply — same /graph?op=export surface)
+  // =========================================================================
+  function fetchGraph() {
+    var qs = new URLSearchParams({ op: "export" });
+    if (selDomain.value) qs.set("domain", selDomain.value);
+    if (selType.value) qs.set("type", selType.value);
+    if (parseFloat(rngStrength.value) > 0) qs.set("minStrength", rngStrength.value);
+    var lim = parseInt(inpLimit.value, 10);
+    // No client-side cap — the server clamps to EXPORT_MAX_LIMIT and is the
+    // single authority (a hand-synced cap here is how the 2000 bug happened).
+    if (lim > 0) qs.set("limit", String(lim));
+
+    var headers = {};
+    if (token) headers["Authorization"] = "Bearer " + token;
+
+    showStatus("Loading graph…");
+    fetch("/graph?" + qs.toString(), { headers: headers })
+      .then(function (resp) {
+        if (resp.status === 401) { showTokenPrompt(); throw new Error("unauthorized"); }
+        if (!resp.ok) {
+          return resp.json().catch(function () { return {}; }).then(function (body) {
+            throw new Error(body.error || ("Server error " + resp.status));
+          });
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        overlay.classList.remove("open");
+        applyData(data);
+      })
+      .catch(function (err) {
+        if (err.message === "unauthorized") return; // prompt already shown
+        showStatus("Failed to load graph: " + err.message);
+      });
+  }
+
+  function showTokenPrompt() {
+    hideStatus();
+    overlay.classList.add("open");
+    document.getElementById("token-input").focus();
+  }
+  document.getElementById("token-submit").addEventListener("click", submitToken);
+  document.getElementById("token-input").addEventListener("keydown", function (e) {
+    if (e.key === "Enter") submitToken();
+  });
+  function submitToken() {
+    var v = document.getElementById("token-input").value.trim();
+    if (!v) return;
+    token = v;
+    try { localStorage.setItem("hicortexToken", v); } catch (e) { /* ignore */ }
+    document.getElementById("token-err").style.display = "none";
+    var headers = { "Authorization": "Bearer " + token };
+    fetch("/graph?op=export&limit=1", { headers: headers }).then(function (resp) {
+      if (resp.status === 401) {
+        document.getElementById("token-err").style.display = "block";
+        return;
+      }
+      overlay.classList.remove("open");
+      fetchGraph();
+    }).catch(function () {
+      document.getElementById("token-err").style.display = "block";
+    });
+  }
+
+  // =========================================================================
+  // Data → renderer state
+  // =========================================================================
+  function applyData(data) {
+    raw = data;
+    dataVersion++;
+
+    fillSelect(selDomain, data.domains || []);
+    fillSelect(selType, data.types || []);
+    buildDomainLegend(data.domains || []);
+    buildEdgeLegend(data.edges || []);
+    computeLabeled();
+
+    selectedNode = null;
+    detail.classList.remove("open");
+
+    if (!data.nodes || data.nodes.length === 0) {
+      updateMeta(0);
+      showStatus("No memories yet — the graph will appear once the nightly capture has run.");
+      // Still push the empty data so a previous graph is cleared.
+    } else {
+      hideStatus();
+    }
+
+    refreshActive();
+  }
+
+  // Always-visible labels: every hub, plus the top-strength slice picked by
+  // the label-density slider. The rest fade in by camera proximity (3D) or
+  // zoom level (2D).
+  function computeLabeled() {
+    labeledIds = {};
+    var frac = parseFloat(rngLabels.value);
+    var byStrength = raw.nodes.slice().sort(function (a, b) { return b.strength - a.strength; });
+    var quota = Math.max(raw.nodes.length ? 3 : 0, Math.round(raw.nodes.length * frac));
+    for (var i = 0; i < byStrength.length; i++) {
+      var n = byStrength[i];
+      if (n.isHub || i < quota) labeledIds[n.id] = true;
+    }
+  }
+
+  // Generic links (similarity/extends/relates_to) below the threshold are
+  // hidden client-side; specific relationship types always show.
+  function visibleEdges() {
+    var cut = simCut();
+    return (raw.edges || []).filter(function (e) {
+      return !GENERIC_RELS[e.relationship] || (e.strength || 0) >= cut;
+    });
+  }
+
+  function updateMeta(shownEdges) {
+    var hidden = (raw.meta.edgeCount || 0) - shownEdges;
+    metaEl.textContent = "showing " + raw.meta.shown + " of " + raw.meta.total +
+      " · " + shownEdges + " edges" + (hidden > 0 ? " (" + hidden + " hidden)" : "");
+  }
+
+  // Renderers mutate node objects (positions) and rewrite link endpoints to
+  // object refs — each renderer gets its own copies, built from `raw`.
+  function cloneNodes() {
+    return raw.nodes.map(function (n) {
+      return {
+        id: n.id, label: n.label, content: n.content,
+        memory_type: n.memory_type, domain: n.domain, project: n.project,
+        strength: n.strength, linkCount: n.linkCount, isHub: n.isHub,
+        created_at: n.created_at
+      };
+    });
+  }
+  function cloneEdges(edges) {
+    return edges.map(function (e) {
+      return { source: e.source, target: e.target, relationship: e.relationship, strength: e.strength };
+    });
+  }
+
+  // Push current data + encodings into the ACTIVE renderer. The hidden one is
+  // refreshed lazily on toggle.
+  function refreshActive() {
+    var edges = visibleEdges();
+    updateMeta(edges.length);
+    if (mode === "3d") {
+      ensure3d();
+      if (appliedVersion["3d"] !== dataVersion) {
+        appliedVersion["3d"] = dataVersion;
+        graph3d.graphData({ nodes: cloneNodes(), links: cloneEdges(edges) });
+        frame3dOnce = true;
+      } else {
+        // Same nodes (positions preserved), new link set (threshold change).
+        graph3d.graphData({ nodes: graph3d.graphData().nodes, links: cloneEdges(edges) });
+      }
+    } else {
+      ensure2d();
+      if (appliedVersion["2d"] !== dataVersion) {
+        appliedVersion["2d"] = dataVersion;
+        graph2d.graphData({ nodes: cloneNodes(), links: cloneEdges(edges) });
+        frame2dOnce = true;
+      } else {
+        graph2d.graphData({ nodes: graph2d.graphData().nodes, links: cloneEdges(edges) });
+      }
+    }
+  }
+
+  function fillSelect(sel, values) {
+    var current = sel.value;
+    while (sel.options.length > 1) sel.remove(1);
+    values.forEach(function (v) {
+      var opt = document.createElement("option");
+      opt.value = v; opt.textContent = v;
+      sel.appendChild(opt);
+    });
+    sel.value = values.indexOf(current) >= 0 ? current : "";
+  }
+
+  function buildDomainLegend(domains) {
+    var host = document.getElementById("legend-domains");
+    while (host.firstChild) host.removeChild(host.firstChild);
+    domains.slice(0, 14).forEach(function (d) {
+      var row = document.createElement("div");
+      row.className = "legend-row";
+      var dot = document.createElement("span");
+      dot.className = "legend-dot";
+      dot.style.background = domainColor(d);
+      row.appendChild(dot);
+      row.appendChild(document.createTextNode(d));
+      host.appendChild(row);
+    });
+    var noneRow = document.createElement("div");
+    noneRow.className = "legend-row";
+    var noneDot = document.createElement("span");
+    noneDot.className = "legend-dot";
+    noneDot.style.background = domainColor(null);
+    noneRow.appendChild(noneDot);
+    noneRow.appendChild(document.createTextNode("no domain"));
+    host.appendChild(noneRow);
+  }
+
+  function tooltipHtml(n) {
+    return "<b>" + esc(labelText(n)) + "</b><br>" +
+      esc((n.domain || "no domain") + " · " + (n.memory_type || "?") +
+          " · strength " + (typeof n.strength === "number" ? n.strength.toFixed(2) : "?"));
+  }
+
+  // =========================================================================
+  // 3D renderer (default view)
+  // =========================================================================
+  var frame3dOnce = false;
+  var SPRITE_CAP = 1500; // above this only always-on labels get sprites
+
+  function makeTextSprite(text, color, worldHeight) {
+    var THREE = window.THREE;
+    var fontPx = 28;
+    var pad = 10;
+    var canvas = document.createElement("canvas");
+    var g = canvas.getContext("2d");
+    var font = "600 " + fontPx + "px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+    g.font = font;
+    var w = Math.max(2, Math.ceil(g.measureText(text).width));
+    canvas.width = w + pad * 2;
+    canvas.height = fontPx + pad * 2;
+    g = canvas.getContext("2d");
+    g.font = font;
+    g.textBaseline = "middle";
+    // soft dark backing for readability against edges
+    g.fillStyle = "rgba(15,17,23,0.55)";
+    g.fillRect(0, 0, canvas.width, canvas.height);
+    g.fillStyle = color;
+    g.fillText(text, pad, canvas.height / 2);
+    var tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    var mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+    var sprite = new THREE.Sprite(mat);
+    sprite.scale.set(worldHeight * canvas.width / canvas.height, worldHeight, 1);
+    return sprite;
+  }
+
+  function makeHaloSprite(worldSize) {
+    var THREE = window.THREE;
+    var canvas = document.createElement("canvas");
+    canvas.width = 64; canvas.height = 64;
+    var g = canvas.getContext("2d");
+    var grad = g.createRadialGradient(32, 32, 8, 32, 32, 32);
+    grad.addColorStop(0, "rgba(255,255,255,0.5)");
+    grad.addColorStop(0.6, "rgba(255,255,255,0.15)");
+    grad.addColorStop(1, "rgba(255,255,255,0)");
+    g.fillStyle = grad;
+    g.fillRect(0, 0, 64, 64);
+    var tex = new THREE.CanvasTexture(canvas);
+    var mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthWrite: false });
+    var sprite = new THREE.Sprite(mat);
+    sprite.scale.set(worldSize, worldSize, 1);
+    return sprite;
+  }
+
+  function nodeRadius3d(n) {
+    // three-forcegraph: sphere radius = cbrt(val) * nodeRelSize (default 4)
+    return Math.cbrt(nodeVal(n)) * 4;
+  }
+
+  function ensure3d() {
+    if (graph3d) { graph3d.resumeAnimation(); return; }
+    graph3d = new window.ForceGraph3D(el3d, { controlType: "orbit" })
+      .width(window.innerWidth).height(window.innerHeight)
+      .backgroundColor("#0f1117")
+      .showNavInfo(false)
+      .nodeVal(nodeVal)
+      .nodeColor(function (n) { return isMatch(n.id) ? domainColor(n.domain) : DIM_NODE; })
+      .nodeLabel(function (n) { return tooltipHtml(n); })
+      .nodeThreeObjectExtend(true)
+      .nodeThreeObject(function (n) { return buildNodeExtras(n); })
+      .linkColor(function (l) {
+        if (matchIds !== null && !(isMatch(idOf(l.source)) && isMatch(idOf(l.target)))) return DIM_EDGE_3D;
+        return edgeStyle(l.relationship).color3d;
+      })
+      .linkWidth(function (l) { return GENERIC_RELS[l.relationship] ? 0 : 1.2; })
+      .linkOpacity(0.55)
+      .linkLabel(function (l) { return esc(l.relationship); })
+      .onNodeClick(function (n) { openDetail(n); })
+      .onBackgroundClick(function () { closeDetail(); })
+      .onEngineStop(function () {
+        computeGraphRadius();
+        updateSpriteFade();
+        if (frame3dOnce) { frame3dOnce = false; graph3d.zoomToFit(600, 40); }
+      });
+    // Fade secondary labels by camera proximity — orbit controls emit
+    // "change" on every camera move.
+    var controls = graph3d.controls();
+    if (controls && typeof controls.addEventListener === "function") {
+      var pending = false;
+      controls.addEventListener("change", function () {
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(function () { pending = false; updateSpriteFade(); });
+      });
+    }
+  }
+
+  function idOf(endpoint) {
+    // after force-graph binds data, link endpoints become node objects
+    return typeof endpoint === "object" && endpoint !== null ? endpoint.id : endpoint;
+  }
+
+  function buildNodeExtras(n) {
+    var THREE = window.THREE;
+    var always = labeledIds[n.id] === true;
+    var makeSecondary = raw.nodes.length <= SPRITE_CAP;
+    if (!always && !makeSecondary && !n.isHub) return false;
+
+    var group = new THREE.Group();
+    var r = nodeRadius3d(n);
+    if (n.isHub) {
+      var halo = makeHaloSprite(r * 3.2);
+      group.add(halo);
+    }
+    if (always || makeSecondary) {
+      var color = isMatch(n.id) ? "#d5dae4" : "#4a5163";
+      var sprite = makeTextSprite(labelText(n), color, 6);
+      sprite.position.set(0, r + 5, 0);
+      sprite.material.opacity = always ? 1 : 0;
+      n.__labelSprite = sprite;
+      n.__labelAlways = always;
+      group.add(sprite);
+    }
+    return group;
+  }
+
+  function computeGraphRadius() {
+    if (!graph3d) return;
+    var nodes = graph3d.graphData().nodes;
+    var max = 0;
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var d = (n.x || 0) * (n.x || 0) + (n.y || 0) * (n.y || 0) + (n.z || 0) * (n.z || 0);
+      if (d > max) max = d;
+    }
+    graphRadius = Math.max(120, Math.sqrt(max));
+  }
+
+  function updateSpriteFade() {
+    if (!graph3d) return;
+    var cam = graph3d.camera();
+    if (!cam) return;
+    var near = graphRadius * 0.45;
+    var far = graphRadius * 1.1;
+    var nodes = graph3d.graphData().nodes;
+    for (var i = 0; i < nodes.length; i++) {
+      var n = nodes[i];
+      var s = n.__labelSprite;
+      if (!s) continue;
+      var matched = isMatch(n.id);
+      if (n.__labelAlways) {
+        s.material.opacity = matched ? 1 : 0.15;
+        continue;
+      }
+      if (matchIds !== null) {
+        // active search: reveal matching secondary labels, hide the rest
+        s.material.opacity = matched ? 0.95 : 0;
+        continue;
+      }
+      var dx = cam.position.x - (n.x || 0);
+      var dy = cam.position.y - (n.y || 0);
+      var dz = cam.position.z - (n.z || 0);
+      var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      var t = (far - dist) / (far - near);
+      s.material.opacity = Math.max(0, Math.min(0.9, t));
+    }
+  }
+
+  // =========================================================================
+  // 2D renderer (toggle)
+  // =========================================================================
+  var frame2dOnce = false;
+
+  function ensure2d() {
+    if (graph2d) { graph2d.resumeAnimation(); return; }
+    graph2d = new window.ForceGraph(el2d)
+      .width(window.innerWidth).height(window.innerHeight)
+      .backgroundColor("#0f1117")
+      .nodeVal(nodeVal)
+      .nodeColor(function (n) { return isMatch(n.id) ? domainColor(n.domain) : DIM_NODE; })
+      .nodeLabel(function (n) { return tooltipHtml(n); })
+      .nodeCanvasObjectMode(function () { return "after"; })
+      .nodeCanvasObject(function (n, ctx, scale) { drawNodeExtras2d(n, ctx, scale); })
+      .linkColor(function (l) {
+        if (matchIds !== null && !(isMatch(idOf(l.source)) && isMatch(idOf(l.target)))) return DIM_EDGE_2D;
+        return edgeStyle(l.relationship).color;
+      })
+      .linkWidth(function (l) { return edgeStyle(l.relationship).width; })
+      .linkLineDash(function (l) { return edgeStyle(l.relationship).dash; })
+      .linkLabel(function (l) { return esc(l.relationship); })
+      .onNodeClick(function (n) { openDetail(n); })
+      .onBackgroundClick(function () { closeDetail(); })
+      .onEngineStop(function () {
+        if (frame2dOnce) { frame2dOnce = false; graph2d.zoomToFit(400, 60); }
+      });
+  }
+
+  function nodeRadius2d(n) {
+    // force-graph: circle area ∝ val; radius = sqrt(val) * nodeRelSize (4)
+    return Math.sqrt(nodeVal(n)) * 4;
+  }
+
+  function drawNodeExtras2d(n, ctx, scale) {
+    var r = nodeRadius2d(n);
+    var matched = isMatch(n.id);
+
+    if (n.isHub) {
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r + 2.5 / scale, 0, Math.PI * 2);
+      ctx.strokeStyle = matched ? "rgba(255,255,255,0.55)" : "rgba(255,255,255,0.12)";
+      ctx.lineWidth = 1.6 / scale;
+      ctx.stroke();
+    }
+    if (n === selectedNode) {
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r + 1 / scale, 0, Math.PI * 2);
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5 / scale;
+      ctx.stroke();
+    }
+
+    var always = labeledIds[n.id] === true;
+    var alpha;
+    if (matchIds !== null) {
+      alpha = matched ? 1 : (always ? 0.12 : 0);
+    } else if (always) {
+      alpha = 1;
+    } else {
+      // fade the rest in by zoom
+      alpha = Math.max(0, Math.min(0.9, (scale - 1.4) / 1.6));
+    }
+    if (alpha <= 0.01) return;
+
+    var fontSize = Math.max(4, 11 / scale);
+    ctx.font = "600 " + fontSize + "px -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif";
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = matched ? "#d5dae4" : "#4a5163";
+    ctx.textBaseline = "middle";
+    ctx.fillText(labelText(n), n.x + r + 3 / scale, n.y);
+    ctx.globalAlpha = 1;
+  }
+
+  // =========================================================================
+  // View toggle 3D ⇄ 2D
+  // =========================================================================
+  function setMode(next) {
+    mode = next;
+    try { localStorage.setItem("hicortexVizMode", mode); } catch (e) { /* ignore */ }
+    document.body.classList.toggle("mode-2d", mode === "2d");
+    syncModeControl();
+    if (mode === "3d" && graph2d) graph2d.pauseAnimation();
+    if (mode === "2d" && graph3d) graph3d.pauseAnimation();
+    refreshActive();
+  }
+  modeSwitch.addEventListener("change", function () { setMode(modeSwitch.checked ? "3d" : "2d"); });
+
+  // =========================================================================
+  // Zoom controls — explicit buttons alongside the built-in wheel/pinch zoom
+  // =========================================================================
+  function zoomBy(factor) {
+    if (mode === "3d") {
+      if (!graph3d) return;
+      // Move the camera toward/away from the orbit target (factor < 1 = in).
+      var p = graph3d.cameraPosition();
+      var t = graph3d.controls().target;
+      graph3d.cameraPosition({
+        x: t.x + (p.x - t.x) * factor,
+        y: t.y + (p.y - t.y) * factor,
+        z: t.z + (p.z - t.z) * factor
+      }, t, 200);
+    } else {
+      if (!graph2d) return;
+      graph2d.zoom(graph2d.zoom() / factor, 200);
+    }
+  }
+  function zoomFit() {
+    if (mode === "3d" && graph3d) graph3d.zoomToFit(600, 40);
+    if (mode === "2d" && graph2d) graph2d.zoomToFit(400, 60);
+  }
+  document.getElementById("zoom-in").addEventListener("click", function () { zoomBy(0.7); });
+  document.getElementById("zoom-out").addEventListener("click", function () { zoomBy(1.43); });
+  document.getElementById("zoom-fit").addEventListener("click", zoomFit);
+
+  // =========================================================================
+  // Search — client-side highlight (matching bright, others dimmed)
+  // =========================================================================
+  function matchesSearch(n) {
+    var q = searchTerm;
+    return (n.label && n.label.toLowerCase().indexOf(q) >= 0) ||
+           (n.content && n.content.toLowerCase().indexOf(q) >= 0) ||
+           (n.domain && n.domain.toLowerCase().indexOf(q) >= 0) ||
+           (n.project && n.project.toLowerCase().indexOf(q) >= 0);
+  }
+
+  function applySearch() {
+    searchTerm = inpSearch.value.trim().toLowerCase();
+    if (!searchTerm) {
+      matchIds = null;
+    } else {
+      matchIds = {};
+      raw.nodes.forEach(function (n) { if (matchesSearch(n)) matchIds[n.id] = true; });
+    }
+    // Setting the color accessors to FRESH closures (new identity) forces
+    // both renderers to re-evaluate colors for every node/link.
+    if (graph3d) {
+      graph3d
+        .nodeColor(function (n) { return isMatch(n.id) ? domainColor(n.domain) : DIM_NODE; })
+        .linkColor(function (l) {
+          if (matchIds !== null && !(isMatch(idOf(l.source)) && isMatch(idOf(l.target)))) return DIM_EDGE_3D;
+          return edgeStyle(l.relationship).color3d;
+        });
+      updateSpriteFade();
+    }
+    if (graph2d) {
+      graph2d
+        .nodeColor(function (n) { return isMatch(n.id) ? domainColor(n.domain) : DIM_NODE; })
+        .linkColor(function (l) {
+          if (matchIds !== null && !(isMatch(idOf(l.source)) && isMatch(idOf(l.target)))) return DIM_EDGE_2D;
+          return edgeStyle(l.relationship).color;
+        });
+    }
+  }
+  inpSearch.addEventListener("input", applySearch);
+
+  // =========================================================================
+  // Detail panel — memory content is ALWAYS set via textContent, never
+  // innerHTML (pinned security property).
+  // =========================================================================
+  function openDetail(n) {
+    selectedNode = n;
+    detailTitle.textContent = n.label;
+    while (detailMeta.firstChild) detailMeta.removeChild(detailMeta.firstChild);
+    var fields = [
+      ["ID", n.id],
+      ["Domain", n.domain || "—"],
+      ["Project", n.project || "—"],
+      ["Type", n.memory_type || "—"],
+      ["Strength", typeof n.strength === "number" ? n.strength.toFixed(3) : "—"],
+      ["Links", String(n.linkCount) + (n.isHub ? " (hub)" : "")],
+      ["Created", n.created_at || "—"]
+    ];
+    fields.forEach(function (f) {
+      var row = document.createElement("div");
+      var dt = document.createElement("dt"); dt.textContent = f[0];
+      var dd = document.createElement("dd"); dd.textContent = f[1];
+      row.appendChild(dt); row.appendChild(dd);
+      detailMeta.appendChild(row);
+    });
+    detailContent.textContent = n.content;
+    detail.classList.add("open");
+  }
+  function closeDetail() {
+    selectedNode = null;
+    detail.classList.remove("open");
+  }
+  document.getElementById("detail-close").addEventListener("click", closeDetail);
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") closeDetail();
+  });
+
+  // =========================================================================
+  // Controls wiring
+  // =========================================================================
+  rngStrength.addEventListener("input", function () {
+    rngStrengthVal.textContent = parseFloat(rngStrength.value).toFixed(2);
+  });
+  document.getElementById("apply").addEventListener("click", fetchGraph);
+
+  rngSimCut.addEventListener("input", function () {
+    rngSimCutVal.textContent = parseFloat(rngSimCut.value).toFixed(2);
+  });
+  rngSimCut.addEventListener("change", function () { refreshActive(); });
+
+  rngLabels.addEventListener("input", function () {
+    rngLabelsVal.textContent = Math.round(parseFloat(rngLabels.value) * 100) + "%";
+  });
+  rngLabels.addEventListener("change", function () {
+    computeLabeled();
+    // Rebuild node extras (3D) / trigger a redraw (2D) with the new label
+    // set — fresh closures so the renderers can't skip the update.
+    if (graph3d) {
+      graph3d.nodeThreeObject(function (n) { return buildNodeExtras(n); });
+      updateSpriteFade();
+    }
+    if (graph2d) {
+      graph2d.nodeCanvasObject(function (n, ctx, scale) { drawNodeExtras2d(n, ctx, scale); });
+    }
+  });
+
+  window.addEventListener("resize", function () {
+    if (graph3d) graph3d.width(window.innerWidth).height(window.innerHeight);
+    if (graph2d) graph2d.width(window.innerWidth).height(window.innerHeight);
+  });
+
+  // =========================================================================
+  // Boot — after DOMContentLoaded all deferred vendor scripts have executed.
+  // Fail explicitly when a vendored bundle is missing (broken install).
+  // =========================================================================
+  function boot() {
+    if (!window.THREE || !window.ForceGraph3D || !window.ForceGraph) {
+      showStatus(
+        "Failed to load the graph renderer bundles (/viz/vendor/…). " +
+        "The package install looks incomplete — reinstall @gamaze/hicortex " +
+        "and restart the server."
+      );
+      return;
+    }
+    document.body.classList.toggle("mode-2d", mode === "2d");
+    syncModeControl();
+    fetchGraph();
+  }
+  if (document.readyState === "complete" || document.readyState === "interactive") {
+    // DOM already parsed — but deferred scripts may still be pending; queue
+    // behind them via DOMContentLoaded when possible, else run now.
+    if (document.readyState === "complete") boot();
+    else window.addEventListener("DOMContentLoaded", boot);
+  } else {
+    window.addEventListener("DOMContentLoaded", boot);
+  }
+})();
+</script>
+</body>
+</html>

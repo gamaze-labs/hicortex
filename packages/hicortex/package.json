@@ -1,6 +1,6 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.10.0",
+  "version": "0.11.1",
   "description": "Self-learning memory for AI agents — experience captured automatically, distilled into lessons overnight, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, and Pi.",
   "main": "dist/index.js",
   "bin": {
@@ -25,17 +25,20 @@
   "types": "dist/index.d.ts",
   "files": [
     "dist/",
+    "assets/",
     "skills/",
     "hermes-plugin/",
     "openclaw.plugin.json",
-    "README.md"
+    "domains.example.json",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "rm -rf dist && tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "prepack": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/",
-    "prepublishOnly": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/"
+    "prepack": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true",
+    "prepublishOnly": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",

@@ -52,6 +52,11 @@ export interface SelectableLesson {
   access_count?: number;
   id?: string;
   memory_type?: string;
+  /**
+   * Life-sphere domain (content-based classification). Present on Memory rows.
+   * Used by the same-domain affinity boost when the context carries a `domain`.
+   */
+  domain?: string | null;
 }
 
 export interface LessonSelectorContext {
@@ -65,6 +70,13 @@ export interface LessonSelectorContext {
   currentTask?: string;
   /** MODULE_INDEX for domain-aware lesson selection (same-domain projects score 0.5). */
   moduleIndex?: ModuleIndex;
+  /**
+   * Current life-sphere domain, if known (content-based classification). When
+   * set, lessons in the SAME domain get the same-domain affinity boost directly
+   * off `lesson.domain` — the content-mode analogue of the project-grouping
+   * moduleIndex boost.
+   */
+  domain?: string | null;
 }
 
 export interface LessonSelector {

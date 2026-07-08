@@ -14,44 +14,23 @@ import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import { resolveDbPath } from "./db.js";
+import { describeLastNightly } from "./state.js";
 
 const HICORTEX_HOME = join(homedir(), ".hicortex");
-const LAST_RUN_PATH = join(HICORTEX_HOME, "nightly-last-run.txt");
 const CONFIG_PATH = join(HICORTEX_HOME, "config.json");
-const STALE_THRESHOLD_HOURS = 30;
 
 export async function showNightlyStatus(): Promise<void> {
   console.log("Hicortex Nightly Pipeline Status");
   console.log("─".repeat(40));
 
   // Last run
-  let lastRun: Date | null = null;
-  let lastRunStr = "never";
-  try {
-    const ts = readFileSync(LAST_RUN_PATH, "utf-8").trim();
-    const d = new Date(ts);
-    if (!isNaN(d.getTime())) {
-      lastRun = d;
-      lastRunStr = ts;
-    } else {
-      lastRunStr = `${ts} (invalid)`;
-    }
-  } catch {
-    // No file
-  }
-
-  if (lastRun) {
-    const ageMs = Date.now() - lastRun.getTime();
-    const ageHours = Math.round(ageMs / (60 * 60 * 1000));
-    const ageStr =
-      ageHours < 1 ? "just now" :
-      ageHours < 24 ? `${ageHours}h ago` :
-      `${Math.round(ageHours / 24)}d ago`;
-
-    const isStale = ageHours > STALE_THRESHOLD_HOURS;
-    console.log(`Last run:    ${lastRunStr} (${ageStr})${isStale ? " ⚠ STALE" : ""}`);
+  const lastRun = describeLastNightly(HICORTEX_HOME);
+  if (!lastRun) {
+    console.log("Last run:    never");
+  } else if (lastRun.invalid) {
+    console.log(`Last run:    ${lastRun.timestamp} (invalid)`);
   } else {
-    console.log(`Last run:    ${lastRunStr}`);
+    console.log(`Last run:    ${lastRun.timestamp} (${lastRun.ageStr})${lastRun.stale ? " ⚠ STALE" : ""}`);
   }
 
   // LLM config
@@ -149,8 +128,8 @@ export async function showNightlyStatus(): Promise<void> {
   console.log("\n" + "─".repeat(40));
   const issues: string[] = [];
   if (!lastRun) issues.push("Pipeline has never run. Run: hicortex nightly");
-  else if (lastRun && (Date.now() - lastRun.getTime()) > STALE_THRESHOLD_HOURS * 60 * 60 * 1000) {
-    issues.push(`Pipeline hasn't run in ${STALE_THRESHOLD_HOURS}+ hours. Check timer.`);
+  else if (lastRun.stale) {
+    issues.push("Pipeline hasn't run in 30+ hours. Check timer.");
   }
   if (!timerActive) issues.push("No timer installed. Nightly pipeline won't run automatically.");
   if (!existsSync(dbPath)) issues.push("No database found. Run: hicortex init");
