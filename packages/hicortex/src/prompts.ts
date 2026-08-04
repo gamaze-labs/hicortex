@@ -107,27 +107,39 @@ EXTRACT into this markdown format:
 
 # Session Memory: ${date} - ${projectName}
 
-## Classification: [pick one: PUBLIC / WORK / PERSONAL / SENSITIVE]
-
 ### Decisions Made
-- [decision]: [reasoning] (${date})
+- [SUBJECT]: [decision] — [reasoning] (${date})
 
 ### Facts Learned
-- [fact]: [context/source] (${date})
+- [SUBJECT]: [fact] — [context/source] (${date})
 
 ### Problems & Solutions
-- [problem] → [solution that worked] (${date})
+- [SUBJECT]: [problem] → [solution that worked] (${date})
 
 ### Project State Changes
-- [what changed]: [from → to] (${date})
+- [SUBJECT]: [what changed], [from → to] (${date})
 
 ### Key Entities & Relationships
 - [entity A] → [relationship] → [entity B] (${date})
 
 ### Corrections & Rejections
-- [what AI proposed] → [why rejected/corrected] → [what user wanted instead] (${date})
+- [SUBJECT]: [what AI proposed] → [why rejected/corrected] → [what user wanted instead] (${date})
   (Include: tool use denials, "no/wrong/redo", style feedback, approach rejections,
    user corrections of AI assumptions, quality complaints like "too verbose")
+
+TOPIC-FIRST RULE (critical — read carefully):
+Every item MUST begin with its [SUBJECT]: the concrete thing it is about — the
+system, file, component, decision area, or entity. The subject is what a future
+reader would search for.
+- Write:  "Electrical load calculation: don't bundle unknown loads into one figure — user rejected the estimate"
+- NOT:    "User rejected AI's bundling of unknown loads"
+- Write:  "Nightly capture (Hermes): cron sessions are excluded — source='cron' is skipped before distillation"
+- NOT:    "Discovered that cron sessions are filtered out"
+Reason: each item's first words become the memory's one-line index entry AND
+dominate its search embedding. An item that opens with a category label, a
+sentiment ("Strong Negative"), or "User rejected…" is unfindable — it matches
+every emotionally-similar prompt and no topically-relevant one. Front-load the
+subject; put reaction, intensity and reasoning AFTER it.
 
 RULES:
 - Extract MAX 20 items total (quality over quantity)
@@ -138,12 +150,9 @@ RULES:
 - PRIORITIZE Corrections & Rejections — these are high-value signals for learning
   what the user does NOT want. Even a single "no" or style correction is worth extracting.
 - Strong language or profanity from the user is a high-intensity signal — it indicates
-  the correction matters deeply. Note the intensity in the extraction.
-- PRIVACY CLASSIFICATION (one of):
-  - PUBLIC: general tech knowledge, open-source patterns, publicly available info
-  - WORK: project-specific decisions, architecture choices, client/business context
-  - PERSONAL: personal preferences, family, health, lifestyle, private life
-  - SENSITIVE: API keys mentioned, credentials, financial account details, medical records
+  the correction matters deeply. Note the intensity AFTER the subject, never before it
+  (e.g. "Pricing tiers: strongly rejected per-agent billing — …", not
+  "[Strong Negative] User rejected per-agent billing"). The subject always comes first.
 - Omit any section that has zero items (don't include empty sections)
 - If nothing worth extracting, output ONLY: "NO_EXTRACT"
 `;

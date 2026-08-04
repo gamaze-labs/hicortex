@@ -1,6 +1,6 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.11.1",
+  "version": "0.16.3",
   "description": "Self-learning memory for AI agents — experience captured automatically, distilled into lessons overnight, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, and Pi.",
   "main": "dist/index.js",
   "bin": {
@@ -35,8 +35,11 @@
   ],
   "scripts": {
     "build": "rm -rf dist && tsc",
-    "test": "vitest run",
+    "test": "npm run build",
     "test:watch": "vitest",
+    "eval": "node dist/eval/run-eval.js",
+    "eval:recall-sweep": "node dist/eval/recall-sweep.js",
+    "eval:relevance": "node dist/eval/relevance-eval.js",
     "prepack": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true",
     "prepublishOnly": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true"
   },
@@ -48,7 +51,7 @@
     "vitest": "^3.0.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "license": "PolyForm-Noncommercial-1.0.0",
   "homepage": "https://hicortex.gamaze.com",
@@ -64,7 +67,7 @@
   "dependencies": {
     "@huggingface/transformers": "^3.0.0",
     "@modelcontextprotocol/sdk": "^1.28.0",
-    "better-sqlite3": "^11.0.0",
+    "better-sqlite3": "^12.11.1",
     "express": "^4.21.0",
     "sqlite-vec": "^0.1.7"
   }

@@ -38,6 +38,7 @@
  * on the server machine.
  */
 
+import { hicortexHome } from "./paths.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -54,7 +55,7 @@ import {
 import type { EmbedFn } from "./retrieval.js";
 import { loadState, updateState } from "./state.js";
 
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
 
 export interface RelinkOptions {
   /** Full discovery + would-be counts, zero writes, cursor untouched. */
@@ -129,18 +130,10 @@ function loadExistingPairs(db: Database.Database): Set<string> {
 /**
  * Read the stored embedding for a memory from memory_vectors.
  * Returns null when the row is missing (caller falls back to re-embedding).
+ * @deprecated moved to storage.ts (shared with consolidate.ts's supersession
+ * stage); re-exported here so existing importers of relink.ts keep working.
  */
-export function getStoredEmbedding(
-  db: Database.Database,
-  memoryId: string,
-): Float32Array | null {
-  const row = db
-    .prepare("SELECT embedding FROM memory_vectors WHERE id = ?")
-    .get(memoryId) as { embedding: Buffer } | undefined;
-  if (!row?.embedding) return null;
-  const buf = row.embedding;
-  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-}
+export { getStoredEmbedding } from "./storage.js";
 
 /**
  * Run the relink pass. Returns a structured report.
@@ -239,7 +232,7 @@ export async function runRelink(options: RelinkOptions = {}): Promise<RelinkRepo
         const { __rowid: _ignored, ...memRow } = row;
         const mem = memRow as unknown as Memory;
         try {
-          let embedding = getStoredEmbedding(db, mem.id);
+          let embedding = storage.getStoredEmbedding(db, mem.id);
           if (!embedding) {
             embedding = await (await getEmbedFn())(mem.content);
           }

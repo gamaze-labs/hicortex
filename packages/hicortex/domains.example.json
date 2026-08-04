@@ -9,27 +9,66 @@
     "Backfill an existing corpus with: hicortex classify-domains"
   ],
   "domains": [
-    { "name": "Work", "description": "Your job and professional life — employer, clients, workstreams" },
-    { "name": "Personal", "description": "Private life — home, hobbies, everyday matters" },
-    { "name": "People", "description": "Relationships — family, friends, social life, network" },
-    { "name": "Health", "description": "Fitness, wellbeing, medical" },
-    { "name": "Finance", "description": "Money — budgeting, spending, investing" }
+    {
+      "name": "Work",
+      "description": "Your job and professional life — employer, clients, workstreams"
+    },
+    {
+      "name": "Personal",
+      "description": "Private life — home, hobbies, everyday matters"
+    },
+    {
+      "name": "People",
+      "description": "Relationships — family, friends, social life, network"
+    },
+    {
+      "name": "Health",
+      "description": "Fitness, wellbeing, medical"
+    },
+    {
+      "name": "Finance",
+      "description": "Money — budgeting, spending, investing"
+    }
   ],
   "_powerUserExample": {
     "_readme": [
       "A narrower life-sphere set for users who want tighter buckets.",
-      "`compartment: true` makes a domain the PRIMARY whenever it is tagged — a deliberate work/life firewall.",
+      "The PRIMARY domain is derived by argmax association weight (LLM tag order breaks ties) — no manual override flag.",
       "`weakPrimaryFloor` (default 0.45) is the minimum embedding similarity for a no-fit memory to earn a weak primary; tune it from your corpus."
     ],
     "domains": [
-      { "name": "Work", "description": "Employer, day job, client projects, workstreams", "compartment": true },
-      { "name": "Personal", "description": "Private life — home, hobbies, everyday matters" },
-      { "name": "People", "description": "Relationships — family, friends, social life, network" },
-      { "name": "Health", "description": "Fitness, wellbeing, medical" },
-      { "name": "Finance", "description": "Money — budgeting, spending, investing" },
-      { "name": "Boating", "description": "Boats — maintenance, gear, trips, harbour life" },
-      { "name": "Property", "description": "House and land — renovation, upkeep, garden" },
-      { "name": "Vehicles", "description": "Cars and other vehicles — service, repairs, purchases" }
+      {
+        "name": "Work",
+        "description": "Employer, day job, client projects, workstreams"
+      },
+      {
+        "name": "Personal",
+        "description": "Private life — home, hobbies, everyday matters"
+      },
+      {
+        "name": "People",
+        "description": "Relationships — family, friends, social life, network"
+      },
+      {
+        "name": "Health",
+        "description": "Fitness, wellbeing, medical"
+      },
+      {
+        "name": "Finance",
+        "description": "Money — budgeting, spending, investing"
+      },
+      {
+        "name": "Photography",
+        "description": "Camera gear, shoots, editing workflow, photo projects"
+      },
+      {
+        "name": "Home",
+        "description": "House, renovation projects, maintenance, garden"
+      },
+      {
+        "name": "Travel",
+        "description": "Trips, destinations, bookings, travel plans"
+      }
     ],
     "weakPrimaryFloor": 0.5
   }

@@ -11,9 +11,8 @@
  *     embedding of the domain's config description instead.
  *   - weight(memory, tag) = cosine(memory embedding, prototype(tag)). Both
  *     vectors are L2-normalized, so cosine reduces to a dot product.
- *   - PRIMARY (memories.domain) = argmax-weight tag, overridden by any tagged
- *     domain flagged `compartment: true` (deliberate compartmentalization —
- *     the owner's Work firewall). Fully mechanical, no LLM.
+ *   - PRIMARY (memories.domain) = argmax-weight tag, with LLM tag order
+ *     breaking exact-weight ties. Fully mechanical, no LLM.
  *
  * The LLM decides ONLY the discrete part (which schemas apply — see
  * domain-classify.ts); ALL gradation is derived from embeddings here.
@@ -64,6 +63,36 @@ export function l2Normalize(vec: Float32Array): Float32Array {
 }
 
 /**
+ * Weighted sum of two vectors into a NEW Float32Array (inputs untouched). The
+ * result is NOT renormalized — callers normalize explicitly via `l2Normalize`
+ * when they need a unit vector (both call sites below do, because embeddings
+ * are L2-normalized and the blend must stay on the unit sphere to keep cosine
+ * meaningful). Throws on a dimension mismatch rather than silently truncating:
+ * the embedding dim is fixed at 384 in practice, so a mismatch signals a
+ * mid-process model swap or a bug, which must surface (CLAUDE.md: fail
+ * explicitly), not get quietly papered over.
+ *
+ * Used by the session-intent centroid EMA and the recall query blend (#192
+ * session-intent keying): `weightedAdd(a, 1-α, b, α)` is the EMA step,
+ * `weightedAdd(prompt, 1-w, centroid, w)` is the blended search vector.
+ */
+export function weightedAdd(
+  a: Float32Array,
+  wA: number,
+  b: Float32Array,
+  wB: number
+): Float32Array {
+  if (a.length !== b.length) {
+    throw new Error(
+      `weightedAdd: dimension mismatch (${a.length} vs ${b.length}) — expected equal-length L2-normalized embeddings`
+    );
+  }
+  const out = new Float32Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = a[i] * wA + b[i] * wB;
+  return out;
+}
+
+/**
  * Association weight of a memory for a tag = cosine(memory embedding, domain
  * prototype). Both inputs are L2-normalized (embedder.ts normalizes memory
  * embeddings; computeDomainPrototypes normalizes prototypes), so cosine is
@@ -86,32 +115,22 @@ export interface WeightedTag {
   weight: number | null;
 }
 
-/** The configured compartment domain names (DomainDef.compartment === true). */
-export function compartmentSet(domains: DomainDef[]): Set<string> {
-  return new Set(domains.filter((d) => d.compartment === true).map((d) => d.name));
-}
-
 /**
  * Derive the PRIMARY tag (memories.domain) from a weighted tag set.
  *
  * Rules (deterministic, no LLM):
- *   1. Any tagged compartment domain wins — first one in array order if the
- *      (unusual) case of several arises.
- *   2. Else the argmax-weight tag. `tags` MUST be in LLM most-relevant-first
+ *   1. The argmax-weight tag. `tags` MUST be in LLM most-relevant-first
  *      order: ties (and all-null weights) resolve to the EARLIEST array
  *      position — strict `>` comparison keeps the first maximum.
- *   3. A null weight loses to any numeric weight (treated as -Infinity).
+ *   2. A null weight loses to any numeric weight (treated as -Infinity).
  *
  * Throws on an empty tag set — callers guarantee >= 1 tag (an empty tag set
  * from the classifier is a NO-FIT and must be routed through nofit.ts, never
  * here); an empty set reaching this function is a programming error.
  */
-export function derivePrimary(tags: WeightedTag[], compartments: Set<string>): string {
+export function derivePrimary(tags: WeightedTag[]): string {
   if (tags.length === 0) {
     throw new Error("derivePrimary: empty tag set (callers must pass >= 1 tag)");
-  }
-  for (const t of tags) {
-    if (compartments.has(t.tag)) return t.tag;
   }
   let best = tags[0];
   let bestWeight = best.weight ?? Number.NEGATIVE_INFINITY;
@@ -331,9 +350,9 @@ export function recomputeAllTagWeights(
 
 /**
  * Re-derive the PRIMARY (memories.domain) of every tagged memory from its
- * current tag weights: compartment override first, else argmax weight, LLM
- * order (memory_tags insertion order = rowid, written most-relevant-first by
- * storage.setMemoryTags) breaking exact-weight ties.
+ * current tag weights: argmax weight, LLM order (memory_tags insertion order =
+ * rowid, written most-relevant-first by storage.setMemoryTags) breaking
+ * exact-weight ties.
  *
  * Memories with NO memory_tags rows are untouched (e.g. infra-skipped rows
  * awaiting classification — issue #150 discipline).
@@ -342,7 +361,10 @@ export function refreshPrimaries(
   db: Database.Database,
   domains: DomainDef[],
 ): { examined: number; updated: number } {
-  const compartments = compartmentSet(domains);
+  // `domains` is accepted for API symmetry with the other reconsolidation
+  // passes (which need prototypes/weights); the primary is now pure argmax
+  // and does not depend on the domain set.
+  void domains;
   const rows = db
     .prepare(
       `SELECT mt.memory_id, mt.tag, mt.weight, m.domain
@@ -366,7 +388,7 @@ export function refreshPrimaries(
   let updated = 0;
   const tx = db.transaction(() => {
     for (const [memoryId, entry] of byMemory) {
-      const primary = derivePrimary(entry.tags, compartments);
+      const primary = derivePrimary(entry.tags);
       if (primary !== entry.domain) {
         update.run(primary, memoryId);
         updated++;

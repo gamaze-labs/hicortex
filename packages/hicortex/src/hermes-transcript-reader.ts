@@ -2,7 +2,7 @@
  * Hermes transcript reader — the nightly capture path for Nous Research Hermes.
  *
  * Hermes stores conversation in a SQLite state DB, one per profile:
- *   ~/.hermes/profiles/<profile>/state.db   (per-profile agents: lenny, raider, nano)
+ *   ~/.hermes/profiles/<profile>/state.db   (per-profile agents: alice, bob, carol)
  *   ~/.hermes/state.db                       (global, non-profile setups)
  *
  * Schema (relevant columns):
@@ -24,7 +24,7 @@ import { readdirSync, statSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import Database from "better-sqlite3";
-import type { TranscriptBatch } from "./transcript-reader.js";
+import type { TranscriptBatch, CursorMap } from "./transcript-reader.js";
 
 const HERMES_HOME = process.env.HERMES_HOME || join(homedir(), ".hermes");
 
@@ -51,6 +51,7 @@ interface HermesSessionRow {
 }
 
 interface HermesMessageRow {
+  id: number;
   role: string;
   content: string | null;
   tool_name: string | null;
@@ -60,10 +61,15 @@ interface HermesMessageRow {
 /**
  * Read Hermes sessions that ended since `since`, across all profiles.
  * Returns one batch per session, parallel to readCcTranscripts().
+ *
+ * @param cursors Per-session capture cursors (#189), keyed `hermes:<profile>:<sid>`.
+ *   The cursor value is the max `messages.id` already captured; a resumed +
+ *   re-ended session yields only the new rows (`id > cursor`).
  */
 export function readHermesSessions(
   since: Date,
-  hermesHome = HERMES_HOME
+  hermesHome = HERMES_HOME,
+  cursors: CursorMap = {}
 ): TranscriptBatch[] {
   const batches: TranscriptBatch[] = [];
   const sinceEpoch = since.getTime() / 1000; // Hermes timestamps are unix seconds (REAL)
@@ -83,8 +89,21 @@ export function readHermesSessions(
         )
         .all(sinceEpoch) as HermesSessionRow[];
 
+      // Cursor is a message id (INTEGER PRIMARY KEY AUTOINCREMENT — strictly
+      // increasing, never reused), so `id > ?` returns exactly the rows added
+      // since last capture. ORDER BY id (NOT timestamp): id is the capture
+      // boundary, so ordering rows by id makes entryCursors monotonic and the
+      // last row's id the true max consumed — the segment boundary the packer
+      // advances to is then genuinely the largest id, never skipping a
+      // lower-id-but-later-timestamp row. Verified safe: id order == timestamp
+      // order in production (A1: 0 divergences / 4413 rows), so text ordering is
+      // unchanged in practice.
       const msgStmt = db.prepare(
-        "SELECT role, content, tool_name, timestamp FROM messages WHERE session_id = ? ORDER BY timestamp, id"
+        "SELECT id, role, content, tool_name, timestamp FROM messages WHERE session_id = ? AND id > ? ORDER BY id"
+      );
+      // Highest id in the session — used only for the shrink guard below.
+      const maxIdStmt = db.prepare(
+        "SELECT MAX(id) as m FROM messages WHERE session_id = ?"
       );
 
       for (const s of sessions) {
@@ -93,8 +112,24 @@ export function readHermesSessions(
         // messages so we don't even read them.
         if (NON_PRIMARY_SOURCES.has(s.source)) continue;
 
-        const rows = msgStmt.all(s.id) as HermesMessageRow[];
-        // Skip only genuinely empty sessions. Do NOT gate on message count —
+        const cursorKey = `hermes:${profile}:${s.id}`;
+        const pos = cursors[cursorKey] ?? { cursor: 0, gen: 0 };
+        let startCursor = pos.cursor;
+        let gen = pos.gen;
+
+        // Shrink guard: if the stored cursor exceeds the session's max id (DB
+        // reset/restore), re-read from 0 and bump the generation (fix 8). Cheap
+        // MAX(id) probe; the common path (cursor <= max) leaves it untouched.
+        if (startCursor > 0) {
+          const maxId = (maxIdStmt.get(s.id) as { m: number | null }).m ?? 0;
+          if (startCursor > maxId) {
+            startCursor = 0;
+            gen = pos.gen + 1;
+          }
+        }
+
+        const rows = msgStmt.all(s.id, startCursor) as HermesMessageRow[];
+        // Skip only genuinely empty deltas. Do NOT gate on message count —
         // a short 2-message exchange can carry a real decision. Meaningful-
         // content is gated downstream by the post-denoise 200-char check in
         // nightly.ts, so short-but-dense sessions aren't dropped here.
@@ -107,6 +142,10 @@ export function readHermesSessions(
           role: NOISE_ROLES.has(r.role) ? "tool_result" : r.role,
           content: r.content ?? "",
         }));
+        // entryCursors are the row ids, monotonic under ORDER BY id — the last
+        // is the max consumed id, so segment boundaries and the final advance
+        // land exactly on it.
+        const entryCursors = rows.map((r) => r.id);
 
         const endTs = s.ended_at ?? rows[rows.length - 1].timestamp;
         batches.push({
@@ -115,6 +154,10 @@ export function readHermesSessions(
           sourceAgent: `hermes/${profile}`,
           date: new Date(endTs * 1000).toISOString().slice(0, 10),
           entries,
+          cursorKey,
+          startCursor,
+          generation: gen,
+          entryCursors,
         });
       }
     } catch {

@@ -12,13 +12,14 @@
  * cleanup pass once callers have been audited.
  */
 
+import { hicortexHome } from "./paths.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { validateLicense } from "./license.js";
 import { loadState, updateState } from "./state.js";
 import type { LicenseInfo } from "./types.js";
 
-const DEFAULT_STATE_DIR = join(homedir(), ".hicortex");
+const DEFAULT_STATE_DIR = hicortexHome();
 
 // A single canonical "full" feature set — no tiers.
 const FULL_FEATURES: LicenseInfo["features"] = {

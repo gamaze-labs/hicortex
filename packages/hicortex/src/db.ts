@@ -3,6 +3,7 @@
  * Ported from hicortex/db.py — same schema for migration compatibility.
  */
 
+import { hicortexHome } from "./paths.js";
 import Database from "better-sqlite3";
 import { existsSync, lstatSync, mkdirSync, renameSync, symlinkSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -11,7 +12,7 @@ import { homedir } from "node:os";
 const EMBEDDING_DIMENSIONS = 384;
 
 /** Canonical Hicortex home directory. */
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
 
 /** Legacy OC plugin DB path (pre-v0.3 installations). */
 const LEGACY_OC_DB = join(homedir(), ".openclaw", "data", "hicortex.db");
@@ -131,20 +132,33 @@ CREATE INDEX IF NOT EXISTS idx_links_source ON memory_links(source_id);
 CREATE INDEX IF NOT EXISTS idx_links_target ON memory_links(target_id);
 `;
 
+// Fielded FTS5 (#205, migration v10 "fts_fielded"): three columns so bm25()
+// can weight matches per field (body / project / domain). Column order matters
+// — the weights passed to `bm25(memories_fts, w_body, w_project, w_domain)` in
+// storage.searchFts are positional on this declaration. `domain` reads the
+// derived PRIMARY `memories.domain` (the argmax-weight tag from the classifier,
+// set nightly), NOT a memory_tags join — that was judged too fiddly for this
+// phase (a multi-table FTS trigger is fragile and rebuilds on every tag edit).
+// `content_rowid='rowid'` is preserved for lockstep with the legacy schema.
 const FTS_SCHEMA = `
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content,
+    project,
+    domain,
     content_rowid='rowid'
 );
 
 CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories
 BEGIN
-    INSERT INTO memories_fts (rowid, content) VALUES (NEW.rowid, NEW.content);
+    INSERT INTO memories_fts (rowid, content, project, domain)
+    VALUES (NEW.rowid, NEW.content, NEW.project, NEW.domain);
 END;
 
-CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE OF content ON memories
+CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE OF content, project, domain ON memories
 BEGIN
-    UPDATE memories_fts SET content = NEW.content WHERE rowid = NEW.rowid;
+    UPDATE memories_fts
+       SET content = NEW.content, project = NEW.project, domain = NEW.domain
+     WHERE rowid = NEW.rowid;
 END;
 
 CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories
@@ -345,6 +359,138 @@ const MIGRATIONS: Migration[] = [
           updated_at TIMESTAMP
         )
       `);
+    },
+  },
+  {
+    version: 8,
+    name: "add_shown_count",
+    up: (db) => {
+      // #192 recall alignment: exposure tracking separate from use. shown_count
+      // counts appearances in the pushed recall index (/recall-index), which
+      // refreshes last_accessed (mild strengthen: decay clock resets) but does
+      // NOT touch access_count — hardening, the prune shield, and the adoption
+      // metric (uses per showing) stay driven by real use only.
+      if (!hasColumn(db, "memories", "shown_count")) {
+        db.exec("ALTER TABLE memories ADD COLUMN shown_count INTEGER DEFAULT 0");
+      }
+    },
+  },
+  {
+    version: 9,
+    name: "add_dedup_log",
+    up: (db) => {
+      // `hicortex dedup` (#100) audit trail. Every merged-away loser gets a
+      // row here BEFORE it is deleted, keyed by loser_id so a loser can only
+      // be logged once (defensive — the CLI never re-merges a deleted id).
+      // `source_session` is the loser's OWN source_session value (may be
+      // NULL): it is CRITICAL that /distill's dedup prechecks in
+      // mcp-server.ts also consult this table, because a deleted loser may
+      // have carried the ONLY marker for a session — without this table a
+      // `--recapture-window` run could re-ingest content the merge already
+      // consolidated. Sidecar table (not a memories column) since it survives
+      // the row it describes being deleted.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS dedup_log (
+          loser_id TEXT PRIMARY KEY,
+          canonical_id TEXT NOT NULL,
+          source_session TEXT,
+          content_head TEXT,
+          merged_at TIMESTAMP NOT NULL
+        )
+      `);
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_dedup_log_source_session ON dedup_log(source_session)",
+      );
+    },
+  },
+  {
+    version: 10,
+    name: "fts_fielded",
+    up: (db) => {
+      // #205 fielded BM25F. FTS5 cannot be ALTERed (see the virtual-table rule
+      // above), so the single-column `memories_fts(content)` from pre-v10 must
+      // be dropped + recreated multi-column (`content, project, domain`) and
+      // rebuilt from the canonical `memories` rows. The runner wraps up() in a
+      // single transaction (db.ts:216) — that transaction IS the crash window:
+      // a power loss mid-migration rolls back, leaving the OLD single-column
+      // FTS intact (recall falls back to vector-only until the next open;
+      // never silently empty). The nightly capture lock does NOT cover
+      // initDb migrations, so the tx guard is the only safety net.
+      //
+      // Idempotent by construction: DROP IF EXISTS + CREATE + rebuild. On a
+      // fresh DB (where FTS_SCHEMA already created the multi-column form) this
+      // is a 0-row rebuild — wasted but harmless. On a legacy single-column DB
+      // it converts in place. Re-running against an already-migrated DB is a
+      // no-op shape + a refill of the same rows.
+      //
+      // Triggers are dropped + recreated to pick up the new column list (the
+      // pre-v10 update trigger fired only on `UPDATE OF content`; the new one
+      // also fires on project/domain updates so a tag reclassification lands
+      // in FTS without a content edit).
+      db.exec("DROP TRIGGER IF EXISTS memories_fts_insert");
+      db.exec("DROP TRIGGER IF EXISTS memories_fts_update");
+      db.exec("DROP TRIGGER IF EXISTS memories_fts_delete");
+      db.exec("DROP TABLE IF EXISTS memories_fts");
+      db.exec(`
+        CREATE VIRTUAL TABLE memories_fts USING fts5(
+          content,
+          project,
+          domain,
+          content_rowid='rowid'
+        )
+      `);
+      // COALESCE on project/domain because FTS5 stores NULL as no-tokens,
+      // which is what we want for unscoped memories (NULL domain = not yet
+      // classified; NULL project = no cwd-derived label). content is NOT NULL
+      // by the insert contract.
+      db.exec(`
+        INSERT INTO memories_fts (rowid, content, project, domain)
+        SELECT rowid, content, COALESCE(project, ''), COALESCE(domain, '') FROM memories
+      `);
+      db.exec(`
+        CREATE TRIGGER memories_fts_insert AFTER INSERT ON memories
+        BEGIN
+          INSERT INTO memories_fts (rowid, content, project, domain)
+          VALUES (NEW.rowid, NEW.content, NEW.project, NEW.domain);
+        END
+      `);
+      db.exec(`
+        CREATE TRIGGER memories_fts_update AFTER UPDATE OF content, project, domain ON memories
+        BEGIN
+          UPDATE memories_fts
+             SET content = NEW.content, project = NEW.project, domain = NEW.domain
+           WHERE rowid = NEW.rowid;
+        END
+      `);
+      db.exec(`
+        CREATE TRIGGER memories_fts_delete AFTER DELETE ON memories
+        BEGIN
+          DELETE FROM memories_fts WHERE rowid = OLD.rowid;
+        END
+      `);
+    },
+  },
+  {
+    version: 11,
+    name: "add_source_attribution",
+    up: (db) => {
+      // 0.16.x attribution + provenance. Two nullable columns on `memories`,
+      // both populated ONLY by capture (/distill) from client-declared values;
+      // nothing filters, scopes, or scores on either (attribution + echo).
+      //
+      // `source_agent_id`: the capturing client's stable UUID (config.json
+      //   `agentId`, generated once by init). Survives agent/machine renames
+      //   — unlike `source_agent`, a readable name. NULL on legacy rows.
+      // `source_domain`: the client-declared topic/domain of the capturing
+      //   agent (config.json `domain`). Distinct from the content-classified
+      //   `domain` column (which stays the LLM/prototype-derived primary).
+      // Guarded with hasColumn for idempotency across partially-migrated DBs.
+      if (!hasColumn(db, "memories", "source_agent_id")) {
+        db.exec("ALTER TABLE memories ADD COLUMN source_agent_id TEXT");
+      }
+      if (!hasColumn(db, "memories", "source_domain")) {
+        db.exec("ALTER TABLE memories ADD COLUMN source_domain TEXT");
+      }
     },
   },
 ];

@@ -2,6 +2,7 @@
  * Hicortex status — show current configuration and stats.
  */
 
+import { hicortexHome } from "./paths.js";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
@@ -9,10 +10,31 @@ import { execSync } from "node:child_process";
 import { resolveDbPath } from "./db.js";
 import { getValidatedLicense } from "./features.js";
 import { describeLastNightly } from "./state.js";
+import { resolveAgentIdentity } from "./context-store.js";
 
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
 const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
 const OC_CONFIG = join(homedir(), ".openclaw", "openclaw.json");
+
+/**
+ * The value shown after "Agent name:" in `hicortex status` (#179, A3). Reports
+ * EXACTLY what the CC hook resolves (shared `resolveAgentIdentity`), so the
+ * operator never keys `contextAgents`/`agents/<id>/` on an id the install does
+ * not actually send. Unset → the install sends no `?agent=` and shares the
+ * global context (CC default). A configured-but-unsanitizable value is called
+ * out as invalid (the hook sends none) rather than silently accepted.
+ */
+export function statusAgentLine(config: Record<string, unknown>): string {
+  const id = resolveAgentIdentity(config);
+  switch (id.source) {
+    case "configured":
+      return id.agentId as string;
+    case "invalid-config":
+      return `(invalid configured value "${id.rawConfigured}" — fix config.agentName; hook sends none)`;
+    default: // unset
+      return "(not set — global context)";
+  }
+}
 
 export async function runStatus(): Promise<void> {
   console.log("Hicortex Status");
@@ -43,11 +65,12 @@ export async function runStatus(): Promise<void> {
   let licenseKey = "";
   let savedAuthToken = "";
   let isClientMode = false;
+  let parsedConfig: Record<string, unknown> = {};
   try {
-    const config = JSON.parse(readFileSync(configPath, "utf-8"));
-    licenseKey = config.licenseKey ?? "";
-    savedAuthToken = config.authToken ?? "";
-    isClientMode = config.mode === "client";
+    parsedConfig = JSON.parse(readFileSync(configPath, "utf-8"));
+    licenseKey = (parsedConfig.licenseKey as string | undefined) ?? "";
+    savedAuthToken = (parsedConfig.authToken as string | undefined) ?? "";
+    isClientMode = parsedConfig.mode === "client";
   } catch { /* no config */ }
   const validated = getValidatedLicense();
   if (validated?.valid && validated.tier) {
@@ -62,6 +85,10 @@ export async function runStatus(): Promise<void> {
   } else if (!isClientMode && !savedAuthToken) {
     console.log(`Auth token:   not configured (run: npx @gamaze/hicortex init)`);
   }
+
+  // Per-agent context id (#179) — the id this install sends as ?agent= and the
+  // key operators use for contextAgents / agents/<id>/ dirs.
+  console.log(`Agent name:   ${statusAgentLine(parsedConfig)}`);
 
   console.log();
 

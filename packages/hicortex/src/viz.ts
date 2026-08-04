@@ -67,6 +67,13 @@ export function createAuthMiddleware(
     // client-side (URL ?token= handoff or in-page prompt) and sends it as a
     // normal Authorization header on its data fetches.
     if (req.method === "GET" && req.path === "/viz") return next();
+    // The /context/ui page SHELL is public for the same reason as /viz: a
+    // self-contained static editor page, no data and no secrets (it ships
+    // verbatim in the npm tarball). The standing-context DATA it edits comes
+    // from GET/PUT /context, which stay bearer-only (localhost bypass) like
+    // every other data route; the page collects the token client-side and
+    // sends it as a normal Authorization header on its /context fetches.
+    if (req.method === "GET" && req.path === "/context/ui") return next();
     // The pinned renderer bundles the /viz page loads (#139) are public for
     // the same reason as the shell: static third-party code shipped verbatim
     // in the npm tarball, zero data. Kept tight: GET only, and ONLY names on
@@ -128,6 +135,47 @@ export function vizHandler(): express.RequestHandler {
   return (_req, res) => {
     try {
       res.type("html").send(readVizHtml());
+    } catch (err) {
+      res.status(503).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Context layer editor page (/context/ui, 0.12 — spec 2026-07-12 §5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the on-disk path of the context-layer editor page. Throws (fail
+ * explicitly) when the asset is missing — same contract as resolveVizHtmlPath.
+ * assets/ sits next to both dist/ (dist/viz.js → ../assets/) and src/
+ * (src/viz.ts → ../assets/ under tsx), so one sibling candidate covers both.
+ */
+export function resolveContextHtmlPath(): string {
+  const candidates = [join(__dirname, "..", "assets", "context.html")];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    `context.html asset not found — looked in: ${candidates.join(", ")}. ` +
+    `The package install is incomplete (assets/ missing).`
+  );
+}
+
+/** Read the context editor page. Read at request time so a reinstall is live. */
+export function readContextHtml(): string {
+  return readFileSync(resolveContextHtmlPath(), "utf-8");
+}
+
+/**
+ * Express handler for GET /context/ui — the PRIMARY edit surface for the
+ * standing context layer. 503 with the usual {error} shape when the asset
+ * cannot be read, exactly like vizHandler.
+ */
+export function contextUiHandler(): express.RequestHandler {
+  return (_req, res) => {
+    try {
+      res.type("html").send(readContextHtml());
     } catch (err) {
       res.status(503).json({ error: err instanceof Error ? err.message : String(err) });
     }

@@ -17,6 +17,7 @@
  * user-edited and tracked separately from machine state.
  */
 
+import { hicortexHome } from "./paths.js";
 import {
   readFileSync,
   writeFileSync,
@@ -29,7 +30,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import type { LicenseInfo, ModuleIndex } from "./types.js";
 
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
 const STATE_FILE = "state.json";
 
 /** Persisted tier information — reflects the last successful validation. */
@@ -66,6 +67,16 @@ export interface HicortexState {
    * Same discipline as relinkCursor.
    */
   domainCursor?: number;
+  /**
+   * Resume cursor for the nightly's supersession-detection stage (#191 Phase
+   * B) — highest memories.rowid whose decision/correction candidates have
+   * been evaluated (or infra-skipped) this run. Absent/0 = never run. Unlike
+   * relinkCursor/domainCursor (separate resumable CLI commands), this cursor
+   * advances a SMALL amount per night (config `supersessionMaxCalls`, default
+   * 30) as part of the regular nightly — the corpus is back-processed
+   * gradually over many nights.
+   */
+  supersessionCursor?: number;
 }
 
 /**

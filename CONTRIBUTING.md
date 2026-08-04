@@ -25,7 +25,7 @@ npm test
 ```
 
 Requirements:
-- Node.js 18+
+- Node.js 20+
 - An LLM provider (Ollama 9b+ recommended for local dev, or any API key)
 
 ## What we accept

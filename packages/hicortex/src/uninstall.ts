@@ -3,14 +3,16 @@
  * Preserves the database (user data).
  */
 
+import { hicortexHome } from "./paths.js";
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { sendLifecycleEvent } from "./telemetry.js";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { removeLessonsBlock } from "./claude-md.js";
 
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
 const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
 const CC_COMMANDS_DIR = join(homedir(), ".claude", "commands");
 const CLAUDE_MD = join(homedir(), ".claude", "CLAUDE.md");
@@ -26,6 +28,15 @@ async function ask(question: string): Promise<string> {
 }
 
 export async function runUninstall(): Promise<void> {
+  // Churn signal (0.15.2): ping BEFORE removing anything, while state.json
+  // still holds the anonymous id. Opt-out aware; failures are swallowed.
+  try {
+    const home = hicortexHome();
+    const config = JSON.parse(readFileSync(join(home, "config.json"), "utf-8")) as Record<string, unknown>;
+    const version = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version as string;
+    await sendLifecycleEvent("uninstall", home, config, version);
+  } catch { /* no config/state or unreadable — nothing to report */ }
+
   console.log("Hicortex — Uninstall CC Integration\n");
 
   const answer = await ask("This will remove Hicortex from Claude Code. Your memory database is preserved. Continue? [y/N] ");
@@ -36,25 +47,30 @@ export async function runUninstall(): Promise<void> {
 
   console.log();
 
-  // 1. Stop and remove daemon
+  // 1. Stop and remove daemon + nightly timer (both units, or the timer
+  //    keeps firing against a half-removed install)
   const os = platform();
   if (os === "darwin") {
-    const plistPath = join(homedir(), "Library", "LaunchAgents", "com.gamaze.hicortex.plist");
-    if (existsSync(plistPath)) {
-      try {
-        execSync(`launchctl unload ${plistPath} 2>/dev/null`);
-      } catch { /* not loaded */ }
-      unlinkSync(plistPath);
-      console.log("  ✓ Removed launchd daemon");
+    for (const name of ["com.gamaze.hicortex.plist", "com.gamaze.hicortex-nightly.plist"]) {
+      const plistPath = join(homedir(), "Library", "LaunchAgents", name);
+      if (existsSync(plistPath)) {
+        try {
+          execSync(`launchctl unload ${plistPath} 2>/dev/null`);
+        } catch { /* not loaded */ }
+        unlinkSync(plistPath);
+        console.log(`  ✓ Removed ${name}`);
+      }
     }
   } else if (os === "linux") {
-    try {
-      execSync("systemctl --user disable --now hicortex.service 2>/dev/null");
-      const servicePath = join(homedir(), ".config", "systemd", "user", "hicortex.service");
-      if (existsSync(servicePath)) unlinkSync(servicePath);
-      execSync("systemctl --user daemon-reload 2>/dev/null");
-      console.log("  ✓ Removed systemd service");
-    } catch { /* not installed */ }
+    try { execSync("systemctl --user disable --now hicortex.service 2>/dev/null"); } catch { /* not installed */ }
+    try { execSync("systemctl --user disable --now hicortex-nightly.timer 2>/dev/null"); } catch { /* not installed */ }
+    const unitDir = join(homedir(), ".config", "systemd", "user");
+    for (const name of ["hicortex.service", "hicortex-nightly.timer", "hicortex-nightly.service"]) {
+      const unitPath = join(unitDir, name);
+      try { if (existsSync(unitPath)) unlinkSync(unitPath); } catch { /* leave it */ }
+    }
+    try { execSync("systemctl --user daemon-reload 2>/dev/null"); } catch { /* fine */ }
+    console.log("  ✓ Removed systemd service + nightly timer");
   }
 
   // 2. Remove MCP from CC
@@ -74,14 +90,23 @@ export async function runUninstall(): Promise<void> {
     } catch { /* no settings */ }
   }
 
-  // 3. Remove CC custom commands
+  // 3. Remove CC custom commands — only files we actually wrote. `learn.md` is
+  // a generic name a user may own; guard on the "hicortex" marker the installer
+  // always embedded, so uninstall never deletes an unrelated user command.
+  let removedCmds = 0;
   for (const cmd of ["learn.md", "hicortex-activate.md"]) {
     const cmdPath = join(CC_COMMANDS_DIR, cmd);
-    if (existsSync(cmdPath)) {
-      unlinkSync(cmdPath);
-    }
+    if (!existsSync(cmdPath)) continue;
+    try {
+      if (!readFileSync(cmdPath, "utf-8").toLowerCase().includes("hicortex")) {
+        console.log(`  ⚠ Skipping ${cmd} — not a Hicortex file, left untouched`);
+        continue;
+      }
+    } catch { continue; }
+    unlinkSync(cmdPath);
+    removedCmds++;
   }
-  console.log("  ✓ Removed /learn and /hicortex-activate commands");
+  if (removedCmds > 0) console.log(`  ✓ Removed ${removedCmds} legacy CC command${removedCmds > 1 ? "s" : ""} (/learn, /hicortex-activate)`);
 
   // 4. Remove SessionStart hook (JSON merge — filter out entries containing "lessons-context")
   try {

@@ -124,11 +124,9 @@ export function applyWeakPrimary(
   memoryId: string,
   domain: string,
   weight: number,
-  compartments: Set<string>,
 ): void {
   storage.setMemoryTags(db, memoryId, [domain], {
     weights: { [domain]: weight },
-    compartments,
   });
   console.log(
     `[hicortex] weak-primary ${domain} w=${weight.toFixed(2)} for ${memoryId}`,

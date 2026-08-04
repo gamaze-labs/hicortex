@@ -2,7 +2,7 @@
 
 [![npm](https://img.shields.io/npm/v/@gamaze/hicortex.svg)](https://www.npmjs.com/package/@gamaze/hicortex)
 [![License: PolyForm NC](https://img.shields.io/badge/License-PolyForm_NC_1.0-blue.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D18-brightgreen.svg)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 
 **Self-improving long-term memory for AI agents.** Capture sessions, distill lessons overnight, inject them on the next run. Works with **Claude Code**, **Hermes**, **OpenClaw**, **Pi**, and any MCP-compatible agent.
 
@@ -64,6 +64,8 @@ CAPTURE (nightly)            CONSOLIDATE (nightly)        RETRIEVE (instant)
 
 Memories decay slower the more important and frequently used they are, strengthen on retrieval, and are linked automatically to related memories. Retrieval is zero-LLM: BM25 full-text + vector search fused with Reciprocal Rank Fusion, scored by similarity (40%) + strength (30%) + connections (20%) + recency (10%).
 
+Alongside those auto-distilled memories and lessons, Hicortex holds a hand-edited **context layer** (0.12) — standing "who you are + how to work" Markdown at `~/.hicortex/context/*.md`, injected into every session at start and **never decayed**. Edit it in the web editor at `/context/ui` or with `hicortex context show|edit`; choose which harnesses receive it with `contextClients` (default `["cc"]`). Each agent can also have its **own** context (0.13) — resolved server-side as `override`/`global`/`off` per agent id, so one server serves a fleet of distinct personas. See the [package README](packages/hicortex/README.md#context-layer).
+
 ## MCP tools
 
 Eight MCP tools your agent can call:
@@ -71,7 +73,7 @@ Eight MCP tools your agent can call:
 | Tool | Purpose |
 |------|---------|
 | `hicortex_search`  | Semantic search across all stored memories |
-| `hicortex_context` | Recent decisions + project state for the current session |
+| `hicortex_recent`  | Recent decisions + project state for the current session |
 | `hicortex_ingest`  | Store a memory directly |
 | `hicortex_lessons` | Actionable lessons from nightly reflection |
 | `hicortex_index`   | Knowledge domain index — what topics are stored |
@@ -83,7 +85,7 @@ Plus skills: `/learn` to save explicit learnings.
 
 ## Stack
 
-- **TypeScript**, Node.js 18+
+- **TypeScript**, Node.js 20+
 - **better-sqlite3** + **sqlite-vec** + FTS5 (semantic + full-text search in one DB)
 - **@huggingface/transformers** (bge-small-en-v1.5 ONNX, runs on CPU)
 - **MCP protocol** over HTTP/SSE (Claude Code, Hermes, OpenClaw, Pi, any MCP client)

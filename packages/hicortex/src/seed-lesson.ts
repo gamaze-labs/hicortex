@@ -7,9 +7,9 @@ import type Database from "better-sqlite3";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 
-export const SEED_LESSON = `## Lesson: 1% Daily Self-Improvement
+export const SEED_LESSON = `1% Daily Self-Improvement
 
-Self-improvement protocol: Review your sessions daily. Scan for mistakes, gaps, user corrections, and friction. Identify 1-2 issues maximum. Apply one targeted fix to your instruction files (AGENT.md, IDENTITY.md, TOOLS.md, SOUL.md, or CLAUDE.md). Never overcorrect — feedback is guidance, not emergency. One fix per issue. Never rewrite entire systems. Before changing something, ask: is this a real pattern or am I reacting to noise?
+Self-improvement protocol: Review your sessions daily. Scan for mistakes, gaps, user corrections, and friction. Identify 1-2 issues maximum. Apply one targeted fix to your agent instruction files (e.g. SOUL.md / MEMORY.md for Hermes profiles, CLAUDE.md for Claude Code). Never overcorrect — feedback is guidance, not emergency. One fix per issue. Never rewrite entire systems. Before changing something, ask: is this a real pattern or am I reacting to noise?
 
 The flywheel: Sessions → Hicortex captures → Nightly consolidation → Lessons generated → Lessons injected into your context → You apply one fix → Better sessions tomorrow.
 
@@ -37,7 +37,6 @@ export async function injectSeedLesson(
       project: "global",
       memoryType: "lesson",
       baseStrength: 0.95,
-      privacy: "WORK",
     });
     log("[hicortex] Seed lesson injected: Daily Self-Improvement Protocol");
   } catch (err) {

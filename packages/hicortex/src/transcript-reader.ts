@@ -11,18 +11,40 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
+import type { CursorMap } from "./capture-cursors.js";
+
+export type { CursorMap };
 
 export interface TranscriptBatch {
   sessionId: string;
   projectName: string;
-  date: string; // ISO date of last entry
-  entries: unknown[]; // Raw JSONL entries — fed to extractConversationText()
+  date: string; // ISO date of last entry IN THE DELTA
+  entries: unknown[]; // Raw JSONL entries (the delta) — fed to extractConversationText()
   /**
-   * Optional source-agent label (e.g. "hermes/lenny"). When set, the nightly
+   * Optional source-agent label (e.g. "hermes/alice"). When set, the nightly
    * pipeline uses it verbatim for provenance instead of the default
    * `claude-code/<project>`. Lets per-harness readers stamp their own origin.
    */
   sourceAgent?: string;
+  /**
+   * Per-session cursor key (`<prefix>:<sessionId>`) — the capture-cursors.json
+   * key whose value gates and advances this session's incremental capture (#189).
+   */
+  cursorKey: string;
+  /** Cursor value the delta starts from (entries already captured before this run). */
+  startCursor: number;
+  /**
+   * Shrink-guard generation for this session — woven into segment ids so
+   * post-reset segments can't collide with pre-reset ids on the content-blind
+   * server dedup. Advanced back to the store with the cursor.
+   */
+  generation: number;
+  /**
+   * End-cursor value for each delta entry (length === entries.length). The
+   * packer uses these to land segment boundaries on exact entry boundaries.
+   * JSONL: startCursor + i + 1. Hermes: the row's messages.id.
+   */
+  entryCursors: number[];
 }
 
 /**
@@ -47,7 +69,8 @@ const CC_PROJECTS_DIR = join(homedir(), ".claude", "projects");
  */
 export function readCcTranscripts(
   since: Date,
-  projectsDir = CC_PROJECTS_DIR
+  projectsDir = CC_PROJECTS_DIR,
+  cursors: CursorMap = {}
 ): TranscriptBatch[] {
   const batches: TranscriptBatch[] = [];
 
@@ -92,7 +115,10 @@ export function readCcTranscripts(
       // Skip files not modified since last run
       if (fileStat.mtime <= since) continue;
 
-      const batch = parseTranscriptFile(filePath, projectName);
+      const sessionId = basename(filePath, ".jsonl");
+      const key = `cc:${sessionId}`;
+      const pos = cursors[key] ?? { cursor: 0, gen: 0 };
+      const batch = parseTranscriptFile(filePath, projectName, key, pos.cursor, pos.gen);
       if (batch) {
         batches.push(batch);
       }
@@ -103,12 +129,20 @@ export function readCcTranscripts(
 }
 
 /**
- * Parse a single .jsonl transcript file into a batch.
- * Returns null if the file has too few meaningful entries.
+ * Parse a single .jsonl transcript file into a delta batch.
+ *
+ * Returns null if the file has too few meaningful entries (whole-file gate) or
+ * the cursor already covers everything (nothing new since last capture, #189).
+ *
+ * @param cursorKey capture-cursors.json key for this session
+ * @param startCursor entries already captured (delta = entries.slice(startCursor))
  */
 function parseTranscriptFile(
   filePath: string,
-  projectName: string
+  projectName: string,
+  cursorKey: string,
+  startCursor: number,
+  generation: number
 ): TranscriptBatch | null {
   let raw: string;
   try {
@@ -121,43 +155,69 @@ function parseTranscriptFile(
   if (lines.length < MIN_TRANSCRIPT_ENTRIES) return null; // degenerate/empty file
 
   const entries: unknown[] = [];
-  let lastTimestamp = "";
+  const timestamps: string[] = [];
 
   for (const line of lines) {
     try {
       const entry = JSON.parse(line);
       entries.push(entry);
-      if (entry.timestamp) {
-        lastTimestamp = entry.timestamp;
-      }
+      timestamps.push(typeof entry.timestamp === "string" ? entry.timestamp : "");
     } catch {
-      // Skip malformed lines
+      // Skip malformed lines — a permanently-malformed line is skipped
+      // identically every run, and a partial trailing write fails JSON.parse
+      // now and parses (at the same index) once fully flushed.
     }
   }
 
+  // Whole-file degeneracy gate stays on the full parse, not the delta.
   if (entries.length < MIN_TRANSCRIPT_ENTRIES) return null;
 
-  // Extract session ID from filename (UUID.jsonl)
-  const sessionId = basename(filePath, ".jsonl");
+  // Shrink guard: a truncated/rotated file with fewer entries than the stored
+  // cursor → reset to 0 AND bump the generation. The generation is woven into
+  // the segment id downstream so the fresh file's segments can never collide
+  // with the pre-reset ids on the server's content-blind dedup (fix 8).
+  let start = startCursor;
+  let gen = generation;
+  if (start > entries.length) {
+    start = 0;
+    gen = generation + 1;
+  }
+
+  const delta = entries.slice(start);
+  if (delta.length === 0) return null; // cursor already covers the whole file
+
+  // Per-entry end cursors: entry i (0-based in the delta) ends at start+i+1.
+  const entryCursors = delta.map((_, i) => start + i + 1);
+
+  // Date from the LAST timestamped entry in the delta (per-night created_at for
+  // multi-day sessions), falling back to today.
+  let lastTimestamp = "";
+  for (let i = start; i < entries.length; i++) {
+    if (timestamps[i]) lastTimestamp = timestamps[i];
+  }
 
   return {
-    sessionId,
+    sessionId: basename(filePath, ".jsonl"),
     projectName,
     date: lastTimestamp
       ? lastTimestamp.slice(0, 10)
       : new Date().toISOString().slice(0, 10),
-    entries,
+    entries: delta,
+    cursorKey,
+    startCursor: start,
+    generation: gen,
+    entryCursors,
   };
 }
 
 /**
  * Decode CC project directory name to a human-readable project name.
- * CC uses path-based hashing: "-Users-mattias-Development-Tools-hicortex"
+ * CC uses path-based hashing: "-Users-alice-Development-Tools-hicortex"
  * becomes "hicortex" (last path component).
  */
 function decodeProjectDirName(dirName: string): string {
   // CC encodes paths by replacing / with -
-  // e.g. "-Users-mattias-Development-Tools-hicortex"
+  // e.g. "-Users-alice-Development-Tools-hicortex"
   const parts = dirName.split("-").filter(Boolean);
   if (parts.length === 0) return dirName;
 

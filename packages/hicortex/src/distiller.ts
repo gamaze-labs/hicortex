@@ -255,13 +255,18 @@ export function extractConversationText(
  * Send filtered conversation to LLM for knowledge extraction.
  * For large transcripts, chunks into segments to avoid overwhelming small models.
  * Returns an array of memory entries to ingest, or empty array if nothing worth extracting.
+ *
+ * `droppedOut`, when provided, is filled with every entry the substance gate
+ * discarded (full text). Callers use it to build a durable audit trail (#156);
+ * omitting it leaves gate behaviour unchanged.
  */
 export async function distillSession(
   llm: LlmClient,
   conversation: string,
   projectName: string,
   date: string,
-  chunkSizeChars?: number
+  chunkSizeChars?: number,
+  droppedOut?: string[]
 ): Promise<string[]> {
   if (conversation.length < MIN_CONVERSATION_CHARS) {
     return [];
@@ -278,7 +283,9 @@ export async function distillSession(
 
   // If transcript fits in one chunk, distill directly (errors propagate)
   if (transcript.length <= chunkSize) {
-    return distillChunk(llm, transcript, projectName, date);
+    const { entries, dropped } = await distillChunk(llm, transcript, projectName, date);
+    if (droppedOut) droppedOut.push(...dropped);
+    return entries;
   }
 
   // Chunk large transcripts and distill each segment.
@@ -299,7 +306,8 @@ export async function distillSession(
   for (let i = 0; i < chunks.length; i++) {
     console.log(`[hicortex]     Chunk ${i + 1}/${chunks.length} (${chunks[i].length} chars)`);
     try {
-      const entries = await distillChunk(llm, chunks[i], projectName, date);
+      const { entries, dropped } = await distillChunk(llm, chunks[i], projectName, date);
+      if (droppedOut) droppedOut.push(...dropped);
       for (const entry of entries) {
         // Deduplicate by normalized content
         const key = entry.toLowerCase().replace(/\s+/g, " ").slice(0, 100);
@@ -335,20 +343,24 @@ export async function distillSession(
  * Distill a single chunk of conversation text.
  *
  * Behaviour contract:
- *   - Returns `[]` for legitimate empty results (NO_EXTRACT, empty LLM response,
- *     transcript produced no entries). These are terminal states — the chunk was
- *     processed successfully, there's just nothing worth keeping.
+ *   - Returns `{entries: [], dropped: []}` for legitimate empty results
+ *     (NO_EXTRACT, empty LLM response, transcript produced no entries). These are
+ *     terminal states — the chunk was processed successfully, there's just
+ *     nothing worth keeping.
  *   - Throws for transient errors (LLM unreachable, HTTP 4xx/5xx, timeout, model
  *     not found, rate limit). These MUST propagate so the nightly pipeline can
  *     distinguish "nothing to extract" from "try again later" and avoid
  *     advancing the last-run watermark past sessions it never actually processed.
+ *
+ * `dropped` carries entries the substance gate rejected (full text) so the
+ * caller can surface them in a durable audit trail (#156).
  */
 async function distillChunk(
   llm: LlmClient,
   transcript: string,
   projectName: string,
   date: string
-): Promise<string[]> {
+): Promise<{ entries: string[]; dropped: string[] }> {
   const prompt = distillation(projectName, date, transcript);
 
   // NOTE: Intentionally no try/catch here. Transient LLM errors (network
@@ -356,12 +368,41 @@ async function distillChunk(
   // so the nightly pipeline can treat them as "retry later" instead of
   // "processed successfully with zero extractions".
   const result = await llm.completeDistill(prompt);
-  if (!result) return [];
+  if (!result) return { entries: [], dropped: [] };
   if (result === "NO_EXTRACT" || result.slice(0, 20).includes("NO_EXTRACT")) {
-    return [];
+    return { entries: [], dropped: [] };
   }
 
-  return parseDistilledEntries(result);
+  const parsed = parseDistilledEntries(result);
+
+  // Smoke alarm (PR #218 review): the prompt enforces topic-first, but models
+  // sometimes ignore constraints (cf. the prior max-15-bullet failure). Count
+  // entries that still look actor-led or bracket-led so a format regression
+  // shows in nightly logs, not months later in the next eval. Non-blocking.
+  const offTopic = parsed.filter(
+    (e) => /^\s*(user|ai|the user|assistant)\b/i.test(e) || /^\s*\[/.test(e)
+  ).length;
+  if (parsed.length > 0 && offTopic > 0) {
+    console.log(
+      `[hicortex]     topic-first check: ${offTopic}/${parsed.length} entries look actor/bracket-led (prompt may be ignored)`
+    );
+  }
+
+  const entries: string[] = [];
+  const dropped: string[] = [];
+  for (const entry of parsed) {
+    (hasMinimalSubstance(entry) ? entries : dropped).push(entry);
+  }
+  if (dropped.length > 0) {
+    for (const d of dropped) {
+      const preview = d.length > 120 ? `${d.slice(0, 120)}…` : d;
+      console.log(`[hicortex]     Substance gate: dropped "${preview}"`);
+    }
+    console.log(
+      `[hicortex]     Substance gate: dropped ${dropped.length}/${parsed.length} content-free fragment(s)`
+    );
+  }
+  return { entries, dropped };
 }
 
 /**
@@ -398,6 +439,49 @@ function splitIntoChunks(text: string, maxChars: number): string[] {
   return chunks.filter((c) => c.length >= MIN_CONVERSATION_CHARS);
 }
 
+// Entries longer than this trivially carry substance; the cap short-circuits
+// the checks below and bounds every regex to a small input, so no pathological
+// input can make the gate expensive (#156).
+const MAX_GATE_LENGTH = 2000;
+
+/**
+ * Reject ONLY structurally-empty distiller fragments before they become
+ * memories (#156). The distiller occasionally emits leftovers that parse into
+ * entries but carry no recallable content:
+ *   - bare section prefixes:        "[Specific AI Content:]", "[Facts Learned]"
+ *   - echoed template placeholders: "[decision]: [reasoning] (2026-07-05)"
+ *   - pseudo-header bullets:        "**Facts Learned:**"
+ *   - metadata-only lines:          "(2026-07-05)"
+ *
+ * PRECISION OVER RECALL — deliberate trade: the gate rejects only shapes that
+ * are structurally empty of content, never on a length or word-count threshold.
+ * A kept artifact ("Classification: WORK" style) is cheaply pruned later by the
+ * no-fit decay path; a wrongly-dropped genuine memory is unrecoverable. So when
+ * in doubt, keep. Consequence documented for the reviewer: metadata lines like
+ * "Classification: WORK" now PASS the gate — that is intended.
+ *
+ * Stripping is scoped and anchored (one leading section prefix, one trailing
+ * date stamp), never global, so bracketed payloads ("use [ollama] not
+ * [claude-cli]") and content-bearing dates ("deadline moved (2026-08-01)")
+ * survive. Stripping affects only this gate's decision, never stored text.
+ */
+export function hasMinimalSubstance(entry: string): boolean {
+  const raw = entry.trim();
+  if (raw.length > MAX_GATE_LENGTH) return true;
+  // Strip ONE leading section prefix (anchored + length-bounded, never global).
+  let body = raw.replace(/^\[[^\]]{0,80}\]\s*/, "");
+  // Strip ONE trailing date stamp (anchored to end).
+  body = body.replace(/\(\s*\d{4}-\d{2}-\d{2}\s*\)\s*$/, "");
+  // Markdown decoration.
+  body = body.replace(/[*_`#>]/g, " ").trim();
+  if (!body) return false; // metadata-only line or bare section prefix
+  if (/:$/.test(body)) return false; // pseudo-header: "Facts Learned:"
+  // Pure placeholder echo — nothing but bracketed tokens and separators,
+  // e.g. "[decision]: [reasoning]".
+  if (/^(?:\[[^\]]{0,80}\]|[\s:.,;–-])+$/.test(body)) return false;
+  return true;
+}
+
 /**
  * Parse distilled markdown into individual memory entry strings.
  * Each section item becomes a separate memory.
@@ -405,26 +489,27 @@ function splitIntoChunks(text: string, maxChars: number): string[] {
 function parseDistilledEntries(markdown: string): string[] {
   const entries: string[] = [];
   const lines = markdown.split("\n");
-  let currentSection = "";
 
   for (const line of lines) {
     const trimmed = line.trim();
 
-    // Section headers
-    if (trimmed.startsWith("### ")) {
-      currentSection = trimmed.slice(4).trim();
+    // Skip all markdown headers (session title, section headings). Sections
+    // are NOT prefixed onto entries: each bullet already
+    // starts with its [SUBJECT] (topic-first, enforced by prompts.ts), and
+    // prepending "[Section]" re-introduced the category-first prefix the
+    // 2026-08-02 corpus rewrite removed. The section label is unused
+    // downstream (distilled memories all store memory_type='episode').
+    if (
+      trimmed.startsWith("# ") ||
+      trimmed.startsWith("## ") ||
+      trimmed.startsWith("### ")
+    ) {
       continue;
     }
 
-    // Skip top-level headers and classification
-    if (trimmed.startsWith("# ") || trimmed.startsWith("## ")) continue;
-
-    // Bullet items are individual memories
+    // Bullet items are individual, already topic-first memories.
     if (trimmed.startsWith("- ") && trimmed.length > 5) {
-      const entry = currentSection
-        ? `[${currentSection}] ${trimmed.slice(2)}`
-        : trimmed.slice(2);
-      entries.push(entry);
+      entries.push(trimmed.slice(2));
     }
   }
 

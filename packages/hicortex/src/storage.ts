@@ -55,9 +55,9 @@ export function insertMemory(
     .prepare(
       `INSERT OR IGNORE INTO memories
        (id, content, base_strength, last_accessed, access_count,
-        created_at, ingested_at, source_agent, source_session, project,
-        privacy, memory_type)
-       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`
+        created_at, ingested_at, source_agent, source_agent_id, source_session,
+        source_domain, project, privacy, memory_type)
+       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -67,9 +67,11 @@ export function insertMemory(
       ts,
       ingestedTs,
       opts.sourceAgent ?? "default",
+      opts.sourceAgentId ?? null,
       sourceSession,
+      opts.sourceDomain ?? null,
       opts.project ?? null,
-      opts.privacy ?? "WORK",
+      opts.privacy ?? null,
       opts.memoryType ?? "episode"
     );
 
@@ -92,6 +94,26 @@ export function insertMemory(
 }
 
 /**
+ * Resolve a short ID prefix (e.g. the 8-char id shown in citations and the
+ * recall index) to a full memory UUID. Null when unknown or ambiguous.
+ */
+export function resolveMemoryId(
+  db: Database.Database,
+  idPrefix: string
+): string | null {
+  if (idPrefix.length >= 36) {
+    const row = db
+      .prepare("SELECT id FROM memories WHERE id = ?")
+      .get(idPrefix) as { id: string } | undefined;
+    return row?.id ?? null;
+  }
+  const rows = db
+    .prepare("SELECT id FROM memories WHERE id LIKE ?")
+    .all(`${idPrefix}%`) as { id: string }[];
+  return rows.length === 1 ? rows[0].id : null;
+}
+
+/**
  * Get a single memory by ID. Returns null if not found.
  */
 export function getMemory(
@@ -110,6 +132,10 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   "base_strength",
   "last_accessed",
   "access_count",
+  // shown_count is normally maintained by touchMemoriesShown (bulk +1 per
+  // recall-index appearance); it's also allowed here so `hicortex dedup`
+  // (#100) can sum a merged cluster's counters onto the canonical row.
+  "shown_count",
   "source_agent",
   "source_session",
   "project",
@@ -160,6 +186,29 @@ export function strengthenMemory(
 }
 
 /**
+ * Record that memories appeared in a pushed recall index (#192): bump
+ * shown_count and refresh last_accessed (a mild strengthen — the decay clock
+ * resets so topically-live memories stop sinking) WITHOUT touching
+ * access_count, which stays reserved for real use (hardening + prune shield).
+ */
+export function touchMemoriesShown(
+  db: Database.Database,
+  memoryIds: string[],
+  nowIsoStr: string
+): void {
+  if (memoryIds.length === 0) return;
+  const stmt = db.prepare(
+    `UPDATE memories
+     SET shown_count = COALESCE(shown_count, 0) + 1, last_accessed = ?
+     WHERE id = ?`
+  );
+  const run = db.transaction((ids: string[]) => {
+    for (const id of ids) stmt.run(nowIsoStr, id);
+  });
+  run(memoryIds);
+}
+
+/**
  * Delete a memory, its vector, its tags, and all its links.
  */
 export function deleteMemory(
@@ -186,11 +235,6 @@ export interface SetMemoryTagsOptions {
    * (repaired by the next nightly recompute).
    */
   weights?: Record<string, number | null>;
-  /**
-   * Compartment domain names (DomainDef.compartment === true): a tagged
-   * compartment domain becomes the primary regardless of weights.
-   */
-  compartments?: Set<string>;
 }
 
 /**
@@ -202,9 +246,8 @@ export interface SetMemoryTagsOptions {
  * row stores its association weight (NULL when not yet computed).
  *
  * The PRIMARY (memories.domain) is DERIVED here — never passed in by the LLM:
- * compartment override first, else argmax weight, else first tag (all-null
- * weights). The whole update is one transaction so domain, tag set, and
- * weights never diverge.
+ * argmax weight, else first tag (all-null weights). The whole update is one
+ * transaction so domain, tag set, and weights never diverge.
  *
  * @returns the derived primary written to memories.domain
  */
@@ -225,7 +268,7 @@ export function setMemoryTags(
     tag,
     weight: options.weights?.[tag] ?? null,
   }));
-  const primary = derivePrimary(weighted, options.compartments ?? new Set());
+  const primary = derivePrimary(weighted);
 
   const setDomain = db.prepare("UPDATE memories SET domain = ? WHERE id = ?");
   const clearTags = db.prepare("DELETE FROM memory_tags WHERE memory_id = ?");
@@ -277,6 +320,59 @@ export function getMemoryTagsWeighted(
   return rows;
 }
 
+/**
+ * Batched weighted-tag load for a candidate set (#203 domain affinity). ONE
+ * query for the whole set — never call getMemoryTagsWeighted per-candidate in
+ * a ranking loop. Returns a Map keyed by memory_id; memories with no tags are
+ * simply absent from the map (caller treats missing as "no domain boost").
+ * Ordering within each memory mirrors getMemoryTagsWeighted (weight DESC).
+ */
+export function getMemoryTagsWeightedBatched(
+  db: Database.Database,
+  memoryIds: string[]
+): Map<string, Array<{ tag: string; weight: number | null }>> {
+  const out = new Map<string, Array<{ tag: string; weight: number | null }>>();
+  if (memoryIds.length === 0) return out;
+  const placeholders = memoryIds.map(() => "?").join(", ");
+  const rows = db
+    .prepare(
+      `SELECT memory_id, tag, weight FROM memory_tags
+       WHERE memory_id IN (${placeholders})
+       ORDER BY memory_id, (weight IS NULL) ASC, weight DESC, rowid ASC`
+    )
+    .all(...memoryIds) as Array<{ memory_id: string; tag: string; weight: number | null }>;
+  for (const r of rows) {
+    let arr = out.get(r.memory_id);
+    if (!arr) {
+      arr = [];
+      out.set(r.memory_id, arr);
+    }
+    arr.push({ tag: r.tag, weight: r.weight });
+  }
+  return out;
+}
+
+/**
+ * Read the stored embedding for a memory from memory_vectors.
+ * Returns null when the row is missing (caller falls back to re-embedding).
+ *
+ * Shared by `hicortex relink` and the nightly's supersession stage
+ * (consolidate.ts) — lives here (not in relink.ts) so consolidate.ts can use
+ * it without importing from relink.ts, which itself imports from
+ * consolidate.ts (BudgetTracker, discoverLinkCandidates).
+ */
+export function getStoredEmbedding(
+  db: Database.Database,
+  memoryId: string
+): Float32Array | null {
+  const row = db
+    .prepare("SELECT embedding FROM memory_vectors WHERE id = ?")
+    .get(memoryId) as { embedding: Buffer } | undefined;
+  if (!row?.embedding) return null;
+  const buf = row.embedding;
+  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+}
+
 // ---------------------------------------------------------------------------
 // Vector search
 // ---------------------------------------------------------------------------
@@ -317,28 +413,88 @@ export function vectorSearch(
 }
 
 // ---------------------------------------------------------------------------
-// FTS5 search
+// FTS5 search — fielded BM25F (#205)
 // ---------------------------------------------------------------------------
 
 /**
- * Full-text search using FTS5 BM25 ranking.
- * Returns memories with a rank field (lower is better).
+ * BM25F field weights (config-driven via {@link configureBm25Fts}, called from
+ * retrieval.configureScoring at boot). The order mirrors the FTS5 column
+ * declaration in db.ts (content, project, domain) — `bm25(memories_fts, …)`
+ * takes weights POSITIONALLY, so a new FTS column MUST be added here in the
+ * same position or the weighting silently shifts. Defaults favor scope fields
+ * (project/domain) over body so cross-scope noise that wins on raw token
+ * frequency (the marine "battery" memory on a hardware query) is demoted
+ * without excluding it — the same "graded, never binary" discipline as
+ * computeScore's affinity terms.
+ */
+export interface Bm25Weights {
+  body: number;
+  project: number;
+  domain: number;
+}
+
+const BM25_DEFAULTS: Bm25Weights = {
+  body: 1.0,
+  project: 2.0,
+  domain: 2.0,
+};
+
+let bm25Weights: Bm25Weights = { ...BM25_DEFAULTS };
+
+/**
+ * Configure BM25F weights from config. Called by retrieval.configureScoring
+ * (which itself is called at server + nightly boot) so storage and retrieval
+ * rank identically. Invalid/out-of-range values keep the shipped default per
+ * key. Range [0, ∞) — a 0 weight effectively drops that field from the score;
+ * negative values are rejected (BM25F sign semantics break otherwise). Returns
+ * the resolved set for logging/tests.
+ */
+export function configureBm25Fts(config?: Record<string, unknown> | null): Bm25Weights {
+  const num = (key: string, dflt: number): number => {
+    const v = Number(config?.[key]);
+    return Number.isFinite(v) && v >= 0 ? v : dflt;
+  };
+  bm25Weights = {
+    body: num("bm25WeightBody", BM25_DEFAULTS.body),
+    project: num("bm25WeightProject", BM25_DEFAULTS.project),
+    domain: num("bm25WeightDomain", BM25_DEFAULTS.domain),
+  };
+  return { ...bm25Weights };
+}
+
+/** Current resolved weights (tests + status output). */
+export function getBm25Weights(): Bm25Weights {
+  return { ...bm25Weights };
+}
+
+/**
+ * Full-text search using FTS5 fielded BM25 (BM25F) ranking.
+ * Returns memories with a rank field (lower is better — see sign note below).
+ *
+ * `project` is NOT a filter here (#203): the hard project WHERE from #192 was
+ * removed — project is now a soft affinity boost in retrieval.computeScore AND
+ * a weighted field in BM25F (#205). `privacy` is NOT a filter (0.16.x: the
+ * column is fully vestigial — stored, never filtered; the privacy IN-clause
+ * was removed). `sourceAgent` stays a hard filter (kept for completeness; no
+ * production caller of retrieve() currently passes it).
+ *
+ * #205 sign handling: FTS5's `bm25(table, w0, w1, …)` returns a NEGATIVE score
+ * where MORE-negative = better match (it is 1 − the normalized BM25 score,
+ * which is itself positive — the negation is the FTS5 convention so that
+ * `ORDER BY bm25(…)` ASC gives best-first, matching the legacy `ORDER BY
+ * fts.rank` direction). Higher field weight ⇒ that column contributes MORE to
+ * the per-row score ⇒ matches in that field float up. We bind weights
+ * positionally as parameters (NOT string-interpolated) so query-planner
+ * caching is unaffected and the config path is the only editor.
  */
 export function searchFts(
   db: Database.Database,
   query: string,
   limit = 10,
-  privacy?: string[],
   sourceAgent?: string
 ): Array<Memory & { rank: number }> {
   const conditions = ["memories_fts MATCH ?"];
   const params: unknown[] = [query];
-
-  if (privacy && privacy.length > 0) {
-    const placeholders = privacy.map(() => "?").join(", ");
-    conditions.push(`m.privacy IN (${placeholders})`);
-    params.push(...privacy);
-  }
 
   if (sourceAgent) {
     conditions.push("m.source_agent = ?");
@@ -346,18 +502,29 @@ export function searchFts(
   }
 
   const where = conditions.join(" AND ");
-  params.push(limit);
+  // SQLite binds `?` parameters in LEXICAL SQL order (left-to-right) — the
+  // `bm25(memories_fts, ?, ?, ?)` in the SELECT clause comes BEFORE the WHERE
+  // and LIMIT `?`s, so the weights must be pushed FIRST. Get this order wrong
+  // and FTS5 ends up with a numeric weight as its MATCH expression (parsed as
+  // FTS5 query syntax → "syntax error near '.'" on the decimal point).
+  const boundParams: unknown[] = [
+    bm25Weights.body,
+    bm25Weights.project,
+    bm25Weights.domain,
+    ...params,
+    limit,
+  ];
 
   const rows = db
     .prepare(
-      `SELECT m.*, fts.rank
+      `SELECT m.*, bm25(memories_fts, ?, ?, ?) AS rank
        FROM memories_fts fts
        JOIN memories m ON m.rowid = fts.rowid
        WHERE ${where}
-       ORDER BY fts.rank
+       ORDER BY rank
        LIMIT ?`
     )
-    .all(...params) as Array<Record<string, unknown>>;
+    .all(...boundParams) as Array<Record<string, unknown>>;
 
   return rows.map((r) => {
     const rank = r.rank as number;
@@ -380,6 +547,17 @@ export function addLink(
   relationship: string,
   strength = 0.5
 ): void {
+  // Guard: superseded_by is the sole ranking-demotion signal, so never let a
+  // different relationship clobber an existing superseded_by link for the same
+  // pair — INSERT OR REPLACE would otherwise silently remove the demotion.
+  if (relationship !== "superseded_by") {
+    const protectedLink = db
+      .prepare(
+        "SELECT 1 FROM memory_links WHERE source_id = ? AND target_id = ? AND relationship = 'superseded_by' LIMIT 1"
+      )
+      .get(sourceId, targetId);
+    if (protectedLink) return;
+  }
   db.prepare(
     `INSERT OR REPLACE INTO memory_links
      (source_id, target_id, relationship, strength, created_at)
@@ -439,6 +617,8 @@ export function insertMemoriesBatch(
     content: string;
     embedding: Float32Array;
     sourceAgent?: string;
+    sourceAgentId?: string | null;
+    sourceDomain?: string | null;
     sourceSession?: string | null;
     project?: string | null;
     privacy?: string;
@@ -446,12 +626,15 @@ export function insertMemoriesBatch(
     baseStrength?: number;
   }>
 ): number {
+  // privacy default is null (0.16.x: the distiller no longer sets WORK — the
+  // column is vestigial, never filtered, and goes NULL unless a caller sends
+  // an explicit value).
   const insertMem = db.prepare(
     `INSERT INTO memories
      (id, content, base_strength, last_accessed, access_count,
-      created_at, ingested_at, source_agent, source_session, project,
-      privacy, memory_type)
-     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`
+      created_at, ingested_at, source_agent, source_agent_id, source_session,
+      source_domain, project, privacy, memory_type)
+     VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const insertVec = db.prepare(
     "INSERT INTO memory_vectors (id, embedding) VALUES (?, ?)"
@@ -470,9 +653,11 @@ export function insertMemoriesBatch(
         ts,
         ts,
         mem.sourceAgent ?? "default",
+        mem.sourceAgentId ?? null,
         mem.sourceSession ?? null,
+        mem.sourceDomain ?? null,
         mem.project ?? null,
-        mem.privacy ?? "WORK",
+        mem.privacy ?? null,
         mem.memoryType ?? "episode"
       );
       insertVec.run(id, embedToBlob(mem.embedding));
