@@ -13,19 +13,40 @@
  *   - Register MCP server in CC settings
  *   - Install CC SessionStart hook for query-time lessons
  *   - Strip old static CLAUDE.md learnings block if present
- *   - Install CC custom commands (/learn, /hicortex-activate)
+ *   - Remove legacy pre-0.10 CC commands (/learn, /hicortex-activate) if present
  */
 
-import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, statSync, symlinkSync, rmSync } from "node:fs";
+import { hicortexHome } from "./paths.js";
+import { sendLifecycleEvent } from "./telemetry.js";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, statSync, symlinkSync, rmSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { removeLessonsBlock } from "./claude-md.js";
+import { sanitizeAgentId } from "./context-store.js";
 import type { DomainDef } from "./types.js";
 
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
+
+/** This package's version, for the install lifecycle ping (0.15.2). */
+function pkgVersion(): string {
+  try {
+    return JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version as string;
+  } catch {
+    return "0.0.0";
+  }
+}
+
+/** Read the just-written config so the install ping honours an opt-out. */
+function readHomeConfig(home: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(readFileSync(join(home, "config.json"), "utf-8")) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
 const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
 const CC_COMMANDS_DIR = join(homedir(), ".claude", "commands");
 const OC_CONFIG = join(homedir(), ".openclaw", "openclaw.json");
@@ -171,6 +192,55 @@ function registerCcMcp(serverUrl: string): void {
 
   // Add MCP tool permissions to settings.json so users don't get prompted
   allowHicortexTools();
+
+  // Post-install verification (finding #5): a registration that wrote files
+  // but didn't actually take can still look "done". Best-effort confirm and,
+  // either way, tell the user exactly how to check.
+  verifyCcMcp();
+}
+
+/**
+ * Classify `claude mcp list` output for the hicortex entry. Pure (testable):
+ *   - "missing"    — hicortex not listed → registration didn't take
+ *   - "connected"  — listed AND reachable (✓/✔/Connected shown)
+ *   - "registered" — listed but connection not confirmed (server down / not restarted)
+ */
+export function parseMcpListStatus(mcpListOutput: string): "connected" | "registered" | "missing" {
+  // `claude mcp list` prints one line per server: "hicortex: <url> (SSE) - <status>".
+  // Anchor on the "hicortex:" line prefix (not a bare word match) so a
+  // differently-named MCP like "hicortex-foo" can't be mistaken for our entry,
+  // and read status from THAT line only.
+  const line = mcpListOutput.split(/\r?\n/).find((l) => /^\s*hicortex:/.test(l));
+  if (!line) return "missing";
+  return /(✓|✔|connected)/i.test(line) ? "connected" : "registered";
+}
+
+/**
+ * Best-effort post-install check that the hicortex MCP is actually registered
+ * (and, when reachable, connected). NEVER fails init — if the claude CLI is
+ * absent (e.g. registration went via the ~/.claude.json fallback), we can't
+ * query it, so we just tell the user how to confirm. Closes the "looks
+ * configured but isn't, with no verification" gap.
+ */
+function verifyCcMcp(): void {
+  let out: string;
+  try {
+    out = execSync("claude mcp list", { encoding: "utf-8", stdio: "pipe" });
+  } catch {
+    console.log("  ℹ After restarting Claude Code, confirm with `claude mcp list` (hicortex should show ✓ Connected).");
+    return;
+  }
+  switch (parseMcpListStatus(out)) {
+    case "connected":
+      console.log("  ✓ Verified: hicortex MCP registered and connected");
+      break;
+    case "registered":
+      console.log("  ✓ Verified: hicortex MCP registered — restart Claude Code, then `claude mcp list` should show it Connected");
+      break;
+    case "missing":
+      console.log("  ⚠ Could NOT confirm the hicortex MCP registration — run `claude mcp list`; if it's absent, re-run init.");
+      break;
+  }
 }
 
 function allowHicortexTools(): void {
@@ -198,99 +268,47 @@ function allowHicortexTools(): void {
   }
 }
 
-function installCcCommands(): void {
-  mkdirSync(CC_COMMANDS_DIR, { recursive: true });
-
-  // /learn command
-  const learnContent = `---
-name: learn
-description: Save an explicit learning/insight to Hicortex long-term memory. Immediate storage, no nightly wait. Use when you discover something worth remembering across sessions.
-argument-hint: <learning to save>
-allowed-tools: mcp__hicortex__hicortex_ingest, mcp__hicortex__hicortex_search, mcp__hicortex__hicortex_context, mcp__hicortex__hicortex_lessons
----
-
-# Save Learning to Hicortex
-
-When invoked with \`/learn <text>\`, store the learning in long-term memory via the Hicortex MCP tool.
-
-## Steps
-
-1. Parse the text after \`/learn\`
-2. Clean it up into a clear, self-contained statement that will make sense months from now
-3. Include the "why" when relevant
-4. Add today's date for temporal context
-5. Call the \`hicortex_ingest\` tool with:
-   - \`content\`: The learning text prefixed with "LEARNING: " and suffixed with the date
-   - \`project\`: "global" (unless clearly project-specific)
-   - \`memory_type\`: "lesson"
-6. Confirm what was saved (brief, one line)
-
-## Example
-
-\`/learn always check provider docs before assuming an API uses the same auth scheme as OpenAI\`
-
-Becomes a call to hicortex_ingest with:
-- content: "LEARNING: always check provider docs before assuming an API uses the same auth scheme as OpenAI — header names and token formats vary widely (Bearer vs x-api-key vs custom)."
-- memory_type: "lesson"
-`;
-  const learnPath = join(CC_COMMANDS_DIR, "learn.md");
-  if (existsSync(learnPath)) {
-    // Check if it's ours (contains hicortex_ingest)
-    const existing = readFileSync(learnPath, "utf-8");
-    if (!existing.includes("hicortex_ingest") && !existing.includes("hicortex")) {
-      console.log(`  ⚠ Skipping /learn — existing command found (not Hicortex). Won't overwrite.`);
-    } else {
-      writeFileSync(learnPath, learnContent);
+function cleanupLegacyCcCommands(): void {
+  // Pre-0.10 installs wrote two CC slash commands that are now RETIRED:
+  //   - /learn            : manual immediate ingest. Capture has been automatic
+  //                         (nightly-from-logs) since 0.9; hicortex_ingest
+  //                         remains for *explicitly requested* learnings, but
+  //                         no longer warrants a slash command.
+  //   - /hicortex-activate : registered a commercial license key. licenseKey
+  //                         gates nothing now (the per-install auth TOKEN is
+  //                         the credential, auto-generated at init), so the
+  //                         command is dead.
+  // Remove stale copies so upgraders don't keep dead commands. Idempotent —
+  // a best-effort cleanup of our own files; never throws.
+  for (const name of ["learn.md", "hicortex-activate.md"]) {
+    const p = join(CC_COMMANDS_DIR, name);
+    if (!existsSync(p)) continue;
+    // Ownership guard: only remove a file we actually wrote. `learn.md` is a
+    // generic command name a user may own independently — deleting by filename
+    // alone would silently destroy their file. The retired writer always
+    // embedded "hicortex" (the ingest tool + prose); mirror the same marker the
+    // old installer used before overwriting. Skip + warn on anything else.
+    try {
+      if (!readFileSync(p, "utf-8").toLowerCase().includes("hicortex")) {
+        console.log(`  ⚠ Skipping ${name} in ${CC_COMMANDS_DIR} — not a Hicortex file, left untouched`);
+        continue;
+      }
+    } catch {
+      // Unreadable — do not delete blind; leave it and move on.
+      continue;
     }
-  } else {
-    writeFileSync(learnPath, learnContent);
+    try {
+      rmSync(p);
+      console.log(`  ✓ Removed legacy command ${name} from ${CC_COMMANDS_DIR} (retired pre-0.10)`);
+    } catch (err) {
+      // ENOENT = already gone (fine, idempotent). Anything else (EACCES, EBUSY)
+      // is worth a line so a stuck stale file is diagnosable — but never fatal
+      // to init (best-effort cleanup of our own file).
+      if ((err as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") {
+        console.log(`  ⚠ Could not remove legacy command ${name}: ${(err as Error | undefined)?.message ?? err}`);
+      }
+    }
   }
-
-  // /hicortex-activate command — registers a commercial license key for display in status
-  const activateContent = `---
-name: hicortex-activate
-description: Register a Hicortex commercial license key. Personal and noncommercial use is free; commercial use requires a per-seat license from hicortex.gamaze.com.
-argument-hint: <license-key>
-allowed-tools: Bash(mkdir:*), Bash(echo:*), Bash(launchctl:*), Bash(systemctl:*), Bash(curl:*), mcp__hicortex__hicortex_ingest, mcp__hicortex__hicortex_search, mcp__hicortex__hicortex_context, mcp__hicortex__hicortex_lessons
----
-
-# Register Hicortex Commercial License
-
-## If key provided (e.g. /hicortex-activate hctx-abc123)
-
-1. Write the key to the config file:
-
-\`\`\`bash
-mkdir -p ~/.hicortex
-echo '{ "licenseKey": "THE_KEY_HERE" }' > ~/.hicortex/config.json
-\`\`\`
-
-2. Restart the server to apply:
-
-On macOS:
-\`\`\`bash
-launchctl kickstart -k gui/$(id -u)/com.gamaze.hicortex
-\`\`\`
-
-On Linux:
-\`\`\`bash
-systemctl --user restart hicortex
-\`\`\`
-
-3. Verify the key is recognised:
-\`\`\`bash
-hicortex status
-\`\`\`
-
-4. Tell the user: "Commercial license registered. The license tier will appear in \`hicortex status\`."
-
-## If no key provided
-
-Tell them: "Hicortex is free for personal and noncommercial use. Commercial use requires a per-seat license — see https://hicortex.gamaze.com/. After purchase you will receive a key; pass it here and I'll register it."
-`;
-  writeFileSync(join(CC_COMMANDS_DIR, "hicortex-activate.md"), activateContent);
-
-  console.log(`  ✓ Installed /learn and /hicortex-activate commands in ${CC_COMMANDS_DIR}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -463,23 +481,32 @@ function mergeByKey(candidates: ApiKeyCandidate[]): ApiKeyCandidate[] {
 }
 
 /**
+ * True when an LLM is already persisted and `init` must NOT re-run provider
+ * selection: a named/flat backend, a flat baseUrl+apiKey pair, OR a nested-only
+ * `models.score` (model or baseUrl). The last clause (0.13.1) stops init from
+ * walking a nested-only config back through selection and writing flat keys that
+ * a `models.score` would then silently shadow (nested > flat).
+ */
+export function isLlmConfigured(config: Record<string, unknown>): boolean {
+  const modelsScore = (config.models as { score?: { model?: unknown; baseUrl?: unknown } } | undefined)?.score;
+  const hasModelsScore = Boolean(modelsScore?.model || modelsScore?.baseUrl);
+  return Boolean(config.llmBackend || (config.llmApiKey && config.llmBaseUrl) || hasModelsScore);
+}
+
+/**
  * Detect or ask for LLM config and persist to ~/.hicortex/config.json.
  * The daemon can't inherit shell env vars, so we persist here.
  * LLM choice is always user-controlled: candidates are detected and presented
  * as a numbered list; the user picks one. Nothing is auto-applied.
  * If the user cancels, the server runs recall-only (no LLM).
  */
-async function persistLlmConfig(): Promise<void> {
-  const configPath = join(HICORTEX_HOME, "config.json");
+export async function persistLlmConfig(configPath: string = join(HICORTEX_HOME, "config.json")): Promise<void> {
+  // Strict load: a malformed existing config throws here — NEVER wiped to a
+  // stub (the 0.16.x BLOCKER). ENOENT seeds {} (fresh install).
+  const { config } = loadConfigStrict(configPath);
 
-  // Read existing config (may have licenseKey)
-  let config: Record<string, unknown> = {};
-  try {
-    config = JSON.parse(readFileSync(configPath, "utf-8"));
-  } catch { /* new file */ }
-
-  // Don't overwrite if LLM config already persisted
-  if (config.llmBackend || (config.llmApiKey && config.llmBaseUrl)) {
+  // Don't overwrite if LLM config already persisted (incl. a nested-only config).
+  if (isLlmConfigured(config)) {
     console.log(`  ✓ LLM config already configured`);
     return;
   }
@@ -691,7 +718,7 @@ async function persistLlmConfig(): Promise<void> {
   const selectedLabel = options[selectedIdx].label;
   if (selectedLabel.startsWith("Skip")) {
     console.log(
-      "  No LLM configured — server will run recall-only (search/lessons/context work).\n" +
+      "  No LLM configured — server will run recall-only (search/lessons/recent work).\n" +
       "  To enable capture and consolidation later, run: npx @gamaze/hicortex init"
     );
   } else {
@@ -725,6 +752,141 @@ function saveConfig(configPath: string, config: Record<string, unknown>): void {
 }
 
 /**
+ * Strict config loader — the SINGLE source of truth for "read config.json or
+ * fail loudly". Every config writer in init (persistLlmConfig, persistAuthToken,
+ * ensureAndPersistAgentId, scaffoldDefaultDomains) loads through this, and the
+ * runtime readers (nightly, server boot) route through it too (catching the
+ * throw to fail-soft with a visible WARN).
+ *
+ * The 0.16.x BLOCKER this closes: the bare `try { JSON.parse(readFileSync) }
+ * catch { /* new file *\/ }` pattern, on a config.json that EXISTS but won't
+ * parse (a hand-edit syntax slip, truncation, corruption), silently seeded `{}`
+ * and the writer then OVERWROTE the file — `persistAuthToken` minted a fresh
+ * token (fleet-wide 401), `scaffoldDefaultDomains` re-seeded the generic
+ * vocabulary over the owner list, etc. `authToken` / `licenseKey` /
+ * `distillApiKey` / `domains` / `weakPrimaryFloor` / `contextClients` all gone.
+ * The early-return guards (existing-key checks) did NOT save them: those only
+ * fire on a VALID parse that reads the key, not on a corrupted file.
+ *
+ * Contract:
+ *   - ENOENT (genuinely no file) → `{ config: {}, hadFile: false }` (a new
+ *     install; the caller decides whether to persist).
+ *   - Any OTHER read failure on an existing file (EACCES, etc.) → THROW.
+ *   - A parse failure (bad JSON) on an existing file → THROW.
+ *   - A non-object JSON value (null / array / true / 5 / "x") → THROW. Such a
+ *     value is not a valid config and must not be silently replaced with {}.
+ *
+ * Refusing is the right DEFAULT, but it dead-ends the operator: `init` is
+ * exactly what you would run to repair a broken install, and it now won't run.
+ * `init --repair-config` is the explicit escape hatch — see
+ * quarantineMalformedConfig below. Never quarantine implicitly: that path mints
+ * a fresh authToken (fleet-wide 401), so it must be a deliberate choice.
+ *
+ * Exported so nightly.ts / mcp-server.ts readers can route through it.
+ */
+export function loadConfigStrict(configPath: string): { config: Record<string, unknown>; hadFile: boolean } {
+  let raw: string;
+  try {
+    raw = readFileSync(configPath, "utf-8");
+  } catch (e) {
+    // Only a genuinely-absent file (ENOENT) may safely seed {}.
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+      return { config: {}, hadFile: false };
+    }
+    // EACCES / EIO / … — the file is there but unreadable. Do not swallow.
+    throw new Error(
+      `Refusing to read ${configPath}: the file exists but is not readable ` +
+      `(fix the permissions and re-run). Cause: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `Refusing to write ${configPath}: the file exists but could not be parsed ` +
+      `(swallowing this would overwrite it with a stub and lose authToken / licenseKey / ` +
+      `domains). Fix the JSON and re-run, or run \`hicortex init --repair-config\` to move ` +
+      `the broken file aside and rebuild. ` +
+      `Cause: ${e instanceof Error ? e.message : String(e)}`
+    );
+  }
+
+  // Non-object JSON (null / array / boolean / number / string) is not a valid
+  // config object and must never be silently replaced with {}.
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    const kind = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed;
+    throw new Error(
+      `Refusing to write ${configPath}: the file parses to ${kind}, not a JSON object ` +
+      `(swallowing this would overwrite it with a stub). Fix the JSON and re-run, or run ` +
+      `\`hicortex init --repair-config\` to move the broken file aside and rebuild.`
+    );
+  }
+
+  return { config: parsed as Record<string, unknown>, hadFile: true };
+}
+
+/**
+ * `init --repair-config` escape hatch: move a malformed config.json aside so
+ * init can rebuild, instead of dead-ending on loadConfigStrict's throw.
+ *
+ * Why this exists: refusing to overwrite a corrupt config is right (it closed
+ * the 0.16.x wipe BLOCKER), but it leaves the operator stuck — `init` is the
+ * natural repair action and it now refuses to run. Deleting the file by hand
+ * works but silently loses `licenseKey` / `authToken` / `distillApiKey`.
+ *
+ * Why it is OPT-IN and never automatic: rebuilding mints a fresh `authToken`,
+ * which 401s every thin client on the fleet until they are re-pointed. That is
+ * a deliberate operator decision, not a fallback.
+ *
+ * Behaviour:
+ *   - Config absent or valid → no-op (`{ quarantined: false }`).
+ *   - Malformed → rename to `config.json.corrupt-<ISO>` (colons stripped for
+ *     Windows), and report the TOP-LEVEL KEY NAMES recovered from the raw text
+ *     so the operator knows what to restore.
+ *
+ * SECURITY: key NAMES only, never values. `authToken`, `licenseKey`,
+ * `distillApiKey` and `reflectApiKey` are secrets — printing them would leak
+ * into terminal scrollback, CI logs, and screen shares. The operator reads the
+ * values out of the backup file themselves.
+ *
+ * Exported for testability.
+ */
+export function quarantineMalformedConfig(
+  configPath: string
+): { quarantined: false } | { quarantined: true; backupPath: string; keys: string[] } {
+  try {
+    loadConfigStrict(configPath);
+    return { quarantined: false }; // absent (ENOENT) or valid — nothing to do.
+  } catch { /* malformed — fall through and quarantine */ }
+
+  // Best-effort key-name recovery from the RAW text. The file does not parse,
+  // so this is a regex over top-level-looking `"key":` occurrences — advisory
+  // only (it may over- or under-report on deeply nested or truncated files).
+  let keys: string[] = [];
+  try {
+    const raw = readFileSync(configPath, "utf-8");
+    keys = [...new Set([...raw.matchAll(/"([A-Za-z_][A-Za-z0-9_]*)"\s*:/g)].map((m) => m[1]))];
+  } catch { /* unreadable — report no keys rather than fail the repair */ }
+
+  const backupPath = `${configPath}.corrupt-${new Date().toISOString().replace(/:/g, "-")}`;
+  renameSync(configPath, backupPath);
+
+  console.log(`  ⚠ ${configPath} was malformed — moved to ${backupPath}`);
+  console.log(`    init will rebuild a fresh config. NOTHING was deleted.`);
+  if (keys.length > 0) {
+    console.log(`    Keys found in the old file: ${keys.join(", ")}`);
+  }
+  console.log(`    ACTION REQUIRED: copy any of licenseKey / distillApiKey / reflectApiKey /`);
+  console.log(`    domains / weakPrimaryFloor back from the backup by hand.`);
+  console.log(`    A NEW authToken will be generated — every thin client pointing at this`);
+  console.log(`    server must be updated, or their recall will 401 (silently, fail-soft).`);
+
+  return { quarantined: true, backupPath, keys };
+}
+
+/**
  * Generate a random auth token in the format hctx-<32 hex chars>.
  * Exported for testability.
  */
@@ -739,10 +901,10 @@ export function generateAuthToken(): string {
  * Exported for testability.
  */
 export function persistAuthToken(configPath: string): { token: string; generated: boolean } {
-  let config: Record<string, unknown> = {};
-  try {
-    config = JSON.parse(readFileSync(configPath, "utf-8"));
-  } catch { /* new file */ }
+  // Strict load: a malformed existing config throws here — NEVER mint a fresh
+  // token over a wiped stub (the 0.16.x BLOCKER: this writer was the worst — a
+  // fleet-wide 401 on a hand-edit slip). ENOENT seeds {} (fresh install).
+  const { config } = loadConfigStrict(configPath);
 
   if (config.authToken && typeof config.authToken === "string") {
     return { token: config.authToken, generated: false };
@@ -753,6 +915,179 @@ export function persistAuthToken(configPath: string): { token: string; generated
   mkdirSync(HICORTEX_HOME, { recursive: true });
   writeFileSync(configPath, JSON.stringify(config, null, 2));
   return { token, generated: true };
+}
+
+/**
+ * Ensure a stable per-install `agentId` UUID is set on a config object.
+ *
+ * The id is the client's attribution identity (stored on each captured
+ * memory as `source_agent_id`) — it survives agent/machine renames, unlike
+ * the readable `source_agent` name. Generated once, never rotated (idempotent:
+ * an existing valid `agentId` is always kept). Pure: mutates `config` in place
+ * and does NO file IO — BOTH server and client init call this on their
+ * in-memory config object before saving (the server path loads/saves
+ * config.json around it; the client builds in-memory and saves once).
+ * Exported for testability.
+ */
+export function ensureAgentId(config: Record<string, unknown>): { agentId: string; generated: boolean } {
+  if (typeof config.agentId === "string" && config.agentId) {
+    return { agentId: config.agentId, generated: false };
+  }
+  const agentId = randomUUID();
+  config.agentId = agentId;
+  return { agentId, generated: true };
+}
+
+/**
+ * Load → ensure → persist wrapper for the `agentId` provenance field. This is
+ * the runtime activation path: `ensureAgentId` was historically called ONLY
+ * inside `init`, so pre-0.16.2 installs that already ran init never get an
+ * `agentId` written → nightly + server boot capture sent `source_agent_id:
+ * null` forever (the feature was inert for the entire existing fleet). Both
+ * nightly and server boot call THIS on startup so the field self-heals on the
+ * first run after upgrade — one read, one conditional write, idempotent.
+ *
+ * Built on the pure `ensureAgentId` (which init's client path and the unit
+ * test still call directly); this wrapper adds the disk IO.
+ *
+ * Hardening (0.16.x CR BLOCKER): the naive "try { read } catch { seed {} }"
+ * + unconditional save WIPES config.json when the file exists but is
+ * unparseable (a hand-edit syntax slip) — the catch swallows the parse error,
+ * {} is seeded, and the save overwrites the file with just {"agentId": ...},
+ * destroying authToken / licenseKey / domains / weakPrimaryFloor, then
+ * cascades into scaffoldDefaultDomains re-seeding the generic vocabulary.
+ * This wrapper refuses that path:
+ *   - ENOENT (file genuinely absent) → seed {} is correct (new install).
+ *   - Any OTHER read/parse failure on a file that EXISTS (corruption,
+ *     truncation, bad JSON) → THROW. Swallowing would overwrite the file; the
+ *     operator must fix the JSON instead of silently losing it.
+ * Save happens ONLY when a new id was generated AND the file already existed
+ * — a missing config.json means init was never run (a separate problem), so we
+ * do not create a stub file just to hold an agentId. The returned id is still
+ * usable in-memory for the run either way.
+ *
+ * Exported for use by init's server path, nightly.ts, and mcp-server.ts boot.
+ */
+export function ensureAndPersistAgentId(configPath: string): { agentId: string; generated: boolean } {
+  // One source of truth: loadConfigStrict throws on a malformed existing file
+  // (never wipe) and returns hadFile=false on ENOENT (do not create a stub).
+  const { config, hadFile } = loadConfigStrict(configPath);
+
+  const result = ensureAgentId(config);
+  if (result.generated && hadFile) {
+    saveConfig(configPath, config);
+  }
+  return result;
+}
+
+/**
+ * Decide the per-agent context id to persist at init (#179; CC default = global,
+ * owner decision 20.07.2026). `agentName` is an explicit opt-in only — there is
+ * NO hostname default, so an install with no `--agent-name` sends no `?agent=`
+ * and shares the global context (one user = one identity across machines).
+ *
+ * Empty string == unset everywhere: `--agent-name ""` (or whitespace-only) is
+ * the explicit way to opt BACK OUT — it CLEARS any existing `agentName` key and
+ * returns to global, rather than erroring as an invalid id.
+ *  - explicit `--agent-name <non-empty>` → the sanitized flag (error if it
+ *    sanitizes to null, so a bad flag is loud rather than silently ignored);
+ *  - explicit `--agent-name ""` / whitespace-only → `clear` (remove the key);
+ *  - no flag but an existing non-empty `agentName` → keep it untouched
+ *    (non-clobber like persistAuthToken / scaffoldDefaultDomains);
+ *  - no flag, no (non-empty) existing value → do not write (global by default).
+ * Pure + exported for testability; never touches disk.
+ */
+export function decideAgentName(
+  existing: unknown,
+  flag: string | undefined,
+): { write: boolean; value: string | null; clear?: boolean; error?: string } {
+  if (flag !== undefined) {
+    // Explicit empty / whitespace-only value → clear back to global (unset).
+    if (flag.trim() === "") return { write: false, value: null, clear: true };
+    const s = sanitizeAgentId(flag);
+    if (s === null) {
+      return {
+        write: false,
+        value: null,
+        error: `Invalid --agent-name '${flag}'. Must contain letters or digits and sanitize to ^[a-z0-9][a-z0-9_-]*$ (max 64 chars). Pass --agent-name "" to clear it (global context).`,
+      };
+    }
+    return { write: true, value: s };
+  }
+  if (typeof existing === "string" && existing.trim().length > 0) return { write: false, value: existing };
+  return { write: false, value: null };
+}
+
+/** Read config.json, set agentName, write it back. Used by the server path.
+ *  Routes through loadConfigStrict — a malformed existing config throws rather
+ *  than being wiped to a `{agentName: …}` stub (0.16.x BLOCKER; same pattern as
+ *  the other four writers). Exported for wipe-protection coverage. */
+export function writeAgentNameConfig(configPath: string, value: string): void {
+  const { config } = loadConfigStrict(configPath);
+  config.agentName = value;
+  mkdirSync(HICORTEX_HOME, { recursive: true });
+  writeFileSync(configPath, JSON.stringify(config, null, 2));
+}
+
+/** Read config.json, delete any `agentName` key, write it back (server path).
+ *  Routes through loadConfigStrict — a malformed existing config throws (never
+ *  silently no-op). ENOENT is still a silent no-op (hadFile=false → empty
+ *  config has no `agentName` key → return without writing). */
+function clearAgentNameConfig(configPath: string): void {
+  const { config } = loadConfigStrict(configPath);
+  if (!("agentName" in config)) return;
+  delete config.agentName;
+  mkdirSync(HICORTEX_HOME, { recursive: true });
+  writeFileSync(configPath, JSON.stringify(config, null, 2));
+}
+
+/**
+ * Client-init config write: strict-load → apply the client overrides → save.
+ * This is the testable seam for the client path's config build (the rest of
+ * runClientInit is interactive / mutates ~/.claude / installs the daemon, so it
+ * is not unit-testable; this helper is).
+ *
+ * Strict load closes the 0.16.x BLOCKER for the client path: the old bare
+ * `try { parse } catch { warn }` seeded `{}` on a malformed existing config,
+ * then proceeded to set mode/serverUrl/authToken/agentId and `saveConfig` —
+ * OVERWRITING the file and losing the client's existing `authToken` (→ 401 on
+ * the next /search) and `licenseKey`, the same class as the server-side wipe.
+ * Now a malformed existing config THROWS (the user is interactive at `init`;
+ * they can fix the JSON and re-run, same as the server path). ENOENT → `{}`
+ * → a genuinely new client config is built fresh and saved.
+ *
+ * `agentNameDecision` is resolved by the caller via decideAgentName (which owns
+ * the process.exit on an invalid --agent-name flag). A no-flag run passes a
+ * {write:false} decision → this helper does not touch `agentName`, preserving
+ * whatever the loaded config already carries. Exported for wipe-protection
+ * coverage.
+ */
+export function writeClientConfig(
+  configPath: string,
+  overrides: { serverUrl: string; authToken?: string },
+  agentNameDecision?: { write: boolean; value: string | null; clear?: boolean },
+): { config: Record<string, unknown> } {
+  const { config } = loadConfigStrict(configPath);
+
+  config.mode = "client";
+  config.serverUrl = overrides.serverUrl;
+  if (overrides.authToken) config.authToken = overrides.authToken;
+
+  if (agentNameDecision) {
+    if (agentNameDecision.clear) {
+      delete config.agentName;
+    } else if (agentNameDecision.write && agentNameDecision.value) {
+      config.agentName = agentNameDecision.value;
+    }
+    // write:false (no --agent-name flag) → leave the existing agentName as-is.
+  }
+
+  // Stable per-install agent id (attribution). Generated once, kept across
+  // re-runs (never rotated). An existing id from a prior init is preserved.
+  ensureAgentId(config);
+
+  saveConfig(configPath, config);
+  return { config };
 }
 
 /**
@@ -784,10 +1119,10 @@ export const GENERIC_DEFAULT_DOMAINS: DomainDef[] = [
  * Exported for testability.
  */
 export function scaffoldDefaultDomains(configPath: string): { scaffolded: boolean } {
-  let config: Record<string, unknown> = {};
-  try {
-    config = JSON.parse(readFileSync(configPath, "utf-8"));
-  } catch { /* new file */ }
+  // Strict load: a malformed existing config throws here — NEVER re-seed the
+  // generic defaults over the owner vocabulary (the 0.16.x BLOCKER). ENOENT
+  // seeds {} (fresh install → scaffold is the point).
+  const { config } = loadConfigStrict(configPath);
 
   if ("domains" in config) {
     console.log("  ✓ Memory domains already configured — leaving your list as-is");
@@ -852,15 +1187,31 @@ function findNpxPath(): string {
 }
 
 /**
+ * True if a resolved binary path lives in npm's ephemeral npx cache
+ * (`~/.npm/_npx/<hash>/node_modules/.bin/…`). When `hicortex init` is itself
+ * run via `npx -y @gamaze/hicortex init`, npx prepends that cache dir to PATH,
+ * so `which hicortex` resolves there. npm garbage-collects `_npx`, so any
+ * SessionStart hook or nightly timer wired to such a path breaks silently
+ * later — the "looks configured but isn't" trap (#176). Never persist it.
+ */
+export function isEphemeralNpxPath(binPath: string): boolean {
+  return binPath.includes("/_npx/");
+}
+
+/**
  * Resolve the absolute path of the hicortex binary.
  * For global npm installs (e.g. /usr/bin/hicortex) this is the binary itself.
  * For dev/npx installs, falls back to `npx <packageSpec> <command>` form.
  * Returns an array: [binaryPath] for global, or [npxPath, "-y", packageSpec] for npx.
+ *
+ * A `which hicortex` hit inside the npx cache (#176) is REJECTED — it is
+ * ephemeral, so we emit the durable `npx -y <spec>` form instead. This is the
+ * standard client path (`npx … init`), where the fix matters most.
  */
 function resolveBinaryArgs(): string[] {
   try {
     const bin = execSync("which hicortex", { encoding: "utf-8" }).trim();
-    if (bin) return [bin];
+    if (bin && !isEphemeralNpxPath(bin)) return [bin];
   } catch { /* not in PATH as a global binary */ }
   const npxPath = findNpxPath();
   const packageSpec = getPackageSpec();
@@ -878,10 +1229,37 @@ function resolveBinaryArgs(): string[] {
  * @param settingsPath Override for the settings.json path (used in tests; defaults to CC_SETTINGS).
  */
 export function installSessionStartHook(settingsPath?: string): void {
+  installCcHook("SessionStart", "lessons-context", 10, settingsPath);
+}
+
+/**
+ * Install (or verify) the #192 pushed-recall hooks: `hicortex recall-hook`
+ * under UserPromptSubmit (per-prompt recall index) AND under SessionStart
+ * (per-session dedup reset — the CLI dispatches on the payload's
+ * hook_event_name, so one command serves both events).
+ */
+export function installRecallHooks(settingsPath?: string): void {
+  installCcHook("UserPromptSubmit", "recall-hook", 3, settingsPath);
+  installCcHook("SessionStart", "recall-hook", 3, settingsPath);
+}
+
+/**
+ * Shared CC-hook installer: add `hicortex <subcommand>` under the given hook
+ * event in ~/.claude/settings.json. Idempotent per (event, subcommand): skips
+ * if any existing entry for that event already runs the subcommand. `timeout`
+ * is CC's hook-process kill timeout in SECONDS (the network timeout inside the
+ * command is separate and shorter).
+ */
+function installCcHook(
+  eventName: string,
+  subcommand: string,
+  timeout: number,
+  settingsPath?: string
+): void {
   const targetPath = settingsPath ?? CC_SETTINGS;
   const binaryArgs = resolveBinaryArgs();
-  // Build the command string: "/path/to/hicortex lessons-context" or "npx -y @gamaze/hicortex lessons-context"
-  const command = [...binaryArgs, "lessons-context"].join(" ");
+  // e.g. "/path/to/hicortex lessons-context" or "npx -y @gamaze/hicortex recall-hook"
+  const command = [...binaryArgs, subcommand].join(" ");
 
   let settings: Record<string, unknown> = {};
   if (existsSync(targetPath)) {
@@ -889,25 +1267,28 @@ export function installSessionStartHook(settingsPath?: string): void {
       settings = JSON.parse(readFileSync(targetPath, "utf-8"));
     } catch {
       // File exists but is malformed — do NOT overwrite (would destroy the user's entire CC config).
-      console.log(`  ⚠ ${targetPath} exists but is not valid JSON — skipping SessionStart hook.`);
+      console.log(`  ⚠ ${targetPath} exists but is not valid JSON — skipping ${eventName} hook.`);
       console.log(`    Fix the file, then re-run init, or add the hook manually:`);
       console.log(`    command: "${command}"`);
       return;
     }
   }
 
-  // Ensure hooks object and SessionStart array exist
+  // Ensure hooks object and the event array exist
   if (!settings.hooks || typeof settings.hooks !== "object") {
     settings.hooks = {};
   }
   const hooks = settings.hooks as Record<string, unknown>;
-  if (!Array.isArray(hooks.SessionStart)) {
-    hooks.SessionStart = [];
+  if (!Array.isArray(hooks[eventName])) {
+    hooks[eventName] = [];
   }
-  const sessionStart = hooks.SessionStart as Array<unknown>;
+  const entries = hooks[eventName] as Array<unknown>;
 
-  // Idempotent: skip if any existing entry's command contains "lessons-context"
-  const alreadyInstalled = sessionStart.some((entry) => {
+  // Idempotent: skip if any existing entry's command runs this subcommand.
+  // Word-boundary guard so "recall-hook" never matches a hypothetical
+  // "recall-hook-foo" command.
+  const subcommandRe = new RegExp(`(^|\\s)${subcommand}(\\s|$)`);
+  const alreadyInstalled = entries.some((entry) => {
     if (typeof entry !== "object" || entry === null) return false;
     const e = entry as Record<string, unknown>;
     // CC hook format: { hooks: [{ type: "command", command: "..." }] }
@@ -915,24 +1296,24 @@ export function installSessionStartHook(settingsPath?: string): void {
       return e.hooks.some((h: unknown) => {
         if (typeof h !== "object" || h === null) return false;
         const hook = h as Record<string, unknown>;
-        return typeof hook.command === "string" && hook.command.includes("lessons-context");
+        return typeof hook.command === "string" && subcommandRe.test(hook.command);
       });
     }
     return false;
   });
 
   if (alreadyInstalled) {
-    console.log(`  ✓ SessionStart hook already installed`);
+    console.log(`  ✓ ${eventName} hook (${subcommand}) already installed`);
     return;
   }
 
-  sessionStart.push({
-    hooks: [{ type: "command", command, timeout: 10 }],
+  entries.push({
+    hooks: [{ type: "command", command, timeout }],
   });
 
   mkdirSync(dirname(targetPath), { recursive: true });
   writeFileSync(targetPath, JSON.stringify(settings, null, 2));
-  console.log(`  ✓ Installed SessionStart hook: ${command}`);
+  console.log(`  ✓ Installed ${eventName} hook: ${command}`);
 }
 
 function installLaunchd(binaryArgs: string[]): boolean {
@@ -1049,9 +1430,18 @@ async function ask(question: string): Promise<string> {
 // Main
 // ---------------------------------------------------------------------------
 
-export async function runInit(options: { serverUrl?: string } = {}): Promise<void> {
+export async function runInit(
+  options: { serverUrl?: string; agentName?: string; repairConfig?: boolean } = {}
+): Promise<void> {
+  // --repair-config: quarantine a malformed config.json BEFORE any writer runs,
+  // so the strict loaders see ENOENT and rebuild instead of throwing. Must come
+  // first — every writer downstream loads through loadConfigStrict.
+  if (options.repairConfig) {
+    quarantineMalformedConfig(join(HICORTEX_HOME, "config.json"));
+  }
+
   if (options.serverUrl) {
-    await runClientInit(options.serverUrl);
+    await runClientInit(options.serverUrl, options.agentName);
     return;
   }
 
@@ -1094,7 +1484,6 @@ export async function runInit(options: { serverUrl?: string } = {}): Promise<voi
   if (!d.localServer && !d.remoteServer) actions.push("Install Hicortex server daemon");
   if (!d.ccMcpRegistered) actions.push("Register MCP server in CC settings");
   if (d.hermesFound) actions.push("Install Hermes plugin + configure");
-  actions.push("Install /learn and /hicortex-activate commands");
   actions.push("Install SessionStart hook (query-time lessons)");
 
   if (actions.length === 0) {
@@ -1128,12 +1517,45 @@ export async function runInit(options: { serverUrl?: string } = {}): Promise<voi
     console.log(`  ✓ Auth token already configured`);
   }
 
+  // Stable per-install agent id (attribution on captured memories; survives
+  // renames). Generated once, never rotated — same non-clobber philosophy as
+  // the auth token. Goes through ensureAndPersistAgentId (hardened wrapper:
+  // throws on a malformed existing config instead of swallowing + wiping, and
+  // saves ONLY when a new id was generated). persistAuthToken above already
+  // ensured config.json exists by this point. The client path shares the SAME
+  // loadConfigStrict discipline via writeClientConfig — it throws on a malformed
+  // existing config too (ENOENT builds a fresh client config), so no path in
+  // init silently wipes config.json anymore.
+  const agentIdResult = ensureAndPersistAgentId(configPath);
+  if (agentIdResult.generated) {
+    console.log(`  ✓ Agent id: ${agentIdResult.agentId}`);
+  }
+
   // Scaffold the generic default memory domains (server mode only — domains
   // live in the server's config; a client's memories are classified by the
   // server). Non-clobber: an existing `domains` key is never touched.
   // Classification activates automatically once an LLM is configured; until
   // then domains sit inert (strict-skip path).
   scaffoldDefaultDomains(configPath);
+
+  // Per-agent context id (#179): server mode writes it ONLY when the operator
+  // passes --agent-name. Without the flag no agentName is written and the
+  // co-located CC shares the global context (global by default). Explicit flag
+  // overwrites on re-init; `--agent-name ""` clears it back to global.
+  if (options.agentName !== undefined) {
+    const decision = decideAgentName(undefined, options.agentName);
+    if (decision.error) {
+      console.error(`  ✗ ${decision.error}`);
+      process.exit(1);
+    }
+    if (decision.clear) {
+      clearAgentNameConfig(configPath);
+      console.log("  ✓ Agent name cleared — global context");
+    } else if (decision.write && decision.value) {
+      writeAgentNameConfig(configPath, decision.value);
+      console.log(`  ✓ Agent name set to '${decision.value}'`);
+    }
+  }
 
   // Install the nightly job (capture via localhost /distill + consolidation).
   // Without it a server-mode install never captures or consolidates — the
@@ -1168,8 +1590,8 @@ export async function runInit(options: { serverUrl?: string } = {}): Promise<voi
   // Ensure tool permissions are set (also needed for users upgrading from older versions)
   allowHicortexTools();
 
-  // Install CC commands
-  installCcCommands();
+  // Remove legacy pre-0.10 CC commands (/learn, /hicortex-activate) if present
+  cleanupLegacyCcCommands();
 
   // Setup Hermes if detected
   if (d.hermesFound) {
@@ -1182,6 +1604,8 @@ export async function runInit(options: { serverUrl?: string } = {}): Promise<voi
   // Install CC SessionStart hook for query-time lesson injection.
   // Lessons are now fetched live at session start — no static CLAUDE.md block needed.
   installSessionStartHook();
+  // #192: per-prompt pushed recall index + session dedup reset.
+  installRecallHooks();
 
   // Strip the old static lessons block from CLAUDE.md (0.9.0 migration).
   // Lessons are now delivered via the SessionStart hook instead.
@@ -1191,21 +1615,32 @@ export async function runInit(options: { serverUrl?: string } = {}): Promise<voi
   }
 
   console.log("\n✓ Hicortex setup complete!\n");
+  // Telemetry disclosure at install time (informed consent, best practice):
+  // opt-out telemetry is only acceptable if the user is TOLD about it.
+  console.log("Anonymous usage telemetry (aggregate counts only, no content) is on by default —");
+  console.log("see exactly what is sent with `hicortex telemetry`; to opt out, add");
+  console.log('"telemetry": false to ~/.hicortex/config.json or set HICORTEX_TELEMETRY=off.\n');
+  // Install ping (0.15.2) — sent AFTER the disclosure above, opt-out aware, so
+  // the install → first-nightly → retained funnel is measurable. Never blocks:
+  // failures are swallowed inside sendLifecycleEvent.
+  await sendLifecycleEvent("install", HICORTEX_HOME, readHomeConfig(HICORTEX_HOME), pkgVersion());
   console.log("Next steps:");
-  console.log("  1. Restart Claude Code to pick up the new MCP server and SessionStart hook");
+  // Counter-based so the list stays contiguous (1,2,3,4) whether or not Hermes
+  // was detected — a conditional middle step used to leave a "1, 3, 4" gap.
+  let step = 1;
+  console.log(`  ${step++}. Restart Claude Code to pick up the new MCP server and SessionStart hook`);
   if (d.hermesFound) {
-    console.log("  2. Activate the Hermes plugin: run `hermes memory setup`, select 'hicortex', then restart the gateway(s)");
+    console.log(`  ${step++}. Activate the Hermes plugin: run \`hermes memory setup\`, select 'hicortex', then restart the gateway(s)`);
   }
-  console.log("  3. Ask your agent: 'What Hicortex tools do you have?'");
-  console.log("  4. Try /learn to save something to long-term memory");
-  console.log(`  5. Check server: curl ${serverUrl}/health`);
+  console.log(`  ${step++}. Ask your agent: 'What Hicortex tools do you have?'`);
+  console.log(`  ${step++}. Check server: curl ${serverUrl}/health`);
 }
 
 // ---------------------------------------------------------------------------
 // Client Mode Init
 // ---------------------------------------------------------------------------
 
-async function runClientInit(serverUrl: string): Promise<void> {
+async function runClientInit(serverUrl: string, agentName?: string): Promise<void> {
   console.log("Hicortex — Client Mode Setup\n");
   serverUrl = serverUrl.replace(/\/+$/, "");
 
@@ -1272,21 +1707,31 @@ async function runClientInit(serverUrl: string): Promise<void> {
   // Step 3: Save client config
   mkdirSync(HICORTEX_HOME, { recursive: true });
   const configPath = join(HICORTEX_HOME, "config.json");
-  let config: Record<string, unknown> = {};
-  if (existsSync(configPath)) {
-    try {
-      config = JSON.parse(readFileSync(configPath, "utf-8"));
-    } catch {
-      console.log(`  ⚠ ${configPath} exists but is not valid JSON — starting with empty config (licenseKey and LLM settings may need to be re-entered).`);
-    }
+
+  // Per-agent context id (#179): explicit opt-in only. resolve the flag via
+  // decideAgentName (it owns the process.exit on an invalid --agent-name). A
+  // no-flag run yields a {write:false} decision → writeClientConfig leaves any
+  // existing agentName untouched (preserving what the loaded config carries).
+  const nameDecision = decideAgentName(undefined, agentName);
+  if (nameDecision.error) {
+    console.error(`  ✗ ${nameDecision.error}`);
+    process.exit(1);
+  }
+  if (nameDecision.clear) {
+    console.log("  ✓ Agent name cleared — global context");
+  } else if (nameDecision.write && nameDecision.value && agentName && nameDecision.value !== agentName) {
+    console.log(`  ℹ Agent name sanitized to '${nameDecision.value}'`);
   }
 
-  config.mode = "client";
-  config.serverUrl = serverUrl;
-  if (authToken) config.authToken = authToken;
+  // writeClientConfig: strict-load → apply overrides → save. Throws on a
+  // malformed existing config (0.16.x BLOCKER — never wipe the client's
+  // authToken/licenseKey). ENOENT → fresh client config.
+  const { config } = writeClientConfig(configPath, { serverUrl, authToken }, nameDecision);
 
-  saveConfig(configPath, config);
   console.log(`  ✓ Client config saved to ${configPath}`);
+  if (typeof config.agentName === "string") {
+    console.log(`  ✓ Agent name: ${config.agentName}`);
+  }
 
   // Step 4: Register CC MCP pointing to remote server
   if (authToken) {
@@ -1317,11 +1762,13 @@ async function runClientInit(serverUrl: string): Promise<void> {
   }
   allowHicortexTools();
 
-  // Step 5: Install CC commands
-  installCcCommands();
+  // Step 5: Remove legacy pre-0.10 CC commands if present
+  cleanupLegacyCcCommands();
 
-  // Step 6: Install SessionStart hook for query-time lessons.
+  // Step 6: Install SessionStart hook for query-time lessons + the #192
+  // per-prompt pushed-recall hooks.
   installSessionStartHook();
+  installRecallHooks();
 
   // Strip the old static CLAUDE.md lessons block if present (0.9.0 migration).
   const claudeMdPath = join(homedir(), ".claude", "CLAUDE.md");
@@ -1339,6 +1786,15 @@ async function runClientInit(serverUrl: string): Promise<void> {
   }
 
   console.log("\n✓ Hicortex client setup complete!\n");
+  // Telemetry disclosure at install time (informed consent, best practice):
+  // opt-out telemetry is only acceptable if the user is TOLD about it.
+  console.log("Anonymous usage telemetry (aggregate counts only, no content) is on by default —");
+  console.log("see exactly what is sent with `hicortex telemetry`; to opt out, add");
+  console.log('"telemetry": false to ~/.hicortex/config.json or set HICORTEX_TELEMETRY=off.\n');
+  // Install ping (0.15.2) — sent AFTER the disclosure above, opt-out aware, so
+  // the install → first-nightly → retained funnel is measurable. Never blocks:
+  // failures are swallowed inside sendLifecycleEvent.
+  await sendLifecycleEvent("install", HICORTEX_HOME, readHomeConfig(HICORTEX_HOME), pkgVersion());
   console.log("How it works:");
   console.log("  • MCP tools (search, context, ingest) talk to the remote server");
   console.log("  • Nightly pipeline denoises CC transcripts, POSTs to server for distillation");
@@ -1373,11 +1829,13 @@ function installNightlyCron(hour: number): void {
 
   // PATH must start with the binary's own directory (see installLaunchd for rationale).
   const binDir = dirname(binaryArgs[0]);
+  // One canonical nightly log path across platforms — status output, docs,
+  // and support instructions all reference this single location.
+  const logPath = join(HICORTEX_HOME, "nightly.log");
 
   if (os === "darwin") {
     const plistDir = join(homedir(), "Library", "LaunchAgents");
     const plistPath = join(plistDir, "com.gamaze.hicortex-nightly.plist");
-    const logPath = join(HICORTEX_HOME, "nightly.log");
 
     // Never overwrite an existing schedule — users tune these (multi-slot
     // capture windows, quiet hours). Fresh installs only.
@@ -1433,20 +1891,18 @@ ${programArgs}
     const servicePath = join(configDir, "hicortex-nightly.service");
     const timerPath = join(configDir, "hicortex-nightly.timer");
 
-    // Never overwrite an existing schedule — users tune these. Fresh installs only.
-    if (existsSync(timerPath)) {
-      console.log(`  ✓ Nightly timer already installed — leaving existing schedule as-is`);
-      return;
-    }
-
     const execStart = [...binaryArgs, "nightly"].join(" ");
-
+    // File logging, not journal: oneshot runs on machines with a volatile
+    // journal (e.g. Raspberry Pi defaults) otherwise fail without a trace.
+    // Same log path as the macOS plist. append: needs systemd ≥ 240 (2018).
     const service = `[Unit]
 Description=Hicortex Nightly (distill + POST)
 
 [Service]
 Type=oneshot
 ExecStart=${execStart}
+StandardOutput=append:${logPath}
+StandardError=append:${logPath}
 Environment=PATH=${binDir}:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=${homedir()}
 WorkingDirectory=${homedir()}`;
@@ -1462,7 +1918,15 @@ Persistent=true
 WantedBy=timers.target`;
 
     mkdirSync(configDir, { recursive: true });
+    // The .service file is ours — always refresh it so fixes (like file
+    // logging) reach existing installs. The .timer holds the user-tuned
+    // schedule and is never overwritten.
     writeFileSync(servicePath, service);
+    if (existsSync(timerPath)) {
+      try { execSync("systemctl --user daemon-reload", { stdio: "pipe" }); } catch { /* fine */ }
+      console.log(`  ✓ Nightly service refreshed — existing timer schedule kept as-is`);
+      return;
+    }
     writeFileSync(timerPath, timer);
     try {
       execSync("systemctl --user daemon-reload", { stdio: "pipe" });

@@ -14,6 +14,8 @@
  * OpenAI, Anthropic, Google, Ollama, OpenRouter, and Claude CLI.
  */
 
+import type { ModelTierOverride } from "./types.js";
+
 export interface LlmConfig {
   baseUrl: string;
   apiKey: string;
@@ -102,6 +104,130 @@ export function resolveExplicitLlmConfig(overrides?: {
  */
 export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
 
+// ModelTierOverride is defined in types.ts (the schema module) and re-exported
+// here for consumers that import LLM types from this module.
+export type { ModelTierOverride } from "./types.js";
+
+/**
+ * Map from a `models.<tier>` name to the flat config keys it feeds. The base
+ * tier is `score` — score IS the base model today (completeFast reads
+ * config.model), so it lands on the llm* keys and its `provider` is ignored
+ * (the base provider comes from llmBackend / detectProvider, not config).
+ * Tiers with a `provider` key (distill/reflect/classify) apply their apiKey +
+ * provider through a baseUrl-gated overlay downstream; `score` (no provider
+ * key) rides the base resolution.
+ */
+const MODELS_TIER_KEYS: Record<
+  string,
+  { model: string; baseUrl: string; apiKey: string; provider?: string }
+> = {
+  score: { model: "llmModel", baseUrl: "llmBaseUrl", apiKey: "llmApiKey" },
+  distill: { model: "distillModel", baseUrl: "distillBaseUrl", apiKey: "distillApiKey", provider: "distillProvider" },
+  reflect: { model: "reflectModel", baseUrl: "reflectBaseUrl", apiKey: "reflectApiKey", provider: "reflectProvider" },
+  classify: { model: "classifyModel", baseUrl: "classifyBaseUrl", apiKey: "classifyApiKey", provider: "classifyProvider" },
+};
+
+/**
+ * Normalize a nested `models: { <tier>: {model,baseUrl,apiKey,provider} }` block
+ * onto the flat `llm*` / `distill*` / `reflect*` / `classify*` keys the resolver
+ * already consumes. Nested overrides WIN over any flat key of the same name; every
+ * non-mapped key (llmBackend, licenseKey, distillFallback, contextClients, …)
+ * is preserved via spread. Pure: returns the SAME reference when there is no
+ * `models` key, so this is a provable no-op for every existing install.
+ *
+ * Robust to a malformed config.json: a config that parses to a scalar, array,
+ * or null is returned untouched (matching the pre-0.13.1 optional-chaining
+ * tolerance — this function must never throw at server/nightly boot).
+ *
+ * Fail-explicit (warn + skip, never throw): an invalid `models` value, an
+ * unknown tier name, a non-object tier value, a non-string field value, a tier
+ * apiKey/provider set without a baseUrl (they are baseUrl-gated downstream), and
+ * a dead score apiKey/provider under an ollama base.
+ */
+export function applyModelsBlock(
+  saved: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  // Guard the container itself first — `"models" in saved` throws a TypeError on
+  // a truthy non-object (config.json = `true`/`5`/`"x"`); such configs must pass
+  // through so the boot path degrades to recall-only exactly as before.
+  if (typeof saved !== "object" || saved === null || Array.isArray(saved)) return saved;
+  if (!("models" in saved)) return saved;
+
+  const models = saved.models;
+  if (typeof models !== "object" || models === null || Array.isArray(models)) {
+    console.warn(
+      `[hicortex] Ignoring invalid "models" config: expected an object of per-tier overrides, got ${
+        Array.isArray(models) ? "array" : models === null ? "null" : typeof models
+      }`,
+    );
+    return saved;
+  }
+
+  const ollamaBase = saved.llmBackend === "ollama";
+  const mapped: Record<string, unknown> = {};
+
+  for (const [tier, value] of Object.entries(models as Record<string, unknown>)) {
+    const keys = MODELS_TIER_KEYS[tier];
+    if (!keys) {
+      console.warn(`[hicortex] Ignoring unknown "models" tier "${tier}" (expected: score, distill, reflect, classify)`);
+      continue;
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      console.warn(`[hicortex] Ignoring invalid "models.${tier}" override: expected an object with model/baseUrl/apiKey/provider`);
+      continue;
+    }
+    const o = value as Record<string, unknown>;
+
+    // Per-field string validation: a non-string value would map verbatim and
+    // fail opaquely downstream (e.g. baseUrl: 11434), so drop it with a warning.
+    const strField = (name: keyof ModelTierOverride): string | undefined => {
+      const v = o[name];
+      if (v === undefined) return undefined;
+      if (typeof v !== "string") {
+        console.warn(`[hicortex] Ignoring non-string "models.${tier}.${name}" (expected a string)`);
+        return undefined;
+      }
+      return v;
+    };
+
+    const model = strField("model");
+    const baseUrl = strField("baseUrl");
+    const apiKey = strField("apiKey");
+    const provider = strField("provider");
+
+    if (model !== undefined) mapped[keys.model] = model;
+    if (baseUrl !== undefined) mapped[keys.baseUrl] = baseUrl;
+
+    if (keys.provider) {
+      // Overlay tier (distill/reflect/classify): the downstream overlay only
+      // consumes apiKey/provider when the tier ALSO sets its own baseUrl.
+      // Without one, they would silently bill to the base key — so warn + drop.
+      if ((apiKey !== undefined || provider !== undefined) && baseUrl === undefined) {
+        console.warn(`[hicortex] Ignoring "models.${tier}" apiKey/provider without a baseUrl: they only take effect when the tier sets its own baseUrl`);
+      } else {
+        if (apiKey !== undefined) mapped[keys.apiKey] = apiKey;
+        if (provider !== undefined) mapped[keys.provider] = provider;
+      }
+    } else {
+      // score = base tier: no separate provider key, and apiKey rides llmApiKey.
+      if (provider !== undefined) {
+        console.warn(`[hicortex] Ignoring "models.score.provider": the base provider comes from llmBackend (or is auto-detected from the endpoint)`);
+      }
+      if (apiKey !== undefined) {
+        if (ollamaBase) {
+          // The ollama base path hardcodes an empty api key and never reads
+          // llmApiKey, so score.apiKey is dead there.
+          console.warn(`[hicortex] Ignoring "models.score.apiKey": the base ollama path sends no api key`);
+        } else {
+          mapped[keys.apiKey] = apiKey;
+        }
+      }
+    }
+  }
+
+  return { ...saved, ...mapped };
+}
+
 /**
  * Resolve an LlmConfig from a saved ~/.hicortex/config.json object.
  *
@@ -113,14 +239,20 @@ export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
  *
  * Returns `reason: "claude_binary_missing"` when claude-cli is configured but
  * the binary can't be found, so callers can log a context-specific message.
+ *
+ * `findBinary` is injectable (defaults to the real `findClaudeBinary`) so the
+ * claude-cli branch — including the missing-binary passthrough — can be pinned
+ * deterministically in tests without depending on the host filesystem.
  */
 export function resolveSavedLlmConfig(
   savedConfig: Record<string, unknown> | null,
+  findBinary: () => string | null = findClaudeBinary,
 ): { config: LlmConfig | null; reason?: "claude_binary_missing" } {
+  savedConfig = applyModelsBlock(savedConfig);
   let llmConfig: LlmConfig | null = null;
 
   if (savedConfig?.llmBackend === "claude-cli") {
-    const claudePath = findClaudeBinary();
+    const claudePath = findBinary();
     if (claudePath) {
       llmConfig = claudeCliConfig(claudePath);
     } else {
@@ -410,12 +542,28 @@ export class RateLimitError extends Error {
   }
 }
 
+// Rate-limit backoff is shared across all LlmClient instances that target the
+// same endpoint, keyed by provider@baseUrl. completeWithOverride() spins up a
+// throwaway client per call for the distill/reflect/classify override tiers;
+// with per-instance state each throwaway started un-rate-limited and re-hit a
+// 429'd provider immediately, defeating the backoff on exactly the configs
+// (e.g. z.ai via distillBaseUrl/reflectBaseUrl) that route through those tiers.
+const rateLimitedUntilByEndpoint = new Map<string, number>();
+
 export class LlmClient {
   private config: LlmConfig;
-  private rateLimitedUntil = 0;
 
   constructor(config: LlmConfig) {
     this.config = config;
+  }
+
+  /** Endpoint identity for shared rate-limit state (provider + base URL). */
+  private get endpointKey(): string {
+    return `${this.config.provider}@${this.config.baseUrl ?? ""}`;
+  }
+
+  private get rateLimitedUntil(): number {
+    return rateLimitedUntilByEndpoint.get(this.endpointKey) ?? 0;
   }
 
   /** Check if we're currently rate limited */
@@ -429,10 +577,11 @@ export class LlmClient {
     const retryMs = retryAfter
       ? parseInt(retryAfter, 10) * 1000
       : DEFAULT_RATE_LIMIT_RETRY_MS;
-    this.rateLimitedUntil = Date.now() + retryMs;
+    const until = Date.now() + retryMs;
+    rateLimitedUntilByEndpoint.set(this.endpointKey, until);
     console.log(
-      `[hicortex] Rate limited by LLM provider. ` +
-      `Will retry after ${new Date(this.rateLimitedUntil).toISOString()}`
+      `[hicortex] Rate limited by LLM provider (${this.endpointKey}). ` +
+      `Will retry after ${new Date(until).toISOString()}`
     );
     throw new RateLimitError(retryMs);
   }

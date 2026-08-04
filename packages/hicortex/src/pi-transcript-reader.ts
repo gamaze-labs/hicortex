@@ -16,28 +16,23 @@
  *
  * Directory layout:
  *   ~/.pi/agent/sessions/
- *     --home-agents-Agents-raider--/
+ *     --home-alice-projects-myagent--/
  *       2026-04-10T18-37-44-615Z_<uuid>.jsonl
  *       2026-04-11T07-51-28-282Z_<uuid>.jsonl
- *     --home-agents-Development-MAIC--/
+ *     --home-user-projects-ExampleApp--/
  *       ...
  *
- * The encoded-cwd uses double-dash separators: /home/agents/Agents/raider
- * becomes --home-agents-Agents-raider--. The session header's `cwd` field
+ * The encoded-cwd uses double-dash separators: /home/alice/projects/myagent
+ * becomes --home-alice-projects-myagent--. The session header's `cwd` field
  * is the canonical path; the directory name is a filesystem-safe encoding.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
+import type { TranscriptBatch, CursorMap } from "./transcript-reader.js";
 
-export interface TranscriptBatch {
-  sessionId: string;
-  projectName: string;
-  date: string;
-  entries: unknown[];
-  sourceAgent?: string; // optional provenance label (matches transcript-reader.ts)
-}
+export type { TranscriptBatch, CursorMap };
 
 const DEFAULT_PI_SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
 
@@ -49,10 +44,14 @@ const DEFAULT_PI_SESSIONS_DIR = join(homedir(), ".pi", "agent", "sessions");
  *
  * @param since Only return sessions with mtime > this date
  * @param sessionsDir Override the session directory (default: ~/.pi/agent/sessions/)
+ * @param cursors Per-session capture cursors (#189); default empty = whole file
+ * @param keyPrefix Cursor-key namespace ("pi" here; OC passes "oc:<agentId>")
  */
 export function readPiTranscripts(
   since: Date,
   sessionsDir: string = DEFAULT_PI_SESSIONS_DIR,
+  cursors: CursorMap = {},
+  keyPrefix = "pi",
 ): TranscriptBatch[] {
   const batches: TranscriptBatch[] = [];
 
@@ -91,6 +90,7 @@ export function readPiTranscripts(
         const raw = readFileSync(filePath, "utf-8");
         const lines = raw.split("\n").filter((l) => l.trim());
         const entries: unknown[] = [];
+        const timestamps: string[] = [];
         let sessionId = "";
         let sessionCwd = "";
         let sessionDate = "";
@@ -99,6 +99,7 @@ export function readPiTranscripts(
           try {
             const entry = JSON.parse(line);
             entries.push(entry);
+            timestamps.push(typeof entry.timestamp === "string" ? entry.timestamp : "");
 
             // Extract metadata from the session header
             if (entry.type === "session") {
@@ -127,14 +128,39 @@ export function readPiTranscripts(
           sessionDate = extractDateFromFilename(file) ?? "";
         }
 
-        if (entries.length > 0) {
-          batches.push({
-            sessionId,
-            projectName,
-            date: sessionDate,
-            entries,
-          });
+        if (entries.length === 0) continue;
+
+        // Incremental slice (#189): append-only JSONL v3, same discipline as CC.
+        const cursorKey = `${keyPrefix}:${sessionId}`;
+        const pos = cursors[cursorKey] ?? { cursor: 0, gen: 0 };
+        let start = pos.cursor;
+        let gen = pos.gen;
+        if (start > entries.length) {
+          // shrink guard (truncation/rotation) — reset + bump generation (fix 8)
+          start = 0;
+          gen = pos.gen + 1;
         }
+        const delta = entries.slice(start);
+        if (delta.length === 0) continue; // cursor already covers the file
+
+        const entryCursors = delta.map((_, i) => start + i + 1);
+
+        // Prefer the last timestamped entry in the delta for per-night dating.
+        let deltaDate = "";
+        for (let i = start; i < entries.length; i++) {
+          if (timestamps[i]) deltaDate = timestamps[i].slice(0, 10);
+        }
+
+        batches.push({
+          sessionId,
+          projectName,
+          date: deltaDate || sessionDate || new Date().toISOString().slice(0, 10),
+          entries: delta,
+          cursorKey,
+          startCursor: start,
+          generation: gen,
+          entryCursors,
+        });
       } catch {
         // File read or parse failed — skip
       }
@@ -146,7 +172,7 @@ export function readPiTranscripts(
 
 /**
  * Extract the last path segment from a cwd as the project name.
- * /home/agents/Agents/raider → "raider"
+ * /home/alice/projects/myagent → "myagent"
  * Falls back to decoding the directory name if cwd is empty.
  */
 function deriveProjectName(cwd: string, encodedDir: string): string {
@@ -155,7 +181,7 @@ function deriveProjectName(cwd: string, encodedDir: string): string {
     return segments[segments.length - 1] ?? "unknown";
   }
 
-  // Decode the Pi directory encoding: --home-agents-Agents-raider-- → raider
+  // Decode the Pi directory encoding: --home-alice-projects-myagent-- → myagent
   const decoded = encodedDir.replace(/^--/, "").replace(/--$/, "").split("-");
   return decoded[decoded.length - 1] ?? "unknown";
 }

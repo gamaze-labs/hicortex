@@ -4,14 +4,14 @@
   "description": "Your agents remember past decisions, avoid repeated mistakes, and get smarter every day. Nightly reflection generates actionable lessons that automatically update agent behavior.",
   "version": "0.10.0",
   "kind": "lifecycle",
-  "skills": ["./skills/hicortex-memory", "./skills/hicortex-learn", "./skills/hicortex-activate"],
+  "skills": ["./skills/hicortex-memory"],
   "configSchema": {
     "type": "object",
     "properties": {
       "serverUrl": {
         "type": "string",
         "default": "http://127.0.0.1:8787",
-        "description": "Hicortex server URL. Defaults to localhost (co-located server). For multi-machine setups, point this at the remote server (e.g. http://bedrock:8787 or a Tailscale HTTPS URL)."
+        "description": "Hicortex server URL. Defaults to localhost (co-located server). For multi-machine setups, point this at the remote server (e.g. http://your-server:8787 or an HTTPS URL)."
       },
       "authToken": {
         "type": "string",

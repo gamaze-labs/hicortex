@@ -16,7 +16,7 @@ You have access to a long-term memory system that stores knowledge from past ses
 - You're about to make a decision that might contradict past work
 - Starting work on a project you've worked on before
 
-## When to use hicortex_context
+## When to use hicortex_recent
 
 - At the start of a session to recall recent project state
 - When switching between projects to load relevant context

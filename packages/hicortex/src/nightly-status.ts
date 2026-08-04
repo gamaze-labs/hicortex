@@ -9,14 +9,16 @@
  *   - Staleness warnings
  */
 
+import { hicortexHome } from "./paths.js";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import { resolveDbPath } from "./db.js";
 import { describeLastNightly } from "./state.js";
+import { applyModelsBlock } from "./llm.js";
 
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
 const CONFIG_PATH = join(HICORTEX_HOME, "config.json");
 
 export async function showNightlyStatus(): Promise<void> {
@@ -35,7 +37,9 @@ export async function showNightlyStatus(): Promise<void> {
 
   // LLM config
   try {
-    const config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+    // No `?? {}` coercion: a null/invalid parse must fall through to the catch
+    // below (as it did pre-0.13.1) rather than print a fabricated-healthy status.
+    const config = applyModelsBlock(JSON.parse(readFileSync(CONFIG_PATH, "utf-8"))) as any;
     const backend = config.llmBackend ?? "auto-detect";
     const model = config.llmModel ?? "default";
     const mode = config.mode === "client" ? "client → " + (config.serverUrl ?? "?") : "server (local)";
@@ -89,6 +93,13 @@ export async function showNightlyStatus(): Promise<void> {
   }
 
   console.log(`Timer:       ${timerInfo}${!timerActive ? " ⚠ Pipeline will NOT run automatically" : ""}`);
+
+  // Scheduled runs log here (launchd plist / systemd unit both append) —
+  // point operators at it, since the runs' output is not in journalctl.
+  const nightlyLogPath = join(HICORTEX_HOME, "nightly.log");
+  if (existsSync(nightlyLogPath)) {
+    console.log(`Log:         ${nightlyLogPath}`);
+  }
 
   // DB stats
   const dbPath = resolveDbPath();

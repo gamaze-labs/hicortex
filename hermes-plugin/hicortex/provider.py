@@ -1,9 +1,28 @@
 """Hicortex MemoryProvider for Hermes — recall-only.
 
-Recall:   prefetch()          -> GET /search   (relevant memories before each turn)
-          queue_prefetch()    -> GET /search   (background recall for the next turn)
-          tools               -> hicortex_search / hicortex_recall_recent
+Recall:   prefetch()          -> POST /recall-index (pushed recall index, 0.14 —
+                                 compact one-line-per-memory menu; the agent
+                                 lazy-loads full content with hicortex_get).
+                                 Falls back to GET /search full-content
+                                 injection against a pre-0.14 server (404).
+          queue_prefetch()    -> no-op on the recall-index path (the server
+                                 dedups per turn; a client-side cache would
+                                 double-suppress). Legacy background GET /search
+                                 only on the 404 fallback path.
+          tools               -> hicortex_search / hicortex_get / hicortex_recent / …
           system_prompt_block -> lessons + memory index injected into the prompt
+          initialize()        -> POST /recall-index {reset:true} (new session =
+                                 fresh context, so the server's per-session
+                                 shown-set is cleared). Synchronous with the
+                                 short recall timeout so it can never land
+                                 AFTER the first turn's prefetch and wipe the
+                                 registry state that turn just built. The
+                                 MemoryProvider interface exposes NO
+                                 compaction/context-rebuild signal, so a
+                                 mid-session compaction cannot trigger a reset
+                                 — the server's turn-based re-show window
+                                 (recallReshowTurns) covers that gap by
+                                 re-showing after enough turns.
 
 Capture is NOT the plugin's job. A nightly reader on the Hicortex server
 distills each agent's own session store (Hermes: ~/.hermes/profiles/<agent>/
@@ -16,8 +35,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 import threading
-from typing import Any, Dict, List, Optional
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from agent.memory_provider import MemoryProvider
 
@@ -28,6 +52,97 @@ logger = logging.getLogger(__name__)
 
 _INJECT_CONTENT_CAP = 500
 
+# How long a /recall-index 404 latches the legacy-fallback path before the
+# endpoint is re-probed. The latch must EXPIRE (review F2): during a
+# client-first rollout the plugin may probe a still-0.13 server once and would
+# otherwise stay on the legacy path until a gateway restart nobody knows to do.
+# Long enough not to hammer an old server every turn, short enough that a
+# server upgrade is picked up within minutes.
+_FALLBACK_RETRY_SECONDS = 600.0
+
+# Agent ids are joined into a filesystem path server-side, so they share the
+# section-name allowlist. \Z (NOT $) anchors the END OF STRING: Python's $ also
+# matches just before a trailing "\n", so "alice\n" would pass and go out as
+# agent=alice%0A → a 400 the fail-soft path silently swallows.
+_AGENT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*\Z")
+
+
+def _valid_agent_id(name: Optional[str]) -> bool:
+    return bool(name) and len(name) <= 64 and bool(_AGENT_ID_RE.match(name))
+
+
+def _sanitize_agent_id(raw: Optional[str]) -> Optional[str]:
+    """Sanitize a raw identity (profile name / env value) into a valid agent id,
+    or None when nothing valid remains — mirrors the TS ``sanitizeAgentId``
+    EXACTLY so a profile resolves to the SAME id on both harnesses (a mismatch
+    would make one honor the persona firewall and the other leak global context
+    into an ``off``/``override`` persona): lowercase → collapse invalid runs to
+    "-" → strip leading -/_ → truncate 64 → validate. "Alice" → "alice";
+    "MacBook-Pro.local" → "macbook-pro-local"; all-symbols → None."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = re.sub(r"[^a-z0-9_-]+", "-", raw.lower())
+    cleaned = re.sub(r"^[-_]+", "", cleaned)[:64]
+    return cleaned if _valid_agent_id(cleaned) else None
+
+
+def _profile_from_home(home: str) -> Optional[str]:
+    """Parse a Hermes profile name from a ``HERMES_HOME`` ending in
+    ``…/profiles/<name>``; None when the path is not profile-shaped."""
+    home = (home or "").strip().rstrip("/")
+    if not home:
+        return None
+    parent, name = os.path.split(home)
+    return name if name and os.path.basename(parent) == "profiles" else None
+
+
+def _resolve_agent_name(cfg: Dict[str, Any]) -> Optional[str]:
+    """Resolve the per-agent context id (0.13), in priority order:
+      1. config ``agent_name`` (explicit override);
+      2. ``HERMES_PROFILE`` env;
+      3. parse ``HERMES_HOME`` when it ends ``profiles/<name>``;
+      4. None → bare fetch → the global set.
+    Each source is stripped then SANITIZED (not rejected) so "Alice" → "alice"
+    matches the TS contract; a source that sanitizes to None yields None (bare
+    fetch), never a fall-through to another identity."""
+    configured = (cfg.get("agent_name") or "").strip()
+    if configured:
+        return _sanitize_agent_id(configured)
+    prof = (os.environ.get("HERMES_PROFILE") or "").strip()
+    if prof:
+        return _sanitize_agent_id(prof)
+    parsed = _profile_from_home(os.environ.get("HERMES_HOME") or "")
+    if parsed:
+        return _sanitize_agent_id(parsed)
+    return None
+
+
+def _title_case_section(name: str) -> str:
+    """"user" → "User", "my_notes" → "My Notes" (mirrors the CC/OC helper)."""
+    words = [w for w in re.split(r"[-_]+", name) if w]
+    return " ".join(w[:1].upper() + w[1:] for w in words)
+
+
+def _order_section_names(names: Iterable[str]) -> List[str]:
+    """Stable ordering: user, rules, then the rest alphabetically."""
+    names = list(names)
+    primaries = [p for p in ("user", "rules") if p in names]
+    rest = sorted(n for n in names if n not in ("user", "rules"))
+    return primaries + rest
+
+
+def _render_context_block(sections: Dict[str, Any]) -> str:
+    """Render the ``## Context`` block, or "" when every section is blank."""
+    body_parts: List[str] = []
+    for name in _order_section_names(sections.keys()):
+        body = sections.get(name)
+        if not isinstance(body, str) or not body.strip():
+            continue
+        body_parts.extend([f"### {_title_case_section(name)}", "", body.strip()])
+    if not body_parts:
+        return ""
+    return "\n".join(["## Context", "", *body_parts])
+
 
 class HicortexProvider(MemoryProvider):
     """Hicortex long-term memory backend for Hermes (recall-only)."""
@@ -37,8 +152,21 @@ class HicortexProvider(MemoryProvider):
         self._project: Optional[str] = None
         self._recall_limit: int = 5
         self._privacy: Optional[str] = "WORK,PERSONAL"
+        self._mission_domains: List[str] = []  # #203 scope (set from config in initialize)
+        self._agent_name: Optional[str] = None
         self._prefetch_cache: Dict[str, str] = {}
         self._bg_threads: List[threading.Thread] = []
+        self._session_id: Optional[str] = None
+        # /recall-index 404 latch: 0.0 = not latched; otherwise the
+        # time.monotonic() deadline until which the legacy /search prefetch is
+        # used. Expires (re-probe) per _FALLBACK_RETRY_SECONDS. Only a
+        # definitive 404 latches; network errors stay fail-soft per turn.
+        self._recall_index_retry_at: float = 0.0
+        # Warn-once bookkeeping (review F3): a persistent non-404 HTTP error —
+        # especially 401/403 from a bad token — must surface at WARNING level
+        # once per distinct status, not vanish at debug level (the class of
+        # silent auth failure that once hid a dead recall path for days).
+        self._warned_recall_statuses: Set[int] = set()
 
     @property
     def name(self) -> str:
@@ -81,10 +209,36 @@ class HicortexProvider(MemoryProvider):
         except (TypeError, ValueError):
             self._recall_limit = 5
         self._privacy = cfg.get("privacy_filter", "WORK,PERSONAL")
+        # #203 scope: declared knowledge domains for this role-bound agent
+        # (e.g. a health-focused agent → Health). Soft affinity boost on
+        # recall; never excludes.
+        _md_raw = cfg.get("mission_domains") or ""
+        self._mission_domains = [d.strip() for d in _md_raw.split(",") if d.strip()]
+        self._agent_name = _resolve_agent_name(cfg)
         try:
             self._client = self._build_client()
         except Exception as e:
             logger.warning("hicortex: init client build failed: %s", e)
+        # New session = fresh context window, so the server's per-session
+        # shown-set is stale by definition. SYNCHRONOUS (review F8): a
+        # background reset could land AFTER the first turn's prefetch and wipe
+        # the shown-set/turn counter that turn just built. The client's short
+        # recall timeout (1.5 s) bounds the startup cost; fail-soft. The id
+        # goes through the SAME resolver as prefetch (review F7) so the reset
+        # hits the key the turns will accumulate under.
+        sid = self._resolve_session_id(session_id)
+        client = self._client
+        if client is not None:
+            try:
+                status, _ = client.recall_index(sid, reset=True)
+                if status == 404:
+                    # Pre-0.14 server — latch the legacy path now rather than
+                    # paying another probe on the first turn; the TTL heals it.
+                    self._recall_index_retry_at = (
+                        time.monotonic() + _FALLBACK_RETRY_SECONDS
+                    )
+            except Exception as e:
+                logger.debug("hicortex recall reset failed: %s", e)
 
     # ------------------------------------------------------------------- recall
     def _format_hits(self, hits: list[dict]) -> str:
@@ -103,14 +257,96 @@ class HicortexProvider(MemoryProvider):
             lines.append(f"- [{date}, {proj}] {content}")
         return "\n".join(lines)
 
+    def _resolve_session_id(self, session_id: str) -> str:
+        """Session id for /recall-index, unified across initialize() and
+        prefetch() (review F7). Precedence: an explicit non-empty id ALWAYS
+        wins and becomes the stored id (so a Hermes that hands initialize an
+        empty id but passes real ids per turn converges on the real id — the
+        turns and any later reset then share one registry key); else the
+        stored id; else a generated ``hermes-<uuid4>`` stored once (dedup
+        degrades from session to provider-instance scope — still correct,
+        never a shared "" that would merge every session on the server)."""
+        if session_id:
+            self._session_id = session_id
+            return session_id
+        if not self._session_id:
+            self._session_id = f"hermes-{uuid.uuid4()}"
+        return self._session_id
+
+    def _recall_index_latched(self) -> bool:
+        """True while the /recall-index 404 latch is active (legacy path)."""
+        return (
+            self._recall_index_retry_at > 0
+            and time.monotonic() < self._recall_index_retry_at
+        )
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        client = self._client_or_none()
+        if client is None:
+            return ""
+        # Pushed recall index (0.14): the server does relevance gating and
+        # TURN-based dedup — every user turn is sent, the server decides what
+        # is new. The sha1 prefetch cache is deliberately NOT consulted on this
+        # path: replaying a cached block would skip the server call, so the
+        # registry's turn counter would drift and dedup would double-suppress.
+        if not self._recall_index_latched():
+            try:
+                status, resp = client.recall_index(
+                    self._resolve_session_id(session_id),
+                    prompt=query,
+                    project=self._project,
+                    privacy=self._privacy,
+                    mission_domains=self._mission_domains,
+                )
+                if status == 404:
+                    # Old-server guard: pre-0.14 has no /recall-index. Latch
+                    # the legacy /search prefetch, re-probe after the TTL.
+                    logger.info(
+                        "hicortex: server has no /recall-index (pre-0.14) — "
+                        "falling back to /search prefetch for %.0f s",
+                        _FALLBACK_RETRY_SECONDS,
+                    )
+                    self._recall_index_retry_at = (
+                        time.monotonic() + _FALLBACK_RETRY_SECONDS
+                    )
+                elif status == 200:
+                    self._recall_index_retry_at = 0.0
+                    block = resp.get("block") if isinstance(resp, dict) else None
+                    # block is None when nothing is new/relevant → inject nothing.
+                    return block if isinstance(block, str) else ""
+                else:
+                    # Auth/5xx/…: not a version signal — fail soft this turn
+                    # (legacy /search would hit the same wall anyway), but
+                    # surface it ONCE per status at WARNING: a persistent 401
+                    # from a bad token must never hide at debug level.
+                    if status not in self._warned_recall_statuses:
+                        self._warned_recall_statuses.add(status)
+                        hint = (
+                            " — check hicortex_auth_token/HICORTEX_AUTH_TOKEN"
+                            if status in (401, 403)
+                            else ""
+                        )
+                        logger.warning(
+                            "hicortex: /recall-index returned HTTP %s; recall "
+                            "injection is disabled while this persists%s",
+                            status,
+                            hint,
+                        )
+                    else:
+                        logger.debug("hicortex recall-index HTTP %s", status)
+                    return ""
+            except Exception as e:
+                logger.debug("hicortex recall-index failed: %s", e)
+                return ""
+        return self._legacy_search_prefetch(client, query)
+
+    def _legacy_search_prefetch(self, client: HicortexClient, query: str) -> str:
+        """Pre-0.14 behavior: full-content /search injection with the one-shot
+        sha1 cache warmed by queue_prefetch."""
         key = hashlib.sha1(query.encode("utf-8")).hexdigest()
         cached = self._prefetch_cache.pop(key, None)
         if cached is not None:
             return cached
-        client = self._client_or_none()
-        if client is None:
-            return ""
         try:
             hits = client.search(
                 query, limit=self._recall_limit, project=self._project, privacy=self._privacy
@@ -121,6 +357,13 @@ class HicortexProvider(MemoryProvider):
             return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        # Recall-index path: no background warm-up. One /recall-index POST per
+        # turn (from prefetch) is the contract — a queued call here would burn
+        # a registry turn AND cache a block the server thinks it already
+        # showed. Only the latched (confirmed-404) legacy path keeps the old
+        # behavior.
+        if not self._recall_index_latched():
+            return
         client = self._client_or_none()
         if client is None:
             return
@@ -142,6 +385,51 @@ class HicortexProvider(MemoryProvider):
         client = self._client_or_none()
         if client is None:
             return ""
+        # Standing context (L2, 0.13) is prepended ABOVE the lessons block. The
+        # two fetches run CONCURRENTLY (matching the TS Promise.all paths): run
+        # serially, a blackholed server would stall the turn for up to 2× the
+        # client timeout. Each block fails soft independently — a context failure
+        # must never cost the lessons block, and vice versa.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f_context = executor.submit(self._context_block, client)
+            f_lessons = executor.submit(self._lessons_block, client)
+            blocks = [f_context.result(), f_lessons.result()]
+        return "\n\n".join(b for b in blocks if b)
+
+    def _context_block(self, client: HicortexClient) -> str:
+        """Fetch the standing context layer and render a ``## Context`` block,
+        or "" when nothing should be injected. Gates (ALL): "hermes" in the
+        server-resolved ``clients``; when an agent id was SENT, the response
+        echoes ``agent`` (old-server guard — a pre-0.13 server ignores ?agent=
+        and returns global with no echo; injecting would push global context
+        into every persona; the check is skipped on a bare fetch); and the
+        resolved section set is non-empty (mode "off" → {}).
+
+        Reference implementation for the gate: TS ``gateAndRenderContext`` in
+        ``packages/hicortex/src/lessons-context.ts`` (keep the two in sync).
+
+        The ENTIRE path — fetch, parse, gate, render — is inside the try: a
+        malformed ``clients`` value (e.g. an int from a proxy error page) would
+        otherwise raise during the ``in`` check, escape, and cost the lessons
+        block too (mirrors the TS ``.catch(() => null)`` totality)."""
+        try:
+            data = client.context(agent=self._agent_name)
+            if not isinstance(data, dict):
+                return ""
+            clients = data.get("clients") or []
+            if "hermes" not in clients:
+                return ""
+            if self._agent_name is not None and not isinstance(data.get("agent"), str):
+                return ""
+            sections = data.get("sections") or {}
+            if not isinstance(sections, dict):
+                return ""
+            return _render_context_block(sections)
+        except Exception as e:
+            logger.debug("hicortex context injection failed: %s", e)
+            return ""
+
+    def _lessons_block(self, client: HicortexClient) -> str:
         try:
             data = client.lessons()
         except Exception as e:
@@ -152,12 +440,18 @@ class HicortexProvider(MemoryProvider):
         lines = [
             "## Hicortex long-term memory",
             "You have shared long-term memory across sessions. Use `hicortex_search` "
-            "for specific recall and `hicortex_recall_recent` for recent context.",
+            "for specific recall, `hicortex_get` to fetch one memory by id (e.g. from "
+            "the recall index), and `hicortex_recent` for recent memories by project.",
         ]
         if lessons:
             lines.append("Lessons:")
             for l in lessons:
                 c = (l.get("content") or "").strip().replace("\n", " ")
+                # Legacy lessons were stored with a "## Lesson:" prefix; new ones are
+                # topic-first (selected by memory_type, not the prefix). Strip it so
+                # Hermes renders the same topic-first line as the CC/OC lessons blocks.
+                if c.startswith("## Lesson: "):
+                    c = c[len("## Lesson: "):]
                 lines.append(f"- {c[:200]}")
         if idx.get("total"):
             lines.append(
@@ -188,24 +482,34 @@ class HicortexProvider(MemoryProvider):
                 },
             },
             {
-                "name": "hicortex_recall_recent",
-                "description": "Recall recent context memories, optionally filtered by project.",
+                "name": "hicortex_get",
+                "description": (
+                    "Fetch ONE memory's full content by id — use this to lazy-load "
+                    "entries from the recall index or from search results whose "
+                    "snippet was not enough. Fetching a memory marks it as used "
+                    "(strengthens it), so fetch entries that could change your "
+                    "action — not every shown one. When the memory shapes your "
+                    "answer, cite it as given in the response — mark a fetched "
+                    "memory FETCHED and a one-line entry cited unread SNIPPET; "
+                    "don't pass SNIPPET off as established."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "project": {"type": "string"},
-                        "limit": {
-                            "type": "number",
-                            "description": "Max results (default 10)",
+                        "id": {
+                            "type": "string",
+                            "description": "Memory ID (as shown in the recall index or search results)",
                         },
                     },
+                    "required": ["id"],
                 },
             },
             {
-                "name": "hicortex_context",
+                "name": "hicortex_recent",
                 "description": (
-                    "Get recent context memories, optionally filtered by project. "
-                    "Useful to recall what happened recently."
+                    "Get recent memories, optionally filtered by project. Queryless recall "
+                    "of the latest memories by project, ranked by importance. Useful to "
+                    "catch up on what happened recently."
                 ),
                 "parameters": {
                     "type": "object",
@@ -335,8 +639,31 @@ class HicortexProvider(MemoryProvider):
                 )
                 return json.dumps(hits)
 
-            elif tool_name in ("hicortex_recall_recent", "hicortex_context"):
-                hits = client.context(
+            elif tool_name == "hicortex_get":
+                id_val = args.get("id", "")
+                if not id_val:
+                    return json.dumps({"error": "id is required"})
+                # The configured privacy filter rides along (review F1): an
+                # out-of-scope memory reads as 404 server-side.
+                status, resp = client.get_memory(id_val, privacy=self._privacy)
+                if status == 404:
+                    # Either no such memory (0.14+) or a pre-0.14 server with
+                    # no /memory endpoint — the id hint covers the common case.
+                    return json.dumps(
+                        {"error": f"Memory not found: {id_val} (or the server predates 0.14)"}
+                    )
+                if status != 200 or not isinstance(resp, dict):
+                    err = resp.get("error") if isinstance(resp, dict) else None
+                    return json.dumps({"error": err or f"HTTP {status}"})
+                memory = resp.get("memory") or {}
+                content = memory.get("content") or ""
+                citation = resp.get("citation") or ""
+                # Render the content BEHIND the server's citation string — the
+                # server-side rendering is the single provenance norm (0.14.1).
+                return f"{citation}\n\n{content}".strip()
+
+            elif tool_name == "hicortex_recent":
+                hits = client.recent(
                     project=args.get("project") or self._project,
                     limit=int(args.get("limit", 10)),
                 )

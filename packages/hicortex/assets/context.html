@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hicortex — context</title>
+<!--
+  Hicortex standing-context editor (#165, 0.12 — spec 2026-07-12 §5).
+  Self-contained: inline CSS/JS, ZERO external requests (CSP-safe). The PRIMARY
+  edit surface for the context layer.
+
+  One tab per section, tabs built dynamically from GET /context `sections`
+  (the server serves any allowlist-named *.md as a section — nothing hardcoded).
+  Each tab is a <textarea>; Save PUTs only the active section (partial upsert).
+
+  The page SHELL is public (exempted in createAuthMiddleware like /viz); the
+  GET/PUT /context data calls are bearer-only with a localhost bypass, so on the
+  server box no token is needed. Remote browsers hand off a token via
+  ?token=<t> (stripped from the URL on load), localStorage, or a 401 prompt.
+
+  Security: section content is only ever read/written through textarea .value —
+  never innerHTML. Tab labels and messages use textContent. No markdown preview
+  in v1 (spec §5).
+-->
+<style>
+  :root {
+    --bg: #ffffff;
+    --panel: #f6f7f9;
+    --panel-border: #d9dce2;
+    --text: #1c1f26;
+    --text-dim: #656d7a;
+    --accent: #2f6fb0;
+    --accent-text: #ffffff;
+    --danger: #c0392b;
+    --ok: #2f8f4e;
+    --tab-active: #ffffff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1117;
+      --panel: #161a23;
+      --panel-border: #262c3a;
+      --text: #d5dae4;
+      --text-dim: #8b93a5;
+      --accent: #5b9dd9;
+      --accent-text: #0b0d12;
+      --danger: #e05555;
+      --ok: #5fbf77;
+      --tab-active: #0f1117;
+    }
+  }
+  /* Explicit theme override wins over the media default in BOTH directions. */
+  :root[data-theme="light"] {
+    --bg: #ffffff; --panel: #f6f7f9; --panel-border: #d9dce2;
+    --text: #1c1f26; --text-dim: #656d7a; --accent: #2f6fb0;
+    --accent-text: #ffffff; --danger: #c0392b; --ok: #2f8f4e; --tab-active: #ffffff;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1117; --panel: #161a23; --panel-border: #262c3a;
+    --text: #d5dae4; --text-dim: #8b93a5; --accent: #5b9dd9;
+    --accent-text: #0b0d12; --danger: #e05555; --ok: #5fbf77; --tab-active: #0f1117;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex; flex-direction: column;
+  }
+
+  header {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 12px 18px; border-bottom: 1px solid var(--panel-border);
+  }
+  header h1 { font-size: 15px; font-weight: 600; white-space: nowrap; }
+  header .meta { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+  header .spacer { flex: 1; }
+  header select, header #newagent {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 5px;
+    padding: 4px 6px; font: inherit; font-size: 12px;
+  }
+  header #newagent { width: 120px; }
+  header .btn.small { padding: 4px 10px; font-size: 12px; }
+
+  main { flex: 1; display: flex; flex-direction: column; padding: 14px 18px; gap: 12px; min-height: 0; }
+
+  #tabs {
+    display: flex; flex-wrap: wrap; gap: 4px; align-items: center;
+    border-bottom: 1px solid var(--panel-border); padding-bottom: 0;
+  }
+  .tab {
+    background: transparent; color: var(--text-dim);
+    border: 1px solid transparent; border-bottom: none;
+    border-radius: 6px 6px 0 0; padding: 6px 14px; cursor: pointer;
+    font: inherit; font-size: 13px; position: relative; top: 1px;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--text); background: var(--tab-active);
+    border-color: var(--panel-border); border-bottom: 1px solid var(--tab-active);
+  }
+  .tab.inherited { opacity: 0.6; font-style: italic; }
+  .tab .dirty { color: var(--accent); margin-left: 5px; }
+  .tab .inh { color: var(--text-dim); margin-left: 5px; font-size: 11px; }
+
+  #addwrap { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  #addname {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 5px;
+    padding: 5px 8px; font: inherit; font-size: 13px; width: 150px;
+  }
+
+  button.btn {
+    background: var(--accent); color: var(--accent-text);
+    border: none; border-radius: 5px; padding: 6px 14px;
+    font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button.btn:hover { filter: brightness(1.08); }
+  button.btn.secondary {
+    background: transparent; color: var(--text);
+    border: 1px solid var(--panel-border); font-weight: 500;
+  }
+  button.btn:disabled { opacity: 0.5; cursor: default; filter: none; }
+
+  #editor { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  textarea {
+    flex: 1; width: 100%; min-height: 240px; resize: vertical;
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 6px;
+    padding: 12px; font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    tab-size: 2;
+  }
+  textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+  #bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  #bar .grow { flex: 1; }
+  #msg { font-size: 13px; min-height: 18px; }
+  #msg.ok { color: var(--ok); }
+  #msg.err { color: var(--danger); }
+  #msg.dim { color: var(--text-dim); }
+
+  #empty { color: var(--text-dim); padding: 24px 0; }
+  #empty code { background: var(--panel); padding: 1px 5px; border-radius: 3px; }
+
+  /* token overlay */
+  #overlay {
+    position: fixed; inset: 0; display: none; z-index: 30;
+    align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, 0.55);
+  }
+  #overlay.open { display: flex; }
+  #overlay .box {
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 8px; padding: 22px; max-width: 420px; width: 90%;
+  }
+  #overlay .box h2 { font-size: 15px; margin-bottom: 8px; }
+  #overlay .box p { color: var(--text-dim); margin-bottom: 12px; font-size: 13px; }
+  #overlay .box code { background: var(--bg); padding: 1px 5px; border-radius: 3px; }
+  #overlay input {
+    width: 100%; background: var(--bg); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 5px;
+    padding: 8px; font: inherit; margin-bottom: 10px;
+  }
+  #token-err { color: var(--danger); font-size: 13px; margin-top: 8px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Hicortex — context</h1>
+  <label class="meta" for="scope">scope</label>
+  <select id="scope" title="Which agent's context to edit"></select>
+  <input type="text" id="newagent" placeholder="new-agent-id" autocomplete="off" spellcheck="false">
+  <button class="btn secondary small" id="addagent">Add agent</button>
+  <span class="meta" id="clients"></span>
+  <div class="spacer"></div>
+  <span class="meta" id="mode"></span>
+  <span class="meta" id="updated"></span>
+</header>
+
+<main>
+  <div id="tabs">
+    <div id="addwrap">
+      <input type="text" id="addname" placeholder="new-section-name" autocomplete="off" spellcheck="false">
+      <button class="btn secondary" id="add">Add</button>
+    </div>
+  </div>
+
+  <div id="empty" style="display:none">
+    No sections yet. Add one above (e.g. <code>user</code> or <code>rules</code>) — a lowercase name
+    of letters, digits, <code>-</code> or <code>_</code>.
+  </div>
+
+  <div id="editor" style="display:none">
+    <textarea id="area" spellcheck="false" placeholder="# Markdown…"></textarea>
+    <div id="bar" style="margin-top:12px">
+      <button class="btn" id="save">Save</button>
+      <span class="grow"></span>
+      <span id="msg" class="dim"></span>
+    </div>
+  </div>
+</main>
+
+<div id="overlay">
+  <div class="box">
+    <h2>Authentication required</h2>
+    <p>This server needs a token for remote access.
+       Run <code>hicortex status</code> on the server to get it.</p>
+    <input type="password" id="token-input" placeholder="hctx-…" autocomplete="off">
+    <button class="btn" id="token-submit">Connect</button>
+    <div id="token-err">Still unauthorized — check the token.</div>
+  </div>
+</div>
+
+<script>
+"use strict";
+(function () {
+  // =========================================================================
+  // Section-name allowlist — mirrors the server contract (context-store.ts
+  // SECTION_NAME_RE / SECTION_NAME_MAX). Client check is UX; the server also
+  // enforces it and is the authority.
+  // =========================================================================
+  var NAME_RE = /^[a-z0-9][a-z0-9_-]*$/;
+  var NAME_MAX = 64;
+  function validName(n) {
+    return typeof n === "string" && n.length >= 1 && n.length <= NAME_MAX && NAME_RE.test(n);
+  }
+
+  // =========================================================================
+  // Auth token handling — mirrors assets/viz.html: ?token= handoff (stripped
+  // from history immediately), localStorage persistence, in-page 401 prompt.
+  // On localhost the server bypasses auth, so tokenless fetches just work and
+  // the prompt only appears on a real 401.
+  // =========================================================================
+  var token = null;
+  (function initToken() {
+    var params = new URLSearchParams(window.location.search);
+    var fromUrl = params.get("token");
+    if (fromUrl) {
+      token = fromUrl;
+      try { localStorage.setItem("hicortexToken", fromUrl); } catch (e) { /* private mode */ }
+      params.delete("token");
+      var qs = params.toString();
+      history.replaceState(null, "", window.location.pathname + (qs ? "?" + qs : ""));
+    } else {
+      try { token = localStorage.getItem("hicortexToken"); } catch (e) { token = null; }
+    }
+  })();
+
+  function authHeaders(extra) {
+    var h = extra ? Object.assign({}, extra) : {};
+    if (token) h["Authorization"] = "Bearer " + token;
+    return h;
+  }
+
+  // =========================================================================
+  // DOM refs
+  // =========================================================================
+  var tabsEl = document.getElementById("tabs");
+  var addWrap = document.getElementById("addwrap");
+  var addName = document.getElementById("addname");
+  var addBtn = document.getElementById("add");
+  var emptyEl = document.getElementById("empty");
+  var editorEl = document.getElementById("editor");
+  var area = document.getElementById("area");
+  var saveBtn = document.getElementById("save");
+  var msgEl = document.getElementById("msg");
+  var clientsEl = document.getElementById("clients");
+  var updatedEl = document.getElementById("updated");
+  var modeEl = document.getElementById("mode");
+  var scopeSel = document.getElementById("scope");
+  var newAgentInput = document.getElementById("newagent");
+  var addAgentBtn = document.getElementById("addagent");
+  var overlay = document.getElementById("overlay");
+  var tokenInput = document.getElementById("token-input");
+  var tokenErr = document.getElementById("token-err");
+
+  // =========================================================================
+  // State — sections is name -> { saved, draft, isNew }
+  // =========================================================================
+  var sections = {};        // name -> { saved: string, draft: string, isNew: bool }
+  var order = [];           // tab order (section names)
+  var active = null;        // active section name
+  var afterAuth = null;     // action to retry after a successful token prompt
+
+  // Per-agent scope (0.13). scope = null → the global set; otherwise an agent
+  // id, and edits target PUT /context?agent=<id>. `agents` is the id -> mode
+  // map from the bare (global) GET; `origins` is the id -> "global"|"agent"
+  // provenance from an agent-scope GET (used to dim inherited tabs).
+  var scope = null;
+  var agents = {};
+  var origins = {};
+
+  // ?agent= query for the active scope. Written so the literal fetch("/context"
+  // survives the self-containment test; the server does the resolution.
+  function scopeQS() {
+    return scope ? "?agent=" + encodeURIComponent(scope) : "";
+  }
+
+  function setMsg(text, cls) {
+    msgEl.textContent = text || "";
+    msgEl.className = cls || "dim";
+  }
+
+  function isDirty(name) {
+    var s = sections[name];
+    return !!s && (s.isNew || s.draft !== s.saved);
+  }
+
+  // =========================================================================
+  // Rendering — tab labels are textContent only (never innerHTML). Section
+  // content lives exclusively in the textarea .value.
+  // =========================================================================
+  function renderTabs() {
+    // Remove existing tab buttons but keep the add-section control.
+    var btns = tabsEl.querySelectorAll(".tab");
+    for (var i = 0; i < btns.length; i++) tabsEl.removeChild(btns[i]);
+
+    order.forEach(function (name) {
+      var b = document.createElement("button");
+      // In an agent scope, a section still coming from the global set is
+      // inherited — dim it and mark it. Saving it PUTs to the agent (override).
+      var inherited = scope && origins[name] === "global";
+      b.className = "tab" + (name === active ? " active" : "") + (inherited ? " inherited" : "");
+      b.type = "button";
+      b.appendChild(document.createTextNode(name));
+      if (inherited) {
+        var inh = document.createElement("span");
+        inh.className = "inh";
+        inh.textContent = "(inherited)";
+        b.appendChild(inh);
+      }
+      if (isDirty(name)) {
+        var dot = document.createElement("span");
+        dot.className = "dirty";
+        dot.textContent = "•"; // bullet = unsaved
+        b.appendChild(dot);
+      }
+      b.addEventListener("click", function () { selectTab(name); });
+      tabsEl.insertBefore(b, addWrap);
+    });
+
+    var hasTabs = order.length > 0;
+    emptyEl.style.display = hasTabs ? "none" : "block";
+    editorEl.style.display = hasTabs && active ? "flex" : "none";
+  }
+
+  function selectTab(name) {
+    // Persist the current textarea into the draft before switching.
+    if (active && sections[active]) sections[active].draft = area.value;
+    active = name;
+    area.value = sections[name] ? sections[name].draft : "";
+    setMsg("", "dim");
+    renderTabs();
+    area.focus();
+  }
+
+  function updateMeta(clients, updatedAt, mode) {
+    if (Array.isArray(clients)) {
+      clientsEl.textContent = clients.length ? "clients: " + clients.join(", ") : "clients: none";
+    }
+    if (updatedAt !== undefined) {
+      updatedEl.textContent = updatedAt ? "updated " + updatedAt : "";
+    }
+    if (mode !== undefined) {
+      modeEl.textContent = mode ? "mode: " + mode : "";
+    }
+  }
+
+  // Rebuild the scope <select> from the known agents map. Options are added via
+  // textContent only (never innerHTML); the current scope stays selected.
+  function populateScopeOptions() {
+    while (scopeSel.firstChild) scopeSel.removeChild(scopeSel.firstChild);
+    var globalOpt = document.createElement("option");
+    globalOpt.value = "";
+    globalOpt.textContent = "Global";
+    scopeSel.appendChild(globalOpt);
+    Object.keys(agents).sort().forEach(function (id) {
+      var o = document.createElement("option");
+      o.value = id;
+      o.textContent = id + " (" + agents[id] + ")";
+      scopeSel.appendChild(o);
+    });
+    scopeSel.value = scope || "";
+  }
+
+  // =========================================================================
+  // Load — GET /context, build tabs from the returned sections keys.
+  // =========================================================================
+  function load() {
+    setMsg("Loading…", "dim");
+    fetch("/context" + scopeQS(), { headers: authHeaders() })
+      .then(function (resp) {
+        if (resp.status === 401) { afterAuth = load; showTokenPrompt(); throw new Error("unauthorized"); }
+        if (!resp.ok) {
+          return resp.json().catch(function () { return {}; }).then(function (body) {
+            throw new Error(body.error || ("Server error " + resp.status));
+          });
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        overlay.classList.remove("open");
+        // The bare (global) response carries the `agents` map; an agent-scope
+        // response carries `origins`. Retain the last-known agents list when the
+        // current response omits it so the selector stays populated.
+        if (scope === null && data.agents && typeof data.agents === "object") agents = data.agents;
+        origins = (data.origins && typeof data.origins === "object") ? data.origins : {};
+        var incoming = data.sections || {};
+        var names = Object.keys(incoming).sort();
+        sections = {};
+        order = [];
+        names.forEach(function (n) {
+          sections[n] = { saved: incoming[n], draft: incoming[n], isNew: false };
+          order.push(n);
+        });
+        // Keep the active tab if it still exists, else pick the first.
+        if (!active || order.indexOf(active) < 0) active = order.length ? order[0] : null;
+        if (active) area.value = sections[active].draft;
+        updateMeta(data.clients, data.updated_at || null, data.mode || "");
+        populateScopeOptions();
+        renderTabs();
+        setMsg(order.length ? "" : "", "dim");
+      })
+      .catch(function (err) {
+        if (err.message === "unauthorized") return;
+        setMsg("Failed to load: " + err.message, "err");
+      });
+  }
+
+  // =========================================================================
+  // Save — PUT /context with ONLY the active section (partial upsert).
+  // =========================================================================
+  function save() {
+    if (!active) return;
+    if (sections[active]) sections[active].draft = area.value;
+    var name = active;
+    var value = area.value;
+
+    if (!validName(name)) {
+      setMsg("Invalid section name: " + name, "err");
+      return;
+    }
+
+    var payload = { sections: {} };
+    payload.sections[name] = value;
+
+    saveBtn.disabled = true;
+    setMsg("Saving…", "dim");
+    fetch("/context" + scopeQS(), {
+      method: "PUT",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify(payload),
+    })
+      .then(function (resp) {
+        if (resp.status === 401) {
+          afterAuth = save;
+          showTokenPrompt();
+          throw new Error("unauthorized");
+        }
+        return resp.json().catch(function () { return {}; }).then(function (body) {
+          if (!resp.ok) throw new Error(body.error || ("Server error " + resp.status));
+          return body;
+        });
+      })
+      .then(function (body) {
+        overlay.classList.remove("open");
+        var s = sections[name];
+        if (s) { s.saved = value; s.isNew = false; }
+        // In an agent scope the just-saved section is now an override (no longer
+        // inherited); a first save also registers the agent in the selector.
+        if (scope) {
+          origins[name] = "agent";
+          if (!agents[scope]) { agents[scope] = body.mode || "override"; populateScopeOptions(); }
+        }
+        updateMeta(undefined, body.updated_at || null, body.mode);
+        setMsg("Saved" + (body.updated_at ? " · " + body.updated_at : ""), "ok");
+        renderTabs();
+      })
+      .catch(function (err) {
+        if (err.message !== "unauthorized") setMsg("Save failed: " + err.message, "err");
+      })
+      .then(function () { saveBtn.disabled = false; });
+  }
+
+  // =========================================================================
+  // Add a new section (client-side; created on first Save). Validated against
+  // the same allowlist BEFORE it can be edited — inline error otherwise.
+  // =========================================================================
+  function addSection() {
+    var name = addName.value.trim();
+    if (!validName(name)) {
+      setMsg("Invalid name — use lowercase letters, digits, - or _ (max 64, no leading - or _).", "err");
+      addName.focus();
+      return;
+    }
+    if (sections[name]) {
+      // Already exists — just switch to it.
+      addName.value = "";
+      selectTab(name);
+      return;
+    }
+    sections[name] = { saved: "", draft: "", isNew: true };
+    order.push(name);
+    addName.value = "";
+    selectTab(name);
+    setMsg("New section “" + name + "” — edit and Save to create it.", "dim");
+  }
+
+  // =========================================================================
+  // Scope switching — reload the selected agent's (or the global) context.
+  // Warns before discarding unsaved edits in the current scope.
+  // =========================================================================
+  function anyDirty() {
+    return order.some(function (n) { return isDirty(n); });
+  }
+
+  function switchScope(next) {
+    if (anyDirty() && !window.confirm("Discard unsaved changes and switch scope?")) {
+      scopeSel.value = scope || "";
+      return;
+    }
+    scope = next || null;
+    active = null; // let load() pick the first tab in the new scope
+    load();
+  }
+
+  function addAgent() {
+    var id = newAgentInput.value.trim();
+    if (!validName(id)) {
+      setMsg("Invalid agent id — lowercase letters, digits, - or _ (max 64, no leading - or _).", "err");
+      newAgentInput.focus();
+      return;
+    }
+    newAgentInput.value = "";
+    // The agent dir is created server-side on the first Save; until then the
+    // scope resolves to the inherited global set. Register it locally so the
+    // selector shows it immediately.
+    if (!agents[id]) agents[id] = "override";
+    switchScope(id);
+  }
+
+  // =========================================================================
+  // Token prompt (remote only — localhost bypasses auth)
+  // =========================================================================
+  function showTokenPrompt() {
+    setMsg("", "dim");
+    overlay.classList.add("open");
+    tokenInput.focus();
+  }
+  function submitToken() {
+    var v = tokenInput.value.trim();
+    if (!v) return;
+    token = v;
+    try { localStorage.setItem("hicortexToken", v); } catch (e) { /* ignore */ }
+    tokenErr.style.display = "none";
+    // Verify with a cheap GET before closing; retry the pending action on success.
+    fetch("/context", { headers: authHeaders() }).then(function (resp) {
+      if (resp.status === 401) { tokenErr.style.display = "block"; return; }
+      overlay.classList.remove("open");
+      var next = afterAuth || load;
+      afterAuth = null;
+      next();
+    }).catch(function () { tokenErr.style.display = "block"; });
+  }
+
+  // =========================================================================
+  // Wiring
+  // =========================================================================
+  saveBtn.addEventListener("click", save);
+  addBtn.addEventListener("click", addSection);
+  addName.addEventListener("keydown", function (e) { if (e.key === "Enter") addSection(); });
+  scopeSel.addEventListener("change", function () { switchScope(scopeSel.value); });
+  addAgentBtn.addEventListener("click", addAgent);
+  newAgentInput.addEventListener("keydown", function (e) { if (e.key === "Enter") addAgent(); });
+  area.addEventListener("input", function () {
+    if (active && sections[active]) sections[active].draft = area.value;
+    renderTabs();
+  });
+  // Cmd/Ctrl+S saves the active tab.
+  window.addEventListener("keydown", function (e) {
+    if ((e.metaKey || e.ctrlKey) && (e.key === "s" || e.key === "S")) {
+      e.preventDefault();
+      save();
+    }
+  });
+  document.getElementById("token-submit").addEventListener("click", submitToken);
+  tokenInput.addEventListener("keydown", function (e) { if (e.key === "Enter") submitToken(); });
+
+  load();
+})();
+</script>
+</body>
+</html>

@@ -14,7 +14,7 @@
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { readPiTranscripts, type TranscriptBatch } from "./pi-transcript-reader.js";
+import { readPiTranscripts, type TranscriptBatch, type CursorMap } from "./pi-transcript-reader.js";
 
 const DEFAULT_OC_AGENTS_DIR = join(homedir(), ".openclaw", "agents");
 
@@ -23,10 +23,12 @@ const DEFAULT_OC_AGENTS_DIR = join(homedir(), ".openclaw", "agents");
  *
  * @param since Only return sessions with mtime > this date
  * @param agentsDir Override the OC agents directory (default: ~/.openclaw/agents/)
+ * @param cursors Per-session capture cursors (#189); keyed `oc:<agentId>:<sid>`
  */
 export function readOcTranscripts(
   since: Date,
   agentsDir: string = DEFAULT_OC_AGENTS_DIR,
+  cursors: CursorMap = {},
 ): TranscriptBatch[] {
   let agentIds: string[];
   try {
@@ -46,8 +48,9 @@ export function readOcTranscripts(
     }
 
     // agents/<agentId>/ contains a `sessions/` child with *.jsonl — exactly
-    // the <root>/<projectDir>/*.jsonl shape readPiTranscripts walks.
-    for (const batch of readPiTranscripts(since, agentPath)) {
+    // the <root>/<projectDir>/*.jsonl shape readPiTranscripts walks. The
+    // key prefix namespaces cursors per agent (oc:<agentId>:<sessionId>).
+    for (const batch of readPiTranscripts(since, agentPath, cursors, `oc:${agentId}`)) {
       batches.push({
         ...batch,
         // The Pi walk labels the project from the cwd or the "sessions" dir

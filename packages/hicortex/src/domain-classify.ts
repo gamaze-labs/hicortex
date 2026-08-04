@@ -5,20 +5,20 @@
  * ---------------
  * The nightly's legacy `stageDomainCuration` groups PROJECTS into domains and
  * assigns every memory its project's domain. For an owner whose "projects" are
- * often AGENT names (lenny, nano, ...), one agent produces memories spanning
+ * often AGENT names (alice, bob, ...), one agent produces memories spanning
  * many life areas, so life-memories get smeared under the agent. This module
  * classifies a single memory into life-spheres by its CONTENT, drawn from a
  * user-curated vocabulary in ~/.hicortex/config.json (`domains`).
  *
  * GRADED SCHEMA TAGS (spec 2026-07-07, supersedes the LLM-picked primary from
- * PR #152/#153): a memory genuinely spans spheres — "set up bedrock for the
+ * PR #152/#153): a memory genuinely spans spheres — "set up the server for the
  * agent fleet" is both Hardware AND Ventures. The classifier now returns ONLY
  * the discrete part:
  *   - `tags`: 0..N vocabulary names that genuinely apply, MOST-RELEVANT FIRST
  *     (the order is used solely as an exact-weight tiebreak downstream).
  * The PRIMARY (memories.domain) is NO LONGER requested from the LLM — audits
  * proved LLM primaries a coin-flip on overlapping spheres. It is DERIVED
- * deterministically (argmax association weight + compartment override) in
+ * deterministically (argmax association weight, LLM tag order breaking ties) in
  * schema-prototypes.ts / storage.setMemoryTags.
  *
  * NO-FIT = EMPTY TAG SET (owner amendment 07.07): "Unsorted" is a non-tag —
@@ -31,7 +31,7 @@
  *
  * The `project` name is passed to the classifier as a HINT (content wins;
  * project only breaks ties). This rescues terse technical memories from
- * projects like raider/hiops/catalyst whose content alone reads as ambiguous.
+ * projects whose content alone reads as ambiguous.
  *
  * The classifier makes ONE constrained LLM call per memory (via the classify
  * tier — classifyModel/classifyBaseUrl when configured, else the reflect
@@ -79,9 +79,6 @@ export function parseConfigDomains(config: Record<string, unknown> | null | unde
     const description = typeof d.description === "string" ? d.description.trim() : "";
     if (!name) continue;
     const def: DomainDef = { name, description };
-    // Compartment policy passthrough (graded-schema spec): a domain flagged
-    // `compartment: true` becomes the primary whenever tagged.
-    if (d.compartment === true) def.compartment = true;
     out.push(def);
   }
   return out.length > 0 ? out : null;

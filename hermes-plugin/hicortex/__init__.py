@@ -1,7 +1,8 @@
 """Hicortex memory provider plugin for Hermes — recall-only.
 
-Recall:   prefetch()          -> GET /search   (relevant memories before each turn)
-          tools               -> hicortex_search / hicortex_recall_recent
+Recall:   prefetch()          -> POST /recall-index (pushed recall index; falls
+                                 back to GET /search on a pre-0.14 server)
+          tools               -> hicortex_search / hicortex_get / hicortex_recent / …
           system_prompt_block -> lessons injected into the system prompt
 
 Capture is NOT the plugin's job. A nightly reader on the Hicortex server

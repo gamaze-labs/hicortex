@@ -5,8 +5,8 @@
  * Why this exists:
  *   - Session transcripts contain tool output: file reads, command output,
  *     env var dumps. These regularly contain API keys, tokens, and paths.
- *   - The distillation LLM is often remote (e.g., Ollama on MBP via
- *     Tailscale). Secrets in the transcript travel over the network.
+ *   - The distillation LLM is often remote (e.g., a mesh VPN link to a
+ *     GPU box). Secrets in the transcript travel over the network.
  *   - Even if the LLM correctly classifies the memory as SENSITIVE, the
  *     secret is already stored and searchable via hicortex_search.
  *   - Redaction runs BEFORE the LLM sees the text, eliminating the risk.

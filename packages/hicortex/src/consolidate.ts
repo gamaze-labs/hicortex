@@ -21,7 +21,6 @@ import {
   type DomainDef,
 } from "./domain-classify.js";
 import {
-  compartmentSet,
   computeDomainPrototypes,
   computeTagWeights,
   recomputeAllTagWeights,
@@ -41,7 +40,7 @@ const CONSOLIDATE_PRUNE_MIN_AGE_DAYS = 90;
  * Minimum COSINE similarity for a link candidate.
  *
  * Calibration (2026-07): measured top-10 neighbor cosine histogram on the
- * 2945-memory production corpus (bedrock). Typical top-1 neighbor cosine:
+ * ~3000-memory production corpus. Typical top-1 neighbor cosine:
  * median 0.823, p10 0.743, p90 0.902. Threshold 0.75 combined with the
  * top-3 cap yields ≈ 2.2 candidate links/memory. The previous value (0.55)
  * lived on an accidental 1−L2 scale where it required cosine > 0.90 — a
@@ -342,7 +341,10 @@ async function stageReflection(
       const confidence = String(lo.confidence ?? "medium");
       const sourcePattern = String(lo.source_pattern ?? "");
 
-      let content = `## Lesson: ${lessonText}\n\n`;
+      // No `## Lesson:` prefix: memory_type='lesson' carries the type, and the
+      // text is the topic-first first line (display reads the first line, not a
+      // header parse — see lessons-context.ts / index.ts).
+      let content = `${lessonText}\n\n`;
       content += `**Type:** ${lessonType}\n`;
       content += `**Severity:** ${severity}\n`;
       content += `**Confidence:** ${confidence}\n`;
@@ -398,7 +400,6 @@ async function stageReflection(
             project,
             memoryType: "lesson",
             baseStrength: baseStrength[severity] ?? 0.8,
-            privacy: "WORK",
           });
           generated++;
         }
@@ -518,7 +519,6 @@ async function stageContentDomains(
   }
 
   const getEmbedFn = async () => embedFn;
-  const compartments = compartmentSet(domains);
   let classified = 0;
   let weakPrimary = 0;
   let noAssociationDecayed = 0;
@@ -549,7 +549,7 @@ async function stageContentDomains(
         // double-halves.
         const resolution = resolveNoFit(db, row.id, domains, startPrototypes, weakPrimaryFloor);
         if (resolution.kind === "weak_primary") {
-          applyWeakPrimary(db, row.id, resolution.domain, resolution.weight, compartments);
+          applyWeakPrimary(db, row.id, resolution.domain, resolution.weight);
           weakPrimary++;
         } else {
           applyNoAssociationDecay(db, row.id);
@@ -558,7 +558,7 @@ async function stageContentDomains(
         continue;
       }
       const weights = computeTagWeights(db, row.id, result.tags, startPrototypes);
-      storage.setMemoryTags(db, row.id, result.tags, { weights, compartments });
+      storage.setMemoryTags(db, row.id, result.tags, { weights });
       classified++;
     }
   }
@@ -1012,10 +1012,311 @@ function stageHubBoost(
 }
 
 // ---------------------------------------------------------------------------
+// Stage 3.7: Supersession Detection (#191 Phase B)
+// ---------------------------------------------------------------------------
+//
+// A later decision/correction can reverse, replace, or invalidate an earlier
+// one — e.g. "chose Ollama for distillation" superseded a month later by
+// "switched distillation to a local 35B model over a mesh VPN". Left
+// unlinked, retrieval and lesson selection can surface the stale one. This
+// stage links OLD → NEW with relationship `superseded_by` and accelerates the
+// old memory's decay, WITHOUT deleting it (unlike `hicortex dedup`'s merge —
+// this is a judgment call about content, not a duplicate).
+//
+// Scope: memories with `rowid > supersessionCursor` (state.json; starts 0 —
+// the corpus is back-processed gradually, config `supersessionMaxCalls` LLM
+// calls per night) whose shape suggests a decision/correction. For each,
+// KNN top-5 OLDER same-shape neighbors at/above `supersessionMinSimilarity`;
+// one constrained classify-tier LLM call per pair decides `superseded: true|
+// false`. A parse/infra error skips just that PAIR (retried naturally next
+// night since the cursor still advances past the memory — see the cursor
+// note below); it never mis-links.
+
+/** Default minimum COSINE similarity for a supersession candidate pair. */
+export const DEFAULT_SUPERSESSION_MIN_SIMILARITY = 0.8;
+/** Default max classify-tier LLM calls (pairs evaluated) spent per nightly run. */
+export const DEFAULT_SUPERSESSION_MAX_CALLS = 30;
+/** Default multiplier applied to a superseded memory's base_strength. */
+/** Floor under which a superseded memory's base_strength never drops. */
+/** Neighbor pool size before shape/older/similarity filtering narrows to top 5. */
+const SUPERSESSION_NEIGHBOR_POOL = 15;
+/** Older-neighbor pairs kept per candidate after filtering. */
+const SUPERSESSION_NEIGHBOR_TOP_K = 5;
+/** Candidate rows read per SQL page (call budget stops the loop well before this in practice). */
+const SUPERSESSION_BATCH_SIZE = 500;
+
+export interface SupersessionOptions {
+  minSimilarity?: number;
+  maxCalls?: number;
+}
+
+export interface SupersessionStageResult {
+  scanned: number;
+  evaluated: number;
+  superseded: number;
+  skipped_infra: number;
+  skipped_idempotent: number;
+  cursor: number;
+}
+
+/**
+ * A memory whose content/type marks it as a SUPERSEDABLE claim — one a newer
+ * memory about the same subject can replace. Decisions and corrections were the
+ * original scope; plain facts and project-state updates were added because an
+ * updated fact ("distillModel is X" → later "is Y") otherwise never gets a
+ * superseded_by link and both versions compete in recall forever. Ordinary
+ * episodic chatter and problem/solution history stay excluded: they record
+ * events, not mutable state, so there is nothing to supersede.
+ */
+function isSupersedableShape(mem: { memory_type: string; content: string }): boolean {
+  return (
+    mem.memory_type === "decision" ||
+    mem.content.includes("[Decisions Made]") ||
+    mem.content.includes("[Corrections & Rejections]") ||
+    mem.content.includes("[Facts Learned]") ||
+    mem.content.includes("[Project State Changes]")
+  );
+}
+
+/** True when a `superseded_by` link already exists between the pair, either direction. */
+function alreadySupersedeLinked(db: Database.Database, oldId: string, newId: string): boolean {
+  const row = db
+    .prepare(
+      `SELECT 1 FROM memory_links WHERE relationship = 'superseded_by'
+       AND ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`,
+    )
+    .get(oldId, newId, newId, oldId);
+  return !!row;
+}
+
+/**
+ * Build the constrained supersession-check prompt. Content is truncated the
+ * same width as domain-classify.ts's classifier (1500 chars) — this is a
+ * classify-tier call with the same cost profile.
+ */
+export function buildSupersessionPrompt(oldContent: string, newContent: string): string {
+  const trunc = (s: string) => (s.length > 1500 ? `${s.slice(0, 1500)}…` : s);
+  return (
+    `You are checking whether a NEWER memory supersedes an OLDER one in an AI agent's long-term memory.\n\n` +
+    `OLDER MEMORY:\n${trunc(oldContent)}\n\n` +
+    `NEWER MEMORY:\n${trunc(newContent)}\n\n` +
+    `Does the NEWER memory reverse, replace, update, or invalidate the OLDER one — e.g. a later decision ` +
+    `overturns an earlier one, a correction retracts a prior claim, or a later fact updates the SAME subject's ` +
+    `value/status that has since changed (e.g. "model is X" → "model is Y")? Reply true ONLY for a genuine ` +
+    `replacement of the same fact/decision. Two memories that are merely related, or that can both still be ` +
+    `true — even about the same project or entity (different facts, an addition, an elaboration) — are NOT a ` +
+    `supersession.\n` +
+    `Reply with ONLY a JSON object, no prose: {"superseded": true} or {"superseded": false}.`
+  );
+}
+
+/**
+ * Parse the model's supersession verdict. Returns the boolean on a valid
+ * reply, or null on anything unparseable (caller skips the pair — no retry,
+ * unlike domain-classify's tag classifier; a missed pair is retried naturally
+ * when this stage revisits the corpus).
+ */
+export function parseSupersessionReply(reply: string): boolean | null {
+  if (!reply) return null;
+  const start = reply.indexOf("{");
+  const end = reply.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  try {
+    const obj = JSON.parse(reply.slice(start, end + 1)) as Record<string, unknown>;
+    return typeof obj.superseded === "boolean" ? obj.superseded : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * ONE classify-tier LLM call judging whether `newContent` supersedes
+ * `oldContent`. Returns null on any infra error or unparseable reply — the
+ * caller treats null as "skip this pair" (never mis-links on ambiguity).
+ */
+async function classifySupersession(
+  llm: LlmClient,
+  oldContent: string,
+  newContent: string,
+): Promise<boolean | null> {
+  try {
+    const raw = await llm.completeClassify(buildSupersessionPrompt(oldContent, newContent), 32);
+    return parseSupersessionReply(raw);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find up to SUPERSESSION_NEIGHBOR_TOP_K OLDER, same-shape neighbors for a
+ * candidate, at/above minSimilarity, highest cosine first. Reuses the
+ * candidate's stored embedding when available (relink-style fallback to
+ * embedFn otherwise).
+ */
+async function findOlderNeighbors(
+  db: Database.Database,
+  candidate: Memory,
+  embedFn: EmbedFn,
+  minSimilarity: number,
+): Promise<Array<Memory & { distance: number }>> {
+  const embedding = storage.getStoredEmbedding(db, candidate.id) ?? (await embedFn(candidate.content));
+  return storage
+    .vectorSearch(db, embedding, SUPERSESSION_NEIGHBOR_POOL, [candidate.id])
+    .filter(
+      (n) =>
+        n.created_at < candidate.created_at &&
+        isSupersedableShape(n) &&
+        l2ToCosine(n.distance) >= minSimilarity,
+    )
+    .sort((a, b) => l2ToCosine(b.distance) - l2ToCosine(a.distance))
+    .slice(0, SUPERSESSION_NEIGHBOR_TOP_K);
+}
+
+/**
+ * Nightly supersession-detection stage. Scans memories/rowid > cursor whose
+ * shape is supersedable (decision/correction/fact/state — isSupersedableShape),
+ * checks each against its older same-shape neighbors, and links confirmed
+ * supersessions. Dry-run performs discovery + the free idempotency check only —
+ * no LLM calls, no writes, no
+ * cursor persistence (mirrors stageImportance/stageContentDomains's dry-run
+ * convention of never spending budget on a preview).
+ *
+ * Cursor discipline is DELIBERATELY simple (owner amendment): the cursor
+ * advances past a candidate once its neighbor set has been considered,
+ * REGARDLESS of whether every pair got an LLM call (call budget) or a clean
+ * verdict (infra skip) — missing one pair is acceptable and self-heals next
+ * time this memory's neighborhood is re-examined via a NEWER memory's own
+ * candidacy. It only stops SHORT of a candidate when the budget is already
+ * exhausted before that candidate starts, so the cursor never skips a
+ * candidate that was never looked at.
+ */
+export async function stageSupersession(
+  db: Database.Database,
+  llm: LlmClient,
+  budget: BudgetTracker,
+  embedFn: EmbedFn,
+  dryRun: boolean,
+  stateDir: string | undefined,
+  options: SupersessionOptions = {},
+): Promise<SupersessionStageResult> {
+  // Config values pass through `unknown`-typed JSON — validate rather than
+  // trust (same discipline as retrieval.ts's configureRecall).
+  const validNumber = (v: unknown, fallback: number, ok: (n: number) => boolean): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && ok(n) ? n : fallback;
+  };
+  const minSimilarity = validNumber(options.minSimilarity, DEFAULT_SUPERSESSION_MIN_SIMILARITY, (n) => n > 0 && n <= 1);
+  const maxCalls = validNumber(options.maxCalls, DEFAULT_SUPERSESSION_MAX_CALLS, (n) => n >= 0);
+
+  const startCursor = loadState(stateDir).supersessionCursor ?? 0;
+  const rows = db
+    .prepare(
+      // Candidate shape must mirror isSupersedableShape() exactly — keep the two
+      // in lockstep (an inline SQL copy, so drift here silently narrows scope).
+      `SELECT rowid AS __rowid, * FROM memories
+       WHERE rowid > ?
+         AND (memory_type = 'decision'
+              OR content LIKE '%[Decisions Made]%'
+              OR content LIKE '%[Corrections & Rejections]%'
+              OR content LIKE '%[Facts Learned]%'
+              OR content LIKE '%[Project State Changes]%')
+       ORDER BY rowid ASC LIMIT ?`,
+    )
+    .all(startCursor, SUPERSESSION_BATCH_SIZE) as Array<Memory & { __rowid: number }>;
+
+  let scanned = 0;
+  let evaluated = 0;
+  let superseded = 0;
+  let skippedInfra = 0;
+  let skippedIdempotent = 0;
+  let callsUsed = 0;
+  let cursor = startCursor;
+
+  for (const candidate of rows) {
+    if (!dryRun && (callsUsed >= maxCalls || budget.exhausted)) break;
+    scanned++;
+
+    let neighbors: Array<Memory & { distance: number }>;
+    try {
+      neighbors = await findOlderNeighbors(db, candidate, embedFn, minSimilarity);
+    } catch (err) {
+      console.warn(
+        `[hicortex] supersession: discovery failed for ${candidate.id.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
+      );
+      cursor = candidate.__rowid;
+      continue;
+    }
+
+    for (const neighbor of neighbors) {
+      if (alreadySupersedeLinked(db, neighbor.id, candidate.id)) {
+        skippedIdempotent++;
+        continue;
+      }
+      if (dryRun) continue; // preview only — no LLM call, no write
+
+      if (callsUsed >= maxCalls || !budget.use("supersession")) break;
+      callsUsed++;
+
+      const verdict = await classifySupersession(llm, neighbor.content, candidate.content);
+      evaluated++;
+      if (verdict === null) {
+        skippedInfra++;
+        continue;
+      }
+      if (verdict) {
+        const cosine = l2ToCosine(neighbor.distance);
+        // The link IS the signal (0.15.2): retrieval demotes superseded
+        // memories via an explicit scoring multiplier (supersededDemotion,
+        // retrieval.ts). The old base_strength penalty was retired because it
+        // (a) fought the config-tunable strength weight and (b) leaked into
+        // prune eligibility — a reversed decision must rank lower, not edge
+        // toward deletion.
+        storage.addLink(db, neighbor.id, candidate.id, "superseded_by", cosine);
+        superseded++;
+        console.log(
+          `[hicortex] Supersession: ${neighbor.id.slice(0, 8)} superseded_by ${candidate.id.slice(0, 8)} (cosine ${cosine.toFixed(3)})`,
+        );
+      }
+    }
+
+    cursor = candidate.__rowid;
+  }
+
+  if (!dryRun) {
+    updateState((s) => {
+      s.supersessionCursor = cursor;
+    }, stateDir);
+  }
+
+  if (rows.length > 0) {
+    console.log(
+      `[hicortex] Supersession detection: ${scanned} scanned, ${evaluated} evaluated, ${superseded} superseded, ` +
+        `${skippedIdempotent} already-linked, ${skippedInfra} infra-skipped (cursor ${cursor})`,
+    );
+  }
+
+  return {
+    scanned,
+    evaluated,
+    superseded,
+    skipped_infra: skippedInfra,
+    skipped_idempotent: skippedIdempotent,
+    cursor,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Stage 4: Decay & Prune
 // ---------------------------------------------------------------------------
 
-function stageDecayPrune(
+/**
+ * Exported for the #191 eval baseline (src/eval/decay-eval.ts) so the audit
+ * runs the REAL production prune predicate against a DB snapshot instead of
+ * reimplementing it. `dryRun=true` performs reads only (candidates are
+ * counted, nothing is deleted) — safe against a readonly snapshot connection.
+ * Not otherwise part of the public API surface.
+ */
+export function stageDecayPrune(
   db: Database.Database,
   dryRun: boolean
 ): { candidates: number; pruned: number; failed: number } {
@@ -1099,6 +1400,7 @@ export async function runConsolidation(
   skipReflection = false,
   stateDir?: string,
   domainOptions?: DomainStageOptions,
+  supersessionOptions?: SupersessionOptions,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -1201,6 +1503,11 @@ export async function runConsolidation(
 
     // Stage 3.5: Hub Detection — boost highly-connected memories
     report.stages.hub_boost = stageHubBoost(db, dryRun);
+
+    // Stage 3.7: Supersession Detection (#191 Phase B)
+    report.stages.supersession = await stageSupersession(
+      db, llm, budget, embedFn, dryRun, stateDir, supersessionOptions,
+    );
 
     // Stage 4: Decay & Prune
     report.stages.decay_prune = stageDecayPrune(db, dryRun);

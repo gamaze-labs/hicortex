@@ -16,7 +16,7 @@
  *     reflect tier), same as the nightly. The LLM emits ONLY the ordered tag
  *     set; per-tag weights come from the domain prototypes (computed once at
  *     run start) and the PRIMARY (memories.domain) is derived (argmax weight,
- *     compartment override, LLM order breaking ties) inside
+ *     LLM order breaking ties) inside
  *     storage.setMemoryTags. After a completed (non-aborted) run the
  *     prototypes, all weights, and all primaries are recomputed from the
  *     final tag sets — same reconsolidation pass as the nightly.
@@ -38,6 +38,7 @@
  * nothing to classify into and the command exits with a clear message.
  */
 
+import { hicortexHome } from "./paths.js";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -59,7 +60,6 @@ import {
 } from "./domain-classify.js";
 import { rebuildContentModuleIndex } from "./consolidate.js";
 import {
-  compartmentSet,
   computeDomainPrototypes,
   computeTagWeights,
   derivePrimary,
@@ -75,7 +75,7 @@ import {
 } from "./nofit.js";
 import type { EmbedFn } from "./retrieval.js";
 
-const HICORTEX_HOME = join(homedir(), ".hicortex");
+const HICORTEX_HOME = hicortexHome();
 
 export interface ClassifyDomainsOptions {
   /** Reclassify EVERY memory, not just NULL/stale-domain rows. */
@@ -261,7 +261,6 @@ export async function runClassifyDomains(
     // Prototypes once at run start — newly classified memories get their
     // weights from these; the post-run reconsolidation pass refreshes
     // everything from the final tag sets.
-    const compartments = compartmentSet(domains);
     const { prototypes } = await computeDomainPrototypes(db, domains, getEmbedFn);
 
     // Scope filter: default = NULL / not-in-set / no tags yet; --all = everything.
@@ -333,12 +332,10 @@ export async function runClassifyDomains(
           continue;
         }
         // Derived primary (argmax weight from the run-start prototypes,
-        // compartment override, LLM order breaking ties) — the same value
-        // setMemoryTags will write below.
+        // LLM order breaking ties) — the same value setMemoryTags writes below.
         const weights = computeTagWeights(db, row.id, result.tags, prototypes);
         const derived = derivePrimary(
           result.tags.map((tag) => ({ tag, weight: weights[tag] ?? null })),
-          compartments,
         );
         if (derived === row.domain) {
           batchUnchanged++;
@@ -354,9 +351,9 @@ export async function runClassifyDomains(
       const tx = db.transaction(() => {
         for (const w of writes) {
           if (w.kind === "tags") {
-            storage.setMemoryTags(db, w.id, w.tags, { weights: w.weights, compartments });
+            storage.setMemoryTags(db, w.id, w.tags, { weights: w.weights });
           } else if (w.resolution.kind === "weak_primary") {
-            applyWeakPrimary(db, w.id, w.resolution.domain, w.resolution.weight, compartments);
+            applyWeakPrimary(db, w.id, w.resolution.domain, w.resolution.weight);
           } else {
             applyNoAssociationDecay(db, w.id);
           }
