@@ -55,6 +55,9 @@ const THIS_HARNESS = "oc";
 let serverUrl = DEFAULT_SERVER_URL;
 let authToken: string | undefined;
 let hicortexHome = HICORTEX_HOME;
+/** Resolved plugin config captured at service start — used for tunable knobs
+ *  (e.g. lessonsLimit) that injected context blocks read at hook time. */
+let pluginConfig: HicortexConfig | null = null;
 /** Old-server guard (F2): 0 = not latched; otherwise the Date.now() epoch-ms
  *  until which /recall-index is skipped after a 404 (pre-0.14 server). The
  *  latch EXPIRES so a client-first rollout heals itself once the server is
@@ -175,7 +178,7 @@ async function buildLessonsBlock(project?: string): Promise<string | null> {
   const { data } = await serverGet<LessonsApiResponse>("/lessons", LESSONS_TIMEOUT_MS);
   if (!data || !data.lessons || data.lessons.length === 0) return null;
 
-  const maxLessons = lessonsLimit();
+  const maxLessons = lessonsLimit(pluginConfig);
   const state = loadState(hicortexHome);
   const moduleIndex = data.moduleIndex ?? state.moduleIndex;
   const selected = await getLessonSelector().select(data.lessons, {
@@ -312,6 +315,7 @@ export default {
 
       async start(ctx: any) {
         const config = (ctx.config ?? {}) as HicortexConfig;
+        pluginConfig = config;
         const log = ctx.logger
           ? (msg: string) => ctx.logger.info(msg)
           : console.log;

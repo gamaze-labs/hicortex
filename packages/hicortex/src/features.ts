@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { homedir } from "node:os";
 import { validateLicense } from "./license.js";
 import { loadState, updateState } from "./state.js";
+import { readPositiveConfig } from "./config-read.js";
 import type { LicenseInfo } from "./types.js";
 
 const DEFAULT_STATE_DIR = hicortexHome();
@@ -99,9 +100,18 @@ export function memoryCapReached(_currentCount: number): boolean {
   return false;
 }
 
-/** Always 20. */
-export function lessonsLimit(): number {
-  return 20;
+/**
+ * Max lessons injected into an agent's session-start context. Configurable via
+ * `config.lessonsLimit` (a positive integer); defaults to 10. Reuses
+ * `readPositiveConfig` so a present-but-invalid value (0, negative, NaN, wrong
+ * type) is rejected AT THE BOUNDARY with a warn — never silently. 0 is NOT
+ * honoured as "off" (use a real config switch if that's ever needed); it is
+ * invalid and falls back to 10 with a warning, so an operator can't
+ * accidentally silence lesson injection by typing 0.
+ */
+export function lessonsLimit(config?: { lessonsLimit?: unknown } | null): number {
+  if (!config) return 10;
+  return Math.floor(readPositiveConfig({ lessonsLimit: config.lessonsLimit }, "lessonsLimit", 10));
 }
 
 /** Always true — remote ingest is always allowed. */

@@ -20,22 +20,31 @@ const LARGE_MODEL_MAX_CHUNK_CHARS = 60_000; // ~15K tokens — ok for 8B+ on GPU
 /**
  * Estimate a safe chunk size in chars based on the LLM provider and model.
  * - API providers (Anthropic, OpenAI, claude-cli): no chunking needed (large context windows)
- * - Ollama: query /api/show for context_length AND parameter_count, cap based on both
- * - Small models (<8B params): max 20K chars (~5K tokens) — keeps CPU inference under ~60s
- * - Larger models: up to 60K chars (~15K tokens)
+ * - Ollama: chunk size derives from the resolved `numCtx` (the request's actual
+ *   context window), capped by parameter-count-derived speed limits:
+ *   - Small models (<8B params): max 20K chars (~5K tokens) — keeps CPU inference under ~60s
+ *   - Larger models: up to 60K chars (~15K tokens)
  * - Fallback: 20K chars
+ *
+ * `numCtx` is the single source of truth for the context constraint (#231): it is
+ * the value completeOllama will actually send as `num_ctx`, so chunking against it
+ * keeps the chunker and the request in agreement (kills the silent-truncation bug
+ * #228, where chunks were sized from the model's ADVERTISED context while the
+ * request used a smaller `numCtx`). The `/api/show` query is KEPT — but only for
+ * the parameter-count speed cap (`maxBySpeed`, SMALL vs LARGE), NOT for context.
  */
 export async function detectChunkSize(
   provider: string,
   model: string,
-  baseUrl?: string
+  baseUrl?: string,
+  numCtx?: number,
 ): Promise<number> {
   // API-based providers handle large contexts natively — no chunking needed
   if (provider !== "ollama") {
     return MAX_TRANSCRIPT_CHARS;
   }
 
-  // Query Ollama for model metadata
+  // Query Ollama for model metadata (parameter count → speed cap)
   if (baseUrl) {
     try {
       const resp = await fetch(`${baseUrl}/api/show`, {
@@ -60,27 +69,21 @@ export async function detectChunkSize(
           : 0;
         const isSmallModel = paramCount > 0 && paramCount < SMALL_MODEL_PARAMS;
 
-        // Extract context length for context-aware capping
-        const ctxKey = Object.keys(info).find(
-          (k) => k.endsWith("context_length") || k.endsWith("context_window")
-        );
-        const contextTokens = ctxKey && typeof info[ctxKey] === "number"
-          ? (info[ctxKey] as number)
-          : 0;
-
         // Determine max chunk size based on model size (speed constraint)
         // Unknown param count defaults to conservative (small model) — safe for any hardware
         const maxBySpeed = !isSmallModel && paramCount > 0 ? LARGE_MODEL_MAX_CHUNK_CHARS : SMALL_MODEL_MAX_CHUNK_CHARS;
 
-        // Determine max chunk size based on context window (fits-in-context constraint)
-        const maxByContext = contextTokens > 0
-          ? Math.floor(contextTokens * 0.6 * 4) // 60% of context, ~4 chars/token
-          : MAX_TRANSCRIPT_CHARS;
+        // Determine max chunk size from the resolved numCtx (the request's ACTUAL
+        // context window), NOT the model's advertised context_length. 60% of context,
+        // ~4 chars/token. Falls back to MAX_TRANSCRIPT_CHARS when numCtx is unknown
+        // (caller didn't pass it) — but the mcp-server call site always passes it.
+        const resolvedCtx = numCtx ?? 8192;
+        const maxByContext = Math.floor(resolvedCtx * 0.6 * 4);
 
         const chunkChars = Math.min(maxBySpeed, maxByContext);
         console.log(
           `[hicortex]     Model: ${paramCount > 0 ? `${(paramCount / 1e9).toFixed(1)}B params` : "unknown size"}, ` +
-          `context: ${contextTokens > 0 ? `${contextTokens} tokens` : "unknown"}, ` +
+          `numCtx: ${resolvedCtx}, ` +
           `chunk size: ${chunkChars} chars${isSmallModel ? " (small model cap)" : ""}`
         );
         return chunkChars;

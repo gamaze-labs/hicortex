@@ -12,11 +12,10 @@
  *     state.json after each batch. Interruption never loses more than the
  *     current batch. `--reset` restarts from rowid 0.
  *   - Classification: one constrained MULTI-TAG LLM call per memory via the
- *     CLASSIFY tier (classifyBaseUrl/classifyModel when configured, else the
- *     reflect tier), same as the nightly. The LLM emits ONLY the ordered tag
- *     set; per-tag weights come from the domain prototypes (computed once at
- *     run start) and the PRIMARY (memories.domain) is derived (argmax weight,
- *     LLM order breaking ties) inside
+ *     one model (#231 — same as the nightly's reflect/classify/scoring). The
+ *     LLM emits ONLY the ordered tag set; per-tag weights come from the domain
+ *     prototypes (computed once at run start) and the PRIMARY (memories.domain)
+ *     is derived (argmax weight, LLM order breaking ties) inside
  *     storage.setMemoryTags. After a completed (non-aborted) run the
  *     prototypes, all weights, and all primaries are recomputed from the
  *     final tag sets — same reconsolidation pass as the nightly.
@@ -25,11 +24,8 @@
  *     a WEAK primary (argmax prototype cosine, when >= weakPrimaryFloor) or,
  *     below the floor, accelerated decay (base_strength halved, domain left
  *     NULL so later runs re-attempt it). See nofit.ts.
- *   - LLM pre-flight: the endpoint classification will actually use (when a
- *     separate Ollama) is probed before any work. If unreachable, abort
- *     cleanly (nothing written, cursor untouched) — strict, like distill.
  *   - Infra-error abort (issue #150): if the classifier returns null mid-run
- *     (endpoint died AFTER preflight), the run aborts after committing
+ *     (endpoint died mid-run), the run aborts after committing
  *     the last full batch. The failing memory is left completely untouched; the
  *     cursor sits at the last committed batch so a re-run resumes cleanly.
  *   - Server-mode only: needs the local DB.
@@ -48,8 +44,6 @@ import * as storage from "./storage.js";
 import {
   LlmClient,
   resolveSavedLlmConfig,
-  resolveClassifyProbeTarget,
-  probeOllamaModel,
   type LlmConfig,
 } from "./llm.js";
 import {
@@ -88,7 +82,7 @@ export interface ClassifyDomainsOptions {
   dbPath?: string;
   /** State dir override (tests). Defaults to ~/.hicortex. */
   stateDir?: string;
-  /** LLM override (tests). Bypasses config resolution + preflight. */
+  /** LLM override (tests). Bypasses config resolution. */
   llm?: LlmClient;
   /** Config override (tests). Defaults to reading stateDir/config.json. */
   config?: Record<string, unknown> | null;
@@ -138,32 +132,13 @@ function readConfig(stateDir: string): Record<string, unknown> | null {
 }
 
 /**
- * Pre-flight the endpoint classification will ACTUALLY use — the classify
- * tier (classifyModel/classifyBaseUrl) when configured, else the reflect tier.
- * Target resolution is the pure resolveClassifyProbeTarget (llm.ts), the same
- * source of truth as the nightly's contentDomainsReady gate.
- *
- * Returns null when ready, or a reason string when it is unreachable (caller
- * aborts clean). Only a separate Ollama endpoint can go unreachable mid-run;
- * API providers are cloud-reachable.
- */
-async function preflightClassify(config: LlmConfig): Promise<string | null> {
-  const target = resolveClassifyProbeTarget(config);
-  if (!target) return null;
-  const health = await probeOllamaModel(target.baseUrl, target.model);
-  if (!health.ok) {
-    return health.reason === "unreachable"
-      ? `${target.tier} endpoint unreachable (${target.baseUrl})`
-      : `${target.tier} model not loaded (${target.model} missing on ${target.baseUrl})`;
-  }
-  return null;
-}
-
-/**
  * Run the classify-domains pass. Returns a structured report.
- * Throws on unrecoverable setup errors (client mode, no domains, no LLM,
- * classification endpoint down) — the cursor always reflects the last
- * committed batch.
+ * Throws on unrecoverable setup errors (client mode, no domains, no LLM) —
+ * the cursor always reflects the last committed batch. Per-memory
+ * classification failures are handled gracefully inside the classifier
+ * (returns null → memory left unclassified, retried next run via the cursor);
+ * a totally-down model costs latency, not data (#231 removed the pre-flight
+ * probe in favor of complete()'s internal 30s/60s/120s retries).
  */
 export async function runClassifyDomains(
   options: ClassifyDomainsOptions = {},
@@ -197,7 +172,7 @@ export async function runClassifyDomains(
   }
   const weakPrimaryFloor = resolveWeakPrimaryFloor(config);
 
-  // Resolve the LLM (classify tier does the classifying; falls back to reflect).
+  // Resolve the LLM (one model serves all phases — #231).
   let llm: LlmClient;
   if (options.llm) {
     llm = options.llm;
@@ -206,13 +181,6 @@ export async function runClassifyDomains(
     if (!resolved.config) {
       throw new Error(
         "[hicortex] classify-domains: no LLM configured — run `npx @gamaze/hicortex init`.",
-      );
-    }
-    const classifyDown = await preflightClassify(resolved.config);
-    if (classifyDown) {
-      throw new Error(
-        `[hicortex] classify-domains aborted: ${classifyDown}. ` +
-          "Nothing written, cursor untouched — retry when the endpoint is up.",
       );
     }
     llm = new LlmClient(resolved.config);

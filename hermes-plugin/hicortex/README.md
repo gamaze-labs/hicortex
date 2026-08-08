@@ -89,7 +89,7 @@ Env overrides: `HICORTEX_URL`, `HICORTEX_AUTH_TOKEN`.
 ## Topology
 
 - **Server host:** runs Hicortex. Set `hicortex_url: http://localhost:8787` (localhost bypasses auth).
-- **Other Hermes boxes:** set `hicortex_url` to the server's Tailscale hostname (e.g. `http://memory-server:8787`) and `HICORTEX_AUTH_TOKEN` to the server's token. Each box recalls from the same shared brain.
+- **Other Hermes boxes:** set `hicortex_url` to the server's hostname (e.g. `http://memory-server:8787`) and `HICORTEX_AUTH_TOKEN` to the server's token. Each box recalls from the same shared brain.
 
 ## Notes
 

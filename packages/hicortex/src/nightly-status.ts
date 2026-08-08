@@ -16,7 +16,6 @@ import { homedir, platform } from "node:os";
 import { execSync } from "node:child_process";
 import { resolveDbPath } from "./db.js";
 import { describeLastNightly } from "./state.js";
-import { applyModelsBlock } from "./llm.js";
 
 const HICORTEX_HOME = hicortexHome();
 const CONFIG_PATH = join(HICORTEX_HOME, "config.json");
@@ -39,7 +38,7 @@ export async function showNightlyStatus(): Promise<void> {
   try {
     // No `?? {}` coercion: a null/invalid parse must fall through to the catch
     // below (as it did pre-0.13.1) rather than print a fabricated-healthy status.
-    const config = applyModelsBlock(JSON.parse(readFileSync(CONFIG_PATH, "utf-8"))) as any;
+    const config = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as any;
     const backend = config.llmBackend ?? "auto-detect";
     const model = config.llmModel ?? "default";
     const mode = config.mode === "client" ? "client → " + (config.serverUrl ?? "?") : "server (local)";

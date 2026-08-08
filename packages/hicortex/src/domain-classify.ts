@@ -33,9 +33,9 @@
  * project only breaks ties). This rescues terse technical memories from
  * projects whose content alone reads as ambiguous.
  *
- * The classifier makes ONE constrained LLM call per memory (via the classify
- * tier — classifyModel/classifyBaseUrl when configured, else the reflect
- * tier), validates every returned name against the configured vocabulary
+ * The classifier makes ONE constrained LLM call per memory (via the one model
+ * #231 — completeClassify, a thin wrapper over the shared complete()),
+ * validates every returned name against the configured vocabulary
  * (case-insensitive), and retries once on an invalid/unparseable reply.
  *
  * ROBUSTNESS (folds in issue #150):
@@ -260,10 +260,10 @@ export function parseTagReply(reply: string, domains: DomainDef[]): TagResult | 
 /**
  * Multi-tag classify one memory's content against the configured vocabulary.
  *
- * Uses the classify tier (`completeClassify` → classifyBaseUrl/classifyModel
- * when configured, else the reflect tier) — the caller is responsible for
- * having pre-flighted that endpoint via resolveClassifyProbeTarget (strict:
- * skip classification entirely if it is unreachable).
+ * Uses the one model (`completeClassify` — a thin wrapper over the shared
+ * complete(), #231). Per-memory classification failures return null (issue
+ * #150): the caller leaves the memory unclassified and the cursor advances,
+ * so a re-run retries it.
  *
  * Behaviour:
  *   - Valid JSON reply with ≥1 vocabulary tag → {tags} (ordered,

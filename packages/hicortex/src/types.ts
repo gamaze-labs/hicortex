@@ -164,17 +164,6 @@ export interface ConsolidationReport {
   };
 }
 
-/**
- * A single per-stage override inside the nested `models` server-config block.
- * Consumed by `applyModelsBlock` (llm.ts), which re-exports this type.
- */
-export interface ModelTierOverride {
-  model?: string;
-  baseUrl?: string;
-  apiKey?: string;
-  provider?: string;
-}
-
 /** Plugin configuration from openclaw.plugin.json configSchema. */
 export interface HicortexConfig {
   licenseKey?: string;
@@ -197,33 +186,6 @@ export interface HicortexConfig {
   llmApiKey?: string;
   /** @deprecated Use the Hicortex server for distillation and consolidation. */
   llmModel?: string;
-  /** @deprecated Use the Hicortex server for distillation and consolidation. */
-  reflectModel?: string;
-  /**
-   * Optional dedicated model for memory tag classification (server-side
-   * nightly + `hicortex classify-domains`). When unset, classification uses
-   * the reflect tier exactly as before.
-   */
-  classifyModel?: string;
-  /**
-   * Optional dedicated endpoint for classification. When only classifyModel
-   * is set, it runs on the reflect endpoint (else the base endpoint).
-   */
-  classifyBaseUrl?: string;
-  /** Optional API key for the classify endpoint (defaults to the base apiKey). */
-  classifyApiKey?: string;
-  /** Optional provider for the classify endpoint (defaults to the base provider). */
-  classifyProvider?: string;
-  /**
-   * Server config (NOT an OC-plugin key): nested per-stage model overrides.
-   * `{ score|distill|reflect|classify: { model?, baseUrl?, apiKey?, provider? } }`.
-   * Normalized onto the flat `llm*` / `distill*` / `reflect*` / `classify*`
-   * keys at read time (see applyModelsBlock in llm.ts); nested wins, and the
-   * flat keys remain supported at lower precedence. Happy path is a single model via
-   * `llmModel`; use this block only for per-stage routing. `score.provider` is
-   * ignored (base provider comes from llmBackend).
-   */
-  models?: Record<string, ModelTierOverride>;
   /** @deprecated Consolidation is owned by the server nightly. */
   consolidateHour?: number;
   /** @deprecated The OC plugin no longer opens its own database. */
@@ -264,6 +226,44 @@ export interface HicortexConfig {
    */
   domains?: DomainDef[];
   /**
+   * Success-cooldown (hours) for the CAPTURE watchdog (0.17). The capture
+   * timer fires `nightly --watchdog` on a short interval (~20 min); the
+   * watchdog captures only if MORE than this many hours have passed since the
+   * last SUCCESSFUL capture (state `lastNightly`). A failed preflight retries
+   * on the next tick (~20 min) — so a transient fire-instant network miss
+   * costs minutes, not a day (#239). Default 6 (≈4 captures/day). Read at
+   * runtime by the watchdog, not by `init`.
+   */
+  captureCooldownHours?: number;
+  /**
+   * Hours (0–23, local time) for the CONSOLIDATION timer — the full nightly
+   * (capture + distill + score + reflect + link), installed by `init` for
+   * server/co-located mode ONLY (0.17). Default [10, 22]: the 22:00 evening
+   * slot runs after the day's capture waves (same-day results); the 10:00
+   * morning slot runs AFTER the morning's wake-up capture so it catches those
+   * pushes. Omitted on client installs (no local DB → no timer). Validated by
+   * parseHours.
+   */
+  consolidationHours?: number[];
+  /**
+   * Ceiling on total LLM calls across all classify-tier consolidation stages
+   * (content-domain, link discovery, supersession) per nightly run (0.17, #241).
+   * A runaway backstop, not a throughput throttle — on a free local model the
+   * binding constraint is the nightly unit's wall-clock timeout, not call count.
+   * Default `5000` (was a hard-coded 200 that starved link/supersession during a
+   * classification backlog and drained large backlogs at ~cap/night).
+   */
+  consolidateMaxLlmCalls?: number;
+  /**
+   * Release channel pinned into the generated daemon/timer ExecStart for
+   * **npx-thin** installs (global-binary installs use the absolute binary path
+   * and are unaffected). E.g. `"rc"` → the timer runs
+   * `npx -y @gamaze/hicortex@rc nightly`, so the host tracks the rc dist-tag
+   * (the internal fleet uses this to ride rc through a pre-promotion soak).
+   * Absent → auto-detect (bare on `latest`, else `@next`). (0.17.1)
+   */
+  updateChannel?: string;
+  /**
    * Minimum cosine(memory embedding, best domain prototype) for a no-fit
    * memory to earn a WEAK primary instead of decaying (see nofit.ts).
    * Number in (0, 1); default 0.45. Tune from the corpus weight distribution
@@ -293,6 +293,68 @@ export interface HicortexConfig {
    * dup-over-loss); just don't treat the nominal sum as a hard bound.
    */
   preflightRetryGapMs?: number;
+  /**
+   * Max output tokens for the ONE LLM model used by all phases — distillation,
+   * reflection, classification, and scoring. Default 8192. An explicit value
+   * overrides the default. A ceiling, not a target: generation stops at the
+   * model's natural end (finish_reason stop), so a higher cap costs no latency
+   * when it finishes early. Read in llm.ts; see #220.
+   */
+  maxTokens?: number;
+  /**
+   * Toggle the model's internal reasoning ("thinking") stream on the openai-compat
+   * path — applies to ALL phases (distill / reflect / classify / scoring) since one
+   * model serves all of them. Default false. A thinking model with thinking ON can
+   * burn the entire token budget on an unclosed <think> block and emit nothing
+   * (probed 2026-08-04). When set (true or false), completeOpenAiCompat sends
+   * chat_template_kwargs:{enable_thinking}. LOCAL-ENDPOINT ONLY: this is meaningful
+   * only for a chat-template-aware server (ollama, mlx-lm). If the one model is a
+   * cloud OpenAI-compatible endpoint (OpenAI / OpenRouter / Groq / z.ai), LEAVE THIS
+   * UNSET — the non-standard chat_template_kwargs field rides every call and can 400
+   * the whole pipeline (provider cannot distinguish MLX-gateway-as-openai from real
+   * cloud openai, so the gate must be operator-set, not detected). No effect on the
+   * anthropic or claude-cli paths. See #220, #231.
+   */
+  enableThinking?: boolean;
+  /**
+   * Context window for ollama (the one model, all phases). Default 8192 — the point
+   * where context stops being the binding constraint for a sub-8B model on ollama
+   * (above it the SMALL_MODEL_MAX_CHUNK_CHARS speed cap binds instead, so extra
+   * context buys nothing). Also drives `detectChunkSize`'s chunk sizing
+   * (chunkChars ≤ numCtx × 0.6 × 4 chars), so numCtx is the single dial and the
+   * chunker/request agreement is enforced by construction (#228). For an ≥8B model
+   * on ollama the speed cap is 60,000 chars, needing numCtx ≈ 25000 to reach — raise
+   * it if running 8B+ locally. No effect for non-ollama providers.
+   */
+  numCtx?: number;
+  /**
+   * Flush ollama's accumulated memory every N scoring calls — workaround for
+   * ollama's per-request memory growth (the runner's RSS climbs ~171 MB/call and
+   * isn't freed between requests), which swap-thrashes RAM-constrained boxes
+   * during long consolidations. Default 0 (off). When >0, every Nth scoring call
+   * (`completeFast`) triggers a `keep_alive:0` unload + an `ollamaFlushWaitMs`
+   * pause for the runner to exit + release, then the next call reloads fresh.
+   * N=15 caps a cycle at ~2.5 GB. Scoped to the fast tier (scoring) only. Note:
+   * N counts **logical** scoring calls, not raw HTTP requests — `complete()`
+   * retries up to 4× on timeout, so under retry pressure the actual accumulation
+   * may be up to 4×N calls' worth. In practice the flush prevents the thrash that
+   * causes retries, keeping the count accurate.
+   */
+  ollamaFlushEvery?: number;
+  /**
+   * Milliseconds to wait after an ollama flush (`keep_alive:0`) for the runner
+   * to exit + release its accumulated memory before the next call reloads.
+   * Default 180000 (3 min — the runner takes >90 s to exit after keep_alive:0;
+   * doubled for margin). Only relevant when `ollamaFlushEvery` > 0.
+   */
+  ollamaFlushWaitMs?: number;
+  /**
+   * Max lessons injected into an agent's session-start context (default 10).
+   * Lessons are ranked per-session by project/domain affinity + recency +
+   * strength + access, so each session sees its most-relevant slice. Lower =
+   * leaner system prompts.
+   */
+  lessonsLimit?: number;
 }
 
 /** A config-owned life-sphere domain (see HicortexConfig.domains). */

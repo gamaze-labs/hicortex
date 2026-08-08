@@ -21,10 +21,11 @@ let VERSION = "0.0.0";
 try { VERSION = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version; } catch {}
 
 import { initDb, resolveDbPath } from "./db.js";
-import { resolveSavedLlmConfig, resolveClassifyProbeTarget, LlmClient, probeOllamaModel, type LlmConfig } from "./llm.js";
+import { readPositiveConfig, readNonNegativeConfig, warnIgnoredConfigKeys } from "./config-read.js";
+import { resolveSavedLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
-import { runConsolidation } from "./consolidate.js";
+import { runConsolidation, CONSOLIDATE_MAX_LLM_CALLS } from "./consolidate.js";
 import { parseConfigDomains } from "./domain-classify.js";
 import { resolveWeakPrimaryFloor } from "./nofit.js";
 import { readCcTranscripts, type TranscriptBatch } from "./transcript-reader.js";
@@ -36,6 +37,7 @@ import { configureDecay, configureRecall, configureScoring } from "./retrieval.j
 import { loadState, updateState, migrateLegacyState } from "./state.js";
 import { openCursorStore, pruneCursors } from "./capture-cursors.js";
 import { captureBatches, acquireCaptureLock, type PostFn, type PostResult, type DistillBody } from "./capture.js";
+import { writeSnapshot, backfillSnapshots } from "./dashboard.js";
 import { isTelemetryEnabled, getTelemetryId, sendTelemetry, TELEMETRY_PAYLOAD_VERSION } from "./telemetry.js";
 import { ensureAndPersistAgentId, loadConfigStrict } from "./init.js";
 
@@ -164,27 +166,9 @@ function captureLockWaitMs(): number {
   return Number.isFinite(env) && env >= 0 ? env : CAPTURE_LOCK_WAIT_MS;
 }
 
-/**
- * Read a positive finite number from a nightly config key, falling back to
- * `def` when the key is absent/invalid. Used by the pre-flight retry knobs
- * (#163): tuning knobs live in config, never hardcoded (cf. decayHalfLifeDays,
- * recallMinSimilarity).
- *
- * A value that is PRESENT but rejected (non-number, non-finite, or ≤ 0) warns
- * — e.g. an operator who sets `preflightAttempts: 0` intending "don't retry"
- * would otherwise silently get the default 3. (Single-try is
- * `preflightAttempts: 1`, so there's no functional gap — this just makes the
- * silent coercion visible, consistent with the fail-explicit pattern.)
- */
-function readPositiveConfig(config: Record<string, unknown>, key: string, def: number): number {
-  const v = config[key];
-  if (v === undefined) return def;
-  if (typeof v === "number" && Number.isFinite(v) && v > 0) return v;
-  console.warn(
-    `[hicortex] config "${key}" = ${String(v)} is not a positive finite number — using default ${def}.`
-  );
-  return def;
-}
+// readPositiveConfig moved to ./config-read.ts (shared with the distill-tier
+// overlay in llm.ts / mcp-server.ts). Validates positive-number config knobs
+// at the disk→runtime boundary with a warn-on-rejected-value.
 
 const NIGHTLY_LOG_MAX_BYTES = 1024 * 1024; // 1 MB — years of normal runs
 
@@ -211,9 +195,18 @@ export async function runNightly(options: {
   stateDir?: string;
   /** #189 Tier-2 recovery: override discovery to now−N days for one run. */
   recaptureWindowDays?: number;
+  /**
+   * Watchdog mode (0.17, #239): the capture timer fires `nightly --watchdog`
+   * on a short interval so a transient fire-instant network miss retries in
+   * minutes, not at the next daily slot. The gate throttles (success-cooldown)
+   * and preflights BEFORE capture; the watchdog never consolidates (it forces
+   * capture-only). Uniform across client + server/co-located.
+   */
+  watchdog?: boolean;
 } = {}): Promise<void> {
   const dryRun = options.dryRun ?? false;
-  const captureOnly = options.captureOnly ?? false;
+  let captureOnly = options.captureOnly ?? false;
+  const watchdog = options.watchdog ?? false;
   const stateDir = options.stateDir ?? HICORTEX_HOME;
   const recaptureWindowDays = options.recaptureWindowDays;
 
@@ -224,6 +217,8 @@ export async function runNightly(options: {
 
   // Check mode: client or server
   const savedConfig = readNightlyConfig(stateDir);
+  // 0.16.8 upgrade guard: warn if ignored per-stage keys are still present.
+  warnIgnoredConfigKeys(savedConfig);
   // 0.16.2 activation gap: pre-0.16.2 installs never re-run init, so their
   // config has no agentId → capture sent source_agent_id: null forever (the
   // provenance feature was inert for the whole existing fleet). Self-heal on
@@ -235,15 +230,69 @@ export async function runNightly(options: {
     const { agentId } = ensureAndPersistAgentId(join(stateDir, "config.json"));
     savedConfig.agentId = agentId;
   }
+  const port = (savedConfig?.port as number | undefined) ?? 8787;
+
+  // Watchdog gate (before the client/server branch so it is uniform). See the
+  // option doc above. On skip it returns early; on proceed it forces
+  // capture-only and falls through to the normal capture path (the capture
+  // lock with waitMs=0 provides single-flight; writeLastRun advances the
+  // cooldown marker on success).
+  if (watchdog && !dryRun) {
+    captureOnly = true; // the watchdog captures only — never consolidates.
+    // Success-cooldown: lastNightly is advanced ONLY on a clean capture
+    // (writeLastRun is success-gated), so reusing it gives SUCCESS-based
+    // cooldown — a FAILED preflight/capture retries on the next tick (minutes),
+    // a SUCCESS waits the cooldown. This is the better semantics the custom
+    // server watchdog (trigger-based) got wrong.
+    // readNonNegativeConfig (not readPositiveConfig) so 0 is honoured: 0 = no
+    // cooldown = capture every poll (a valid opt-in for a wired/high-frequency
+    // source), not a silent fallback to the default.
+    const cooldownH = readNonNegativeConfig(savedConfig ?? {}, "captureCooldownHours", 6);
+    const last = loadState(stateDir).lastNightly;
+    if (last) {
+      const ageH = (Date.now() - new Date(last).getTime()) / 3_600_000;
+      if (ageH < cooldownH) {
+        console.log(
+          `[hicortex] watchdog: last capture ${ageH.toFixed(1)}h ago (< ${cooldownH}h cooldown) — skipping`,
+        );
+        return;
+      }
+    }
+    // Quick reachability preflight (5s) — a cheap gate so a 20-min poll against
+    // a down link costs one short fetch, not the full in-run preflight. Client
+    // → remote server; server/co-located → localhost daemon.
+    const target = (
+      savedConfig?.mode === "client"
+        ? (savedConfig.serverUrl as string)
+        : `http://127.0.0.1:${port}`
+    ).replace(/\/+$/, "");
+    try {
+      const resp = await fetch(`${target}/health`, { signal: AbortSignal.timeout(5_000) });
+      if (!resp.ok) {
+        console.log(
+          `[hicortex] watchdog: ${target}/health not ok (${resp.status}) — skipping (retry next tick)`,
+        );
+        return;
+      }
+    } catch (e) {
+      console.log(
+        `[hicortex] watchdog: ${target} unreachable (` +
+        `${e instanceof Error ? e.message : String(e)}) — skipping (retry next tick)`,
+      );
+      return;
+    }
+    console.log(`[hicortex] watchdog: cooldown elapsed + ${target} reachable — capturing`);
+  }
+
   if (savedConfig?.mode === "client") {
     // --capture-only is accepted in client mode but irrelevant: client nightly
-    // is already capture-only (no consolidation step).
-    await runClientNightly(savedConfig, dryRun, stateDir, recaptureWindowDays);
+    // is already capture-only (no consolidation step). (If watchdog-gated, the
+    // gate above already ran.)
+    await runClientNightly(savedConfig, dryRun, stateDir, recaptureWindowDays, watchdog);
     return;
   }
 
   const dbPath = resolveDbPath(options.dbPath);
-  const port = (savedConfig?.port as number | undefined) ?? 8787;
   // #192: consolidation's decay/prune stage must score with the same clock as
   // the server's retrieval path (config decayHalfLifeDays, default 365).
   configureDecay({ halfLifeDays: savedConfig?.decayHalfLifeDays });
@@ -380,75 +429,51 @@ export async function runNightly(options: {
     // Runs even if capture had transient failures (opens DB directly, independent
     // of the HTTP capture path). Full nightly only — capture-only runs are
     // intended to run more frequently than once daily.
+    let lessonsGenerated: number | undefined; // hoisted for telemetry; undefined when reflection didn't run (skipped) — bucketed apart from a real 0
+    // Consolidation outcome for telemetry (0.17). undefined on capture-only runs
+    // (which send no nightly ping). "skipped" = runConsolidation's built-in
+    // nothing-to-do short-circuit (zero LLM calls), NOT a failure.
+    let consolidationStatus: "completed" | "skipped" | "failed" | "no_llm" | undefined;
     if (!dryRun && !captureOnly) {
       if (!llm || !llmConfig) {
         console.error(
           "[hicortex] consolidation skipped: no LLM configured — run npx @gamaze/hicortex init"
         );
+        consolidationStatus = "no_llm";
       } else {
-        // Pre-flight health check for the reflect endpoint.
-        // If reflectBaseUrl points to a remote Ollama and it's down (MBP offline),
-        // skip reflection entirely instead of waiting through 3 retries (~3.5 min).
-        // Scoring + linking + decay still run.
-        let skipReflection = false;
-        if (llmConfig.reflectBaseUrl && (llmConfig.reflectProvider ?? llmConfig.provider) === "ollama") {
-          const reflectModel = llmConfig.reflectModel ?? llmConfig.model;
-          const health = await probeOllamaModel(llmConfig.reflectBaseUrl, reflectModel);
-          if (!health.ok) {
-            const reason = health.reason === "unreachable"
-              ? `reflect endpoint unreachable (${llmConfig.reflectBaseUrl})`
-              : `reflect model not loaded (${reflectModel} missing on ${llmConfig.reflectBaseUrl})`;
-            console.warn(`[hicortex] ${reason} — skipping reflection, scoring + linking will still run`);
-            skipReflection = true;
-          }
-        }
-
-        // Content-based domain classification (config-owned `domains`) uses
-        // the classify tier (classifyModel/classifyBaseUrl) when configured,
-        // else the reflect tier. Pre-flight the endpoint classification will
-        // ACTUALLY use (resolveClassifyProbeTarget is the shared source of
-        // truth with `hicortex classify-domains`). If it is down, content
-        // classification is NOT ready this run (strict — skip, don't fall
-        // back). When no `domains` list is configured, this is inert and the
-        // legacy project-grouping path runs.
+        // One model serves all phases (#231) — there is no separate endpoint to
+        // pre-flight. If the model doesn't answer, `complete()` already retries at
+        // 30s/60s/120s (~3.5 min); anything still failing after that is an outage,
+        // not a blip. A failed phase costs latency, not data: capture cursors hold
+        // on failure (dup-over-loss), and consolidation has resumable cursors
+        // (domainCursor, supersessionCursor). The nightly runs 2-4×/day, so the
+        // wait is hours — no polling, no new config. (Issue #231.)
         const cfgDomains = parseConfigDomains(savedConfig);
-        let contentDomainsReady = true;
-        if (cfgDomains) {
-          const classifyTarget = resolveClassifyProbeTarget(llmConfig);
-          if (classifyTarget?.tier === "reflect") {
-            // Classification rides the reflect endpoint — reuse the probe above.
-            contentDomainsReady = !skipReflection;
-          } else if (classifyTarget) {
-            const health = await probeOllamaModel(classifyTarget.baseUrl, classifyTarget.model);
-            if (!health.ok) {
-              const reason = health.reason === "unreachable"
-                ? `classify endpoint unreachable (${classifyTarget.baseUrl})`
-                : `classify model not loaded (${classifyTarget.model} missing on ${classifyTarget.baseUrl})`;
-              console.warn(`[hicortex] ${reason}`);
-              contentDomainsReady = false;
-            }
-          }
-          // classifyTarget === null → base endpoint or API provider, no probe.
-          if (!contentDomainsReady) {
-            console.warn(
-              "[hicortex] content-domain classification skipped — classification endpoint offline (strict)",
-            );
-          }
-        }
 
         console.log(`[hicortex] Running consolidation...`);
-        const report = await runConsolidation(db, llm, embed, dryRun, skipReflection, undefined, {
+        const report = await runConsolidation(db, llm, embed, dryRun, false, undefined, {
           domains: cfgDomains,
-          contentDomainsReady,
+          contentDomainsReady: true,
           weakPrimaryFloor: resolveWeakPrimaryFloor(savedConfig),
         }, {
           minSimilarity: savedConfig?.supersessionMinSimilarity as number | undefined,
           maxCalls: savedConfig?.supersessionMaxCalls as number | undefined,
-        });
+        },
+          // #241: config-driven total LLM-call ceiling (default 5000, was 200).
+          readPositiveConfig(savedConfig ?? {}, "consolidateMaxLlmCalls", CONSOLIDATE_MAX_LLM_CALLS),
+        );
         console.log(
           `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
           (report.stages.reflection ? ` (${report.stages.reflection.lessons_generated} lessons)` : "")
         );
+        consolidationStatus = report.status;
+        // Only set when reflection actually RAN (not skipped). A skipped stage
+        // (e.g. endpoint offline, #232 fail-soft) must NOT collapse to 0 — that
+        // would make "endpoint down" indistinguishable from "prompt too tight"
+        // in the fleet aggregate. Leave undefined so the optional field is
+        // omitted and the aggregate buckets skipped runs separately.
+        const refl = report.stages.reflection;
+        if (refl && !refl.skipped) lessonsGenerated = refl.lessons_generated;
       }
     }
 
@@ -468,6 +493,61 @@ export async function runNightly(options: {
     }
 
     console.log(`[hicortex] Nightly pipeline complete.`);
+
+    // Dashboard snapshot (#224) — full nightly only. The snapshot reflects
+    // corpus state regardless of whether consolidation/LLM ran, so it is
+    // ALWAYS written here (the use case is history; an LLM-less install still
+    // accrues memories). Capture-only runs SKIP it (above, the block guards
+    // on !captureOnly). On the first run after deploy the table is empty →
+    // backfill synthesizes one row per day from created_at so the growth/
+    // composition charts have real history on day one.
+    if (!dryRun && !captureOnly) {
+      try {
+        const backfilled = backfillSnapshots(db);
+        if (backfilled > 0) {
+          console.log(`[hicortex] Dashboard backfill: ${backfilled} day(s) synthesized from created_at`);
+        }
+        // Per-run deltas. `added` = this run's captured memory count (only
+        // available on the server path; client mode never reaches here — it
+        // POSTs to a remote /distill). dedup/supersession are derived from
+        // the dedup_log / superseded_by link tables: count rows created since
+        // the last snapshot (real OR backfilled — both carry valid ISO run_at,
+        // so a plain ORDER BY run_at DESC LIMIT 1 is the correct floor) so a
+        // manual `hicortex dedup` run between nightlies is still reflected,
+        // and a first-write after backfill counts only what landed AFTER the
+        // last backfilled day.
+        const lastSnap = db
+          .prepare("SELECT run_at FROM dashboard_snapshots ORDER BY run_at DESC LIMIT 1")
+          .get() as { run_at: string } | undefined;
+        const sinceTs = lastSnap?.run_at ?? "1970-01-01T00:00:00.000Z";
+        const dedup = (
+          db
+            .prepare("SELECT COUNT(*) AS c FROM dedup_log WHERE merged_at > ?")
+            .get(sinceTs) as { c: number }
+        ).c;
+        const supersession = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS c FROM memory_links
+                WHERE relationship = 'superseded_by' AND created_at > ?`
+            )
+            .get(sinceTs) as { c: number }
+        ).c;
+        writeSnapshot(db, new Date().toISOString(), {
+          added: memoriesIngested,
+          lessonsGenerated,
+          dedup,
+          supersession,
+        });
+      } catch (snapErr) {
+        // The snapshot is a monitoring side-effect — a failure here must NOT
+        // advance to a telemetry gap or move the watermark. Surface + continue.
+        console.warn(
+          `[hicortex] Dashboard snapshot write failed: ` +
+          `${snapErr instanceof Error ? snapErr.message : String(snapErr)}`
+        );
+      }
+    }
 
     // Anonymous telemetry (fire-and-forget, full nightly only).
     // Capture-only runs are excluded to avoid inflating install pings.
@@ -499,6 +579,8 @@ export async function runNightly(options: {
         agent: agentType,
         mem: storage.countMemories(db),
         lessons: storage.getLessons(db, 365).length,
+        lessonsGenerated,
+        consolidation: consolidationStatus,
         sessions: batches.length,
         ok: !hadTransientFailure,
         shown: adoption.shown,
@@ -520,6 +602,7 @@ async function runClientNightly(
   dryRun: boolean,
   stateDir: string = HICORTEX_HOME,
   recaptureWindowDays?: number,
+  watchdog = false,
 ): Promise<void> {
   const serverUrl = (config.serverUrl as string).replace(/\/+$/, "");
   const authToken = config.authToken as string | undefined;
@@ -532,16 +615,21 @@ async function runClientNightly(
   // the whole run — the pre-flight only needs the link back, which can take
   // ~1 min after wake.
   //
-  // Config-overridable (#163): a wired Pi vs a sleeping laptop want different
-  // values. Defaults: 15s per-attempt timeout, 3 attempts, 60s gap.
+  // Config-overridable (#163): a wired/well-connected client vs one whose link
+  // is slow to re-establish after wake want different values. Defaults: 20s
+  // per-attempt timeout, 3 attempts, 60s gap. The 20s per-attempt (bumped from
+  // 15s in 0.17) absorbs a slow link coming back after the client wakes — a
+  // remote server reached over a mesh/VPN link can take several seconds to
+  // answer on the first request. For a genuinely DOWN link (`fetch failed`) no
+  // timeout length helps — the capture watchdog's frequent retry handles that (#239).
   //
   // WALL-CLOCK NOTE: setTimeout and AbortSignal.timeout do NOT advance while
-  // macOS is asleep, so the ~2m45s worst case (3×15s + 2×60s) is wall-clock-
+  // macOS is asleep, so the ~3m worst case (3×20s + 2×60s) is wall-clock-
   // optimistic — a sleeping laptop can straddle sleep cycles and the real
   // elapsed time can exceed it. Not a defect: the capture lock isn't held
   // during the retry and the cursor design is dup-over-loss, so a late success
-  // is harmless. Just don't treat 2m45s as a hard wall-clock bound.
-  const PREFLIGHT_TIMEOUT_MS = readPositiveConfig(config, "preflightTimeoutMs", 15_000);
+  // is harmless. Just don't treat 3m as a hard wall-clock bound.
+  const PREFLIGHT_TIMEOUT_MS = readPositiveConfig(config, "preflightTimeoutMs", 20_000);
   const PREFLIGHT_ATTEMPTS = Math.max(1, Math.floor(readPositiveConfig(config, "preflightAttempts", 3)));
   const PREFLIGHT_RETRY_GAP_MS = readPositiveConfig(config, "preflightRetryGapMs", 60_000);
   let reachable = false;
@@ -571,7 +659,12 @@ async function runClientNightly(
     // no loop), and fire the telemetry ping (ok=false) so the abort is
     // distinguishable from "powered off / uninstalled" in the activity aggregate.
     process.exitCode = 1;
-    if (!dryRun && isTelemetryEnabled(config)) {
+    // In watchdog mode, suppress this failed-preflight ping: the watchdog
+    // retries every ~20 min, so a flaky link would otherwise emit up to ~72
+    // ok:false pings/day and distort the fleet health ratio (#239 CR). A
+    // sustained outage is still visible — as the ABSENCE of success pings, and
+    // a non-watchdog (manual) run still emits ok:false.
+    if (!dryRun && !watchdog && isTelemetryEnabled(config)) {
       await sendTelemetry({
         id: getTelemetryId(stateDir),
         v: VERSION,

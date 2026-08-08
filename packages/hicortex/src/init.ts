@@ -25,6 +25,7 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomBytes, randomUUID } from "node:crypto";
 import { removeLessonsBlock } from "./claude-md.js";
+import { parseHours } from "./config-read.js";
 import { sanitizeAgentId } from "./context-store.js";
 import type { DomainDef } from "./types.js";
 
@@ -244,14 +245,24 @@ function verifyCcMcp(): void {
 }
 
 function allowHicortexTools(): void {
-  let settings: Record<string, unknown> = {};
-  if (existsSync(CC_SETTINGS)) {
-    try {
-      settings = JSON.parse(readFileSync(CC_SETTINGS, "utf-8"));
-    } catch {
-      console.log(`  ⚠ ${CC_SETTINGS} exists but is not valid JSON — skipping tool permissions. Fix the file, then re-run init or add "mcp__hicortex__*" to permissions.allow manually.`);
-      return;
-    }
+  // Only EDIT an existing CC settings file — never invent one. On a host with
+  // no CC client (a server, or a Hermes-only box) ~/.claude/settings.json is
+  // absent; creating a stub there is wrong, and the earlier mkdir+write was the
+  // ENOENT throw on a host with no CC client. Without this entry CC just PROMPTS before
+  // tool use instead of auto-allowing — the MCP still works either way.
+  if (!existsSync(CC_SETTINGS)) {
+    console.log(
+      `  ℹ ${CC_SETTINGS} not found — skipping CC tool permissions (no CC client here; ` +
+      `the MCP works, CC will ask before tool use).`
+    );
+    return;
+  }
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(readFileSync(CC_SETTINGS, "utf-8"));
+  } catch {
+    console.log(`  ⚠ ${CC_SETTINGS} exists but is not valid JSON — skipping tool permissions. Fix the file, then re-run init or add "mcp__hicortex__*" to permissions.allow manually.`);
+    return;
   }
 
   if (!settings.permissions) settings.permissions = {};
@@ -262,7 +273,6 @@ function allowHicortexTools(): void {
   const rule = "mcp__hicortex__*";
   if (!allow.includes(rule)) {
     allow.push(rule);
-    mkdirSync(dirname(CC_SETTINGS), { recursive: true });
     writeFileSync(CC_SETTINGS, JSON.stringify(settings, null, 2));
     console.log(`  ✓ Added Hicortex tool permissions to ${CC_SETTINGS}`);
   }
@@ -482,15 +492,12 @@ function mergeByKey(candidates: ApiKeyCandidate[]): ApiKeyCandidate[] {
 
 /**
  * True when an LLM is already persisted and `init` must NOT re-run provider
- * selection: a named/flat backend, a flat baseUrl+apiKey pair, OR a nested-only
- * `models.score` (model or baseUrl). The last clause (0.13.1) stops init from
- * walking a nested-only config back through selection and writing flat keys that
- * a `models.score` would then silently shadow (nested > flat).
+ * selection: a named backend (llmBackend) or a flat baseUrl+apiKey pair.
+ * (The nested `models` per-tier block was removed in #231 — one model serves
+ * all phases, configured via the flat `llm*` keys only.)
  */
 export function isLlmConfigured(config: Record<string, unknown>): boolean {
-  const modelsScore = (config.models as { score?: { model?: unknown; baseUrl?: unknown } } | undefined)?.score;
-  const hasModelsScore = Boolean(modelsScore?.model || modelsScore?.baseUrl);
-  return Boolean(config.llmBackend || (config.llmApiKey && config.llmBaseUrl) || hasModelsScore);
+  return Boolean(config.llmBackend || (config.llmApiKey && config.llmBaseUrl));
 }
 
 /**
@@ -764,7 +771,7 @@ function saveConfig(configPath: string, config: Record<string, unknown>): void {
  * and the writer then OVERWROTE the file — `persistAuthToken` minted a fresh
  * token (fleet-wide 401), `scaffoldDefaultDomains` re-seeded the generic
  * vocabulary over the owner list, etc. `authToken` / `licenseKey` /
- * `distillApiKey` / `domains` / `weakPrimaryFloor` / `contextClients` all gone.
+ * `llmApiKey` / `domains` / `weakPrimaryFloor` / `contextClients` all gone.
  * The early-return guards (existing-key checks) did NOT save them: those only
  * fire on a VALID parse that reads the key, not on a corrupted file.
  *
@@ -834,7 +841,7 @@ export function loadConfigStrict(configPath: string): { config: Record<string, u
  * Why this exists: refusing to overwrite a corrupt config is right (it closed
  * the 0.16.x wipe BLOCKER), but it leaves the operator stuck — `init` is the
  * natural repair action and it now refuses to run. Deleting the file by hand
- * works but silently loses `licenseKey` / `authToken` / `distillApiKey`.
+ * works but silently loses `licenseKey` / `authToken` / `llmApiKey`.
  *
  * Why it is OPT-IN and never automatic: rebuilding mints a fresh `authToken`,
  * which 401s every thin client on the fleet until they are re-pointed. That is
@@ -846,10 +853,10 @@ export function loadConfigStrict(configPath: string): { config: Record<string, u
  *     Windows), and report the TOP-LEVEL KEY NAMES recovered from the raw text
  *     so the operator knows what to restore.
  *
- * SECURITY: key NAMES only, never values. `authToken`, `licenseKey`,
- * `distillApiKey` and `reflectApiKey` are secrets — printing them would leak
- * into terminal scrollback, CI logs, and screen shares. The operator reads the
- * values out of the backup file themselves.
+ * SECURITY: key NAMES only, never values. `authToken`, `licenseKey`, and
+ * `llmApiKey` are secrets — printing them would leak into terminal scrollback,
+ * CI logs, and screen shares. The operator reads the values out of the backup
+ * file themselves.
  *
  * Exported for testability.
  */
@@ -878,7 +885,7 @@ export function quarantineMalformedConfig(
   if (keys.length > 0) {
     console.log(`    Keys found in the old file: ${keys.join(", ")}`);
   }
-  console.log(`    ACTION REQUIRED: copy any of licenseKey / distillApiKey / reflectApiKey /`);
+  console.log(`    ACTION REQUIRED: copy any of licenseKey / llmApiKey /`);
   console.log(`    domains / weakPrimaryFloor back from the backup by hand.`);
   console.log(`    A NEW authToken will be generated — every thin client pointing at this`);
   console.log(`    server must be updated, or their recall will 401 (silently, fail-soft).`);
@@ -1141,14 +1148,38 @@ export function scaffoldDefaultDomains(configPath: string): { scaffolded: boolea
 }
 
 /**
- * Determine the npm package specifier for the daemon.
- * Uses tag-based resolution so restarts pick up new versions automatically.
+ * Determine the npm package specifier used in the generated daemon/timer
+ * ExecStart (for npx-thin installs — global-binary installs use the absolute
+ * binary path and never call this). Tag-based so restarts pick up new versions.
  *
- * Checks if the current version matches the npm `latest` tag.
- * If not (e.g. running from @next), uses @gamaze/hicortex@next.
- * If it does match latest, uses bare @gamaze/hicortex.
+ * Priority:
+ *   1. `updateChannel` config key (e.g. "rc") → `@gamaze/hicortex@<channel>`.
+ *      Lets an install pin a release channel — the internal fleet sets "rc" so
+ *      its npx-thin hosts track the rc dist-tag through a pre-promotion soak
+ *      (otherwise the auto-detect below pins @next, which lags rc).
+ *   2. Auto-detect: bare `@gamaze/hicortex` if the running version matches the
+ *      npm `latest` tag, else `@gamaze/hicortex@next` (legacy pre-0.10 cron
+ *      installs follow @next).
+ *
+ * Exported + `configDir`-parametrised so the channel override is unit-testable.
  */
-function getPackageSpec(): string {
+export function getPackageSpec(configDir: string = HICORTEX_HOME): string {
+  try {
+    const { config } = loadConfigStrict(join(configDir, "config.json"));
+    const ch = config.updateChannel;
+    if (typeof ch === "string") {
+      const trimmed = ch.trim();
+      // A dist-tag (rc/next/latest) or an exact version — alphanumerics, dot,
+      // dash, underscore only. Reject anything else: a newline would break the
+      // systemd `ExecStart=` one-liner and `<`/`&` would break the launchd plist
+      // XML the timer writes. Fall through to auto-detect + warn.
+      if (/^[\w.\-]+$/.test(trimmed)) return `@gamaze/hicortex@${trimmed}`;
+      console.warn(
+        `[hicortex] config "updateChannel" = ${JSON.stringify(ch)} is not a valid dist-tag/version ` +
+        `(use e.g. "rc", "next", or "0.17.1") — ignored.`
+      );
+    }
+  } catch { /* no config yet, or malformed — fall through to auto-detect */ }
   try {
     const currentVersion = JSON.parse(
       readFileSync(join(__dirname, "..", "package.json"), "utf-8")
@@ -1557,10 +1588,13 @@ export async function runInit(
     }
   }
 
-  // Install the nightly job (capture via localhost /distill + consolidation).
-  // Without it a server-mode install never captures or consolidates — the
-  // daemon only serves recall + /distill. Skips if a schedule already exists.
-  installNightlyCron(resolveNightlyHour("server"));
+  // Install the scheduling timers (0.17): a CAPTURE WATCHDOG (short-interval
+  // poll, success-cooldown-throttled — uniform with clients) + a CONSOLIDATION
+  // timer (the full nightly, fixed slots). Re-init rewrites both; customize the
+  // consolidation slots via consolidationHours in config.json (capture cadence
+  // via captureCooldownHours).
+  installCaptureWatchdogTimer();
+  installConsolidationTimer(resolveConsolidationHours("server") ?? DEFAULT_CONSOLIDATION_HOURS);
 
   // Install daemon if needed
   if (!d.localServer && !d.remoteServer) {
@@ -1776,8 +1810,12 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
     console.log(`  ✓ Removed old static lessons block from CLAUDE.md — lessons now injected at session start`);
   }
 
-  // Step 7: Install nightly cron (denoise locally, POST to server /distill)
-  installNightlyCron(resolveNightlyHour("client"));
+  // Step 7: Install the CAPTURE WATCHDOG (denoise locally, POST to server
+  // /distill, throttled + preflight-gated) — the same capture mechanism every
+  // install gets. Clients have no local DB → no consolidation timer; also
+  // remove any legacy full-nightly timer a pre-0.17 install left behind.
+  installCaptureWatchdogTimer();
+  removeConsolidationTimer();
 
   // Step 8: Setup Hermes if detected
   if (existsSync(HERMES_HOME)) {
@@ -1808,63 +1846,200 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
 }
 
 /**
- * Resolve the nightly hour (0–23, local time) for the generated schedule.
- * Priority: `nightlyHour` in ~/.hicortex/config.json → mode default.
- * Defaults: client 02:00, server 03:00 — staggered so that in mixed fleets
- * clients push their sessions before the server's capture + consolidation run.
+ * Scheduling (0.17): one UNIFORM capture mechanism + one role-specific
+ * consolidation timer, replacing the old single daily full-nightly.
+ *
+ *   - CAPTURE WATCHDOG (`hicortex-capture`): a short-interval timer fires
+ *     `nightly --capture-only --watchdog`. The watchdog throttles by a
+ *     success-cooldown (`captureCooldownHours`, default 6 ≈ 4 captures/day) and
+ *     preflights before capturing, so a transient fire-instant network miss
+ *     retries in minutes, not at the next daily slot (#239: a once-daily client
+ *     fire that caught a slow/flaky link lost ~24h of capture). Installed
+ *     UNIFORMLY for client AND server/co-located — one capture code path, no
+ *     per-topology branch. A failed preflight retries on the next tick; a
+ *     successful capture waits the cooldown (success-based cooldown — the
+ *     better semantics; the custom server watchdog used trigger-based).
+ *   - CONSOLIDATION timer (`hicortex-nightly`): full `nightly` (capture +
+ *     distill + score + reflect + link). Server/co-located ONLY — clients have
+ *     no local DB, so no consolidation timer is installed (and a legacy one
+ *     left by a pre-0.17 install is removed). Fixed slots (default [10, 22]).
+ *
+ * Customize: `consolidationHours` (the consolidation slots) and
+ * `captureCooldownHours` (the watchdog throttle) in config.json. Re-init
+ * rewrites the timers to the resolved standard (the pre-0.17 "never overwrite"
+ * contract is intentionally relaxed so the fleet adopts the standard). The
+ * legacy single `nightlyHour` is honoured as a one-slot consolidation fallback
+ * only when `consolidationHours` is absent (preserves "one daily job at H").
+ */
+const DEFAULT_CONSOLIDATION_HOURS = [10, 22];
+/**
+ * Capture-watchdog poll interval (minutes). The capture timer fires
+ * `nightly --capture-only --watchdog` this often; the watchdog itself throttles
+ * by the success-cooldown (`captureCooldownHours`, read at runtime). Short so a
+ * transient fire-instant network miss retries in minutes, not at the next daily
+ * slot (#239). Cheap: a tick against a down server is one 5s preflight.
+ */
+const CAPTURE_WATCHDOG_INTERVAL_MIN = 20;
+
+/**
+ * Resolve the CONSOLIDATION hours (the only slot-based timer in 0.17). The
+ * CAPTURE mechanism is the watchdog (an interval timer, not slots) — uniform
+ * across client + server/co-located — so this function no longer returns a
+ * capture schedule. Returns null in client mode (no local DB → no
+ * consolidation timer).
+ *
+ * Priority: `consolidationHours` array → legacy `nightlyHour` (single int, only
+ * when the array key is absent → one consolidation slot at H, preserving the
+ * pre-0.17 "one daily job" intent) → role default ([10, 22] server / null client).
+ */
+export function resolveConsolidationHours(mode: "server" | "client", configDir = HICORTEX_HOME): number[] | null {
+  let config: Record<string, unknown> = {};
+  try {
+    config = JSON.parse(readFileSync(join(configDir, "config.json"), "utf-8"));
+  } catch { /* no config yet — use the standard default */ }
+
+  if (mode === "client") return null; // clients have no local DB → no consolidation timer
+
+  const arr = parseHours(config, "consolidationHours");
+  if (arr) return arr;
+
+  const legacy = readLegacyNightlyHour(config);
+  if (legacy !== null) return [legacy];
+
+  return DEFAULT_CONSOLIDATION_HOURS;
+}
+
+/** Read the legacy `nightlyHour` (single int 0–23) if validly set, else null. */
+function readLegacyNightlyHour(config: Record<string, unknown>): number | null {
+  const h = config.nightlyHour;
+  if (typeof h === "number" && Number.isInteger(h) && h >= 0 && h <= 23) return h;
+  return null;
+}
+
+/**
+ * Legacy single-hour resolver (pre-0.17). Kept for backward compat + the
+ * existing tests; new scheduling goes through `resolveConsolidationHours`.
  */
 export function resolveNightlyHour(mode: "server" | "client", configDir = HICORTEX_HOME): number {
   try {
     const config = JSON.parse(readFileSync(join(configDir, "config.json"), "utf-8"));
-    const h = config.nightlyHour;
-    if (typeof h === "number" && Number.isInteger(h) && h >= 0 && h <= 23) return h;
+    const legacy = readLegacyNightlyHour(config);
+    if (legacy !== null) return legacy;
   } catch { /* no config yet — use the default */ }
   return mode === "server" ? 3 : 2;
 }
 
-function installNightlyCron(hour: number): void {
+interface ScheduleUnitOpts {
+  /** systemd unit base, e.g. "hicortex-capture" → .service/.timer. */
+  unitBase: string;
+  /** launchd Label, e.g. "com.gamaze.hicortex-capture". */
+  plistLabel: string;
+  serviceDesc: string;
+  timerDesc: string;
+  /** Args after the binary: ["nightly"], ["nightly","--capture-only"], etc. */
+  nightlyArgs: string[];
+  /**
+   * Fixed calendar hours (OnCalendar / StartCalendarInterval array) — used for
+   * the consolidation timer. Exactly one of `hours` / `intervalSec` is set.
+   */
+  hours?: number[];
+  /**
+   * Poll interval in seconds (OnUnitActiveSec / StartInterval) — used for the
+   * capture watchdog timer. Exactly one of `hours` / `intervalSec` is set.
+   */
+  intervalSec?: number;
+  /**
+   * Runaway BACKSTOP in minutes (systemd `TimeoutStartSec`). NOT an operating
+   * limit — set well above the longest legitimate run so it only kills a true
+   * hang. The budget cap governs throughput; this only catches a stuck process.
+   * Linux only (launchd has no native run-time cap on a oneshot).
+   */
+  timeoutMin?: number;
+}
+
+/**
+ * One `OnCalendar=*-*-* HH:00:00` line per hour, newline-joined — systemd fires
+ * a timer at EACH OnCalendar entry (multi-slot in a single timer). Hours are
+ * sorted so the generated file is stable/diffable. Exported for testing.
+ */
+export function formatOnCalendarLines(hours: number[]): string {
+  return [...hours]
+    .sort((a, b) => a - b)
+    .map((h) => `OnCalendar=*-*-* ${String(h).padStart(2, "0")}:00:00`)
+    .join("\n");
+}
+
+/**
+ * The launchd `StartCalendarInterval` ARRAY body — one `<dict>` per hour.
+ * launchd fires the job at each dict; a single dict is the 1-slot special case
+ * but the array form is uniform across 1..N. Exported for testing.
+ */
+export function formatLaunchdIntervals(hours: number[]): string {
+  return [...hours]
+    .sort((a, b) => a - b)
+    .map(
+      (h) => `    <dict>
+      <key>Hour</key>
+      <integer>${h}</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>`,
+    )
+    .join("\n");
+}
+
+/**
+ * Write + enable one schedule unit (timer + service on Linux, plist on macOS),
+ * multi-slot. Shared by the capture and consolidation installers. Always
+ * rewrites both files (the 0.17 migration decision: re-init brings an install
+ * up to the resolved standard; customization is via config keys, not hand-
+ * edited unit files). Logs the resolved slots.
+ */
+function writeScheduleUnit(opts: ScheduleUnitOpts): void {
   const binaryArgs = resolveBinaryArgs();
   const os = platform();
-  const hh = String(hour).padStart(2, "0");
-
   // PATH must start with the binary's own directory (see installLaunchd for rationale).
   const binDir = dirname(binaryArgs[0]);
   // One canonical nightly log path across platforms — status output, docs,
   // and support instructions all reference this single location.
   const logPath = join(HICORTEX_HOME, "nightly.log");
+  const isInterval = typeof opts.intervalSec === "number";
+  if (!isInterval && (!opts.hours || opts.hours.length === 0)) {
+    throw new Error("writeScheduleUnit: provide either hours or intervalSec");
+  }
+  // Human-readable schedule label for the log line.
+  const slotLabel = isInterval
+    ? `every ${Math.round((opts.intervalSec as number) / 60)} min`
+    : [...(opts.hours as number[])].sort((a, b) => a - b).map((h) => `${String(h).padStart(2, "0")}:00`).join(", ");
 
   if (os === "darwin") {
     const plistDir = join(homedir(), "Library", "LaunchAgents");
-    const plistPath = join(plistDir, "com.gamaze.hicortex-nightly.plist");
+    const plistPath = join(plistDir, `${opts.plistLabel}.plist`);
 
-    // Never overwrite an existing schedule — users tune these (multi-slot
-    // capture windows, quiet hours). Fresh installs only.
-    if (existsSync(plistPath)) {
-      console.log(`  ✓ Nightly cron already installed — leaving existing schedule as-is`);
-      return;
-    }
-
-    const programArgs = [...binaryArgs, "nightly"]
+    const programArgs = [...binaryArgs, ...opts.nightlyArgs]
       .map((a) => `    <string>${a}</string>`)
       .join("\n");
+    // Schedule block: StartInterval (seconds) for the watchdog poll, or
+    // StartCalendarInterval as an ARRAY of dicts (one per hour) for slots.
+    // RunAtLoad ONLY on the interval (watchdog) plist — so a Mac that reboots
+    // gets a first capture tick on load (~parity with systemd's OnBootSec=2min),
+    // not 20 min later. The cooldown gate makes a load-time fire a cheap no-op
+    // if a capture ran recently.
+    const scheduleBlock = isInterval
+      ? `  <key>StartInterval</key>\n  <integer>${opts.intervalSec}</integer>\n  <key>RunAtLoad</key>\n  <true/>`
+      : `  <key>StartCalendarInterval</key>\n  <array>\n${formatLaunchdIntervals(opts.hours as number[])}\n  </array>`;
 
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.gamaze.hicortex-nightly</string>
+  <string>${opts.plistLabel}</string>
   <key>ProgramArguments</key>
   <array>
 ${programArgs}
   </array>
-  <key>StartCalendarInterval</key>
-  <dict>
-    <key>Hour</key>
-    <integer>${hour}</integer>
-    <key>Minute</key>
-    <integer>0</integer>
-  </dict>
+${scheduleBlock}
   <key>StandardOutPath</key>
   <string>${logPath}</string>
   <key>StandardErrorPath</key>
@@ -1880,60 +2055,133 @@ ${programArgs}
     mkdirSync(plistDir, { recursive: true });
     writeFileSync(plistPath, plist);
     try {
-      try { execSync(`launchctl unload ${plistPath} 2>/dev/null`, { stdio: "pipe" }); } catch {}
+      try { execSync(`launchctl unload ${plistPath} 2>/dev/null`, { stdio: "pipe" }); } catch { /* not loaded */ }
       execSync(`launchctl load ${plistPath}`, { stdio: "pipe" });
-      console.log(`  ✓ Installed nightly cron (runs daily at ${hh}:00)`);
+      console.log(`  ✓ Installed ${opts.timerDesc} (${slotLabel})`);
     } catch {
-      console.log(`  ⚠ Could not load nightly plist. Load manually: launchctl load ${plistPath}`);
+      console.log(`  ⚠ Could not load plist. Load manually: launchctl load ${plistPath}`);
     }
   } else if (os === "linux") {
     const configDir = join(homedir(), ".config", "systemd", "user");
-    const servicePath = join(configDir, "hicortex-nightly.service");
-    const timerPath = join(configDir, "hicortex-nightly.timer");
+    const servicePath = join(configDir, `${opts.unitBase}.service`);
+    const timerPath = join(configDir, `${opts.unitBase}.timer`);
 
-    const execStart = [...binaryArgs, "nightly"].join(" ");
+    const execStart = [...binaryArgs, ...opts.nightlyArgs].join(" ");
     // File logging, not journal: oneshot runs on machines with a volatile
     // journal (e.g. Raspberry Pi defaults) otherwise fail without a trace.
     // Same log path as the macOS plist. append: needs systemd ≥ 240 (2018).
     const service = `[Unit]
-Description=Hicortex Nightly (distill + POST)
+Description=${opts.serviceDesc}
 
 [Service]
 Type=oneshot
 ExecStart=${execStart}
-StandardOutput=append:${logPath}
+${opts.timeoutMin ? `TimeoutStartSec=${opts.timeoutMin}min\n` : ""}StandardOutput=append:${logPath}
 StandardError=append:${logPath}
 Environment=PATH=${binDir}:/usr/local/bin:/usr/bin:/bin
 Environment=HOME=${homedir()}
 WorkingDirectory=${homedir()}`;
 
+    // Timer body: OnUnitActiveSec (interval, watchdog) or one OnCalendar line
+    // per hour (multi-slot). systemd ORs multiple OnCalendar entries.
+    const timerBody = isInterval
+      ? `OnBootSec=2min\nOnUnitActiveSec=${Math.round((opts.intervalSec as number) / 60)}min`
+      : formatOnCalendarLines(opts.hours as number[]);
     const timer = `[Unit]
-Description=Hicortex Nightly Timer
+Description=${opts.timerDesc}
 
 [Timer]
-OnCalendar=*-*-* ${hh}:00:00
+${timerBody}
 Persistent=true
 
 [Install]
 WantedBy=timers.target`;
 
     mkdirSync(configDir, { recursive: true });
-    // The .service file is ours — always refresh it so fixes (like file
-    // logging) reach existing installs. The .timer holds the user-tuned
-    // schedule and is never overwritten.
+    // Always rewrite both .service and .timer (0.17 migration: re-init adopts
+    // the resolved standard schedule; the config keys are the tuning surface).
     writeFileSync(servicePath, service);
-    if (existsSync(timerPath)) {
-      try { execSync("systemctl --user daemon-reload", { stdio: "pipe" }); } catch { /* fine */ }
-      console.log(`  ✓ Nightly service refreshed — existing timer schedule kept as-is`);
-      return;
-    }
     writeFileSync(timerPath, timer);
     try {
       execSync("systemctl --user daemon-reload", { stdio: "pipe" });
-      execSync("systemctl --user enable --now hicortex-nightly.timer", { stdio: "pipe" });
-      console.log(`  ✓ Installed nightly timer (runs daily at ${hh}:00)`);
+      execSync(`systemctl --user enable --now ${opts.unitBase}.timer`, { stdio: "pipe" });
+      console.log(`  ✓ Installed ${opts.unitBase}.timer (${slotLabel})`);
     } catch {
-      console.log(`  ⚠ Could not enable nightly timer. Enable manually: systemctl --user enable --now hicortex-nightly.timer`);
+      console.log(
+        `  ⚠ Could not enable ${opts.unitBase}.timer. Enable manually: ` +
+        `systemctl --user enable --now ${opts.unitBase}.timer`,
+      );
+    }
+  }
+}
+
+/**
+ * Install the CAPTURE WATCHDOG timer — a short-interval poll that fires
+ * `nightly --capture-only --watchdog`. The watchdog itself throttles by the
+ * success-cooldown (`captureCooldownHours`) and preflights, so a transient
+ * fire-instant network miss retries in minutes, not at the next daily slot
+ * (#239). Installed UNIFORMLY for client + server/co-located (one capture
+ * mechanism everywhere — no per-topology branch).
+ */
+function installCaptureWatchdogTimer(): void {
+  writeScheduleUnit({
+    unitBase: "hicortex-capture",
+    plistLabel: "com.gamaze.hicortex-capture",
+    serviceDesc: "Hicortex Capture Watchdog (denoise + POST /distill, throttled)",
+    timerDesc: "Hicortex Capture Watchdog",
+    nightlyArgs: ["nightly", "--capture-only", "--watchdog"],
+    intervalSec: CAPTURE_WATCHDOG_INTERVAL_MIN * 60,
+    timeoutMin: 30, // backstop only — capture is no-LLM, bounded; 30min catches a stuck POST
+  });
+}
+
+/**
+ * Install the CONSOLIDATION timer (full `nightly`). Reuses the existing
+ * `hicortex-nightly` unit name (repurposed from the pre-0.17 single full-nightly).
+ */
+function installConsolidationTimer(hours: number[]): void {
+  writeScheduleUnit({
+    unitBase: "hicortex-nightly",
+    plistLabel: "com.gamaze.hicortex-nightly",
+    serviceDesc: "Hicortex Nightly (capture + consolidate)",
+    timerDesc: "Hicortex Consolidation Timer",
+    nightlyArgs: ["nightly"],
+    hours,
+    // Backstop only (NOT an operating limit) — set well above the longest
+    // legitimate run so it catches a true hang, never a slow-but-progressing
+    // one. ~5000 LLM calls × ~1–3s/call ≈ 1.4–4.2h → 6h clears it with margin.
+    // Coupled to the consolidateMaxLlmCalls budget (#241): raise together.
+    timeoutMin: 360,
+  });
+}
+
+/**
+ * Remove the consolidation timer + service (and the macOS plist). Used on
+ * CLIENT installs: clients have no local DB, so a pre-0.17 `hicortex-nightly`
+ * timer (which auto-capture-onlys on clients) is redundant with the new capture
+ * timer — remove it so it doesn't double-fire.
+ */
+function removeConsolidationTimer(): void {
+  const os = platform();
+  if (os === "darwin") {
+    const plistPath = join(homedir(), "Library", "LaunchAgents", "com.gamaze.hicortex-nightly.plist");
+    if (existsSync(plistPath)) {
+      try { execSync(`launchctl unload ${plistPath} 2>/dev/null`, { stdio: "pipe" }); } catch { /* not loaded */ }
+      try { rmSync(plistPath); console.log("  ✓ Removed legacy nightly timer (client mode — capture-only)"); } catch { /* leave it */ }
+    }
+  } else if (os === "linux") {
+    try { execSync("systemctl --user disable --now hicortex-nightly.timer 2>/dev/null", { stdio: "pipe" }); } catch { /* not installed */ }
+    const unitDir = join(homedir(), ".config", "systemd", "user");
+    let removed = false;
+    for (const name of ["hicortex-nightly.timer", "hicortex-nightly.service"]) {
+      const p = join(unitDir, name);
+      if (existsSync(p)) {
+        try { rmSync(p); removed = true; } catch { /* leave it */ }
+      }
+    }
+    if (removed) {
+      try { execSync("systemctl --user daemon-reload 2>/dev/null", { stdio: "pipe" }); } catch { /* fine */ }
+      console.log("  ✓ Removed legacy nightly timer (client mode — capture-only)");
     }
   }
 }
