@@ -71,6 +71,17 @@ switch (command) {
     } else {
       const dryRun = args.includes("--dry-run");
       const captureOnly = args.includes("--capture-only");
+      const watchdog = args.includes("--watchdog");
+      // Timestamp every log line. The nightly writes to a file (launchd /
+      // systemd StandardOutput append) with NO per-line timestamp, which made
+      // diagnosing capture gaps impossible (the #239 investigation couldn't
+      // tell when a fire aborted). The daemon is unaffected — it logs to
+      // journald, which already timestamps. Scoped to this process only.
+      const origLog = console.log, origWarn = console.warn, origErr = console.error;
+      const ts = () => `[${new Date().toISOString()}]`;
+      console.log = (...a: unknown[]) => origLog(ts(), ...a);
+      console.warn = (...a: unknown[]) => origWarn(ts(), ...a);
+      console.error = (...a: unknown[]) => origErr(ts(), ...a);
       // #189 Tier-2 recovery: re-discover sessions that went quiet before the
       // upgrade by widening the discovery window to now−N days for one run.
       let recaptureWindowDays: number | undefined;
@@ -83,7 +94,7 @@ switch (command) {
         }
       }
       import("./nightly.js").then(({ runNightly }) => {
-        runNightly({ dryRun, captureOnly, recaptureWindowDays }).catch((err) => {
+        runNightly({ dryRun, captureOnly, watchdog, recaptureWindowDays }).catch((err) => {
           console.error("[hicortex] Nightly pipeline failed:", err);
           process.exit(1);
         });

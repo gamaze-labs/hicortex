@@ -47,11 +47,14 @@ export async function runUninstall(): Promise<void> {
 
   console.log();
 
-  // 1. Stop and remove daemon + nightly timer (both units, or the timer
-  //    keeps firing against a half-removed install)
+  // 1. Stop and remove daemon + capture/nightly timers (all units, or a timer
+  //    keeps firing against a half-removed install). Since 0.17 there are two
+  //    scheduled jobs: the capture timer (hicortex-capture) and the
+  //    consolidation timer (hicortex-nightly); remove both either way (a client
+  //    install has no consolidation timer, a server install has both).
   const os = platform();
   if (os === "darwin") {
-    for (const name of ["com.gamaze.hicortex.plist", "com.gamaze.hicortex-nightly.plist"]) {
+    for (const name of ["com.gamaze.hicortex.plist", "com.gamaze.hicortex-nightly.plist", "com.gamaze.hicortex-capture.plist"]) {
       const plistPath = join(homedir(), "Library", "LaunchAgents", name);
       if (existsSync(plistPath)) {
         try {
@@ -64,13 +67,14 @@ export async function runUninstall(): Promise<void> {
   } else if (os === "linux") {
     try { execSync("systemctl --user disable --now hicortex.service 2>/dev/null"); } catch { /* not installed */ }
     try { execSync("systemctl --user disable --now hicortex-nightly.timer 2>/dev/null"); } catch { /* not installed */ }
+    try { execSync("systemctl --user disable --now hicortex-capture.timer 2>/dev/null"); } catch { /* not installed */ }
     const unitDir = join(homedir(), ".config", "systemd", "user");
-    for (const name of ["hicortex.service", "hicortex-nightly.timer", "hicortex-nightly.service"]) {
+    for (const name of ["hicortex.service", "hicortex-nightly.timer", "hicortex-nightly.service", "hicortex-capture.timer", "hicortex-capture.service"]) {
       const unitPath = join(unitDir, name);
       try { if (existsSync(unitPath)) unlinkSync(unitPath); } catch { /* leave it */ }
     }
     try { execSync("systemctl --user daemon-reload 2>/dev/null"); } catch { /* fine */ }
-    console.log("  ✓ Removed systemd service + nightly timer");
+    console.log("  ✓ Removed systemd service + capture/nightly timers");
   }
 
   // 2. Remove MCP from CC

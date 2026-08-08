@@ -19,13 +19,15 @@ import { z } from "zod";
 import type Database from "better-sqlite3";
 
 import { initDb, getStats, resolveDbPath } from "./db.js";
-import { resolveExplicitLlmConfig, applyModelsBlock, LlmClient, findClaudeBinary, claudeCliConfig, resolveDistillFallback, type LlmConfig } from "./llm.js";
+import { resolveExplicitLlmConfig, applyTierTuningOverlay, LlmClient, findClaudeBinary, claudeCliConfig, type LlmConfig } from "./llm.js";
 import { initFeatures } from "./features.js";
+import { warnIgnoredConfigKeys } from "./config-read.js";
 import { loadState, migrateLegacyState } from "./state.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import { getNeighbors, shortestPath, detectHubs, exportGraph, EXPORT_DEFAULT_LIMIT } from "./graph.js";
-import { createAuthMiddleware, vizHandler, vizVendorHandler, contextUiHandler } from "./viz.js";
+import { createAuthMiddleware, vizHandler, vizVendorHandler, contextUiHandler, dashboardHandler } from "./viz.js";
+import { dashboardDataHandler } from "./dashboard.js";
 import {
   handleContextGet,
   handleContextPut,
@@ -49,8 +51,8 @@ import type { MemorySearchResult } from "./types.js";
 
 let db: Database.Database | null = null;
 let llm: LlmClient | null = null;
-// llmConfig is module-level so the /distill handler can call resolveDistillFallback
-// without having to read config on every request. null when no LLM is configured.
+// llmConfig is module-level so the /distill handler can read numCtx without
+// re-resolving on every request. null when no LLM is configured.
 let llmConfig: LlmConfig | null = null;
 
 // One-time-per-process deprecation warning for the `?privacy=` query param
@@ -68,9 +70,6 @@ function warnDeprecatedPrivacyParamIfPresent(query: Record<string, unknown>, rou
     `Use a separate Hicortex server for isolation. (This warning fires once per process.)`
   );
 }
-// distillFallbackMode controls whether a failed remote distill endpoint causes an
-// immediate abort ("strict", default) or a fallback to the base model ("local").
-let distillFallbackMode: "strict" | "local" = "strict";
 let stateDir = "";
 // Resolved contextClients list (spec §2) — the harness names allowed to inject
 // the standing context layer. Echoed by GET /context so each hook self-gates.
@@ -404,7 +403,11 @@ export async function startServer(options: {
   // Named backends (claude-cli, ollama) → immediate config; everything else
   // goes through resolveExplicitLlmConfig which requires a user-chosen provider.
   // If nothing is configured: start recall-only with an unmissable warning.
-  const savedConfig = applyModelsBlock(readConfigFile(stateDir));
+  // One model serves all phases (#231) — no per-tier overlay here.
+  const savedConfig = readConfigFile(stateDir);
+  // 0.16.8 upgrade guard: per-stage keys are silently ignored now. Warn loudly
+  // so a carried-over distill/reflect model doesn't silently downgrade quality.
+  warnIgnoredConfigKeys(savedConfig);
   // 0.16.2 activation gap: self-heal the agentId provenance field for
   // pre-0.16.2 server installs on first boot after upgrade. The server's own
   // nightly captures its sessions to localhost:8787/distill and needs this id;
@@ -430,7 +433,6 @@ export async function startServer(options: {
       baseUrl: (savedConfig.llmBaseUrl as string | undefined) ?? "http://localhost:11434",
       apiKey: "",
       model: (savedConfig.llmModel as string) ?? "qwen3.5:4b",
-      reflectModel: (savedConfig.reflectModel as string) ?? (savedConfig.llmModel as string) ?? "qwen3.5:4b",
       provider: "ollama",
     };
   } else {
@@ -438,38 +440,16 @@ export async function startServer(options: {
       llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
       llmApiKey: savedConfig?.llmApiKey as string | undefined,
       llmModel: savedConfig?.llmModel as string | undefined,
-      reflectModel: savedConfig?.reflectModel as string | undefined,
     });
   }
 
   if (llmConfig) {
-    // Apply optional distill endpoint (e.g. remote Ollama with faster model)
-    if (savedConfig?.distillModel) {
-      llmConfig.distillModel = savedConfig.distillModel as string;
-    }
-    if (savedConfig?.distillBaseUrl) {
-      llmConfig.distillBaseUrl = savedConfig.distillBaseUrl as string;
-      llmConfig.distillApiKey = (savedConfig.distillApiKey as string | undefined) ?? llmConfig.apiKey;
-      llmConfig.distillProvider = (savedConfig.distillProvider as string | undefined) ?? llmConfig.provider;
-    }
-    // Apply separate reflect endpoint if configured (e.g. remote Ollama with larger model)
-    if (savedConfig?.reflectBaseUrl) {
-      llmConfig.reflectBaseUrl = savedConfig.reflectBaseUrl as string;
-      llmConfig.reflectApiKey = (savedConfig.reflectApiKey as string | undefined) ?? llmConfig.apiKey;
-      llmConfig.reflectProvider = (savedConfig.reflectProvider as string | undefined) ?? llmConfig.provider;
-    }
-    // distillFallback: "strict" (default) aborts on remote failure so the session
-    // is retried next run. "local" restores 0.9.0 fallback-to-base-model behavior.
-    const df = savedConfig?.distillFallback as string | undefined;
-    distillFallbackMode = df === "local" ? "local" : "strict";
+    // Tuning (#220: maxTokens + enableThinking + numCtx + flush), validated +
+    // copied via the shared overlay (also applied in resolveSavedLlmConfig for
+    // the nightly). Wrong-typed values warn + drop.
+    applyTierTuningOverlay(llmConfig, savedConfig as Record<string, unknown> | null);
     llm = new LlmClient(llmConfig);
-    const distillInfo = llmConfig.distillBaseUrl
-      ? `${llmConfig.distillProvider}/${llmConfig.distillModel}@${llmConfig.distillBaseUrl}`
-      : llmConfig.distillModel ? llmConfig.distillModel : "";
-    const reflectInfo = llmConfig.reflectBaseUrl
-      ? `${llmConfig.reflectProvider}/${llmConfig.reflectModel}@${llmConfig.reflectBaseUrl}`
-      : llmConfig.reflectModel;
-    console.log(`[hicortex] LLM fast: ${llmConfig.provider}/${llmConfig.model}${distillInfo ? `, distill: ${distillInfo}` : ""}, reflect: ${reflectInfo}`);
+    console.log(`[hicortex] LLM (one model, all phases): ${llmConfig.provider}/${llmConfig.model}`);
   } else {
     llm = null;
     console.warn("");
@@ -923,24 +903,12 @@ export async function startServer(options: {
       }
     }
 
-    // Pre-flight the distill endpoint. In strict mode (default) a failed remote
-    // probe returns "abort" immediately without mutating llmConfig — the nightly
-    // watermark stays put so the session is re-shipped next run. In "local" mode
-    // the config is mutated to fall back to the base model.
-    const cfg = llmConfig;
-    const distillFallbackStatus = await resolveDistillFallback(cfg, distillFallbackMode);
-    if (distillFallbackStatus === "abort") {
-      res.status(503).json({ error: "Distill endpoint unavailable — session will be retried next run" });
-      return;
-    }
-
     // Cache detectChunkSize per endpoint so we probe at most once per server boot.
-    const effectiveProvider = cfg.distillProvider ?? cfg.provider;
-    const effectiveModel = cfg.distillModel ?? cfg.model;
-    const effectiveBaseUrl = cfg.distillBaseUrl ?? cfg.baseUrl;
-    const cacheKey = `${effectiveProvider}/${effectiveModel}@${effectiveBaseUrl}`;
+    // numCtx is passed so chunk size derives from the request's ACTUAL context
+    // window (#231, #228) — the chunker and the request agree by construction.
+    const cacheKey = `${llmConfig.provider}/${llmConfig.model}@${llmConfig.baseUrl}`;
     if (!chunkSizeCache.has(cacheKey)) {
-      chunkSizeCache.set(cacheKey, await detectChunkSize(effectiveProvider, effectiveModel, effectiveBaseUrl));
+      chunkSizeCache.set(cacheKey, await detectChunkSize(llmConfig.provider, llmConfig.model, llmConfig.baseUrl, llmConfig.numCtx));
     }
     const chunkSize = chunkSizeCache.get(cacheKey)!;
 
@@ -1256,6 +1224,27 @@ export async function startServer(options: {
   // bypass). The page collects the token client-side: ?token= URL param
   // (stripped on load) or an in-page prompt on 401, persisted in localStorage.
   app.get("/context/ui", contextUiHandler());
+
+  // GET /dashboard — view-only memory analytics page (#224).
+  //
+  // Self-contained HTML (inline CSS/JS, hand-rolled inline SVG charts, zero
+  // external requests) served from assets/dashboard.html. Fetches
+  // /dashboard/data from its own origin. The page SHELL is public (exempted
+  // in createAuthMiddleware, like /viz and /context/ui — it carries no data);
+  // the /dashboard/data fetch is bearer-only (localhost bypass). The page
+  // collects the token client-side: ?token= URL param (stripped on load) or an
+  // in-page prompt on 401, persisted in localStorage.
+  app.get("/dashboard", dashboardHandler());
+
+  // GET /dashboard/data — the metric payload (series, composition, digest).
+  // Bearer-only (the auth middleware is installed at app boot); no separate
+  // exemption. The handler lives in src/dashboard.ts (pure); this is the thin
+  // express adapter that injects the live db + config. STRICTLY view-only —
+  // no mutation endpoints on the dashboard surface.
+  app.get("/dashboard/data", dashboardDataHandler(
+    () => db!,
+    () => readConfigFile(stateDir),
+  ));
 
   // SSE endpoint — each connection gets its own McpServer + transport
   app.get("/sse", async (req, res) => {

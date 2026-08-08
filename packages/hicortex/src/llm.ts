@@ -1,6 +1,9 @@
 /**
  * Multi-provider LLM client for consolidation and distillation.
  *
+ * ONE model serves all phases (distill, reflect, classify, scoring) — #231.
+ * The 0.16.x per-tier split (distill, reflect, classify + base) is removed.
+ *
  * Resolution (resolveExplicitLlmConfig):
  *   1. Explicit config-file overrides (llmBaseUrl + llmApiKey + llmModel)
  *   2. Hicortex-specific env vars (HICORTEX_LLM_BASE_URL + HICORTEX_LLM_API_KEY + HICORTEX_LLM_MODEL)
@@ -14,39 +17,24 @@
  * OpenAI, Anthropic, Google, Ollama, OpenRouter, and Claude CLI.
  */
 
-import type { ModelTierOverride } from "./types.js";
+import { readPositiveConfig, readStrictBoolean, readNonNegativeConfig } from "./config-read.js";
 
 export interface LlmConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
-  reflectModel: string;
   provider: string;
-  /** Optional separate model for distillation (defaults to model if unset). */
-  distillModel?: string;
-  /** Optional separate endpoint for distillation (e.g. remote Ollama with larger/faster model). */
-  distillBaseUrl?: string;
-  distillApiKey?: string;
-  distillProvider?: string;
-  /** Optional separate endpoint for reflect-tier LLM (e.g. remote Ollama with larger model). */
-  reflectBaseUrl?: string;
-  reflectApiKey?: string;
-  reflectProvider?: string;
-  /**
-   * Optional separate model for memory tag classification (defaults to the
-   * reflect tier when unset — zero behavior change for existing installs).
-   * Chosen after an A/B benchmark where a dedicated classifier model
-   * materially outperformed the reflect model on this task.
-   */
-  classifyModel?: string;
-  /**
-   * Optional separate endpoint for classification. When only classifyModel is
-   * set, the classify model runs on the reflect endpoint (or the base endpoint
-   * when no reflect endpoint is configured).
-   */
-  classifyBaseUrl?: string;
-  classifyApiKey?: string;
-  classifyProvider?: string;
+  /** Max output tokens for all phases (one model). Default 8192. */
+  maxTokens?: number;
+  /** Toggle thinking on the openai-compat path for all phases. Absent = no kwarg sent.
+   *  LOCAL-endpoint only (ollama / mlx-lm gateway); see HicortexConfig.enableThinking. */
+  enableThinking?: boolean;
+  /** Context window for ollama (the one model, all phases). Default 8192. */
+  numCtx?: number;
+  /** Flush ollama memory every N ollama calls (0 = off). See HicortexConfig.ollamaFlushEvery. */
+  ollamaFlushEvery?: number;
+  /** Ms to wait after an ollama flush for the runner to release. */
+  ollamaFlushWaitMs?: number;
 }
 
 /**
@@ -65,7 +53,6 @@ export function resolveExplicitLlmConfig(overrides?: {
   llmBaseUrl?: string;
   llmApiKey?: string;
   llmModel?: string;
-  reflectModel?: string;
 }): LlmConfig | null {
   // 1. Explicit config-file overrides (both baseUrl and apiKey required)
   if (overrides?.llmBaseUrl && overrides?.llmApiKey) {
@@ -74,7 +61,6 @@ export function resolveExplicitLlmConfig(overrides?: {
       baseUrl: overrides.llmBaseUrl,
       apiKey: overrides.llmApiKey,
       model: overrides.llmModel ?? "claude-haiku-4-5-20251001",
-      reflectModel: overrides.reflectModel ?? overrides.llmModel ?? "claude-sonnet-4-6",
       provider,
     };
   }
@@ -89,7 +75,6 @@ export function resolveExplicitLlmConfig(overrides?: {
       baseUrl: hcBaseUrl,
       apiKey: hcApiKey,
       model: hcModel ?? "claude-haiku-4-5-20251001",
-      reflectModel: process.env.HICORTEX_REFLECT_MODEL ?? hcModel ?? "claude-sonnet-4-6",
       provider,
     };
   }
@@ -104,128 +89,42 @@ export function resolveExplicitLlmConfig(overrides?: {
  */
 export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
 
-// ModelTierOverride is defined in types.ts (the schema module) and re-exported
-// here for consumers that import LLM types from this module.
-export type { ModelTierOverride } from "./types.js";
-
 /**
- * Map from a `models.<tier>` name to the flat config keys it feeds. The base
- * tier is `score` — score IS the base model today (completeFast reads
- * config.model), so it lands on the llm* keys and its `provider` is ignored
- * (the base provider comes from llmBackend / detectProvider, not config).
- * Tiers with a `provider` key (distill/reflect/classify) apply their apiKey +
- * provider through a baseUrl-gated overlay downstream; `score` (no provider
- * key) rides the base resolution.
- */
-const MODELS_TIER_KEYS: Record<
-  string,
-  { model: string; baseUrl: string; apiKey: string; provider?: string }
-> = {
-  score: { model: "llmModel", baseUrl: "llmBaseUrl", apiKey: "llmApiKey" },
-  distill: { model: "distillModel", baseUrl: "distillBaseUrl", apiKey: "distillApiKey", provider: "distillProvider" },
-  reflect: { model: "reflectModel", baseUrl: "reflectBaseUrl", apiKey: "reflectApiKey", provider: "reflectProvider" },
-  classify: { model: "classifyModel", baseUrl: "classifyBaseUrl", apiKey: "classifyApiKey", provider: "classifyProvider" },
-};
-
-/**
- * Normalize a nested `models: { <tier>: {model,baseUrl,apiKey,provider} }` block
- * onto the flat `llm*` / `distill*` / `reflect*` / `classify*` keys the resolver
- * already consumes. Nested overrides WIN over any flat key of the same name; every
- * non-mapped key (llmBackend, licenseKey, distillFallback, contextClients, …)
- * is preserved via spread. Pure: returns the SAME reference when there is no
- * `models` key, so this is a provable no-op for every existing install.
+ * Validate + copy the tuning keys (#220: maxTokens + enableThinking + numCtx +
+ * ollama flush) from the saved disk config onto a runtime LlmConfig. Called by
+ * BOTH LlmConfig construction sites — the daemon in mcp-server.ts (runs
+ * distill) AND resolveSavedLlmConfig below (the nightly runs reflect +
+ * classify) — so every process honors the keys, and a future site calling this
+ * inherits them by construction.
  *
- * Robust to a malformed config.json: a config that parses to a scalar, array,
- * or null is returned untouched (matching the pre-0.13.1 optional-chaining
- * tolerance — this function must never throw at server/nightly boot).
- *
- * Fail-explicit (warn + skip, never throw): an invalid `models` value, an
- * unknown tier name, a non-object tier value, a non-string field value, a tier
- * apiKey/provider set without a baseUrl (they are baseUrl-gated downstream), and
- * a dead score apiKey/provider under an ollama base.
+ * All keys are optional; absent = call-site defaults (maxTokens 8192, numCtx
+ * 8192, thinking kwarg omitted, flush off). Wrong-typed values warn and are
+ * dropped (readPositiveConfig / readStrictBoolean / readNonNegativeConfig) —
+ * notably a JSON slip `"enableThinking": "false"` (string) is rejected rather
+ * than coerced to truthy thinking-on, which would silently invert the fix this
+ * key exists to apply.
  */
-export function applyModelsBlock(
-  saved: Record<string, unknown> | null,
-): Record<string, unknown> | null {
-  // Guard the container itself first — `"models" in saved` throws a TypeError on
-  // a truthy non-object (config.json = `true`/`5`/`"x"`); such configs must pass
-  // through so the boot path degrades to recall-only exactly as before.
-  if (typeof saved !== "object" || saved === null || Array.isArray(saved)) return saved;
-  if (!("models" in saved)) return saved;
-
-  const models = saved.models;
-  if (typeof models !== "object" || models === null || Array.isArray(models)) {
-    console.warn(
-      `[hicortex] Ignoring invalid "models" config: expected an object of per-tier overrides, got ${
-        Array.isArray(models) ? "array" : models === null ? "null" : typeof models
-      }`,
-    );
-    return saved;
+export function applyTierTuningOverlay(
+  llmConfig: LlmConfig,
+  savedConfig: Record<string, unknown> | null | undefined,
+): void {
+  if (!savedConfig) return;
+  if (savedConfig.maxTokens !== undefined) {
+    llmConfig.maxTokens = readPositiveConfig(savedConfig, "maxTokens", 8192);
   }
-
-  const ollamaBase = saved.llmBackend === "ollama";
-  const mapped: Record<string, unknown> = {};
-
-  for (const [tier, value] of Object.entries(models as Record<string, unknown>)) {
-    const keys = MODELS_TIER_KEYS[tier];
-    if (!keys) {
-      console.warn(`[hicortex] Ignoring unknown "models" tier "${tier}" (expected: score, distill, reflect, classify)`);
-      continue;
-    }
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      console.warn(`[hicortex] Ignoring invalid "models.${tier}" override: expected an object with model/baseUrl/apiKey/provider`);
-      continue;
-    }
-    const o = value as Record<string, unknown>;
-
-    // Per-field string validation: a non-string value would map verbatim and
-    // fail opaquely downstream (e.g. baseUrl: 11434), so drop it with a warning.
-    const strField = (name: keyof ModelTierOverride): string | undefined => {
-      const v = o[name];
-      if (v === undefined) return undefined;
-      if (typeof v !== "string") {
-        console.warn(`[hicortex] Ignoring non-string "models.${tier}.${name}" (expected a string)`);
-        return undefined;
-      }
-      return v;
-    };
-
-    const model = strField("model");
-    const baseUrl = strField("baseUrl");
-    const apiKey = strField("apiKey");
-    const provider = strField("provider");
-
-    if (model !== undefined) mapped[keys.model] = model;
-    if (baseUrl !== undefined) mapped[keys.baseUrl] = baseUrl;
-
-    if (keys.provider) {
-      // Overlay tier (distill/reflect/classify): the downstream overlay only
-      // consumes apiKey/provider when the tier ALSO sets its own baseUrl.
-      // Without one, they would silently bill to the base key — so warn + drop.
-      if ((apiKey !== undefined || provider !== undefined) && baseUrl === undefined) {
-        console.warn(`[hicortex] Ignoring "models.${tier}" apiKey/provider without a baseUrl: they only take effect when the tier sets its own baseUrl`);
-      } else {
-        if (apiKey !== undefined) mapped[keys.apiKey] = apiKey;
-        if (provider !== undefined) mapped[keys.provider] = provider;
-      }
-    } else {
-      // score = base tier: no separate provider key, and apiKey rides llmApiKey.
-      if (provider !== undefined) {
-        console.warn(`[hicortex] Ignoring "models.score.provider": the base provider comes from llmBackend (or is auto-detected from the endpoint)`);
-      }
-      if (apiKey !== undefined) {
-        if (ollamaBase) {
-          // The ollama base path hardcodes an empty api key and never reads
-          // llmApiKey, so score.apiKey is dead there.
-          console.warn(`[hicortex] Ignoring "models.score.apiKey": the base ollama path sends no api key`);
-        } else {
-          mapped[keys.apiKey] = apiKey;
-        }
-      }
-    }
+  const thinking = readStrictBoolean(savedConfig, "enableThinking");
+  if (thinking !== undefined) {
+    llmConfig.enableThinking = thinking;
   }
-
-  return { ...saved, ...mapped };
+  if (savedConfig.numCtx !== undefined) {
+    llmConfig.numCtx = readPositiveConfig(savedConfig, "numCtx", 8192);
+  }
+  if (savedConfig.ollamaFlushEvery !== undefined) {
+    llmConfig.ollamaFlushEvery = readNonNegativeConfig(savedConfig, "ollamaFlushEvery", 0);
+  }
+  if (savedConfig.ollamaFlushWaitMs !== undefined) {
+    llmConfig.ollamaFlushWaitMs = readPositiveConfig(savedConfig, "ollamaFlushWaitMs", 180000);
+  }
 }
 
 /**
@@ -233,9 +132,8 @@ export function applyModelsBlock(
  *
  * This is the SINGLE config path used by pipeline runs (nightly consolidation
  * and `hicortex relink`): named backends (claude-cli, ollama) first, then the
- * explicit-config/env fallthrough via resolveExplicitLlmConfig, then the
- * reflect endpoint overlay. Extracted verbatim from nightly.ts — behavior
- * is identical to the pre-0.11 inline block.
+ * explicit-config/env fallthrough via resolveExplicitLlmConfig. One model
+ * serves all phases (#231) — there is no per-tier overlay here.
  *
  * Returns `reason: "claude_binary_missing"` when claude-cli is configured but
  * the binary can't be found, so callers can log a context-specific message.
@@ -248,7 +146,6 @@ export function resolveSavedLlmConfig(
   savedConfig: Record<string, unknown> | null,
   findBinary: () => string | null = findClaudeBinary,
 ): { config: LlmConfig | null; reason?: "claude_binary_missing" } {
-  savedConfig = applyModelsBlock(savedConfig);
   let llmConfig: LlmConfig | null = null;
 
   if (savedConfig?.llmBackend === "claude-cli") {
@@ -263,7 +160,6 @@ export function resolveSavedLlmConfig(
       baseUrl: (savedConfig.llmBaseUrl as string | undefined) ?? "http://localhost:11434",
       apiKey: "",
       model: (savedConfig.llmModel as string) ?? "qwen3.5:4b",
-      reflectModel: (savedConfig.reflectModel as string) ?? (savedConfig.llmModel as string) ?? "qwen3.5:4b",
       provider: "ollama",
     };
   } else {
@@ -271,72 +167,16 @@ export function resolveSavedLlmConfig(
       llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
       llmApiKey: savedConfig?.llmApiKey as string | undefined,
       llmModel: savedConfig?.llmModel as string | undefined,
-      reflectModel: savedConfig?.reflectModel as string | undefined,
     });
   }
 
-  if (llmConfig && savedConfig?.reflectBaseUrl) {
-    llmConfig.reflectBaseUrl = savedConfig.reflectBaseUrl as string;
-    llmConfig.reflectApiKey = (savedConfig.reflectApiKey as string | undefined) ?? llmConfig.apiKey;
-    llmConfig.reflectProvider = (savedConfig.reflectProvider as string | undefined) ?? llmConfig.provider;
-  }
-
-  // Optional classify tier (memory tag classification). Same overlay pattern
-  // as distillModel/distillBaseUrl: when absent, completeClassify falls back
-  // to the reflect tier — zero behavior change for existing installs.
-  if (llmConfig && savedConfig?.classifyModel) {
-    llmConfig.classifyModel = savedConfig.classifyModel as string;
-  }
-  if (llmConfig && savedConfig?.classifyBaseUrl) {
-    llmConfig.classifyBaseUrl = savedConfig.classifyBaseUrl as string;
-    llmConfig.classifyApiKey = (savedConfig.classifyApiKey as string | undefined) ?? llmConfig.apiKey;
-    llmConfig.classifyProvider = (savedConfig.classifyProvider as string | undefined) ?? llmConfig.provider;
+  // Tuning overlay (#220: maxTokens + enableThinking + numCtx + flush). Applied
+  // at both construction sites (daemon + nightly) so every phase honors the keys.
+  if (llmConfig) {
+    applyTierTuningOverlay(llmConfig, savedConfig as Record<string, unknown> | null);
   }
 
   return { config: llmConfig };
-}
-
-/**
- * Endpoint + model that memory tag classification will ACTUALLY use, for
- * pre-flight probing. Pure function — the single source of truth shared by
- * the nightly's contentDomainsReady gate and `hicortex classify-domains`.
- *
- * Mirrors LlmClient.completeClassify's routing:
- *   - classify tier configured (classifyModel and/or classifyBaseUrl) →
- *     classifyBaseUrl ?? reflectBaseUrl, classifyModel ?? reflectModel
- *   - classify tier absent → the reflect tier (reflectBaseUrl/reflectModel),
- *     exactly what completeReflect uses
- *
- * Returns null when no probe applies: only a SEPARATE Ollama endpoint can go
- * unreachable mid-run (API providers are cloud-reachable; the base endpoint
- * is not pre-flighted anywhere, matching distill/reflect behavior).
- *
- * `tier` tells callers which configuration produced the target — "reflect"
- * means the classification probe is identical to the reflect-stage probe and
- * its result can be reused.
- */
-export function resolveClassifyProbeTarget(
-  config: LlmConfig,
-): { tier: "classify" | "reflect"; baseUrl: string; model: string } | null {
-  const classifyConfigured = Boolean(config.classifyModel || config.classifyBaseUrl);
-
-  if (classifyConfigured) {
-    const baseUrl = config.classifyBaseUrl ?? config.reflectBaseUrl;
-    const model = config.classifyModel ?? config.reflectModel;
-    const provider = config.classifyBaseUrl
-      ? (config.classifyProvider ?? config.provider)
-      : (config.reflectProvider ?? config.provider); // riding the reflect endpoint
-    if (baseUrl && provider === "ollama") {
-      return { tier: "classify", baseUrl, model };
-    }
-    return null; // base endpoint or API provider — no probe
-  }
-
-  // Classify tier absent — classification delegates to completeReflect.
-  if (config.reflectBaseUrl && (config.reflectProvider ?? config.provider) === "ollama") {
-    return { tier: "reflect", baseUrl: config.reflectBaseUrl, model: config.reflectModel ?? config.model };
-  }
-  return null;
 }
 
 function detectProvider(
@@ -387,7 +227,6 @@ export function claudeCliConfig(claudePath: string): LlmConfig {
     baseUrl: claudePath,
     apiKey: "",
     model: "haiku",
-    reflectModel: "haiku",
     provider: "claude-cli",
   };
 }
@@ -420,112 +259,6 @@ export async function probeOllama(
   }
 }
 
-/**
- * Pre-flight health check for a specific Ollama endpoint + model.
- * Returns { ok, reason } so callers can log a clear abort message.
- *
- *   - `ok: true` — endpoint reachable AND the requested model appears in
- *     `/api/tags`. Safe to proceed with a batch distillation run.
- *   - `ok: false, reason: "unreachable"` — network failure or non-2xx.
- *   - `ok: false, reason: "model_missing"` — endpoint is up but the
- *     model isn't listed (the exact case that caused data loss when
- *     a remote Ollama box didn't have the distill model loaded).
- *
- * Matches on exact name OR name prefix ("qwen3.5:35b" matches "qwen3.5:35b-a3b").
- */
-export async function probeOllamaModel(
-  baseUrl: string,
-  modelName: string,
-): Promise<{ ok: true } | { ok: false; reason: "unreachable" | "model_missing" }> {
-  try {
-    const resp = await fetch(`${baseUrl.replace(/\/$/, "")}/api/tags`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!resp.ok) return { ok: false, reason: "unreachable" };
-    const data = (await resp.json()) as { models?: Array<{ name: string }> };
-    const models = data.models ?? [];
-    const found = models.some(
-      (m) => m.name === modelName || m.name.startsWith(modelName + ":"),
-    );
-    return found ? { ok: true } : { ok: false, reason: "model_missing" };
-  } catch {
-    return { ok: false, reason: "unreachable" };
-  }
-}
-
-/**
- * Resolve the distillation endpoint before a /distill request.
- *
- * @param config  LlmConfig (mutated in "local" mode when fallback is used)
- * @param mode
- *   "strict" (default) — when a separate distillBaseUrl is configured and its
- *     Ollama probe fails, return "abort" immediately WITHOUT mutating config.
- *     The session is not distilled now; the nightly watermark is not advanced,
- *     so the session is re-shipped on the next run (harness stores retain raw
- *     for 30–90 days — the retry IS the queue). Prefer this to producing
- *     low-quality memories from a weak fallback model.
- *   "local" — legacy 0.9.0 behaviour: fall back to the base endpoint (local
- *     Ollama or API provider) when the remote is down. Mutates config IN PLACE
- *     to repoint distill* at the fallback.
- *
- * Returns:
- *   "ok"       — remote distill endpoint healthy, or no separate endpoint set
- *   "fellback" — ("local" mode only) remote down; distill redirected to base
- *   "abort"    — remote down and fallback not allowed (strict) or both down (local)
- */
-export async function resolveDistillFallback(
-  config: LlmConfig,
-  mode: "strict" | "local" = "strict",
-): Promise<"ok" | "fellback" | "abort"> {
-  const distillProvider = config.distillProvider ?? config.provider;
-  // Only a remote Ollama distill endpoint can go unreachable mid-run; API
-  // providers are cloud-reachable and need no fallback.
-  if (!config.distillBaseUrl || distillProvider !== "ollama") return "ok";
-
-  const distillModel = config.distillModel ?? config.model;
-  const remote = await probeOllamaModel(config.distillBaseUrl, distillModel);
-  if (remote.ok) return "ok";
-
-  const reason =
-    remote.reason === "unreachable"
-      ? `remote distill endpoint unreachable (${config.distillBaseUrl})`
-      : `remote distill model not loaded (${distillModel} on ${config.distillBaseUrl})`;
-
-  if (mode === "strict") {
-    // Do not mutate config. Log once and let the caller return 503 so the
-    // nightly watermark stays put and the session is retried next run.
-    console.error(
-      `[hicortex] ABORT: ${reason} — session will be retried next run`,
-    );
-    return "abort";
-  }
-
-  // "local" mode: fall back to the base endpoint.
-  // If the base is Ollama, verify it is actually up before committing;
-  // if the base is an API provider, it is cloud-reachable.
-  if (config.provider === "ollama") {
-    const local = await probeOllamaModel(config.baseUrl, config.model);
-    if (!local.ok) {
-      console.error(
-        `[hicortex] ABORT: ${reason}, and local fallback (${config.model} on ${config.baseUrl}) also unavailable — retry next run`,
-      );
-      return "abort";
-    }
-    config.distillBaseUrl = config.baseUrl;
-  } else {
-    // Base is an API provider — route distill through it (no separate baseUrl).
-    config.distillBaseUrl = undefined;
-  }
-  config.distillModel = config.model;
-  config.distillProvider = config.provider;
-  config.distillApiKey = config.apiKey;
-  console.warn(
-    `[hicortex] ${reason} — falling back to base endpoint for distillation ` +
-      `(${config.provider}/${config.model}). Lower quality, but capture continues.`,
-  );
-  return "fellback";
-}
-
 // ---------------------------------------------------------------------------
 // LLM Client class
 // ---------------------------------------------------------------------------
@@ -542,16 +275,16 @@ export class RateLimitError extends Error {
   }
 }
 
-// Rate-limit backoff is shared across all LlmClient instances that target the
-// same endpoint, keyed by provider@baseUrl. completeWithOverride() spins up a
-// throwaway client per call for the distill/reflect/classify override tiers;
-// with per-instance state each throwaway started un-rate-limited and re-hit a
-// 429'd provider immediately, defeating the backoff on exactly the configs
-// (e.g. z.ai via distillBaseUrl/reflectBaseUrl) that route through those tiers.
+// Rate-limit backoff is keyed by provider@baseUrl at module scope so it is
+// shared across any LlmClient instances that target the same endpoint (e.g. a
+// daemon client + a future constructed client). One model serves all phases
+// (#231), so in practice there is a single client per process today; the
+// module-level map keeps the state shared correctly if that ever changes.
 const rateLimitedUntilByEndpoint = new Map<string, number>();
 
 export class LlmClient {
   private config: LlmConfig;
+  private ollamaCallCount = 0;
 
   constructor(config: LlmConfig) {
     this.config = config;
@@ -587,118 +320,58 @@ export class LlmClient {
   }
 
   /**
-   * Fast-tier completion (importance scoring, simple tasks).
+   * Fast-tier completion (importance scoring, simple tasks). One model serves
+   * all phases (#231); numCtx + enableThinking are read from config directly
+   * inside completeOnce's per-provider dispatch, not threaded here. The periodic
+   * ollama flush stays (provider-gated) — it is a scoring-call-count cadence and
+   * scoring is the highest-frequency call, so this is where the flush belongs.
    */
-  async completeFast(prompt: string, maxTokens = 2048): Promise<string> {
-    return this.complete(this.config.model, prompt, maxTokens, 600_000);
+  async completeFast(prompt: string, maxTokens?: number): Promise<string> {
+    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
+    const result = await this.complete(this.config.model, prompt, tokens, 600_000);
+    const flushEvery = this.config.ollamaFlushEvery ?? 0;
+    if (this.config.provider === "ollama" && flushEvery > 0) {
+      this.ollamaCallCount++;
+      if (this.ollamaCallCount >= flushEvery) {
+        await this.flushOllama(this.config.model);
+        this.ollamaCallCount = 0;
+      }
+    }
+    return result;
   }
 
   /**
-   * Reflect-tier completion (nightly reflection, needs reasoning).
-   * Routes to reflectBaseUrl/reflectProvider if configured (e.g. remote Ollama with larger model).
+   * Reflect-tier completion (nightly reflection). One model serves all phases
+   * (#231) — this is a thin wrapper kept for call-site readability.
    */
-  async completeReflect(prompt: string, maxTokens = 8192): Promise<string> {
-    if (this.config.reflectBaseUrl) {
-      return this.completeWithOverride(
-        this.config.reflectBaseUrl,
-        this.config.reflectApiKey ?? this.config.apiKey,
-        this.config.reflectProvider ?? this.config.provider,
-        this.config.reflectModel,
-        prompt,
-        maxTokens,
-        900_000,
-      );
-    }
-    return this.complete(this.config.reflectModel, prompt, maxTokens, 900_000);
+  async completeReflect(prompt: string, maxTokens?: number): Promise<string> {
+    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
+    return this.complete(this.config.model, prompt, tokens, 900_000);
   }
 
   /**
-   * Distillation-tier completion (session knowledge extraction).
-   * Routes to distillBaseUrl/distillProvider if configured (e.g. remote Ollama with faster model).
+   * Distillation-tier completion (session knowledge extraction). One model
+   * serves all phases (#231) — thin wrapper kept for call-site readability.
    */
-  async completeDistill(prompt: string, maxTokens = 2048): Promise<string> {
-    if (this.config.distillBaseUrl) {
-      return this.completeWithOverride(
-        this.config.distillBaseUrl,
-        this.config.distillApiKey ?? this.config.apiKey,
-        this.config.distillProvider ?? this.config.provider,
-        this.config.distillModel ?? this.config.model,
-        prompt,
-        maxTokens,
-        900_000,
-      );
-    }
-    return this.complete(this.config.distillModel ?? this.config.model, prompt, maxTokens, 900_000);
+  async completeDistill(prompt: string, maxTokens?: number): Promise<string> {
+    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
+    return this.complete(this.config.model, prompt, tokens, 900_000);
   }
 
   /**
-   * Classification-tier completion (memory tag classification).
-   *
-   * Routing (same "optional dedicated model+baseUrl with fallback" pattern as
-   * completeDistill; Ollama calls inherit think:false via completeOllama):
-   *   - Neither classifyModel nor classifyBaseUrl set → delegate to
-   *     completeReflect (exactly the pre-classify-tier behavior).
-   *   - classifyBaseUrl set → that endpoint, model classifyModel ?? reflectModel.
-   *   - Only classifyModel set → the classify model on the reflect endpoint
-   *     when one is configured, else on the base endpoint.
+   * Classification-tier completion (memory tag classification). One model
+   * serves all phases (#231) — thin wrapper kept for call-site readability.
    */
-  async completeClassify(prompt: string, maxTokens = 8192): Promise<string> {
-    if (!this.config.classifyModel && !this.config.classifyBaseUrl) {
-      return this.completeReflect(prompt, maxTokens);
-    }
-    const model = this.config.classifyModel ?? this.config.reflectModel;
-    if (this.config.classifyBaseUrl) {
-      return this.completeWithOverride(
-        this.config.classifyBaseUrl,
-        this.config.classifyApiKey ?? this.config.apiKey,
-        this.config.classifyProvider ?? this.config.provider,
-        model,
-        prompt,
-        maxTokens,
-        900_000,
-      );
-    }
-    if (this.config.reflectBaseUrl) {
-      return this.completeWithOverride(
-        this.config.reflectBaseUrl,
-        this.config.reflectApiKey ?? this.config.apiKey,
-        this.config.reflectProvider ?? this.config.provider,
-        model,
-        prompt,
-        maxTokens,
-        900_000,
-      );
-    }
-    return this.complete(model, prompt, maxTokens, 900_000);
-  }
-
-  /**
-   * Complete with overridden baseUrl/apiKey/provider (used for reflect tier with separate endpoint).
-   * Creates a temporary LlmClient to avoid mutating shared config under concurrent calls.
-   */
-  private async completeWithOverride(
-    baseUrl: string,
-    apiKey: string,
-    provider: string,
-    model: string,
-    prompt: string,
-    maxTokens: number,
-    timeoutMs: number,
-  ): Promise<string> {
-    const tempClient = new LlmClient({
-      ...this.config,
-      baseUrl,
-      apiKey,
-      provider,
-    });
-    return tempClient.complete(model, prompt, maxTokens, timeoutMs);
+  async completeClassify(prompt: string, maxTokens?: number): Promise<string> {
+    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
+    return this.complete(this.config.model, prompt, tokens, 900_000);
   }
 
   private async complete(
     model: string,
     prompt: string,
     maxTokens: number,
-    timeoutMs: number
+    timeoutMs: number,
   ): Promise<string> {
     if (this.isRateLimited) {
       throw new RateLimitError(this.rateLimitedUntil - Date.now());
@@ -727,7 +400,7 @@ export class LlmClient {
     model: string,
     prompt: string,
     maxTokens: number,
-    timeoutMs: number
+    timeoutMs: number,
   ): Promise<string> {
     if (this.config.provider === "claude-cli") {
       return this.completeClaude(model, prompt, timeoutMs);
@@ -738,6 +411,7 @@ export class LlmClient {
     if (this.config.provider === "anthropic") {
       return this.completeAnthropic(model, prompt, maxTokens, timeoutMs);
     }
+    // enableThinking is read from config here (one value, all phases — #231).
     return this.completeOpenAiCompat(model, prompt, maxTokens, timeoutMs);
   }
 
@@ -774,12 +448,13 @@ export class LlmClient {
 
   /**
    * Ollama: use /api/generate with think:false (important for qwen3.5 models).
+   * num_ctx is read from config (one value, all phases — #231; default 8192).
    */
   private async completeOllama(
     model: string,
     prompt: string,
     maxTokens: number,
-    timeoutMs: number
+    timeoutMs: number,
   ): Promise<string> {
     const url = `${this.config.baseUrl.replace(/\/$/, "")}/api/generate`;
     // Ollama can take minutes to process large contexts — use streaming to avoid
@@ -792,7 +467,11 @@ export class LlmClient {
         prompt,
         stream: true,
         think: false,
-        options: { num_predict: maxTokens, num_ctx: 32768 },
+        // num_ctx: one value for all phases (#231), default 8192 — the point where
+        // context stops being the binding constraint for a sub-8B model on ollama
+        // (above it the SMALL_MODEL_MAX_CHUNK_CHARS speed cap binds instead). Also
+        // drives detectChunkSize, so the chunker and the request agree by construction.
+        options: { num_predict: maxTokens, num_ctx: this.config.numCtx ?? 8192 },
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
@@ -824,6 +503,33 @@ export class LlmClient {
       }
     }
     return result.trim();
+  }
+
+  /**
+   * Flush ollama's accumulated memory: unload the model (keep_alive:0) so the
+   * runner exits + releases its per-request RSS growth, then wait for the release
+   * before the next call reloads fresh. The runner takes >90 s to exit after
+   * keep_alive:0 (measured), so the wait is generous (ollamaFlushWaitMs, default
+   * 180 s). Logs the flush so the wait is distinguishable from a hang. If the
+   * unload request fails (ollama down), the wait is skipped — no dead time for a
+   * release that can't have happened. See #229 review.
+   */
+  private async flushOllama(model: string): Promise<void> {
+    const url = `${this.config.baseUrl.replace(/\/$/, "")}/api/generate`;
+    const waitMs = this.config.ollamaFlushWaitMs ?? 180_000;
+    console.log(`[hicortex] ollama flush: unloading ${model} after ${this.ollamaCallCount} scoring calls, waiting ${waitMs / 1000}s for memory release…`);
+    try {
+      await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ model, keep_alive: 0 }),
+        signal: AbortSignal.timeout(60_000),
+      });
+      await new Promise((r) => setTimeout(r, waitMs));
+      console.log(`[hicortex] ollama flush: complete`);
+    } catch {
+      console.warn(`[hicortex] ollama flush: unload request failed (ollama unreachable?) — skipping wait`);
+    }
   }
 
   /**
@@ -870,12 +576,13 @@ export class LlmClient {
 
   /**
    * OpenAI-compatible /v1/chat/completions (works for OpenAI, OpenRouter, etc).
+   * enableThinking is read from config here (one value, all phases — #231).
    */
   private async completeOpenAiCompat(
     model: string,
     prompt: string,
     maxTokens: number,
-    timeoutMs: number
+    timeoutMs: number,
   ): Promise<string> {
     const baseUrl = this.config.baseUrl.replace(/\/$/, "");
     // Some providers include the API version in the base URL already
@@ -891,14 +598,27 @@ export class LlmClient {
       headers["Authorization"] = `Bearer ${this.config.apiKey}`;
     }
 
+    // Qwen3 thinking mode: when on, the model can burn the whole token budget on
+    // an unclosed <think> block and emit nothing (probed 2026-08-04). One value
+    // for all phases (#231): when set (true or false) the chat_template_kwargs
+    // kwarg rides every call — so it is LOCAL-endpoint only (ollama, mlx-lm
+    // gateway); a cloud OpenAI/OpenRouter/Groq endpoint would 400 on the unknown
+    // field. provider cannot gate this (the MLX gateway is also provider:openai),
+    // so the operator leaves enableThinking unset for cloud endpoints. See #220.
+    const thinking = this.config.enableThinking;
+    const body: Record<string, unknown> = {
+      model,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: maxTokens,
+    };
+    if (thinking !== undefined) {
+      body.chat_template_kwargs = { enable_thinking: thinking };
+    }
+
     const resp = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({
-        model,
-        messages: [{ role: "user", content: prompt }],
-        max_tokens: maxTokens,
-      }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
     });
 

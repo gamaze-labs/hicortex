@@ -14,10 +14,12 @@
  * readable here nightly. No runtime plugin capture is needed; the Hermes plugin
  * is recall-only.
  *
- * We process only ENDED sessions (ended_at set) that ended since the last run.
- * A live session is distilled after it ends — this avoids partial-session
- * distillation and keeps per-session dedup clean (chunks are stored as
- * `<sessionId>#<chunkIndex>`; see nightly.ts).
+ * We process ENDED sessions (ended_at set) that ended since the last run PLUS
+ * OPEN sessions (ended_at NULL) that have messages — a Discord conversation is
+ * one long-lived thread that stays open and accrues content, so gating only on
+ * ended_at would drop the whole interactive corpus (#240). Open sessions are
+ * delta-sliced by the per-session cursor; per-session dedup stays clean
+ * (chunks are stored as `<sessionId>#<chunkIndex>`; see nightly.ts).
  */
 
 import { readdirSync, statSync, existsSync } from "node:fs";
@@ -59,8 +61,15 @@ interface HermesMessageRow {
 }
 
 /**
- * Read Hermes sessions that ended since `since`, across all profiles.
- * Returns one batch per session, parallel to readCcTranscripts().
+ * Read Hermes sessions across all profiles: ended sessions newer than `since`
+ * (the bulk watermark) PLUS open sessions (`ended_at IS NULL`) that have any
+ * message. Returns one batch per session, parallel to readCcTranscripts().
+ *
+ * Why open sessions are included (#240): in Hermes' Discord model a
+ * conversation is one long-lived thread = one session that stays open for
+ * days/weeks and accumulates the interactive content. The per-session cursor
+ * slices each such thread to its unseen delta across runs (same discover-
+ * broadly / delta-narrowly model as CC readers).
  *
  * @param cursors Per-session capture cursors (#189), keyed `hermes:<profile>:<sid>`.
  *   The cursor value is the max `messages.id` already captured; a resumed +
@@ -83,9 +92,25 @@ export function readHermesSessions(
     }
 
     try {
+      // Discovery (#240): ended sessions past the watermark (bulk) PLUS open
+      // sessions (ended_at IS NULL) that have any message. In Hermes' Discord
+      // model a conversation is ONE long-lived thread = one session that stays
+      // open for days/weeks and accumulates essentially all the interactive
+      // content. Gating discovery only on `ended_at IS NOT NULL` meant those
+      // open threads were NEVER discovered → distilled — the entire interactive
+      // corpus was silently dropped. The per-session cursor below slices each
+      // open session to its unseen delta across runs (same model as CC: discover
+      // broadly, delta narrowly), and `rows.length === 0` skips an open session
+      // that is already current. The EXISTS probe is one cheap check per open
+      // session (typically one open thread per agent).
       const sessions = db
         .prepare(
-          "SELECT id, ended_at, source FROM sessions WHERE ended_at IS NOT NULL AND ended_at > ? ORDER BY ended_at"
+          `SELECT id, ended_at, source FROM sessions
+            WHERE (ended_at IS NOT NULL AND ended_at > ?)
+               OR (ended_at IS NULL AND EXISTS (
+                     SELECT 1 FROM messages WHERE messages.session_id = sessions.id
+                   ))
+            ORDER BY (ended_at IS NULL), ended_at`
         )
         .all(sinceEpoch) as HermesSessionRow[];
 

@@ -74,6 +74,13 @@ export function createAuthMiddleware(
     // every other data route; the page collects the token client-side and
     // sends it as a normal Authorization header on its /context fetches.
     if (req.method === "GET" && req.path === "/context/ui") return next();
+    // The /dashboard page SHELL is public for the same reason as /viz and
+    // /context/ui: a self-contained view-only analytics page, no data and no
+    // secrets (it ships verbatim in the npm tarball). All metric data comes
+    // from GET /dashboard/data, which stays bearer-only (localhost bypass) like
+    // every other data route; the page collects the token client-side and
+    // sends it as a normal Authorization header on its /dashboard/data fetch.
+    if (req.method === "GET" && req.path === "/dashboard") return next();
     // The pinned renderer bundles the /viz page loads (#139) are public for
     // the same reason as the shell: static third-party code shipped verbatim
     // in the npm tarball, zero data. Kept tight: GET only, and ONLY names on
@@ -176,6 +183,48 @@ export function contextUiHandler(): express.RequestHandler {
   return (_req, res) => {
     try {
       res.type("html").send(readContextHtml());
+    } catch (err) {
+      res.status(503).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Dashboard page (/dashboard, #224 — view-only memory analytics)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the on-disk path of the dashboard page. Throws (fail explicitly)
+ * when the asset is missing — same contract as resolveVizHtmlPath and
+ * resolveContextHtmlPath. assets/ sits next to both dist/ and src/ (the
+ * sibling layout the other resolvers rely on).
+ */
+export function resolveDashboardHtmlPath(): string {
+  const candidates = [join(__dirname, "..", "assets", "dashboard.html")];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) return candidate;
+  }
+  throw new Error(
+    `dashboard.html asset not found — looked in: ${candidates.join(", ")}. ` +
+    `The package install is incomplete (assets/ missing).`
+  );
+}
+
+/** Read the dashboard page. Read at request time so a reinstall is picked up live. */
+export function readDashboardHtml(): string {
+  return readFileSync(resolveDashboardHtmlPath(), "utf-8");
+}
+
+/**
+ * Express handler for GET /dashboard — the view-only analytics page (#224).
+ * 503 with the usual {error} shape when the asset cannot be read, exactly like
+ * vizHandler and contextUiHandler. The page SHELL is public (exempted in
+ * createAuthMiddleware); all data comes from GET /dashboard/data (bearer-only).
+ */
+export function dashboardHandler(): express.RequestHandler {
+  return (_req, res) => {
+    try {
+      res.type("html").send(readDashboardHtml());
     } catch (err) {
       res.status(503).json({ error: err instanceof Error ? err.message : String(err) });
     }

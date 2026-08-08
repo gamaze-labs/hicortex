@@ -199,20 +199,28 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 |-------|-------------|
 | `mode` | `"server"` (default) or `"client"` |
 | `serverUrl` | Remote server URL (client mode) |
-| `llmModel` | The one model the whole pipeline uses (server mode). One model is the happy path; route individual stages with `models` — see [Advanced: per-stage models](#advanced-per-stage-models) |
-| `models` | Optional nested per-stage model overrides (`score`/`distill`/`reflect`/`classify`) — see [Advanced: per-stage models](#advanced-per-stage-models) |
-| `distillFallback` | `"strict"` (default) — abort on remote distill failure, retry next run; `"local"` — fall back to base model (lower quality, 0.9.0 behaviour) |
+| `llmModel` | The one model used by all phases (distill, score, classify, reflect). Set via `init`. |
+| `numCtx` | Context window for ollama (default 8192, one value for all phases). Scoring uses ~850 tokens, so 2048 is ample; distill/reflect/classify need more for `detectChunkSize`'s chunk sizing. |
+| `enableThinking` | Toggle the model's internal reasoning ("thinking") stream for OpenAI-compatible endpoints (default false). Only meaningful for local chat-template-aware servers (ollama, mlx-lm); leave unset for cloud OpenAI/OpenRouter/Groq endpoints (they 400 on the unknown `chat_template_kwargs` field). |
+| `maxTokens` | Max output tokens for all phases (default 8192). A ceiling, not a target — the model stops early when done. |
+| `ollamaFlushEvery` | Flush ollama's accumulated memory every N scoring calls. **Off by default (0)** — opt-in only for an **ollama** install whose runner RSS growth (~171 MB/call) swap-thrashes long consolidations on a RAM-constrained box; N=15 caps a cycle at ~2.5 GB. Gated on the provider being ollama (local **or** remote) — no effect for non-ollama providers. Only you can judge whether your ollama endpoint actually suffers the growth (a managed/cloud ollama host may not), so it stays off until you set it. |
+| `ollamaFlushWaitMs` | Milliseconds to wait after an ollama flush for the runner to exit + release memory (default 180000 = 3 min). |
 | `authToken` | Bearer token for endpoint auth. Generated on first `init` in server mode. Find the active token with `hicortex status` or in `~/.hicortex/config.json`. |
 | `corsAllowedOrigins` | Browser origins allowed to read cross-origin responses, e.g. `["https://ui.example.com"]`. **Empty by default** — the server sends no `Access-Control-Allow-Origin` and never `Allow-Credentials`, so no external web page can read its data. The bundled `/viz` and `/context/ui` pages are same-origin and need no entry. |
 | `licenseKey` | Commercial license key (optional; for display in `hicortex status`) |
 | `domains` | Your memory domain list (`[{name, description}]`). Scaffolded by `init`; edit freely — see [Memory Domains & Tags](#memory-domains--tags) |
 | `weakPrimaryFloor` | Minimum similarity for a no-fit memory to keep a weak domain association (default: 0.45) |
 | `moduleIndexTokenBudget` | Max tokens for domain index in lessons context (default: 500) |
+| `lessonsLimit` | Max lessons injected into an agent's session-start context (default: 10). Lessons are ranked per session by project/domain affinity + recency + strength + access, so each session sees its most-relevant slice. Lower = leaner system prompts. |
 | `contextClients` | Which harnesses inject the [context layer](#context-layer) at session start (default `["cc"]`; `"all"` or any subset of `cc`/`hermes`/`oc`) |
 | `contextAgents` | Per-agent context modes (0.13): `{ "<id>": "override" \| "global" \| "off" }`. Absent + no `agents/<id>/` dir → every agent gets the global set. Boot-time (restart to apply) — see [Per-agent context](#per-agent-context-013) |
 | `agentName` | This install's per-agent context id sent as `?agent=`. **Unset by default** (CC shares the global context — no `?agent=` sent). Explicit opt-in via `init --agent-name <name>`; `init --agent-name ""` clears it. An empty/whitespace value equals unset |
-| `nightlyHour` | Local hour (0–23) for the nightly job installed by `init` (defaults: client 2, server 3). Applied on fresh installs; existing schedules are never overwritten |
-| `preflightTimeoutMs` | **Client mode only.** Per-attempt timeout for the nightly's server-reachability check before it starts capturing (default: 15000 ms) |
+| `captureCooldownHours` | Success-cooldown (hours) for the **capture watchdog** (0.17). The capture timer polls every ~20 min; the watchdog captures only if more than this has elapsed since the last *successful* capture (`state.lastNightly`). Default `6` (≈4 captures/day). A failed preflight retries on the next poll (~20 min) — so a transient fire-instant network miss costs minutes, not a day (#239) |
+| `consolidationHours` | Hours (0–23, local) for the **consolidation** timer — the full nightly (capture + distill + score + reflect + link). Installed for **server/co-located only** (clients have no local DB). Default `[10, 22]`: the 22:00 evening slot runs after the day's capture waves (same-day results); the 10:00 morning slot runs *after* the morning capture so wake-up pushes are caught. Omitted on clients |
+| `consolidateMaxLlmCalls` | Ceiling on total LLM calls across all classify-tier consolidation stages (content-domain, link discovery, supersession) per run. A runaway **backstop**, not a throughput throttle — on a free local model the binding constraint is the nightly unit's wall-clock timeout, not call count. Default `5000` (was a hard-coded 200 that starved link/supersession during a classification backlog) |
+| `updateChannel` | Release channel pinned into the generated daemon/timer ExecStart for **npx-thin** installs (global-binary installs use the absolute binary and are unaffected). A dist-tag (`"rc"`, `"next"`) or an exact version (`"0.17.1"`). E.g. `"rc"` → the timer runs `npx -y @gamaze/hicortex@rc nightly`, so the host tracks the rc dist-tag (an internal fleet can ride rc through a pre-promotion soak). Validated as `[\w.\-]+` (rejects anything that'd break the unit/plist templates). Absent → auto-detect (bare on `latest`, else `@next`). (0.17.1) |
+| `nightlyHour` | **Deprecated (0.17) single-slot fallback.** Local hour (0–23) honoured only when `consolidationHours` is absent — yields one daily consolidation slot at that hour (preserves the pre-0.17 "one daily job" intent). New installs should use `consolidationHours` |
+| `preflightTimeoutMs` | **Client mode only.** Per-attempt timeout for the nightly's server-reachability check before it starts capturing (default: 20000 ms, bumped from 15000 in 0.17 to absorb a slow link re-establishing after the client wakes) |
 | `preflightAttempts` | **Client mode only.** Reachability-check retries before the nightly aborts (default: 3; floored at 1). `1` = single try, no retry |
 | `preflightRetryGapMs` | **Client mode only.** Delay between reachability retries (default: 60000 ms). Note: timers don't advance while the machine is asleep, so on a sleeping laptop this gap counts awake-time, not wall-clock |
 | `scoreSimilarityWeight` | Weight of semantic similarity in the ranking score (default: 0.50) |
@@ -295,30 +303,6 @@ LLM selection is **user-controlled**: `npx @gamaze/hicortex init` detects candid
 
 If no LLM is configured, the server starts in **recall-only mode**: search, lessons, and context work; `/distill` and consolidation are disabled. Run `npx @gamaze/hicortex init` to configure.
 
-### Advanced: per-stage models
-
-The happy path is **one model** (`llmModel`) for the whole pipeline. If you want to route the four pipeline stages to different models or endpoints, add a nested `models` block to `~/.hicortex/config.json`:
-
-```json
-{
-  "llmBackend": "ollama",
-  "llmModel": "qwen3.5:4b",
-  "models": {
-    "score":    { "model": "qwen3.5:4b" },
-    "distill":  { "model": "qwen3.5:35b-a3b", "baseUrl": "http://gpu-box:11434" },
-    "reflect":  { "model": "qwen3.5:35b-a3b", "baseUrl": "http://gpu-box:11434" },
-    "classify": { "model": "gemma4-31b",      "baseUrl": "http://gpu-box:11434" }
-  }
-}
-```
-
-The four tiers: `score` (importance scoring — this **is** the base model), `distill` (session distillation, 9b+ recommended), `reflect` (nightly reflection, largest available), `classify` (memory-domain tagging). Each accepts `model`, `baseUrl`, `apiKey`, and `provider`. Omitting a tier inherits: `distill` and `reflect` fall back to the **base** (`score`) model; **`classify` falls back to the `reflect` tier** (not the base — `classify` delegates to the reflect path when unset).
-
-- **Flat keys still work.** `distillModel`/`distillBaseUrl`/`reflectModel`/`reflectBaseUrl`/`classifyModel`/`classifyBaseUrl` remain supported at **lower precedence** — a `models` entry wins over the flat key of the same name.
-- **A tier's `apiKey`/`provider` require the tier's own `baseUrl`.** They only take effect when the tier sets `baseUrl`; set on a tier without a `baseUrl` they are **ignored with a warning** (a bare `models.reflect: { model, apiKey }` would otherwise silently bill to the base key). Set `provider` when a tier's `baseUrl` points at a different provider type than the base (e.g. an OpenAI-compatible API while the base is Ollama); set `apiKey` for an API-provider tier over an Ollama base, whose base key is empty (`""`).
-- **`init` writes a flat `llmModel`.** The already-configured guard now recognizes a nested-only config (`models.score`), so re-running `init` on one is a no-op. But if a config has **both** a flat `llmModel` and a `models.score.model`, the nested value **shadows** the flat one (nested > flat) — keep the model in one place.
-- **`score.provider` (and `score.apiKey` on an Ollama base) are ignored** (a warning is logged): the base provider comes from `llmBackend` (or is auto-detected from the base endpoint), and the Ollama base path sends no api key.
-
 ## Database
 
 Canonical location: `~/.hicortex/hicortex.db`. The OC plugin no longer owns its own database — it is a thin client to the server. Previously, OC installations at `~/.openclaw/data/hicortex.db` were migrated automatically on upgrade; this migration path remains in the server's `resolveDbPath` for any pre-0.10.0 installations.
@@ -334,7 +318,7 @@ npm test
 
 ## Troubleshooting
 
-**`init` fails with "Refusing to write ~/.hicortex/config.json":** the file exists but is not valid JSON — usually a hand-edit slip (a trailing comma, a truncated write). `init` refuses rather than overwriting it, because overwriting would lose `authToken`, `licenseKey`, `distillApiKey`, and your `domains` list. Two ways out:
+**`init` fails with "Refusing to write ~/.hicortex/config.json":** the file exists but is not valid JSON — usually a hand-edit slip (a trailing comma, a truncated write). `init` refuses rather than overwriting it, because overwriting would lose `authToken`, `licenseKey`, and your `domains` list. Two ways out:
 
 1. **Preferred — fix the JSON.** The error names the parse failure and its position. Correct it and re-run `init`. Nothing is lost.
 2. **`npx @gamaze/hicortex init --repair-config`.** Moves the broken file to `config.json.corrupt-<timestamp>` and rebuilds from scratch. Nothing is deleted, and it prints the top-level key names it found (names only — never secret values) so you know what to copy back. **This mints a new `authToken`**, so every thin client pointing at this server must be updated or its recall will silently 401 (recall is fail-soft — you will see no error, just no memories).

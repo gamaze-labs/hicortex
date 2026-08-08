@@ -3,6 +3,86 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.17.1] - 2026-08-07
+
+Two rollout-edge fixes surfaced by the 0.17.0 fleet migration.
+
+### Fixed
+- **`init` no longer throws `ENOENT ~/.claude/settings.json` on a host with no CC client** (a server, or a Hermes-only box). `allowHicortexTools` had tried to mkdir+write a stub CC settings file when it was absent; the `writeFileSync` was the throw. Now it skips gracefully (only edits an existing CC settings file) — the MCP works either way; CC just prompts before tool use without the entry.
+
+### Added
+- **`updateChannel` config key for npx-thin installs.** `getPackageSpec`'s auto-detect pinned `@next` whenever the running version differed from `latest` — but during a pre-promotion soak the running version is ahead of both `latest` and `next`, so npx-thin hosts got pinned to `@next` (an older version). The new key overrides the spec — a dist-tag (`"rc"`, `"next"`) or an exact version (`"0.17.1"`) — so an internal fleet can ride `rc` through a soak. Default behaviour preserved (bare on `latest`, else `@next`). Validated `[\w.\-]+`. Only affects npx-thin installs; global-binary hosts use the absolute binary.
+
+## [0.17.0] - 2026-08-07
+
+First public release since 0.15.3. The 0.16.x versions below (one-model refactor, sharper lessons, startup warning) were internal iterations never published to `latest`/`next`; 0.17.0 bundles them with the capture/scheduling rework and ships as one release.
+
+### Added
+- **Capture watchdog (#239).** A uniform capture mechanism installed on every install (client + server/co-located): a short-interval (~20 min) timer fires `nightly --capture-only --watchdog`, throttled by a success-cooldown (`captureCooldownHours`, default 6 h) and gated by a 5 s reachability preflight. A transient fire-instant network miss now retries in minutes instead of waiting for the next daily slot — a once-daily client fire that caught a slow/flaky link previously lost ~24 h of capture per miss.
+- **Memory analytics dashboard (#224).** A new view-only `/dashboard` page (alongside `/viz`) with growth/composition/recall-adoption/nightly-digest sections, a nightly `dashboard_snapshots` series (migration v12), and `uses-per-showing` as the headline metric. Strictly read-only — not an approval queue.
+- **Config keys:** `captureCooldownHours` (default 6), `consolidationHours` (default [10, 22], server/co-located only), `consolidateMaxLlmCalls` (default 5000, was hard-coded 200). Every nightly log line is now ISO-timestamped (the file log had no timestamps, which made capture gaps un-diagnosable).
+
+### Changed
+- **Scheduling unification.** One capture mechanism (the watchdog) everywhere + a fixed-slot consolidation timer (`consolidationHours`) on server/co-located only. Re-init rewrites timers to the resolved standard; the legacy `nightlyHour` is honoured as a single-slot consolidation fallback when `consolidationHours` is absent. `captureHours` removed → `captureCooldownHours`. Multi-slot via native systemd `OnCalendar`×N / launchd `StartCalendarInterval` arrays; the watchdog uses `OnUnitActiveSec` / `StartInterval`.
+- **Hermes open-thread discovery (#240).** The Hermes reader gated discovery on `ended_at IS NOT NULL`, but a Discord conversation is one long-lived open thread (`ended_at = NULL`) that accrues the interactive content — so it was never distilled. Open sessions with messages are now discovered and delta-sliced by the per-session cursor. cron exclusion unchanged.
+- **Consolidation budget config-driven (#241).** The hard-coded 200-call ceiling (sized for a paid-cloud model that no longer applies, and shared across content-domain/link/supersession so a classification backlog starved link/supersession) is now `consolidateMaxLlmCalls`, default 5000 — a runaway backstop, not a throttle (on a free local model the binding constraint is wall-clock, not call count). Coupled to a new `TimeoutStartSec=6h` consolidation backstop (raised in lockstep).
+- **Preflight per-attempt timeout 15 s → 20 s** (`preflightTimeoutMs`), to absorb a slow link re-establishing after the client wakes.
+
+### Notes
+- Consolidation `consolidation` status (`completed`/`skipped`/`failed`/`no_llm`) is now in the nightly telemetry, so a real run is distinguishable from the built-in nothing-to-do skip.
+- **Upgraders from ≤0.16.7:** the 0.16.10 startup warning names any ignored per-stage model keys / `distillFallback`. Consolidate into `llmModel`/`llmBaseUrl`/`llmProvider` and remove the old keys to clear it.
+
+## [0.16.10] - UNRELEASED
+
+### Added
+- **Startup warning for ignored config keys.** 0.16.8 made one model serve all phases and stopped reading the per-stage keys (`distillModel`/`distillBaseUrl`/`distillApiKey`/`distillProvider`, `reflectModel`/`reflectBaseUrl`/`reflectApiKey`/`reflectProvider`, `classifyModel`/`classifyBaseUrl`/`classifyApiKey`/`classifyProvider`, and the nested `models` block); #232 removed `distillFallback` entirely. For a user upgrading from ≤0.16.7 who had a larger model on a separate distill/reflect tier, the model keys are now silently ignored — distillation/reflection/classification would silently drop to `llmModel`; and a `"distillFallback": "local"` setting silently stops falling back (strict mode is default). The daemon boot and the nightly now warn loudly at config-read time, naming the ignored keys and the corrective action, so neither change is silent. The warning clears once the keys are removed (and, for the model keys, the model is consolidated into `llmModel`/`llmBaseUrl`/`llmProvider`).
+
+## [0.16.9] - UNRELEASED
+
+### Changed
+- **`lessonsLimit` is configurable (default 10, was hardcoded 20).** Lessons injected into an agent's session-start context are now capped at 10 by default — a focused, domain-relevant digest (~500-600 tokens) instead of a ~1000-token dump. Tunable via `config.lessonsLimit` (positive integer; bad values fail soft to 10). Lessons are ranked per session by project/domain affinity + recency + strength + access, so each session sees its own most-relevant slice.
+- **Reflection prompt tightened — generalizable principles only.** The nightly reflection prompt now carries an explicit generality bar: a lesson must be a transferable operating principle, NOT an incident report, changelog entry, one-event fact, or tool/name-specific recipe. Specifics get abstracted out of the lesson text (into `source_pattern` only). Stops the noise at the source — a corpus audit had found ~15% of generated "lessons" were incident notes mislabeled as lessons.
+- **Telemetry: per-run `lessonsGenerated` field.** The nightly telemetry ping now **collects** how many lessons the reflection stage created *this run* (server mode only), distinct from the existing `lessons` corpus total — which drifts too slowly via decay/prune to reveal a sudden drop. The field is omitted (not 0) when reflection was skipped (e.g. endpoint offline, #232 fail-soft) so a down endpoint is distinguishable from an over-tight prompt in the raw telemetry rows. Surfacing it in the admin aggregate is a separate follow-up (touches `web/`, which auto-deploys).
+
+### Notes
+- One-time corpus cull (manual, server-side, not code): ~16 mislabeled lessons reclassified to `episode`/`decision` or merged, cleaning the existing lessons channel to match the new prompt's bar. No data lost — reclassified rows stay in the store as base memories, just out of the lessons injection channel.
+
+## [0.16.8] - UNRELEASED
+
+### Changed
+- **One model for all phases.** The LLM config collapsed from a 4-tier split (distill/reflect/classify/base) to a single `llmModel` used by distill, score, classify, and reflect. Removes per-tier config fields (`distillModel`, `reflectModel`, `classifyModel`, and their `baseUrl`/`apiKey`/`provider` variants), the nested `models` block, the `completeWithOverride` routing path, `applyModelsBlock`, `resolveDistillFallback`, `resolveClassifyProbeTarget`, and `probeOllamaModel`. `completeDistill`/`completeReflect`/`completeClassify` are now thin wrappers over `this.complete(this.config.model, ...)`. One `numCtx` default (8192) drives both scoring context and `detectChunkSize`'s chunk sizing, eliminating the silent-truncation class of bug. `maxTokens` has one default (8192) across all phases; scoring no longer has a separate 2048 default.
+- **Health-checks removed.** The preflight blocks that probed the reflect and classify endpoints are deleted. A model that doesn't answer after `complete()`'s internal retries (30s/60s/120s) simply fails the phase soft and retries on the next nightly run (2–4×/day frequency is a timer config, not a code change).
+- **`distillFallback` removed.** With one model there's nothing to fall back to; the `distillFallback` config key, the `resolveDistillFallback` function, the `distillFallbackMode` variable, and the mcp-server abort branch are all deleted. Remote-endpoint failures now 503 (strict mode) and retry next run — quality-first, no silent downgrade.
+
+### Removed
+- **Per-tier test files.** `tests/classify-tier.test.ts` (254 lines, the classify tier), `tests/models-block.test.ts` (388 lines, the `models` block normalization), and `tests/llm-ratelimit.test.ts` (tested `completeWithOverride`'s per-client rate-limiting; `completeWithOverride` is gone, so the regression scenario is structurally impossible). A minimal test was added to verify the module-level rate-limiter map exists and is shared across LlmClient instances.
+
+### Fixed
+- **`detectChunkSize` silent-truncation fix.** `detectChunkSize` now derives chunk size from the resolved `numCtx` parameter (default 8192) instead of the model's advertised `context_length` — the request and chunker agree by construction, preventing the #228 class of bug where ollama silently truncated distillation on all-ollama installs. The function signature changed to accept `numCtx`; callers pass the resolved config value.
+
+## [0.16.7] - 2026-08-05
+
+### Fixed
+- **Ollama flush scoped to the fast tier (scoring) only.** The flush was in the shared `completeOllama` (all ollama tiers), injecting a multi-minute pause mid-distillation on all-ollama installs + potentially unloading the wrong model. Moved to `completeFast` (provider-gated) — heavy tiers don't flush. Same threading fix as #228's numCtx scoping. (PR #229 review.)
+- **`ollamaFlushEvery: 0` no longer warns.** The documented default + off-switch was rejected by `readPositiveConfig` (v > 0). Added `readNonNegativeConfig` (allows 0).
+- **Flush wait skipped on unload failure.** If the `keep_alive:0` request fails (ollama down), the multi-minute wait is skipped — no dead time for a release that can't have happened.
+- **Flush logged.** The deliberate multi-minute stall is now visible in the nightly log (`[hicortex] ollama flush: …`), distinguishable from the original silent hang.
+
+## [0.16.6] - 2026-08-05
+
+### Added
+- **`ollamaFlushEvery` + `ollamaFlushWaitMs` — periodic ollama memory flush.** ollama's runner RSS grows ~171 MB per scoring call and isn't freed between requests (a known ollama behavior), which swap-thrashes RAM-constrained boxes during long consolidations. When `ollamaFlushEvery` > 0 (default 0 = off, opt-in), every Nth ollama call triggers a `keep_alive:0` unload + an `ollamaFlushWaitMs` pause (default 180000 ms = 3 min — the runner takes >90 s to exit after `keep_alive:0`, doubled for margin) for the runner to release its accumulated memory, then the next call reloads fresh. Bounds the within-run growth to N calls' worth (N=15 → ~2.5 GB/cycle). Set e.g. `ollamaFlushEvery: 15` on constrained boxes; leave 0 on boxes with ample RAM.
+
+## [0.16.5] - 2026-08-05
+
+### Fixed
+- **`numCtx` config key for the ollama fast tier (default 2048; was hardcoded 32768 for all tiers).** Scoring/importance prompts are ~850 tokens, so 2048 fits with headroom. At `num_ctx: 32768` (hardcoded since 0.5.0), the KV-cache + prompt-cache accumulated past available RAM on memory-constrained boxes during long consolidations, swap-thrashing the nightly to a halt. Scoped to the fast tier via threading (the heavy distill/reflect/classify tiers keep 32768 — `detectChunkSize` packs ~60% of context per chunk, so lowering it for them would silently truncate distillation on all-ollama installs). `numCtx` makes the fast-tier window tunable; 2048 minimizes the accumulating footprint.
+
+## [0.16.4] - 2026-08-04
+
+### Added
+- **LLM tuning keys.** Two optional config keys make the output budget and the model's thinking mode operator-controlled: `maxTokens` (default 8192 for the heavy phases — distillation/reflection/classification — and 2048 for scoring; the distill tier was previously hardcoded 2048. A ceiling, not a target, so a higher cap costs no latency when the model finishes early; an explicit value overrides every phase) and `enableThinking` (default false; the heavy phases only — scoring is excluded since on the local fast tier it's `think:false` regardless). The thinking toggle matters for reasoning-style models served via an OpenAI-compatible endpoint: with thinking on, such a model can spend the entire output budget on an internal reasoning stream and emit nothing, so the call returns empty. When `enableThinking` is set (true or false), the OpenAI-compatible request sends `chat_template_kwargs:{enable_thinking}`; it is threaded structurally from each heavy phase, so scoring never sends it. No effect on the Anthropic path. Wrong-typed values (e.g. `"enableThinking": "false"` as a string, which would otherwise coerce to truthy thinking-on) are rejected at the config boundary with a warn. Copied through at both LLM-config construction sites — the daemon (runs distill) and the nightly consolidation path (runs reflect + classify) — so explicit values are effective in every process.
+
 ## [0.16.3] - 2026-08-04
 
 ### Fixed

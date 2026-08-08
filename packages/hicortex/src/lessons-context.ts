@@ -62,6 +62,8 @@ export interface ResolvedConfig {
   home: string;
   /** Per-agent context id sent as ?agent= (0.13); null → global (no param). */
   agentName: string | null;
+  /** Max lessons to inject (config.lessonsLimit, default 10). */
+  lessonsLimit?: number;
 }
 
 /**
@@ -91,7 +93,13 @@ export function resolveConfig(): ResolvedConfig | null {
   // (NO ?agent=), never a 400 that the fail-soft hook would silently swallow.
   const agentName = resolveAgentIdentity(config).agentId;
 
-  return { serverUrl, authToken: config.authToken as string | undefined, home, agentName };
+  return {
+    serverUrl,
+    authToken: config.authToken as string | undefined,
+    home,
+    agentName,
+    lessonsLimit: typeof config.lessonsLimit === "number" ? config.lessonsLimit : undefined,
+  };
 }
 
 function authHeaders(authToken: string | undefined): Record<string, string> {
@@ -110,7 +118,7 @@ async function fetchLessonsBlock(cfg: ResolvedConfig): Promise<string | null> {
   if (!resp.ok) return null;
   const data = await resp.json() as LessonsResponse;
 
-  const maxLessons = lessonsLimit();
+  const maxLessons = lessonsLimit(cfg);
   const moduleIndex = data.moduleIndex ?? loadState(cfg.home).moduleIndex;
   // The SessionStart hook runs in the session's working directory, whose last
   // path component matches the capture-side CC project name convention

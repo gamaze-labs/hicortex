@@ -493,6 +493,30 @@ const MIGRATIONS: Migration[] = [
       }
     },
   },
+  {
+    version: 12,
+    name: "add_dashboard_snapshots",
+    up: (db) => {
+      // #224 memory analytics dashboard. One row per FULL nightly run (never
+      // capture-only — the snapshot reflects corpus state, so it is written
+      // from the same !dryRun && !captureOnly block that runs consolidation).
+      // `run_at` is the ISO timestamp of the run (PRIMARY KEY so a re-run for
+      // the same instant is idempotent — the nightly never retries within one
+      // process, and a manual re-run uses a fresh `now`). `metrics` is a JSON
+      // blob (not typed columns): the metric set is meant to evolve without a
+      // migration (add a key, ship), so the schema stays one column. The
+      // backfill (dashboard.ts:backfillSnapshots) also writes here, one row
+      // per derived day. Adoption fields are point-in-time and can't be
+      // reconstructed from created_at — backfilled rows leave them null.
+      // IF NOT EXISTS keeps it idempotent across partial migrations.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS dashboard_snapshots (
+          run_at TEXT PRIMARY KEY,
+          metrics TEXT NOT NULL
+        )
+      `);
+    },
+  },
 ];
 
 /**

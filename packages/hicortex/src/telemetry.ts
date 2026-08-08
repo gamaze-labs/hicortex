@@ -13,6 +13,9 @@
  *              client is never miscounted as "cc".
  *   mem      — total memory count
  *   lessons  — total lesson count
+ *   lessonsGenerated — lessons created THIS run (server mode only; the per-run
+ *              delta, distinct from `lessons` which is the corpus total). Lets a
+ *              silent decline in reflection output be seen in the fleet aggregate.
  *   sessions — sessions distilled this run
  *   ok       — nightly succeeded (true/false)
  *   shown    — sum of shown_count (server mode only)
@@ -81,6 +84,23 @@ export interface TelemetryPayload {
   shown?: number;
   uses?: number;
   cold?: number;
+  /**
+   * Lessons generated THIS run (server mode only). The per-run delta —
+   * `lessons` above is the corpus total, which drifts slowly via decay/prune
+   * and can't reveal a sudden drop in reflection output. 0.16.9+.
+   */
+  lessonsGenerated?: number;
+  /**
+   * Consolidation outcome for THIS full nightly (server mode only —
+   * capture-only runs send no nightly ping, so the field is absent there).
+   * `runConsolidation`'s status: "completed" | "skipped" | "failed", plus
+   * "no_llm" when consolidation was skipped because no LLM was configured.
+   * "skipped" = the built-in nothing-to-do short-circuit (no new + no unscored
+   * memories → zero LLM calls), NOT a failure. Lets the fleet aggregate tell a
+   * real consolidation run from a no-op without repurposing `ok` (which is the
+   * capture-health signal). 0.17+.
+   */
+  consolidation?: "completed" | "skipped" | "failed" | "no_llm";
 }
 
 /**

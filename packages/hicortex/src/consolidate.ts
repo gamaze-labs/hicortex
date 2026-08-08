@@ -34,7 +34,18 @@ import {
 } from "./nofit.js";
 
 // Default config constants (matching Python config.py)
-const CONSOLIDATE_MAX_LLM_CALLS = 200;
+/**
+ * Default ceiling on total LLM calls across all classify-tier consolidation
+ * stages (content-domain, link discovery, supersession) per run. This is a
+ * runaway BACKSTOP, not a throughput throttle — on a free local model there is
+ * no per-call cost to defend against; the binding constraint is the nightly
+ * unit's wall-clock timeout (TimeoutStartSec), not call count. 5000 clears a
+ * one-time classification backlog (a ~2000-memory batch drains in ~1-2 runs
+ * instead of ~11 nights at the old 200) with margin for link/supersession, and
+ * ~5000 calls x ~1-3s/call ≈ 1.4-4.2h fits the 6h consolidation backstop.
+ * Config-overridable as `consolidateMaxLlmCalls` (#241).
+ */
+export const CONSOLIDATE_MAX_LLM_CALLS = 5000;
 const CONSOLIDATE_PRUNE_MIN_AGE_DAYS = 90;
 /**
  * Minimum COSINE similarity for a link candidate.
@@ -1063,7 +1074,7 @@ export interface SupersessionStageResult {
  * A memory whose content/type marks it as a SUPERSEDABLE claim — one a newer
  * memory about the same subject can replace. Decisions and corrections were the
  * original scope; plain facts and project-state updates were added because an
- * updated fact ("distillModel is X" → later "is Y") otherwise never gets a
+ * updated fact ("scoring model is X" → later "is Y") otherwise never gets a
  * superseded_by link and both versions compete in recall forever. Ordinary
  * episodic chatter and problem/solution history stay excluded: they record
  * events, not mutable state, so there is nothing to supersede.
@@ -1373,11 +1384,11 @@ export function stageDecayPrune(
  * Options controlling how the domain-assignment stage runs.
  *
  * When `domains` is a non-empty list, the pipeline uses content-based
- * classification (config-owned) INSTEAD of project grouping — provided the
- * classification endpoint (classify tier when configured, else reflect) passed
- * pre-flight (`contentDomainsReady`). If that endpoint is unreachable, the
- * caller sets `contentDomainsReady: false` and the stage is SKIPPED entirely
- * (strict — no fall-back to a weak model or to project grouping). When
+ * classification (config-owned) INSTEAD of project grouping. The single
+ * model serves all phases; if it's unavailable, `complete()` retries
+ * internally (30s/60s/120s) and the phase fails soft on persistence —
+ * the nightly retries on the next run. No pre-flight health checks; the
+ * phase either answers or is skipped until the next scheduled run. When
  * `domains` is absent/empty, the legacy project-grouping curation runs
  * unchanged.
  */
@@ -1401,6 +1412,10 @@ export async function runConsolidation(
   stateDir?: string,
   domainOptions?: DomainStageOptions,
   supersessionOptions?: SupersessionOptions,
+  /** Total LLM-call ceiling across classify-tier stages (#241). The caller
+   *  reads `consolidateMaxLlmCalls` from config and passes it; unset → the
+   *  exported `CONSOLIDATE_MAX_LLM_CALLS` default (5000). */
+  budgetMaxCalls?: number,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -1438,7 +1453,10 @@ export async function runConsolidation(
     return report;
   }
 
-  const budget = new BudgetTracker(CONSOLIDATE_MAX_LLM_CALLS);
+  // Config-overridable total LLM-call ceiling (#241). Default 5000 (was 200) —
+  // see CONSOLIDATE_MAX_LLM_CALLS. The caller reads `consolidateMaxLlmCalls`
+  // from config and passes it here.
+  const budget = new BudgetTracker(budgetMaxCalls ?? CONSOLIDATE_MAX_LLM_CALLS);
 
   try {
     // Stage 2: Importance Scoring
@@ -1470,9 +1488,8 @@ export async function runConsolidation(
 
     // Stage 2.7: Domain assignment.
     // Content-based (config-owned domains) REPLACES project grouping when a
-    // domain list is configured AND the reflect endpoint passed pre-flight.
-    // If the list is configured but the reflect endpoint is down, SKIP the
-    // stage (strict) — do not fall back to project grouping.
+    // domain list is configured. The single model serves all phases; if it's
+    // down, the phase skips and retries on the next nightly run (no fallback).
     const cfgDomains = domainOptions?.domains;
     if (cfgDomains && cfgDomains.length > 0) {
       if (domainOptions?.contentDomainsReady === false) {

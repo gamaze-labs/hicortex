@@ -1,6 +1,12 @@
 /**
  * LLM prompt templates for memory consolidation and distillation.
  * Copied EXACTLY from the Python codebase (proven working prompts).
+ *
+ * SHIPPED SOURCE: this file is compiled into dist/ and published to npm + the
+ * public mirror (it is NOT in .publicignore). Any example, name, or detail in
+ * these prompts is therefore public. Use generic, anonymous examples — never
+ * real internal project/tool/host names or real incident specifics. The
+ * infra-name denylist cannot catch conceptual leaks, only known names.
  */
 
 /**
@@ -38,6 +44,9 @@ export function reflection(memoriesBlock: string, recentLessons?: string): strin
 
 Like human learning: we grow fastest when we reinforce what works AND correct what doesn't. A system that only learns from mistakes becomes overly cautious. A system that only learns from successes never improves. The combination multiplies.
 
+GENERALITY BAR (read carefully — the most important rule):
+Every lesson MUST be a generalizable operating principle that transfers across contexts, agents, and projects. It is NOT: an incident report, a changelog entry, a one-event fact, a tool-specific recipe, or a note about a named entity. If a memory is only interesting as "what happened today", it is an EPISODE — do not emit a lesson for it. Abstract away specific tool names, hostnames, and incident details from the lesson text; state the transferable rule.
+
 Quality over quantity. 1-3 lessons is typical. An empty array [] is the CORRECT response when memories show routine competent work without noteworthy patterns, surprises, or friction. Do not manufacture lessons from nothing.
 
 LESSON TYPES:
@@ -53,15 +62,19 @@ Good reinforce: "Bundling related changes into a single PR with clear narrative 
 Good reinforce: "When presenting multi-scenario analysis, show assumptions side-by-side so stakeholders evaluate trade-offs rather than reacting to isolated worst-cases"
 Good correct: "Always verify ALL substitution targets by diffing output — partial fixes cause silent failures"
 Good principle: "Gather evidence from logs before forming hypotheses — evidence-first debugging resolved issues 3x faster today"
+Good principle: "When a long-running background agent survives a system migration as an orphan, explicitly unregister it before declaring the migration clean — orphans cause silent crash-loops"
 Bad lesson: "The deploy script had a bug" (restatement, not actionable)
+Bad (incident note / changelog entry): "The graph resolver was fixed by adding a computed-at marker column" — that is a changelog entry, not a lesson
+Bad (tool-specific decision): "Tool X is banned because it broke Tool Y's settings" — a one-tool decision, not transferable
+Bad (single-event): "The chat client crashed after a system restore because a background agent was left orphaned" — an incident report, not a principle
 
 For each lesson, output a JSON object:
-- "lesson": Concise, actionable rule in imperative voice
+- "lesson": Concise, actionable rule in imperative voice. State the transferable rule — abstract away specific tool names, hostnames, and incident details.
 - "type": "reinforce" | "correct" | "principle"
 - "project": "global" unless genuinely project-specific (project-specific lessons are still valuable)
 - "severity": "critical" | "important" | "minor"
 - "confidence": "high" | "medium" | "low"
-- "source_pattern": What triggered this (1 sentence, no personal data)
+- "source_pattern": What triggered this (1 sentence, no personal data; may name the specific incident/tool here — but the \`lesson\` field itself stays generic)
 
 Severity guide:
 - "critical": Near-misses that could have caused data loss or security breach, even if caught in time. Also: recurring patterns that keep appearing despite prior corrections.
@@ -84,7 +97,7 @@ Focus on:
 
 Privacy: Never include personal data (names, health, finances, credentials) in lesson text. Abstract to the process level.
 
-Skip: isolated trivial actions, already-documented rules. However, if multiple small successes form a consistent pattern of quality, extract that pattern as a reinforcement.
+Skip: isolated trivial actions, already-documented rules, incident notes, changelog entries, and tool-specific recipes. However, if multiple small successes form a consistent pattern of quality, extract that pattern as a reinforcement.
 
 Respond with a JSON array. Empty array [] is a valid response.`;
 }
