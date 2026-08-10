@@ -41,6 +41,7 @@
       --accent-2: #2f8f4e;
       --warn: #b08030;
       --danger: #c0392b;
+      --nav-bg: #f6f7f9;
     }
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -76,7 +77,7 @@
   .bar-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; font-size: 13px; }
   .bar-row .k { width: 140px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .bar-row .track { flex: 1; height: 14px; background: rgba(128,128,128,0.12); border-radius: 3px; overflow: hidden; }
-  .bar-row .fill { height: 100%; background: var(--accent); }
+  .bar-row .fill { display: block; height: 100%; background: var(--accent); }
   .bar-row .n { width: 50px; text-align: right; color: var(--text-dim); font-variant-numeric: tabular-nums; }
   .line { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--text); white-space: pre-wrap; word-break: break-word; }
   .line a { color: var(--accent); text-decoration: none; }
@@ -89,9 +90,42 @@
   table.digest td.k { color: var(--text-dim); width: 180px; }
   .stage-pill { display: inline-block; padding: 1px 6px; border-radius: 10px; background: rgba(128,128,128,0.18); font-size: 11px; color: var(--text-dim); margin-right: 4px; }
   .empty { color: var(--text-dim); font-style: italic; padding: 12px 0; }
+
+  /* ---- shared console nav (#249) ---- */
+  .hc-nav {
+    position: sticky; top: 0; z-index: 50;
+    display: flex; align-items: center; gap: 16px;
+    height: 48px; padding: 0 20px;
+    margin: -20px -20px 20px;
+    background: var(--nav-bg, #010409);
+    border-bottom: 1px solid var(--panel-border);
+    font-size: 14px;
+  }
+  .hc-nav-logo {
+    color: var(--text); font-weight: 600; text-decoration: none;
+    letter-spacing: 0.02em;
+  }
+  .hc-nav-links { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .hc-nav-links a {
+    color: var(--text-dim); text-decoration: none; transition: color 0.12s;
+  }
+  .hc-nav-links a:hover { color: var(--accent); }
+  .hc-nav-links a[data-nav-active] { color: var(--text); }
+  .hc-nav-disabled {
+    color: var(--text-dim); opacity: 0.4; cursor: not-allowed; user-select: none;
+  }
 </style>
 </head>
 <body>
+<nav class="hc-nav">
+  <a class="hc-nav-logo" href="/dashboard">Hicortex</a>
+  <div class="hc-nav-links">
+    <a href="/dashboard" data-nav-active>Dashboard</a>
+    <a href="/viz">Graph</a>
+    <a href="/context/ui">Context</a>
+    <span class="hc-nav-disabled" title="Coming soon — #250">Self-improvement</span>
+  </div>
+</nav>
 <h1>Hicortex — memory dashboard</h1>
 <div class="sub">View-only analytics. All metrics derived from the live corpus + nightly snapshots.</div>
 
@@ -147,6 +181,8 @@
   <div id="digest-lessons"></div>
   <h2 style="margin-top:16px;">Dedup merges</h2>
   <div id="digest-dedup"></div>
+  <h2 id="digest-tokens-section" style="margin-top:16px;display:none;">Token usage breakdown by stage</h2>
+  <div id="digest-tokens"></div>
 </div>
 
 <div class="sub muted" style="margin-top:24px;">
@@ -205,11 +241,69 @@ function renderHeadline(h) {
   const ups = h.uses_per_showing === null || h.uses_per_showing === undefined
     ? "—"
     : (h.uses_per_showing * 100).toFixed(1) + "%";
+  // Capacity gauge (#245): X / cap memories. Amber at ≥85% of cap, red at ≥100%.
+  // Hidden when the cap is 0 (disabled — indefinite growth, the pre-#245 default).
+  let capStat = "";
+  if (h.memory_soft_cap && h.memory_soft_cap > 0) {
+    const cap = h.memory_soft_cap;
+    const n = h.total_memories;
+    const pct = Math.min(100, (n / cap) * 100);
+    const over = n >= cap;
+    const near = pct >= 85 && !over;
+    const barColor = over ? "var(--bad, #e05555)" : near ? "var(--warn, #e0b055)" : "var(--ok, #61c98f)";
+    capStat = `
+      <div class="stat" style="flex-basis:240px;">
+        <div class="v" style="font-size:18px;">${n.toLocaleString()} <span class="muted" style="font-size:13px;">/ ${cap.toLocaleString()}</span></div>
+        <div class="l">Memories vs soft cap ${over ? "(over cap)" : ""}</div>
+        <div style="margin-top:6px;height:6px;background:rgba(128,128,128,0.2);border-radius:3px;overflow:hidden;">
+          <div style="width:${pct.toFixed(1)}%;height:100%;background:${barColor};"></div>
+        </div>
+      </div>`;
+  }
+  // LLM tokens this period (#246): hidden when `used` is 0 (no metered run yet
+  // — nothing to show). When capped (cap > 0), render a usage bar with the
+  // percentage; amber at ≥85%, red at ≥100%. When uncapped (self-hosted
+  // default), show just the count. Both shapes include "this month" so the
+  // billing-period framing is uniform.
+  let tokenStat = "";
+  const tok = h.tokens;
+  if (tok && tok.used > 0) {
+    const usedStr = formatTokens(tok.used);
+    if (tok.cap > 0) {
+      const pct = Math.min(100, (tok.used / tok.cap) * 100);
+      const over = tok.used >= tok.cap;
+      const near = pct >= 85 && !over;
+      const barColor = over ? "var(--bad, #e05555)" : near ? "var(--warn, #e0b055)" : "var(--ok, #61c98f)";
+      tokenStat = `
+        <div class="stat" style="flex-basis:240px;">
+          <div class="v" style="font-size:18px;">${escapeHtml(usedStr)} <span class="muted" style="font-size:13px;">/ ${escapeHtml(formatTokens(tok.cap))}</span></div>
+          <div class="l">LLM tokens this month ${over ? "(over cap)" : ""}</div>
+          <div style="margin-top:6px;height:6px;background:rgba(128,128,128,0.2);border-radius:3px;overflow:hidden;">
+            <div style="width:${pct.toFixed(1)}%;height:100%;background:${barColor};"></div>
+          </div>
+        </div>`;
+    } else {
+      tokenStat = `
+        <div class="stat">
+          <div class="v">${escapeHtml(usedStr)}</div>
+          <div class="l">LLM tokens this month</div>
+        </div>`;
+    }
+  }
   $("headline").innerHTML = `
     <div class="stat"><div class="v">${h.total_memories}</div><div class="l">Total memories</div></div>
     <div class="stat"><div class="v">${ups}</div><div class="l">Uses per showing (headline)</div></div>
     <div class="stat"><div class="v warn">${h.cold_count}</div><div class="l">Cold long-tail (never shown/used)</div></div>
+    ${capStat}
+    ${tokenStat}
   `;
+}
+
+/** Compact human-readable token count: 1234 → "1.2K", 1_500_000 → "1.5M". */
+function formatTokens(n) {
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
 }
 
 // ---------------------------------------------------------------------------
@@ -348,8 +442,27 @@ function renderDigest(digest) {
     s.lessonsGenerated !== undefined ? `<span class="stage-pill">lessons: ${s.lessonsGenerated}</span>` : "",
     `<span class="stage-pill">dedup: ${s.dedup}</span>`,
     `<span class="stage-pill">supersession: ${s.supersession}</span>`,
+    s.evicted !== undefined && s.evicted > 0 ? `<span class="stage-pill warn">evicted: ${s.evicted}</span>` : "",
+    s.tokens !== undefined ? `<span class="stage-pill">tokens: ${escapeHtml(formatTokens(s.tokens))}</span>` : "",
   ].join(" ");
   $("digest-stages").innerHTML = stages;
+  // Per-stage token breakdown (#246) — only when the day's run metered tokens
+  // and the breakdown was carried (always present together with `tokens`).
+  const tbs = s.tokens_by_stage;
+  if (tbs && Object.keys(tbs).length > 0) {
+    const rows = Object.entries(tbs)
+      .sort((a, b) => (b[1].total - a[1].total))
+      .map(([k, v]) =>
+        `<tr><td class="k">${escapeHtml(k)}</td>` +
+        `<td>${escapeHtml(formatTokens(v.total))}</td>` +
+        `<td class="muted">${escapeHtml(formatTokens(v.prompt))} in / ${escapeHtml(formatTokens(v.completion))} out</td></tr>`
+      ).join("");
+    $("digest-tokens").innerHTML = `<table class="digest"><tbody>${rows}</tbody></table>`;
+    $("digest-tokens-section").style.display = "";
+  } else {
+    $("digest-tokens").innerHTML = `<div class="empty">No token usage that day (no metered LLM run).</div>`;
+    $("digest-tokens-section").style.display = "none";
+  }
 
   if (digest.sample.length === 0) {
     $("digest-sample").innerHTML = `<div class="empty">No new memories that day.</div>`;
@@ -427,6 +540,22 @@ async function load() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  // Shared console nav (#249): append ?token= to internal nav links on click
+  // so navigation between pages doesn't re-authenticate. Reads the token from
+  // any of the page-scoped localStorage keys (each page historically used its
+  // own key) — keeps the snippet identical across the three served pages.
+  document.querySelectorAll(".hc-nav-links a, .hc-nav-logo").forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      var t = token
+        || localStorage.getItem("hicortexToken")
+        || localStorage.getItem("hicortex-dashboard-token");
+      if (!t) return;
+      e.preventDefault();
+      var u = new URL(a.getAttribute("href"), location.origin);
+      u.searchParams.set("token", t);
+      location.href = u.toString();
+    });
+  });
   // Seed the date picker to the digest date from the first load (today).
   $("reload").addEventListener("click", load);
   $("range").addEventListener("change", load);

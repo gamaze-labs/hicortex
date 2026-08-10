@@ -152,10 +152,41 @@ def save_config(values: Dict[str, Any], hermes_home: str) -> None:
 
     Called by `hermes memory setup` after collecting user inputs. Secret fields
     (hicortex_auth_token) are routed to the env store by Hermes, not written here.
+
+    #243: Does NOT clobber existing values with schema defaults. When the form
+    sends a value that matches the schema default for a field AND the existing
+    config.json already has a non-default value, the existing value is kept —
+    so re-opening the dashboard and clicking Save without editing doesn't
+    silently overwrite a remote URL with localhost.
     """
     path = _config_path(hermes_home)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Don't persist secrets to the JSON file — Hermes stores them separately.
-    safe = {k: v for k, v in values.items() if k != "hicortex_auth_token"}
+
+    # Load existing file values (merge target).
+    existing: Dict[str, Any] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                existing = json.load(f) or {}
+        except Exception:
+            existing = {}
+
+    # Build a map of schema defaults for the clobber guard.
+    defaults = {f["key"]: f.get("default") for f in CONFIG_SCHEMA if "default" in f}
+
+    # Merge: for each incoming value, skip it if (a) it equals the schema
+    # default AND (b) the existing config has a different non-default value.
+    # This prevents the dashboard's default-populated form from clobbering a
+    # real remote URL with localhost on a no-op Save.
+    merged = dict(existing)
+    for k, v in values.items():
+        if k == "hicortex_auth_token":
+            continue  # secrets handled by Hermes env store, never written here
+        if v == defaults.get(k) and existing.get(k, defaults.get(k)) != defaults.get(k):
+            # Incoming value is the schema default but existing is NOT — keep existing.
+            logger.debug("hicortex: save_config preserving existing %s=%s (form sent default %s)", k, existing.get(k), v)
+            continue
+        merged[k] = v
+
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(safe, f, indent=2)
+        json.dump(merged, f, indent=2)

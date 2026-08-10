@@ -155,12 +155,30 @@ export interface ConsolidationReport {
       pruned: number;
       failed: number;
     };
+    /** Capacity eviction (#245) — runs after decay_prune. When the corpus
+     *  exceeds `memorySoftCap`, the lowest-effectiveStrength memories are
+     *  evicted until under the cap. `cap = 0` (disabled) → evicted = 0. */
+    memory_cap?: {
+      /** The configured cap (always reported, including 0 = disabled). */
+      cap: number;
+      /** Memories deleted this run (0 when under cap, dry-run, or disabled). */
+      evicted: number;
+    };
   };
   budget?: {
     max_calls: number;
     calls_used: number;
     calls_remaining: number;
     calls_by_stage: Record<string, number>;
+    /**
+     * Token usage per stage (#246). Each value sums prompt + completion +
+     * total across every metered LLM call in that stage this run. A stage with
+     * no metered calls (claude-cli path, or stage didn't run) is absent — the
+     * dashboard treats absent as "no signal", distinct from zero.
+     */
+    tokens_by_stage?: Record<string, { prompt: number; completion: number; total: number }>;
+    /** Run-wide token totals (#246) — sum of every recordUsage call this run. */
+    tokens_total?: { prompt: number; completion: number; total: number };
   };
 }
 
@@ -355,6 +373,32 @@ export interface HicortexConfig {
    * leaner system prompts.
    */
   lessonsLimit?: number;
+  /**
+   * Soft cap on the memory corpus (default 10000). When the corpus exceeds this,
+   * the nightly's capacity-eviction stage (#245) removes the lowest-
+   * `effectiveStrength` memories (ties broken by oldest access) until under the
+   * cap. `0` = disabled (indefinite growth — the pre-#245 behaviour). This is
+   * the active forgetting mechanism that replaces the inert time-based prune
+   * (`effectiveStrength < 0.01` in stageDecayPrune, which essentially never
+   * fires given the strength floor + 365-day half-life). At 10K memories the
+   * load + JS sort is <100 ms. The evicted tail is cold by construction
+   * (effectiveStrength is the same decay-weighted score used in recall ranking,
+   * so these were not surfacing in the top-k anyway).
+   */
+  memorySoftCap?: number;
+  /**
+   * Monthly fair-use ceiling on consolidation LLM token consumption (#246).
+   * Default `0` = unlimited (the self-hosted default — no cap, never throttled).
+   * When > 0: before each consolidation run, the nightly checks
+   * `llmTokensThisPeriod.total + llmTokensLastRun > llmTokensPerMonth`; if so,
+   * consolidation is skipped and telemetry reports `consolidation: "throttled"`.
+   * The estimate uses the previous run's actual usage as a proxy — conservative
+   * (over-throttle vs over-spend) since a throttled night just defers work to
+   * the next period. The hosted service sets this per-tenant to defend against
+   * noisy neighbors; a self-hosted user on a free local model has no reason to
+   * set it. Period resets monthly (state.json `llmTokensThisPeriod.periodStart`).
+   */
+  llmTokensPerMonth?: number;
 }
 
 /** A config-owned life-sphere domain (see HicortexConfig.domains). */

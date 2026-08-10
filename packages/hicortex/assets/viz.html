@@ -55,17 +55,26 @@
   #topbar {
     position: fixed; top: 0; left: 0; right: 0;
     display: flex; align-items: center; gap: 10px;
-    padding: 8px 12px;
+    height: 48px;
+    padding: 0 12px;
     background: rgba(22, 26, 35, 0.94);
     border-bottom: 1px solid var(--panel-border);
     z-index: 10;
   }
   #topbar h1 { font-size: 14px; font-weight: 600; white-space: nowrap; }
-  #meta { color: var(--text-dim); margin-left: auto; white-space: nowrap; }
+  #meta { color: var(--text-dim); white-space: nowrap; margin-left: auto; }
+
+  /* ---- shared console nav links (#249), integrated into the viz topbar ---- */
+  .hc-nav-logo { color: var(--text); text-decoration: none; letter-spacing: 0.02em; }
+  .hc-nav-links { margin-left: 16px; display: flex; align-items: center; gap: 16px; font-size: 14px; }
+  .hc-nav-links a { color: var(--text-dim); text-decoration: none; transition: color 0.12s; }
+  .hc-nav-links a:hover { color: var(--accent); }
+  .hc-nav-links a[data-nav-active] { color: var(--text); }
+  .hc-nav-disabled { color: var(--text-dim); opacity: 0.4; cursor: not-allowed; user-select: none; }
 
   /* ---- left control panel ---- */
   #panel {
-    position: fixed; top: 46px; left: 12px; width: 236px;
+    position: fixed; top: 48px; left: 12px; width: 236px;
     background: rgba(22, 26, 35, 0.94);
     border: 1px solid var(--panel-border); border-radius: 8px;
     padding: 12px; z-index: 10;
@@ -235,8 +244,14 @@
 <div id="graph-2d"></div>
 
 <div id="topbar">
-  <h1>Hicortex — knowledge graph</h1>
+  <h1 class="hc-nav-logo"><a href="/dashboard" style="color:inherit;text-decoration:none">Hicortex</a></h1>
   <span id="meta"></span>
+  <nav class="hc-nav-links">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/viz" data-nav-active>Graph</a>
+    <a href="/context/ui">Context</a>
+    <span class="hc-nav-disabled" title="Coming soon — #250">Self-improvement</span>
+  </nav>
 </div>
 
 <div id="panel">
@@ -342,6 +357,22 @@
       try { token = localStorage.getItem("hicortexToken"); } catch (e) { token = null; }
     }
   })();
+
+  // Shared console nav (#249): append ?token= to internal nav links on click
+  // so navigation between pages doesn't re-authenticate. Reads token from any
+  // page-scoped localStorage key (each page historically used its own).
+  document.querySelectorAll(".hc-nav-links a, .hc-nav-logo").forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      var t = token
+        || localStorage.getItem("hicortexToken")
+        || localStorage.getItem("hicortex-dashboard-token");
+      if (!t) return;
+      e.preventDefault();
+      var u = new URL(a.getAttribute("href"), location.origin);
+      u.searchParams.set("token", t);
+      location.href = u.toString();
+    });
+  });
 
   // =========================================================================
   // DOM references

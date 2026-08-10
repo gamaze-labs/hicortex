@@ -270,7 +270,7 @@ export async function distillSession(
   date: string,
   chunkSizeChars?: number,
   droppedOut?: string[]
-): Promise<string[]> {
+): Promise<DistilledEntry[]> {
   if (conversation.length < MIN_CONVERSATION_CHARS) {
     return [];
   }
@@ -301,7 +301,7 @@ export async function distillSession(
   //     to know this session hit a transient error.
   const chunks = splitIntoChunks(transcript, chunkSize);
   console.log(`[hicortex]     Chunking ${transcript.length} chars into ${chunks.length} segments`);
-  const allEntries: string[] = [];
+  const allEntries: DistilledEntry[] = [];
   const seen = new Set<string>();
   let chunkFailures = 0;
   let lastError: Error | null = null;
@@ -312,8 +312,10 @@ export async function distillSession(
       const { entries, dropped } = await distillChunk(llm, chunks[i], projectName, date);
       if (droppedOut) droppedOut.push(...dropped);
       for (const entry of entries) {
-        // Deduplicate by normalized content
-        const key = entry.toLowerCase().replace(/\s+/g, " ").slice(0, 100);
+        // Deduplicate by normalized content (type tag does not participate —
+        // two chunks extracting the same fact should collapse regardless of
+        // whether one tagged it [F] and the other [E]).
+        const key = entry.content.toLowerCase().replace(/\s+/g, " ").slice(0, 100);
         if (!seen.has(key)) {
           seen.add(key);
           allEntries.push(entry);
@@ -363,14 +365,14 @@ async function distillChunk(
   transcript: string,
   projectName: string,
   date: string
-): Promise<{ entries: string[]; dropped: string[] }> {
+): Promise<{ entries: DistilledEntry[]; dropped: string[] }> {
   const prompt = distillation(projectName, date, transcript);
 
   // NOTE: Intentionally no try/catch here. Transient LLM errors (network
   // failures, 4xx/5xx, model-not-found, timeouts) propagate up to the caller
   // so the nightly pipeline can treat them as "retry later" instead of
   // "processed successfully with zero extractions".
-  const result = await llm.completeDistill(prompt);
+  const { text: result } = await llm.completeDistill(prompt);
   if (!result) return { entries: [], dropped: [] };
   if (result === "NO_EXTRACT" || result.slice(0, 20).includes("NO_EXTRACT")) {
     return { entries: [], dropped: [] };
@@ -382,8 +384,10 @@ async function distillChunk(
   // sometimes ignore constraints (cf. the prior max-15-bullet failure). Count
   // entries that still look actor-led or bracket-led so a format regression
   // shows in nightly logs, not months later in the next eval. Non-blocking.
+  // Note: the type tag ([E]/[F]/[D]) is already stripped by the parser, so a
+  // leading bracket here means a payload-bracket or a category-first regression.
   const offTopic = parsed.filter(
-    (e) => /^\s*(user|ai|the user|assistant)\b/i.test(e) || /^\s*\[/.test(e)
+    (e) => /^\s*(user|ai|the user|assistant)\b/i.test(e.content) || /^\s*\[/.test(e.content)
   ).length;
   if (parsed.length > 0 && offTopic > 0) {
     console.log(
@@ -391,10 +395,14 @@ async function distillChunk(
     );
   }
 
-  const entries: string[] = [];
+  const entries: DistilledEntry[] = [];
   const dropped: string[] = [];
   for (const entry of parsed) {
-    (hasMinimalSubstance(entry) ? entries : dropped).push(entry);
+    if (hasMinimalSubstance(entry.content)) {
+      entries.push(entry);
+    } else {
+      dropped.push(entry.content);
+    }
   }
   if (dropped.length > 0) {
     for (const d of dropped) {
@@ -486,22 +494,58 @@ export function hasMinimalSubstance(entry: string): boolean {
 }
 
 /**
- * Parse distilled markdown into individual memory entry strings.
- * Each section item becomes a separate memory.
+ * A parsed distillation entry: the stored content (type tag STRIPPED) plus the
+ * classified memory_type. `memoryType` is one of "episode" | "fact" |
+ * "decision" — the three distillation-time types. "lesson" is deliberately
+ * absent: lessons are the reflection stage's product, never distillation's
+ * (#216). A missing/unknown tag defaults to "episode" so older distiller
+ * output (pre-#216, no tag) stays backward-compatible.
  */
-function parseDistilledEntries(markdown: string): string[] {
-  const entries: string[] = [];
+export interface DistilledEntry {
+  content: string;
+  memoryType: "episode" | "fact" | "decision";
+}
+
+/**
+ * Map a single-letter type tag to the stored memory_type. Unknown/absent →
+ * episode (the pre-#216 default). `[L]` is explicitly rejected → episode: the
+ * distiller must NEVER emit lessons (that's the reflection stage's job), so a
+ * model that emits `[L]` is wrong and we do not propagate it as a lesson.
+ */
+function typeFromTag(letter: string | undefined): DistilledEntry["memoryType"] {
+  switch (letter) {
+    case "F":
+    case "f":
+      return "fact";
+    case "D":
+    case "d":
+      return "decision";
+    // E, e, L, l (rejected), undefined, or anything else → episode.
+    default:
+      return "episode";
+  }
+}
+
+/**
+ * Parse distilled markdown into individual memory entries with type tags.
+ * Each bullet becomes a separate memory. The leading `[E]`/`[F]`/`[D]` type
+ * tag is extracted (→ memoryType), stripped from the stored content, and
+ * passed to `insertMemory` via the `memoryType` option (#216). Bullets with
+ * no tag default to "episode" (backward compatible with pre-#216 distiller
+ * output that never carried a tag).
+ */
+function parseDistilledEntries(markdown: string): DistilledEntry[] {
+  const entries: DistilledEntry[] = [];
   const lines = markdown.split("\n");
 
   for (const line of lines) {
     const trimmed = line.trim();
 
     // Skip all markdown headers (session title, section headings). Sections
-    // are NOT prefixed onto entries: each bullet already
-    // starts with its [SUBJECT] (topic-first, enforced by prompts.ts), and
-    // prepending "[Section]" re-introduced the category-first prefix the
-    // 2026-08-02 corpus rewrite removed. The section label is unused
-    // downstream (distilled memories all store memory_type='episode').
+    // are NOT prefixed onto entries: each bullet already starts with its type
+    // tag + [SUBJECT] (topic-first, enforced by prompts.ts), and prepending
+    // "[Section]" re-introduced the category-first prefix the 2026-08-02
+    // corpus rewrite removed.
     if (
       trimmed.startsWith("# ") ||
       trimmed.startsWith("## ") ||
@@ -512,7 +556,19 @@ function parseDistilledEntries(markdown: string): string[] {
 
     // Bullet items are individual, already topic-first memories.
     if (trimmed.startsWith("- ") && trimmed.length > 5) {
-      entries.push(trimmed.slice(2));
+      const body = trimmed.slice(2);
+      // Extract an optional leading single-letter type tag: "[E]", "[F]",
+      // "[D]" (case-insensitive). The tag must be the very first token of the
+      // bullet — a bracket that appears later is payload, not a type tag.
+      const tagMatch = body.match(/^\[([EFDefdLl])\]\s*/);
+      if (tagMatch) {
+        const memoryType = typeFromTag(tagMatch[1].toUpperCase());
+        entries.push({ content: body.slice(tagMatch[0].length), memoryType });
+      } else {
+        // No tag → episode (pre-#216 distiller output, or a model that
+        // skipped the tag). Keep the content verbatim.
+        entries.push({ content: body, memoryType: "episode" });
+      }
     }
   }
 

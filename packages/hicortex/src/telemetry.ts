@@ -94,13 +94,23 @@ export interface TelemetryPayload {
    * Consolidation outcome for THIS full nightly (server mode only —
    * capture-only runs send no nightly ping, so the field is absent there).
    * `runConsolidation`'s status: "completed" | "skipped" | "failed", plus
-   * "no_llm" when consolidation was skipped because no LLM was configured.
+   * "no_llm" when consolidation was skipped because no LLM was configured, and
+   * "throttled" (#246) when the run was skipped because the
+   * `llmTokensPerMonth` fair-use cap was projected to be exceeded.
    * "skipped" = the built-in nothing-to-do short-circuit (no new + no unscored
    * memories → zero LLM calls), NOT a failure. Lets the fleet aggregate tell a
    * real consolidation run from a no-op without repurposing `ok` (which is the
    * capture-health signal). 0.17+.
    */
-  consolidation?: "completed" | "skipped" | "failed" | "no_llm";
+  consolidation?: "completed" | "skipped" | "failed" | "no_llm" | "throttled";
+  /**
+   * Total LLM tokens consumed by THIS nightly's consolidation (#246) — the
+   * BudgetTracker total. Server-mode only (capture-only + client runs make no
+   * consolidation LLM calls). Absent on a throttled/no-LLM/skipped run (no
+   * calls → nothing to meter). Aggregate-only: no per-stage breakdown on the
+   * wire (that lives in the dashboard snapshot, not the telemetry ping).
+   */
+  tokens_this_run?: number;
 }
 
 /**

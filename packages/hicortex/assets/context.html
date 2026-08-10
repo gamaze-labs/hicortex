@@ -34,6 +34,7 @@
     --danger: #c0392b;
     --ok: #2f8f4e;
     --tab-active: #ffffff;
+    --nav-bg: #f6f7f9;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -47,6 +48,7 @@
       --danger: #e05555;
       --ok: #5fbf77;
       --tab-active: #0f1117;
+      --nav-bg: #010409;
     }
   }
   /* Explicit theme override wins over the media default in BOTH directions. */
@@ -54,11 +56,13 @@
     --bg: #ffffff; --panel: #f6f7f9; --panel-border: #d9dce2;
     --text: #1c1f26; --text-dim: #656d7a; --accent: #2f6fb0;
     --accent-text: #ffffff; --danger: #c0392b; --ok: #2f8f4e; --tab-active: #ffffff;
+    --nav-bg: #f6f7f9;
   }
   :root[data-theme="dark"] {
     --bg: #0f1117; --panel: #161a23; --panel-border: #262c3a;
     --text: #d5dae4; --text-dim: #8b93a5; --accent: #5b9dd9;
     --accent-text: #0b0d12; --danger: #e05555; --ok: #5fbf77; --tab-active: #0f1117;
+    --nav-bg: #010409;
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -165,9 +169,33 @@
     padding: 8px; font: inherit; margin-bottom: 10px;
   }
   #token-err { color: var(--danger); font-size: 13px; margin-top: 8px; display: none; }
+
+  /* ---- shared console nav (#249) ---- */
+  .hc-nav {
+    display: flex; align-items: center; gap: 16px;
+    height: 48px; padding: 0 18px; flex: none;
+    background: var(--nav-bg);
+    border-bottom: 1px solid var(--panel-border);
+    font-size: 14px;
+  }
+  .hc-nav-logo { color: var(--text); font-weight: 600; text-decoration: none; letter-spacing: 0.02em; }
+  .hc-nav-links { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .hc-nav-links a { color: var(--text-dim); text-decoration: none; transition: color 0.12s; }
+  .hc-nav-links a:hover { color: var(--accent); }
+  .hc-nav-links a[data-nav-active] { color: var(--text); }
+  .hc-nav-disabled { color: var(--text-dim); opacity: 0.4; cursor: not-allowed; user-select: none; }
 </style>
 </head>
 <body>
+<nav class="hc-nav">
+  <a class="hc-nav-logo" href="/dashboard">Hicortex</a>
+  <div class="hc-nav-links">
+    <a href="/dashboard">Dashboard</a>
+    <a href="/viz">Graph</a>
+    <a href="/context/ui" data-nav-active>Context</a>
+    <span class="hc-nav-disabled" title="Coming soon — #250">Self-improvement</span>
+  </div>
+</nav>
 <header>
   <h1>Hicortex — context</h1>
   <label class="meta" for="scope">scope</label>
@@ -181,6 +209,11 @@
 </header>
 
 <main>
+  <p class="hint" style="margin:0 0 12px;color:var(--text-dim);font-size:13px;line-height:1.6">
+    <strong>User</strong> — who you are (persona, preferences). &nbsp;
+    <strong>Rules</strong> — how to work (operating principles, values). &nbsp;
+    <strong>Memory instructions</strong> — how to use Hicortex (product-managed, read-only).
+  </p>
   <div id="tabs">
     <div id="addwrap">
       <input type="text" id="addname" placeholder="new-section-name" autocomplete="off" spellcheck="false">
@@ -249,6 +282,22 @@
     }
   })();
 
+  // Shared console nav (#249): append ?token= to internal nav links on click
+  // so navigation between pages doesn't re-authenticate. Reads token from any
+  // page-scoped localStorage key (each page historically used its own).
+  document.querySelectorAll(".hc-nav-links a, .hc-nav-logo").forEach(function (a) {
+    a.addEventListener("click", function (e) {
+      var t = token
+        || localStorage.getItem("hicortexToken")
+        || localStorage.getItem("hicortex-dashboard-token");
+      if (!t) return;
+      e.preventDefault();
+      var u = new URL(a.getAttribute("href"), location.origin);
+      u.searchParams.set("token", t);
+      location.href = u.toString();
+    });
+  });
+
   function authHeaders(extra) {
     var h = extra ? Object.assign({}, extra) : {};
     if (token) h["Authorization"] = "Bearer " + token;
@@ -283,6 +332,17 @@
   var sections = {};        // name -> { saved: string, draft: string, isNew: bool }
   var order = [];           // tab order (section names)
   var active = null;        // active section name
+
+  // Display labels for known sections (the API key stays lowercase; the UI
+  // shows a friendlier name). Unknown sections display their raw name.
+  var DISPLAY_LABELS = {
+    "user": "User",
+    "rules": "Rules",
+    "memory": "Memory instructions",
+  };
+  // Preferred tab order — known sections first in this order, then any custom
+  // sections alphabetically.
+  var TAB_PRIORITY = ["user", "rules", "memory"];
   var afterAuth = null;     // action to retry after a successful token prompt
 
   // Per-agent scope (0.13). scope = null → the global set; otherwise an agent
@@ -325,7 +385,7 @@
       var inherited = scope && origins[name] === "global";
       b.className = "tab" + (name === active ? " active" : "") + (inherited ? " inherited" : "");
       b.type = "button";
-      b.appendChild(document.createTextNode(name));
+      b.appendChild(document.createTextNode(DISPLAY_LABELS[name] || name));
       if (inherited) {
         var inh = document.createElement("span");
         inh.className = "inh";
@@ -409,7 +469,13 @@
         if (scope === null && data.agents && typeof data.agents === "object") agents = data.agents;
         origins = (data.origins && typeof data.origins === "object") ? data.origins : {};
         var incoming = data.sections || {};
-        var names = Object.keys(incoming).sort();
+        var names = Object.keys(incoming).sort(function (a, b) {
+          var ai = TAB_PRIORITY.indexOf(a), bi = TAB_PRIORITY.indexOf(b);
+          if (ai >= 0 && bi >= 0) return ai - bi;
+          if (ai >= 0) return -1;
+          if (bi >= 0) return 1;
+          return a.localeCompare(b);
+        });
         sections = {};
         order = [];
         names.forEach(function (n) {

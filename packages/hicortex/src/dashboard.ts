@@ -23,7 +23,9 @@ import type express from "express";
 import type Database from "better-sqlite3";
 
 import { formatIndexLine } from "./recall-index.js";
-import { readPositiveConfig } from "./config-read.js";
+import { readPositiveConfig, readNonNegativeConfig } from "./config-read.js";
+import { DEFAULT_MEMORY_SOFT_CAP } from "./consolidate.js";
+import { loadState } from "./state.js";
 
 // ---------------------------------------------------------------------------
 // Types — the JSON blob shape documented in the issue (a stable contract the
@@ -44,6 +46,23 @@ export interface DashboardMetrics {
     lessonsGenerated?: number;
     dedup: number;
     supersession: number;
+    /** Memories evicted by the capacity stage this run (#245). 0 when under
+     *  cap; undefined on backfill rows (a stage outcome, not reconstructable). */
+    evicted?: number;
+    /**
+     * Total LLM tokens consumed by this run's consolidation (#246). Undefined
+     * in lockstep with `tokens_by_stage` (and on backfill rows, which can't
+     * reconstruct a per-run meter).
+     */
+    tokens?: number;
+    /** Per-stage breakdown of `tokens` (#246). Undefined on backfill rows. */
+    tokens_by_stage?: Record<string, { prompt: number; completion: number; total: number }>;
+  };
+  /** Corpus capacity (#245). `memory_soft_cap` is the configured ceiling (0 =
+   *  disabled); always present in real snapshots, undefined on backfilled
+   *  rows (the historical config isn't recoverable from created_at). */
+  capacity?: {
+    memory_soft_cap: number;
   };
   /** Recall adoption aggregate. Null in backfilled rows. uses_per_showing is
    *  null when shown_sum = 0 (divide-by-zero guard). */
@@ -63,12 +82,28 @@ export interface DashboardSnapshot {
 
 /** The /dashboard/data response — the full payload the page renders. */
 export interface DashboardData {
-  range: "7d" | "30d" | "90d" | "all";
   headline: {
     total_memories: number;
     uses_per_showing: number | null;
     cold_count: number;
+    /** Corpus vs cap (#245). `memory_soft_cap` is 0 when the cap is disabled
+     *  (indefinite growth); the page renders no gauge in that case. */
+    memory_soft_cap: number;
+    /**
+     * LLM token usage this billing period (#246). `used` is the running total
+     * (state.llmTokensThisPeriod.total after monthly reset); `cap` is the
+     * configured `llmTokensPerMonth` (0 = unlimited, page renders no cap).
+     * `used` is 0 when no consolidation has metered tokens yet — the page
+     * hides the stat in that case. `period_start` is the ISO timestamp of the
+     * current accrual period (for the "X this month" label).
+     */
+    tokens: {
+      used: number;
+      cap: number;
+      period_start: string | null;
+    };
   };
+  range: "7d" | "30d" | "90d" | "all";
   series: DashboardSnapshot[];
   composition: {
     by_type: Record<string, number>;
@@ -80,7 +115,17 @@ export interface DashboardData {
     run_at: string | null;
     sample: { id: string; line: string; created_at: string }[];
     lessons: { id: string; content: string; created_at: string }[];
-    stages: { lessonsGenerated?: number; dedup: number; supersession: number; added: number };
+    stages: {
+      lessonsGenerated?: number;
+      dedup: number;
+      supersession: number;
+      added: number;
+      evicted?: number;
+      /** Total tokens consumed that run (#246). Undefined = no metered run. */
+      tokens?: number;
+      /** Per-stage breakdown of `tokens` (#246). */
+      tokens_by_stage?: Record<string, { prompt: number; completion: number; total: number }>;
+    };
     dedup_merges: {
       loser_id: string;
       canonical_id: string;
@@ -168,6 +213,21 @@ export interface NightlyDelta {
   lessonsGenerated?: number;
   dedup: number;
   supersession: number;
+  /** Memories evicted by the capacity stage this run (#245). */
+  evicted?: number;
+  /**
+   * Total LLM tokens consumed by this run's consolidation (#246). Undefined
+   * when consolidation didn't run (capture-only / no_llm / throttled / skipped)
+   * or made no metered calls. Stamped into the snapshot so the dashboard can
+   * show a usage trend.
+   */
+  tokensThisRun?: number;
+  /**
+   * Per-stage breakdown of `tokensThisRun` (#246) — same shape as
+   * ConsolidationReport.budget.tokens_by_stage. Undefined in lockstep with
+   * `tokensThisRun`.
+   */
+  tokensByStage?: Record<string, { prompt: number; completion: number; total: number }>;
 }
 
 /**
@@ -175,11 +235,16 @@ export interface NightlyDelta {
  * nightly.ts passes `now`). OR-replace on the PRIMARY KEY is intentional: a
  * manual re-run for the same instant overwrites, the nightly never produces
  * two rows for the same instant. Returns the row that was written.
+ *
+ * `memorySoftCap` (#245) is the resolved cap (0 = disabled) from the config;
+ * it is stamped into `metrics.capacity` so a historical snapshot records what
+ * cap produced its eviction count. Optional for callers that don't track it.
  */
 export function writeSnapshot(
   db: Database.Database,
   runAt: string,
   delta: NightlyDelta,
+  memorySoftCap?: number,
 ): DashboardSnapshot {
   const metrics = computeDashboardMetrics(db);
   metrics.new_this_run = {
@@ -187,7 +252,16 @@ export function writeSnapshot(
     lessonsGenerated: delta.lessonsGenerated,
     dedup: delta.dedup,
     supersession: delta.supersession,
+    evicted: delta.evicted,
+    // #246: forward only when consolidation actually metered tokens this run.
+    // Absent on capture-only / throttled / no-LLM / no-metered-call runs — the
+    // page treats undefined as "no data for this day", matching adoption.
+    ...(delta.tokensThisRun !== undefined ? { tokens: delta.tokensThisRun } : {}),
+    ...(delta.tokensByStage !== undefined ? { tokens_by_stage: delta.tokensByStage } : {}),
   };
+  if (memorySoftCap !== undefined) {
+    metrics.capacity = { memory_soft_cap: memorySoftCap };
+  }
   db.prepare(
     "INSERT OR REPLACE INTO dashboard_snapshots (run_at, metrics) VALUES (?, ?)",
   ).run(runAt, JSON.stringify(metrics));
@@ -446,10 +520,29 @@ export function handleDashboardData(
   const live = computeDashboardMetrics(db);
 
   // Headline = live corpus (the chart shows history; the headline shows now).
+  // `memory_soft_cap` (#245): resolve from the live config (the source of
+  // truth for "what cap is in force right now"), defaulting to the production
+  // default. The page renders no gauge when it's 0 (disabled).
+  //
+  // `tokens` (#246): period accrual from state.json (the same single source
+  // the throttle check reads, so the dashboard always agrees with the runtime
+  // decision). The cap is `llmTokensPerMonth` (0 = unlimited). The page hides
+  // the stat entirely when `used` is 0 (no metered run yet).
+  const tokenState = loadState().llmTokensThisPeriod;
   const headline = {
     total_memories: live.totals.mem,
     uses_per_showing: live.adoption?.uses_per_showing ?? null,
     cold_count: live.adoption?.cold_count ?? 0,
+    memory_soft_cap: readNonNegativeConfig(
+      config ?? {},
+      "memorySoftCap",
+      DEFAULT_MEMORY_SOFT_CAP,
+    ),
+    tokens: {
+      used: tokenState?.total ?? 0,
+      cap: readNonNegativeConfig(config ?? {}, "llmTokensPerMonth", 0),
+      period_start: tokenState?.periodStart ?? null,
+    },
   };
 
   // Digest: pick the day to summarize. `date` (YYYY-MM-DD) wins; else the most
@@ -556,6 +649,11 @@ export function handleDashboardData(
       dedup: dayMetrics?.new_this_run?.dedup ?? dedupRows.length,
       supersession: dayMetrics?.new_this_run?.supersession ?? supersessionCount,
       added: dayMetrics?.new_this_run?.added ?? sampleRows.length,
+      evicted: dayMetrics?.new_this_run?.evicted,
+      // #246: only present when the day's nightly metered tokens. Both fields
+      // are forwarded together — the page renders either the breakdown or nothing.
+      tokens: dayMetrics?.new_this_run?.tokens,
+      tokens_by_stage: dayMetrics?.new_this_run?.tokens_by_stage,
     },
     dedup_merges: dedupRows.map((r) => ({
       loser_id: r.loser_id,

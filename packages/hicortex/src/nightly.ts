@@ -25,7 +25,7 @@ import { readPositiveConfig, readNonNegativeConfig, warnIgnoredConfigKeys } from
 import { resolveSavedLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
-import { runConsolidation, CONSOLIDATE_MAX_LLM_CALLS } from "./consolidate.js";
+import { runConsolidation, CONSOLIDATE_MAX_LLM_CALLS, DEFAULT_MEMORY_SOFT_CAP, shouldThrottleTokens } from "./consolidate.js";
 import { parseConfigDomains } from "./domain-classify.js";
 import { resolveWeakPrimaryFloor } from "./nofit.js";
 import { readCcTranscripts, type TranscriptBatch } from "./transcript-reader.js";
@@ -203,10 +203,21 @@ export async function runNightly(options: {
    * capture-only). Uniform across client + server/co-located.
    */
   watchdog?: boolean;
+  /**
+   * Consolidate-only mode (hosted service, #110): skip capture entirely, run
+   * consolidation only. The hosted consolidation timer uses this so per-tenant
+   * nightly runs don't ingest the operator's local sessions into the tenant's
+   * DB — the tenant's agents push via /distill; the server only consolidates.
+   */
+  consolidateOnly?: boolean;
 } = {}): Promise<void> {
   const dryRun = options.dryRun ?? false;
   let captureOnly = options.captureOnly ?? false;
   const watchdog = options.watchdog ?? false;
+  const consolidateOnly = options.consolidateOnly ?? false;
+  if (captureOnly && consolidateOnly) {
+    throw new Error("runNightly: captureOnly and consolidateOnly are mutually exclusive");
+  }
   const stateDir = options.stateDir ?? HICORTEX_HOME;
   const recaptureWindowDays = options.recaptureWindowDays;
 
@@ -237,7 +248,9 @@ export async function runNightly(options: {
   // capture-only and falls through to the normal capture path (the capture
   // lock with waitMs=0 provides single-flight; writeLastRun advances the
   // cooldown marker on success).
-  if (watchdog && !dryRun) {
+  // consolidateOnly skips the watchdog gate (the watchdog is a capture mechanism;
+  // consolidateOnly is the opposite — skip capture, run consolidation only).
+  if (watchdog && !dryRun && !consolidateOnly) {
     captureOnly = true; // the watchdog captures only — never consolidates.
     // Success-cooldown: lastNightly is advanced ONLY on a clean capture
     // (writeLastRun is success-gated), so reusing it gives SUCCESS-based
@@ -285,9 +298,9 @@ export async function runNightly(options: {
   }
 
   if (savedConfig?.mode === "client") {
-    // --capture-only is accepted in client mode but irrelevant: client nightly
-    // is already capture-only (no consolidation step). (If watchdog-gated, the
-    // gate above already ran.)
+    // --capture-only and --consolidate-only are both accepted in client mode but
+    // irrelevant: client nightly is already capture-only (no consolidation step),
+    // and consolidation-only makes no sense without a local DB.
     await runClientNightly(savedConfig, dryRun, stateDir, recaptureWindowDays, watchdog);
     return;
   }
@@ -298,7 +311,7 @@ export async function runNightly(options: {
   configureDecay({ halfLifeDays: savedConfig?.decayHalfLifeDays });
   configureRecall(savedConfig);
   configureScoring(savedConfig);
-  const modeLabel = captureOnly ? " (capture-only)" : dryRun ? " (dry run)" : "";
+  const modeLabel = consolidateOnly ? " (consolidate-only)" : captureOnly ? " (capture-only)" : dryRun ? " (dry run)" : "";
   console.log(`[hicortex] Nightly pipeline starting${modeLabel}`);
   if (captureOnly) {
     console.log(`[hicortex] capture-only run — consolidation skipped`);
@@ -337,6 +350,12 @@ export async function runNightly(options: {
     let memoriesIngested = 0;
     let hadTransientFailure = false;
 
+    // consolidateOnly (hosted service): skip capture entirely. The hosted
+    // consolidation timer uses this so per-tenant nightly runs don't ingest the
+    // operator's local sessions into the tenant's DB.
+    if (consolidateOnly) {
+      console.log("[hicortex] consolidate-only run — capture skipped");
+    } else {
     // Full nightly waits out a transient --capture-only overlap (each segment
     // POST can block up to 20 min); capture-only fails fast. dry-run writes
     // nothing so it needs no lock.
@@ -424,16 +443,37 @@ export async function runNightly(options: {
         if (pruned > 0) console.log(`[hicortex] Pruned ${pruned} stale capture cursor(s)`);
       }
     }
+    } // end capture block (consolidateOnly else)
 
     // Step 3: Consolidation — skipped in capture-only mode, dry-run, or no LLM.
     // Runs even if capture had transient failures (opens DB directly, independent
     // of the HTTP capture path). Full nightly only — capture-only runs are
     // intended to run more frequently than once daily.
     let lessonsGenerated: number | undefined; // hoisted for telemetry; undefined when reflection didn't run (skipped) — bucketed apart from a real 0
+    // #245: memories evicted by the capacity stage (hoisted for the dashboard
+    // snapshot). 0 is a real value (under cap), so this stays undefined only
+    // when consolidation didn't run at all (capture-only / no_llm / skipped).
+    let evictedCount: number | undefined;
+    // Resolved cap (#245) for the dashboard snapshot. Hoisted so the snapshot
+    // writer (outside the consolidation block) can stamp `capacity` even when
+    // consolidation was skipped (the cap is still "in force" config-wise).
+    const memorySoftCapResolved = readNonNegativeConfig(
+      savedConfig ?? {},
+      "memorySoftCap",
+      DEFAULT_MEMORY_SOFT_CAP,
+    );
     // Consolidation outcome for telemetry (0.17). undefined on capture-only runs
     // (which send no nightly ping). "skipped" = runConsolidation's built-in
     // nothing-to-do short-circuit (zero LLM calls), NOT a failure.
-    let consolidationStatus: "completed" | "skipped" | "failed" | "no_llm" | undefined;
+    // "throttled" (#246) = the llmTokensPerMonth fair-use cap was projected to
+    // be exceeded, so consolidation was skipped before any LLM call.
+    let consolidationStatus: "completed" | "skipped" | "failed" | "no_llm" | "throttled" | undefined;
+    // #246: total consolidation tokens consumed this run (hoisted for telemetry
+    // + the dashboard snapshot). Undefined when consolidation didn't run at all
+    // (capture-only / no_llm / throttled) so the optional field is omitted.
+    let tokensThisRun: number | undefined;
+    // #246: per-stage token breakdown (hoisted for the dashboard snapshot).
+    let tokensByStage: Record<string, { prompt: number; completion: number; total: number }> | undefined;
     if (!dryRun && !captureOnly) {
       if (!llm || !llmConfig) {
         console.error(
@@ -441,39 +481,130 @@ export async function runNightly(options: {
         );
         consolidationStatus = "no_llm";
       } else {
-        // One model serves all phases (#231) — there is no separate endpoint to
-        // pre-flight. If the model doesn't answer, `complete()` already retries at
-        // 30s/60s/120s (~3.5 min); anything still failing after that is an outage,
-        // not a blip. A failed phase costs latency, not data: capture cursors hold
-        // on failure (dup-over-loss), and consolidation has resumable cursors
-        // (domainCursor, supersessionCursor). The nightly runs 2-4×/day, so the
-        // wait is hours — no polling, no new config. (Issue #231.)
-        const cfgDomains = parseConfigDomains(savedConfig);
+        // #246: fair-use cap. Default 0 = unlimited (self-hosted default —
+        // never throttles). When > 0, project this run's cost against the
+        // period running total. The estimate = the PREVIOUS run's actual usage
+        // (state.llmTokensLastRun, 0/absent on the first metered run = never
+        // throttle the first run, since there's no baseline yet). Conservative:
+        // over-throttle vs over-spend, since a throttled night just defers work
+        // to the next period (the corpus is not lost — consolidation has
+        // resumable cursors and runs 2-4×/day on the 0.17 timer).
+        const tokenCap = readNonNegativeConfig(savedConfig ?? {}, "llmTokensPerMonth", 0);
+        if (tokenCap > 0) {
+          // Pure decision lives in consolidate.ts (shouldThrottleTokens) so it
+          // can be unit-tested without spinning up the nightly. Monthly reset
+          // + last-run estimate are handled inside the helper.
+          const periodState = loadState(stateDir).llmTokensThisPeriod;
+          const lastRunTokens = loadState(stateDir).llmTokensLastRun ?? 0;
+          const decision = shouldThrottleTokens(tokenCap, periodState, lastRunTokens);
+          if (decision.throttle) {
+            console.warn(
+              `[hicortex] Consolidation throttled: token fair-use cap reached ` +
+              `(${decision.used!.toLocaleString()} used + ~${lastRunTokens.toLocaleString()} estimated / ${tokenCap.toLocaleString()} this period).`,
+            );
+            consolidationStatus = "throttled";
+            // Month-boundary reset even when throttled (#246 CR): without this,
+            // llmTokensLastRun stays stale from the prior month → soft-locks
+            // every subsequent run forever. Reset the period + the last-run
+            // estimate so the next month starts clean.
+            if (!dryRun) {
+              updateState((s) => {
+                const now = new Date();
+                const cur = s.llmTokensThisPeriod;
+                const startD = cur?.periodStart ? new Date(cur.periodStart) : now;
+                if (startD.getUTCFullYear() !== now.getUTCFullYear() ||
+                    startD.getUTCMonth() !== now.getUTCMonth()) {
+                  s.llmTokensThisPeriod = { prompt: 0, completion: 0, total: 0, periodStart: now.toISOString() };
+                  s.llmTokensLastRun = 0;
+                  console.log("[hicortex] Token fair-use period reset (new month) — throttle cleared.");
+                }
+              }, stateDir);
+            }
+          }
+        }
 
-        console.log(`[hicortex] Running consolidation...`);
-        const report = await runConsolidation(db, llm, embed, dryRun, false, undefined, {
-          domains: cfgDomains,
-          contentDomainsReady: true,
-          weakPrimaryFloor: resolveWeakPrimaryFloor(savedConfig),
-        }, {
-          minSimilarity: savedConfig?.supersessionMinSimilarity as number | undefined,
-          maxCalls: savedConfig?.supersessionMaxCalls as number | undefined,
-        },
-          // #241: config-driven total LLM-call ceiling (default 5000, was 200).
-          readPositiveConfig(savedConfig ?? {}, "consolidateMaxLlmCalls", CONSOLIDATE_MAX_LLM_CALLS),
-        );
-        console.log(
-          `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
-          (report.stages.reflection ? ` (${report.stages.reflection.lessons_generated} lessons)` : "")
-        );
-        consolidationStatus = report.status;
-        // Only set when reflection actually RAN (not skipped). A skipped stage
-        // (e.g. endpoint offline, #232 fail-soft) must NOT collapse to 0 — that
-        // would make "endpoint down" indistinguishable from "prompt too tight"
-        // in the fleet aggregate. Leave undefined so the optional field is
-        // omitted and the aggregate buckets skipped runs separately.
-        const refl = report.stages.reflection;
-        if (refl && !refl.skipped) lessonsGenerated = refl.lessons_generated;
+        if (consolidationStatus !== "throttled") {
+          // One model serves all phases (#231) — there is no separate endpoint to
+          // pre-flight. If the model doesn't answer, `complete()` already retries at
+          // 30s/60s/120s (~3.5 min); anything still failing after that is an outage,
+          // not a blip. A failed phase costs latency, not data: capture cursors hold
+          // on failure (dup-over-loss), and consolidation has resumable cursors
+          // (domainCursor, supersessionCursor). The nightly runs 2-4×/day, so the
+          // wait is hours — no polling, no new config. (Issue #231.)
+          const cfgDomains = parseConfigDomains(savedConfig);
+
+          console.log(`[hicortex] Running consolidation...`);
+          const report = await runConsolidation(db, llm, embed, dryRun, false, undefined, {
+            domains: cfgDomains,
+            contentDomainsReady: true,
+            weakPrimaryFloor: resolveWeakPrimaryFloor(savedConfig),
+          }, {
+            minSimilarity: savedConfig?.supersessionMinSimilarity as number | undefined,
+            maxCalls: savedConfig?.supersessionMaxCalls as number | undefined,
+          },
+            // #241: config-driven total LLM-call ceiling (default 5000, was 200).
+            readPositiveConfig(savedConfig ?? {}, "consolidateMaxLlmCalls", CONSOLIDATE_MAX_LLM_CALLS),
+            // #245: soft cap on the corpus (default 10000; 0 disables eviction).
+            memorySoftCapResolved,
+          );
+          console.log(
+            `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
+            (report.stages.reflection ? ` (${report.stages.reflection.lessons_generated} lessons)` : "")
+          );
+          consolidationStatus = report.status;
+          // #245: capture the eviction count for the dashboard snapshot. The
+          // stage always returns `evicted` (0 when under cap / disabled); report
+          // it as 0 (a real value), not undefined, when the stage ran.
+          evictedCount = report.stages.memory_cap?.evicted ?? 0;
+          // Only set when reflection actually RAN (not skipped). A skipped stage
+          // (e.g. endpoint offline, #232 fail-soft) must NOT collapse to 0 — that
+          // would make "endpoint down" indistinguishable from "prompt too tight"
+          // in the fleet aggregate. Leave undefined so the optional field is
+          // omitted and the aggregate buckets skipped runs separately.
+          const refl = report.stages.reflection;
+          if (refl && !refl.skipped) lessonsGenerated = refl.lessons_generated;
+          // #246: surface token totals for telemetry + dashboard snapshot. Both
+          // fields stay undefined on a skipped/failed run (no metered calls →
+          // nothing to report; the optional fields are omitted from the ping).
+          const tokensTotal = report.budget?.tokens_total;
+          if (tokensTotal && tokensTotal.total > 0) {
+            tokensThisRun = tokensTotal.total;
+            tokensByStage = report.budget?.tokens_by_stage;
+          }
+          // #246: accrue to state.json (monthly reset + last-run estimate for
+          // the next throttle check). Written even on a failed run — a partial
+          // run that made metered calls before the failure still spent tokens,
+          // and the next run's estimate should reflect that.
+          if (!dryRun) {
+            updateState((s) => {
+              const now = new Date();
+              const cur = s.llmTokensThisPeriod;
+              let periodStart = cur?.periodStart ?? now.toISOString();
+              let prompt = cur?.prompt ?? 0;
+              let completion = cur?.completion ?? 0;
+              let total = cur?.total ?? 0;
+              // Monthly reset: if periodStart is in a previous calendar month,
+              // zero the accrual before adding this run's contribution.
+              const startD = new Date(periodStart);
+              if (startD.getUTCFullYear() !== now.getUTCFullYear() ||
+                  startD.getUTCMonth() !== now.getUTCMonth()) {
+                periodStart = now.toISOString();
+                prompt = 0;
+                completion = 0;
+                total = 0;
+              }
+              if (tokensTotal) {
+                prompt += tokensTotal.prompt;
+                completion += tokensTotal.completion;
+                total += tokensTotal.total;
+              }
+              s.llmTokensThisPeriod = {
+                prompt, completion, total, periodStart,
+              };
+              s.llmTokensLastRun = tokensTotal?.total ?? 0;
+            }, stateDir);
+          }
+        }
       }
     }
 
@@ -538,7 +669,12 @@ export async function runNightly(options: {
           lessonsGenerated,
           dedup,
           supersession,
-        });
+          evicted: evictedCount,
+          // #246: token accounting from this run's consolidation (undefined
+          // when consolidation didn't run or made no metered calls).
+          tokensThisRun,
+          tokensByStage,
+        }, memorySoftCapResolved);
       } catch (snapErr) {
         // The snapshot is a monitoring side-effect — a failure here must NOT
         // advance to a telemetry gap or move the watermark. Surface + continue.
@@ -581,6 +717,9 @@ export async function runNightly(options: {
         lessons: storage.getLessons(db, 365).length,
         lessonsGenerated,
         consolidation: consolidationStatus,
+        // #246: total tokens consumed by this run's consolidation (absent on
+        // capture-only / throttled / no_llm / skipped — no metered calls).
+        tokens_this_run: tokensThisRun,
         sessions: batches.length,
         ok: !hadTransientFailure,
         shown: adoption.shown,

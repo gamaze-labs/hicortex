@@ -52,7 +52,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { LlmClient } from "./llm.js";
+import type { LlmClient, LlmUsage } from "./llm.js";
 import type { DomainDef } from "./types.js";
 
 export type { DomainDef };
@@ -279,12 +279,19 @@ export function parseTagReply(reply: string, domains: DomainDef[]): TagResult | 
  *
  * @returns {tags} on success (all members of the vocabulary; empty = no-fit),
  *          or null on infra error.
+ *
+ * `onUsage` (#246) is an optional callback fired ONCE with the LlmUsage from
+ * the SUCCESSFUL attempt (the one whose reply parsed). Throwing/unparseable
+ * attempts don't fire it — only the call that produced the kept result is
+ * metered. The consolidation caller wires this to BudgetTracker.recordUsage;
+ * the CLI caller (classify-domains) has no tracker and omits it.
  */
 export async function classifyMemoryTags(
   content: string,
   project: string | null | undefined,
   domains: DomainDef[],
   llm: LlmClient,
+  onUsage?: (usage: LlmUsage) => void,
 ): Promise<TagResult | null> {
   if (domains.length === 0) return { tags: [] };
 
@@ -296,8 +303,18 @@ export async function classifyMemoryTags(
     let raw: string;
     try {
       // ~64 tokens covers a short JSON object with a handful of tags.
-      raw = await llm.completeClassify(prompt, 64);
+      const r = await llm.completeClassify(prompt, 64);
+      raw = r.text;
       threw = false;
+      // Surface the usage ONLY when this attempt's reply parses (below). Hold
+      // the value across the parse check so the metered call is the one whose
+      // result is actually kept.
+      const heldUsage = r.usage;
+      const parsed = parseTagReply(raw, domains);
+      if (parsed) {
+        if (heldUsage && onUsage) onUsage(heldUsage);
+        return parsed;
+      }
     } catch (err) {
       threw = true;
       if (attempt === 0) continue; // retry once
@@ -306,9 +323,6 @@ export async function classifyMemoryTags(
       );
       return null; // infra error → abort untouched (never filed, never decayed)
     }
-
-    const parsed = parseTagReply(raw, domains);
-    if (parsed) return parsed;
 
     if (attempt === 0) {
       console.warn(

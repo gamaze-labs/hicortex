@@ -121,38 +121,53 @@ EXTRACT into this markdown format:
 # Session Memory: ${date} - ${projectName}
 
 ### Decisions Made
-- [SUBJECT]: [decision] — [reasoning] (${date})
+- [D] [SUBJECT]: [decision] — [reasoning] (${date})
 
 ### Facts Learned
-- [SUBJECT]: [fact] — [context/source] (${date})
+- [F] [SUBJECT]: [fact] — [context/source] (${date})
 
 ### Problems & Solutions
-- [SUBJECT]: [problem] → [solution that worked] (${date})
+- [E] [SUBJECT]: [problem] → [solution that worked] (${date})
 
 ### Project State Changes
-- [SUBJECT]: [what changed], [from → to] (${date})
+- [D] [SUBJECT]: [what changed], [from → to] (${date})
 
 ### Key Entities & Relationships
-- [entity A] → [relationship] → [entity B] (${date})
+- [F] [entity A] → [relationship] → [entity B] (${date})
 
 ### Corrections & Rejections
-- [SUBJECT]: [what AI proposed] → [why rejected/corrected] → [what user wanted instead] (${date})
+- [E] [SUBJECT]: [what AI proposed] → [why rejected/corrected] → [what user wanted instead] (${date})
   (Include: tool use denials, "no/wrong/redo", style feedback, approach rejections,
    user corrections of AI assumptions, quality complaints like "too verbose")
 
+TYPE TAG (critical — prefix EVERY bullet with exactly one letter + space):
+- [E] EPISODE — a specific event, interaction, or narrative: "tried X, failed
+  because Y", a correction, a debugging session, a one-time occurrence. The
+  DEFAULT when in doubt.
+- [F] FACT — a durable truth that will hold across sessions: "the API is at
+  :8787", "uv is used for packages", "config lives in ~/.hicortex/". Not tied
+  to a single moment.
+- [D] DECISION — a choice made that future work builds on, and that a later
+  decision can SUPERSEDE: "switched from gemma4 to qwen3.5", "adopted the
+  graded-schema tag model". Not a fact (it can change) and not an episode
+  (it persists and constrains).
+- NEVER use [L] (lesson). Lessons are extracted by a SEPARATE reflection stage,
+  not here. If the model emits [L], it is wrong — re-tag as episode/fact/decision.
+The type tag goes BEFORE the subject, never as a section/category bracket.
+
 TOPIC-FIRST RULE (critical — read carefully):
-Every item MUST begin with its [SUBJECT]: the concrete thing it is about — the
-system, file, component, decision area, or entity. The subject is what a future
-reader would search for.
-- Write:  "Electrical load calculation: don't bundle unknown loads into one figure — user rejected the estimate"
-- NOT:    "User rejected AI's bundling of unknown loads"
-- Write:  "Nightly capture (Hermes): cron sessions are excluded — source='cron' is skipped before distillation"
-- NOT:    "Discovered that cron sessions are filtered out"
-Reason: each item's first words become the memory's one-line index entry AND
-dominate its search embedding. An item that opens with a category label, a
-sentiment ("Strong Negative"), or "User rejected…" is unfindable — it matches
-every emotionally-similar prompt and no topically-relevant one. Front-load the
-subject; put reaction, intensity and reasoning AFTER it.
+Every item MUST begin with its [SUBJECT] (right after the type tag): the
+concrete thing it is about — the system, file, component, decision area, or
+entity. The subject is what a future reader would search for.
+- Write:  "[E] Electrical load calculation: don't bundle unknown loads into one figure — user rejected the estimate"
+- NOT:    "[E] User rejected AI's bundling of unknown loads"
+- Write:  "[F] Nightly capture (Hermes): cron sessions are excluded — source='cron' is skipped before distillation"
+- NOT:    "[F] Discovered that cron sessions are filtered out"
+Reason: each item's first words (after the type tag) become the memory's one-line
+index entry AND dominate its search embedding. An item that opens with a category
+label, a sentiment ("Strong Negative"), or "User rejected…" is unfindable — it
+matches every emotionally-similar prompt and no topically-relevant one. Front-load
+the subject; put reaction, intensity and reasoning AFTER it.
 
 RULES:
 - Extract MAX 20 items total (quality over quantity)

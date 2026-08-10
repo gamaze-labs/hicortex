@@ -275,6 +275,35 @@ export class RateLimitError extends Error {
   }
 }
 
+/**
+ * Token-usage triplet reported by every LLM call (#246). All three fields are
+ * populated from real API responses — no estimation, no fallback. `usage` is
+ * `undefined` ONLY when a backend genuinely returned no usage object (which
+ * should never happen on a healthy path: OpenAI-compat and Ollama both echo
+ * usage on every successful completion). Callers that record usage must treat
+ * `undefined` as "no signal this call" and skip — never as zero (zero would
+ * silently undercount a real cost).
+ *
+ * Field names mirror the OpenAI spec (`prompt_tokens` / `completion_tokens` /
+ * `total_tokens`) so the shape is parseable by anything that already speaks
+ * that API. Ollama's `prompt_eval_count` / `eval_count` are mapped at the
+ * provider boundary in completeOllama.
+ */
+export interface LlmUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+/**
+ * The result of every LLM completion. `text` is the trimmed model output;
+ * `usage` is the token accounting from the API response (#246).
+ */
+export interface LlmResult {
+  text: string;
+  usage?: LlmUsage;
+}
+
 // Rate-limit backoff is keyed by provider@baseUrl at module scope so it is
 // shared across any LlmClient instances that target the same endpoint (e.g. a
 // daemon client + a future constructed client). One model serves all phases
@@ -326,7 +355,7 @@ export class LlmClient {
    * ollama flush stays (provider-gated) — it is a scoring-call-count cadence and
    * scoring is the highest-frequency call, so this is where the flush belongs.
    */
-  async completeFast(prompt: string, maxTokens?: number): Promise<string> {
+  async completeFast(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
     const result = await this.complete(this.config.model, prompt, tokens, 600_000);
     const flushEvery = this.config.ollamaFlushEvery ?? 0;
@@ -344,7 +373,7 @@ export class LlmClient {
    * Reflect-tier completion (nightly reflection). One model serves all phases
    * (#231) — this is a thin wrapper kept for call-site readability.
    */
-  async completeReflect(prompt: string, maxTokens?: number): Promise<string> {
+  async completeReflect(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
     return this.complete(this.config.model, prompt, tokens, 900_000);
   }
@@ -353,7 +382,7 @@ export class LlmClient {
    * Distillation-tier completion (session knowledge extraction). One model
    * serves all phases (#231) — thin wrapper kept for call-site readability.
    */
-  async completeDistill(prompt: string, maxTokens?: number): Promise<string> {
+  async completeDistill(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
     return this.complete(this.config.model, prompt, tokens, 900_000);
   }
@@ -362,7 +391,7 @@ export class LlmClient {
    * Classification-tier completion (memory tag classification). One model
    * serves all phases (#231) — thin wrapper kept for call-site readability.
    */
-  async completeClassify(prompt: string, maxTokens?: number): Promise<string> {
+  async completeClassify(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
     return this.complete(this.config.model, prompt, tokens, 900_000);
   }
@@ -372,7 +401,7 @@ export class LlmClient {
     prompt: string,
     maxTokens: number,
     timeoutMs: number,
-  ): Promise<string> {
+  ): Promise<LlmResult> {
     if (this.isRateLimited) {
       throw new RateLimitError(this.rateLimitedUntil - Date.now());
     }
@@ -401,7 +430,7 @@ export class LlmClient {
     prompt: string,
     maxTokens: number,
     timeoutMs: number,
-  ): Promise<string> {
+  ): Promise<LlmResult> {
     if (this.config.provider === "claude-cli") {
       return this.completeClaude(model, prompt, timeoutMs);
     }
@@ -418,12 +447,18 @@ export class LlmClient {
   /**
    * Claude CLI: shell out to `claude -p` for subscription users.
    * No API key needed — uses CC's authenticated session.
+   *
+   * Token usage (#246): the claude CLI JSON output does not carry a token
+   * usage field, so this path returns `usage: undefined`. The CLI is billed
+   * by Claude subscription, not per-token — there is nothing to meter. The
+   * fair-use cap therefore never trips on a claude-cli install, which is the
+   * correct outcome (no meterable cost to defend against).
    */
   private async completeClaude(
     model: string,
     prompt: string,
     timeoutMs: number
-  ): Promise<string> {
+  ): Promise<LlmResult> {
     const { execSync } = require("node:child_process") as typeof import("node:child_process");
     const claudePath = this.config.baseUrl; // baseUrl stores the claude binary path
 
@@ -436,7 +471,7 @@ export class LlmClient {
       if (data.is_error) {
         throw new Error(`Claude CLI error: ${data.result}`);
       }
-      return (data.result ?? "").trim();
+      return { text: (data.result ?? "").trim() };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("rate") || msg.includes("429") || msg.includes("overloaded")) {
@@ -449,13 +484,18 @@ export class LlmClient {
   /**
    * Ollama: use /api/generate with think:false (important for qwen3.5 models).
    * num_ctx is read from config (one value, all phases — #231; default 8192).
+   *
+   * Token usage (#246): the FINAL streamed chunk carries the per-request
+   * accounting as `prompt_eval_count` (input) + `eval_count` (output). Earlier
+   * chunks have null/zero — only the terminal chunk is meaningful, so we keep
+   * updating as chunks arrive and the last one wins.
    */
   private async completeOllama(
     model: string,
     prompt: string,
     maxTokens: number,
     timeoutMs: number,
-  ): Promise<string> {
+  ): Promise<LlmResult> {
     const url = `${this.config.baseUrl.replace(/\/$/, "")}/api/generate`;
     // Ollama can take minutes to process large contexts — use streaming to avoid
     // Node.js fetch headers timeout (default ~300s kills long Ollama inferences)
@@ -485,8 +525,13 @@ export class LlmClient {
       throw new Error(`Ollama error ${resp.status}: ${text}`);
     }
 
-    // Collect streamed response chunks
+    // Collect streamed response chunks. The terminal chunk carries the token
+    // accounting (`prompt_eval_count` / `eval_count`); earlier chunks have
+    // null. Track the latest values so the final ones win (mirrors the official
+    // ollama-js streaming parser).
     let result = "";
+    let promptTokens: number | undefined;
+    let completionTokens: number | undefined;
     const reader = resp.body?.getReader();
     if (!reader) throw new Error("No response body");
     const decoder = new TextDecoder();
@@ -499,10 +544,26 @@ export class LlmClient {
         try {
           const data = JSON.parse(line);
           if (data.response) result += data.response;
+          // Token accounting — only present on the terminal chunk. Keep the last
+          // non-null value; missing on both → usage stays undefined (no signal).
+          if (typeof data.prompt_eval_count === "number") {
+            promptTokens = data.prompt_eval_count;
+          }
+          if (typeof data.eval_count === "number") {
+            completionTokens = data.eval_count;
+          }
         } catch { /* skip malformed lines */ }
       }
     }
-    return result.trim();
+    const usage: LlmUsage | undefined =
+      promptTokens !== undefined && completionTokens !== undefined
+        ? {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: promptTokens + completionTokens,
+          }
+        : undefined;
+    return { text: result.trim(), usage };
   }
 
   /**
@@ -535,13 +596,17 @@ export class LlmClient {
   /**
    * Anthropic Messages API (/v1/messages).
    * Auth via x-api-key header.
+   *
+   * Token usage (#246): Anthropic's response carries `usage.input_tokens` +
+   * `usage.output_tokens`. Mapped to the OpenAI-spec field names so downstream
+   * accounting is uniform across providers.
    */
   private async completeAnthropic(
     model: string,
     prompt: string,
     maxTokens: number,
     timeoutMs: number
-  ): Promise<string> {
+  ): Promise<LlmResult> {
     const baseUrl = this.config.baseUrl.replace(/\/$/, "");
     const hasVersion = /\/v\d+\/?$/.test(baseUrl);
     const url = hasVersion ? `${baseUrl}/messages` : `${baseUrl}/v1/messages`;
@@ -569,21 +634,38 @@ export class LlmClient {
 
     const data = (await resp.json()) as {
       content?: Array<{ type: string; text?: string }>;
+      usage?: { input_tokens?: number; output_tokens?: number };
     };
     const textBlock = data.content?.find((c) => c.type === "text");
-    return (textBlock?.text ?? "").trim();
+    const inT = data.usage?.input_tokens;
+    const outT = data.usage?.output_tokens;
+    const usage: LlmUsage | undefined =
+      typeof inT === "number" && typeof outT === "number"
+        ? {
+            prompt_tokens: inT,
+            completion_tokens: outT,
+            total_tokens: inT + outT,
+          }
+        : undefined;
+    return { text: (textBlock?.text ?? "").trim(), usage };
   }
 
   /**
    * OpenAI-compatible /v1/chat/completions (works for OpenAI, OpenRouter, etc).
    * enableThinking is read from config here (one value, all phases — #231).
+   *
+   * Token usage (#246): the OpenAI spec's `usage` object is always present on
+   * a successful completion — `prompt_tokens` / `completion_tokens` /
+   * `total_tokens`. The MLX gateway emits the same shape (verified v0.31.3).
+   * Parsed verbatim; absent only on a non-conforming endpoint, in which case
+   * `usage` stays undefined (no signal, never a fabricated zero).
    */
   private async completeOpenAiCompat(
     model: string,
     prompt: string,
     maxTokens: number,
     timeoutMs: number,
-  ): Promise<string> {
+  ): Promise<LlmResult> {
     const baseUrl = this.config.baseUrl.replace(/\/$/, "");
     // Some providers include the API version in the base URL already
     const hasVersion = /\/v\d+\/?$/.test(baseUrl);
@@ -630,7 +712,23 @@ export class LlmClient {
 
     const data = (await resp.json()) as {
       choices?: Array<{ message?: { content?: string } }>;
+      usage?: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+      };
     };
-    return (data.choices?.[0]?.message?.content ?? "").trim();
+    const u = data.usage;
+    const usage: LlmUsage | undefined =
+      typeof u?.prompt_tokens === "number" &&
+      typeof u?.completion_tokens === "number" &&
+      typeof u?.total_tokens === "number"
+        ? {
+            prompt_tokens: u.prompt_tokens,
+            completion_tokens: u.completion_tokens,
+            total_tokens: u.total_tokens,
+          }
+        : undefined;
+    return { text: (data.choices?.[0]?.message?.content ?? "").trim(), usage };
   }
 }

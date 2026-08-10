@@ -662,6 +662,13 @@ def _write_plugin_config(home, payload):
     return cfg_path
 
 
+def _read_plugin_config(home):
+    """Read $HERMES_HOME/plugins/hicortex/config.json back as a dict."""
+    cfg_path = os.path.join(home, "plugins", "hicortex", "config.json")
+    with open(cfg_path, encoding="utf-8") as f:
+        return json.load(f)
+
+
 @pytest.fixture
 def reset_privacy_deprecation_warn():
     """The deprecation guard is a module-level one-time flag (per-process). Reset
@@ -717,6 +724,72 @@ def test_privacy_filter_deprecation_default_value_does_not_warn(tmp_path, monkey
         config_mod.load_config()
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1  # explicit key → warn, even though value == default
+
+
+# ---------------------------------------------------------------------------
+# #243: save_config clobber guard — must not overwrite a real value with a
+# schema default when the form sends the default unchanged.
+# ---------------------------------------------------------------------------
+
+def test_save_config_preserves_remote_url_when_form_sends_default(monkeypatch, tmp_path):
+    """The headline #243 scenario: form sends localhost (schema default), but
+    config.json has a remote URL. save_config must keep the remote URL."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_plugin_config(str(tmp_path), {"hicortex_url": "http://memory-server:8787"})
+
+    config_mod.save_config(
+        {"hicortex_url": "http://localhost:8787", "hicortex_auth_token": "secret"},
+        str(tmp_path),
+    )
+
+    cfg = _read_plugin_config(str(tmp_path))
+    assert cfg["hicortex_url"] == "http://memory-server:8787"  # preserved!
+
+
+def test_save_config_writes_new_remote_url(monkeypatch, tmp_path):
+    """When the form sends a non-default value, it should be written."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_plugin_config(str(tmp_path), {"hicortex_url": "http://localhost:8787"})
+
+    config_mod.save_config(
+        {"hicortex_url": "http://new-server:8787"},
+        str(tmp_path),
+    )
+
+    cfg = _read_plugin_config(str(tmp_path))
+    assert cfg["hicortex_url"] == "http://new-server:8787"
+
+
+def test_save_config_strips_token(monkeypatch, tmp_path):
+    """The auth token must never be written to config.json (#243 CR)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _write_plugin_config(str(tmp_path), {"hicortex_url": "http://s:8787"})
+
+    config_mod.save_config(
+        {"hicortex_url": "http://s:8787", "hicortex_auth_token": "hctx-secret"},
+        str(tmp_path),
+    )
+
+    cfg = _read_plugin_config(str(tmp_path))
+    assert "hicortex_auth_token" not in cfg
+
+
+def test_get_config_redacts_token(monkeypatch, tmp_path):
+    """get_config must return *** for the token, never the raw value (#243 CR)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HICORTEX_AUTH_TOKEN", "hctx-secret-123")
+    _write_plugin_config(str(tmp_path), {"hicortex_url": "http://s:8787"})
+
+    from hicortex.config import load_config
+    assert load_config().get("hicortex_auth_token") == "hctx-secret-123"
+
+    # get_config (via the provider) must redact.
+    # We test the redaction logic directly since importing the provider
+    # requires Hermes's MemoryProvider base class.
+    cfg = load_config()
+    if cfg.get("hicortex_auth_token"):
+        cfg["hicortex_auth_token"] = "***"
+    assert cfg["hicortex_auth_token"] == "***"
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 name: hicortex
-version: 0.7.2
+version: 0.7.3
 description: "Self-learning memory for Hermes agents — every session is distilled into lessons overnight, and your agent wakes up wiser. Pushes a compact per-turn recall index (lazy-loaded with hicortex_get), injects fresh lessons plus a per-agent standing context block, and exposes the full 9-tool memory surface (search, get, recent, ingest, lessons, index, graph, update, delete) via a shared Hicortex server. Stdlib-only."
 pip_dependencies: []
 hooks: []
