@@ -100,6 +100,19 @@ export class BudgetTracker {
   maxCalls: number;
   callsUsed = 0;
   callsByStage: Record<string, number> = {};
+  /**
+   * Token usage per stage (#246). Keys are the same stage labels passed to
+   * `use()`. A stage that made no metered calls (no usage returned — never the
+   * path on a healthy openai/ollama endpoint) is absent, NOT zero, so the
+   * dashboard can distinguish "nothing spent" from "no signal".
+   */
+  tokensByStage: Record<string, { prompt: number; completion: number; total: number }> = {};
+  /** Run-wide totals — the sum of every recordUsage() call this run. */
+  totalTokens: { prompt: number; completion: number; total: number } = {
+    prompt: 0,
+    completion: 0,
+    total: 0,
+  };
 
   constructor(maxCalls: number) {
     this.maxCalls = maxCalls;
@@ -126,14 +139,78 @@ export class BudgetTracker {
     return true;
   }
 
+  /**
+   * Record token usage from one LLM call (#246). Called by the consolidation
+   * stages after each metered completion. `undefined` usage (claude-cli path,
+   * or a non-conforming endpoint that returned no usage object) is a no-op —
+   * never recorded as zero, which would silently undercount real spend.
+   */
+  recordUsage(stage: string, usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | undefined): void {
+    if (!usage) return;
+    const cur = this.tokensByStage[stage] ?? { prompt: 0, completion: 0, total: 0 };
+    cur.prompt += usage.prompt_tokens;
+    cur.completion += usage.completion_tokens;
+    cur.total += usage.total_tokens;
+    this.tokensByStage[stage] = cur;
+    this.totalTokens.prompt += usage.prompt_tokens;
+    this.totalTokens.completion += usage.completion_tokens;
+    this.totalTokens.total += usage.total_tokens;
+  }
+
   summary(): NonNullable<ConsolidationReport["budget"]> {
     return {
       max_calls: this.maxCalls,
       calls_used: this.callsUsed,
       calls_remaining: this.remaining,
       calls_by_stage: { ...this.callsByStage },
+      tokens_by_stage: Object.fromEntries(
+        Object.entries(this.tokensByStage).map(([k, v]) => [k, { ...v }]),
+      ),
+      tokens_total: { ...this.totalTokens },
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Token fair-use throttle decision (#246)
+// ---------------------------------------------------------------------------
+
+/**
+ * Decide whether consolidation should be throttled this run based on the
+ * `llmTokensPerMonth` fair-use cap. Pure (no I/O) so it can be unit-tested
+ * independently of the nightly wiring.
+ *
+ * Returns `{ throttle: true, used, cap }` when the projected post-run total
+ * would exceed the cap; `{ throttle: false }` otherwise. The estimate is the
+ * previous run's actual usage (`llmTokensLastRun`, 0/absent on the first
+ * metered run = never throttle the first run — no baseline yet).
+ *
+ * `cap = 0` (the self-hosted default) → never throttle (unlimited).
+ * `periodStart` in a previous calendar month → period resets to 0 first
+ * (mirrors the reset logic in nightly.ts; both sides agree because both read
+ * the same state + clock).
+ */
+export function shouldThrottleTokens(
+  cap: number,
+  period: { total: number; periodStart: string } | undefined,
+  lastRunTokens: number,
+  now: Date = new Date(),
+): { throttle: boolean; used?: number; cap?: number } {
+  if (cap <= 0) return { throttle: false };
+  let periodTotal = period?.total ?? 0;
+  const periodStart = period?.periodStart;
+  if (periodStart) {
+    const start = new Date(periodStart);
+    if (start.getUTCFullYear() !== now.getUTCFullYear() ||
+        start.getUTCMonth() !== now.getUTCMonth()) {
+      // Stale period → reset accrual to 0 before the check.
+      periodTotal = 0;
+    }
+  }
+  if (periodTotal + lastRunTokens > cap) {
+    return { throttle: true, used: periodTotal, cap };
+  }
+  return { throttle: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -250,8 +327,9 @@ async function stageImportance(
     }
 
     try {
-      const raw = await llm.completeFast(prompt, 256);
-      let scores = parseJsonLenient<number[] | null>(raw, null);
+      const r = await llm.completeFast(prompt, 256);
+      budget.recordUsage("importance", r.usage);
+      let scores = parseJsonLenient<number[] | null>(r.text, null);
 
       if (!Array.isArray(scores)) {
         scores = new Array(batch.length).fill(0.5);
@@ -331,8 +409,9 @@ async function stageReflection(
   }
 
   try {
-    const raw = await llm.completeReflect(prompt, 2048);
-    const lessons = parseJsonLenient<unknown[]>(raw, []);
+    const r = await llm.completeReflect(prompt, 2048);
+    budget.recordUsage("reflection", r.usage);
+    const lessons = parseJsonLenient<unknown[]>(r.text, []);
 
     if (!Array.isArray(lessons)) {
       return { lessons_generated: 0, failed: true };
@@ -388,12 +467,17 @@ async function stageReflection(
           const existingText = similarLessons[0].content.slice(0, 300);
           const newText = content.slice(0, 300);
           try {
-            const verdict = await llm.completeFast(
+            const verdictR = await llm.completeFast(
               `Two lessons from an AI memory system. Do they CONTRADICT each other (opposite advice on the same topic)?\n\n` +
               `EXISTING: ${existingText}\n\nNEW: ${newText}\n\n` +
               `Answer ONLY "yes" or "no". If the new lesson updates/refines the existing one (not contradicts), answer "no".`,
               16,
             );
+            // Stage label "contradiction_check" matches the budget.use() call
+            // above (separate counter from the reflection call proper). Token
+            // accounting follows the same stage partition as the call counter.
+            budget.recordUsage("contradiction_check", verdictR.usage);
+            const verdict = verdictR.text;
             if (verdict.toLowerCase().trim().startsWith("yes")) {
               contradicted = true;
               console.log(
@@ -548,7 +632,13 @@ async function stageContentDomains(
       // classifyMemoryTags returns null ONLY on infra error (throws after retry) —
       // skip that memory, leaving domain/tags/strength untouched so a later
       // run retries it (issue #150: never file or decay on infra errors).
-      const result = await classifyMemoryTags(row.content, row.project, domains, llm);
+      // The onUsage callback (#246) wires the metered call's token accounting
+      // into this stage's BudgetTracker slot — same stage label the budget.use
+      // call above uses, so call count + tokens stay aligned.
+      const result = await classifyMemoryTags(
+        row.content, row.project, domains, llm,
+        (u) => budget.recordUsage("content_domain", u),
+      );
       if (result === null) {
         console.warn(`[hicortex] content-domain: infra error classifying ${row.id} — skipped (will retry)`);
         continue;
@@ -711,8 +801,9 @@ async function stageDomainCuration(
       .join("\n");
 
     try {
-      const raw = await llm.completeFast(domainCuration(projectLines), 1024);
-      const parsed = parseJsonLenient<unknown[]>(raw, []);
+      const r = await llm.completeFast(domainCuration(projectLines), 1024);
+      budget.recordUsage("domain_curation", r.usage);
+      const parsed = parseJsonLenient<unknown[]>(r.text, []);
       if (!Array.isArray(parsed) || parsed.length === 0) {
         console.warn("[hicortex] Domain curation: LLM returned empty/invalid response, using fallback");
         domains = projectRows.map((r) => ({
@@ -1142,19 +1233,22 @@ export function parseSupersessionReply(reply: string): boolean | null {
 
 /**
  * ONE classify-tier LLM call judging whether `newContent` supersedes
- * `oldContent`. Returns null on any infra error or unparseable reply — the
- * caller treats null as "skip this pair" (never mis-links on ambiguity).
+ * `oldContent`. Returns `{verdict, usage}` — verdict is null on any infra error
+ * or unparseable reply (the caller treats null as "skip this pair", never
+ * mis-links on ambiguity). `usage` is the call's token accounting (#246),
+ * surfaced even on a null verdict so the BudgetTracker still meters a
+ * network-round-tripped attempt (the cost is real even if the parse failed).
  */
 async function classifySupersession(
   llm: LlmClient,
   oldContent: string,
   newContent: string,
-): Promise<boolean | null> {
+): Promise<{ verdict: boolean | null; usage: import("./llm.js").LlmUsage | undefined }> {
   try {
-    const raw = await llm.completeClassify(buildSupersessionPrompt(oldContent, newContent), 32);
-    return parseSupersessionReply(raw);
+    const r = await llm.completeClassify(buildSupersessionPrompt(oldContent, newContent), 32);
+    return { verdict: parseSupersessionReply(r.text), usage: r.usage };
   } catch {
-    return null;
+    return { verdict: null, usage: undefined };
   }
 }
 
@@ -1268,7 +1362,10 @@ export async function stageSupersession(
       if (callsUsed >= maxCalls || !budget.use("supersession")) break;
       callsUsed++;
 
-      const verdict = await classifySupersession(llm, neighbor.content, candidate.content);
+      const { verdict, usage } = await classifySupersession(llm, neighbor.content, candidate.content);
+      // Meter every round-tripped attempt (#246) — even a null verdict spent
+      // real tokens. The stage label matches the budget.use() above.
+      budget.recordUsage("supersession", usage);
       evaluated++;
       if (verdict === null) {
         skippedInfra++;
@@ -1374,8 +1471,121 @@ export function stageDecayPrune(
 }
 
 // ---------------------------------------------------------------------------
-// Full pipeline
+// Stage 4.5: Memory cap eviction (#245)
 // ---------------------------------------------------------------------------
+//
+// The active forgetting mechanism. The pre-#245 prune (stageDecayPrune above)
+// is inert by design — the strength floor (~0.3162) + the `< 0.01` threshold +
+// the 365-day decay half-life means a never-accessed memory takes ~3 years to
+// become eligible, so the corpus grew without bound. This stage bounds it:
+// when the count exceeds `memorySoftCap`, the lowest-effectiveStrength
+// memories are evicted until under the cap.
+//
+// Eviction reuses the SAME effectiveStrength() the recall ranker uses — no
+// formula duplication, so the eviction criterion cannot drift from what
+// surfaces in the top-k. The evicted tail is, by construction, the tail that
+// was not surfacing anyway (cold, decayed). Ties are broken by oldest
+// COALESCE(last_accessed, created_at) — i.e. the memories that have gone
+// longest without anyone looking at them.
+//
+// `cap = 0` disables the stage (indefinite growth — the pre-#245 default is
+// preserved opt-out). The JS-side sort is O(n log n); at 10K memories the
+// load + compute is <100 ms, a rounding error against the LLM-bound phases.
+
+/**
+ * Default soft cap on the memory corpus (#245). Above this the lowest-value
+ * memories are evicted each nightly. 10000 balances headroom for a busy
+ * self-hosted install against the noise cost of a bloated vector index
+ * (recall top-k competes against the long tail). Override via `memorySoftCap`.
+ */
+export const DEFAULT_MEMORY_SOFT_CAP = 10000;
+
+export function stageMemoryCapEviction(
+  db: Database.Database,
+  dryRun: boolean,
+  cap: number,
+): { cap: number; evicted: number } {
+  // `0` = explicitly disabled (current/legacy behaviour). The guard is on `<=`
+  // not `===` to also absorb a stray negative (readNonNegativeConfig already
+  // rejects negatives at the boundary, but this stage is callable directly).
+  if (cap <= 0) return { cap, evicted: 0 };
+
+  const count = storage.countMemories(db);
+  if (count <= cap) return { cap, evicted: 0 };
+
+  const surplus = count - cap;
+
+  // Load the fields effectiveStrength needs + the tiebreak. base_strength is
+  // NOT NULL after scoring; the `?? 0.5` mirrors stageDecayPrune's defensive
+  // default for unscored rows (inserts at 0.5). last_accessed is NULL until
+  // first /recall-index exposure — COALESCE to created_at for the tiebreak so
+  // never-shown memories sort by when they entered the corpus.
+  const rows = db
+    .prepare(
+      `SELECT id, base_strength, last_accessed, access_count, created_at
+         FROM memories`,
+    )
+    .all() as Array<{
+    id: string;
+    base_strength: number | null;
+    last_accessed: string | null;
+    access_count: number | null;
+    created_at: string;
+  }>;
+
+  const linkCounts = storage.getAllLinkCounts(db);
+  const now = new Date();
+
+  // Decorate + sort: lowest effectiveStrength first; ties broken by oldest
+  // COALESCE(last_accessed, created_at). The victims are the first `surplus`.
+  const decorated = rows.map((r) => {
+    const eff = effectiveStrength(
+      r.base_strength ?? 0.5,
+      r.last_accessed,
+      now,
+      {
+        accessCount: r.access_count ?? 0,
+        linkCount: linkCounts.get(r.id) ?? 0,
+      },
+    );
+    return {
+      id: r.id,
+      eff,
+      lastTouch: r.last_accessed ?? r.created_at,
+    };
+  });
+  decorated.sort((a, b) =>
+    // ASC by effectiveStrength, then ASC by lastTouch (oldest first = evict).
+    a.eff !== b.eff ? a.eff - b.eff
+      : a.lastTouch < b.lastTouch ? -1 : a.lastTouch > b.lastTouch ? 1 : 0,
+  );
+
+  const victims = decorated.slice(0, surplus);
+
+  if (dryRun) {
+    console.log(
+      `[hicortex] Memory cap eviction (dry-run): would remove ${victims.length} ` +
+      `lowest-value memories (corpus ${count}, cap ${cap}).`,
+    );
+    return { cap, evicted: victims.length };
+  }
+
+  // deleteMemory cascades: memory_links (both directions), memory_tags,
+  // memory_vectors, and the FTS index (via the AFTER DELETE trigger on
+  // memories, db.ts — no manual FTS cleanup needed). Wrap the batch in a
+  // transaction so a failure leaves the corpus consistent (all-or-nothing).
+  const tx = db.transaction(() => {
+    for (const v of victims) storage.deleteMemory(db, v.id);
+  });
+  tx();
+
+  console.log(
+    `[hicortex] Memory cap eviction: removed ${victims.length} lowest-value ` +
+    `memories (corpus was ${count}, cap ${cap}).`,
+  );
+
+  return { cap, evicted: victims.length };
+}
 
 /**
  * Run the full consolidation pipeline. Returns a structured report.
@@ -1416,6 +1626,10 @@ export async function runConsolidation(
    *  reads `consolidateMaxLlmCalls` from config and passes it; unset → the
    *  exported `CONSOLIDATE_MAX_LLM_CALLS` default (5000). */
   budgetMaxCalls?: number,
+  /** Soft cap on the corpus (#245). Nightly.ts reads `memorySoftCap` from
+   *  config and passes it; unset → `DEFAULT_MEMORY_SOFT_CAP` (10000). `0`
+   *  disables eviction (indefinite growth). */
+  memorySoftCap?: number,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -1446,6 +1660,15 @@ export async function runConsolidation(
     new_memory_count: precheck.newMemories.length,
     unscored_count: scoreMemories.length - precheck.newMemories.length,
   };
+
+  // Memory cap eviction (#245) — runs BEFORE the precheck skip so the corpus
+  // is bounded even on quiet nights (no new memories → precheck would skip,
+  // but the cap stage is pure DB: cheap, idempotent when under cap).
+  report.stages.memory_cap = stageMemoryCapEviction(
+    db,
+    dryRun,
+    memorySoftCap ?? DEFAULT_MEMORY_SOFT_CAP,
+  );
 
   if (skip) {
     report.status = "skipped";
@@ -1528,6 +1751,8 @@ export async function runConsolidation(
 
     // Stage 4: Decay & Prune
     report.stages.decay_prune = stageDecayPrune(db, dryRun);
+
+    // (Memory cap eviction moved before the precheck skip — see above.)
   } catch (err) {
     report.status = "failed";
     console.error("[hicortex] Consolidation pipeline error:", err);

@@ -77,6 +77,35 @@ export interface HicortexState {
    * gradually over many nights.
    */
   supersessionCursor?: number;
+  /**
+   * Resume cursor for `hicortex classify-types` (#216) — highest memories.rowid
+   * whose batch has been fully committed. Absent/0 = never run (or reset).
+   * Same discipline as domainCursor: advances per committed batch so an
+   * interruption never loses more than the in-flight batch.
+   */
+  typeCursor?: number;
+  /**
+   * LLM token usage accrued this billing period (#246). Period reset is
+   * monthly: when `periodStart` is in a previous calendar month, the totals
+   * reset to 0 + a new periodStart (handled in nightly.ts after each run).
+   * The fair-use cap (`config.llmTokensPerMonth`) consults `.total` before
+   * each consolidation to throttle when over budget. Absent = no usage
+   * recorded yet (treated as 0 by the throttle).
+   */
+  llmTokensThisPeriod?: {
+    prompt: number;
+    completion: number;
+    total: number;
+    /** ISO timestamp of the start of the current accrual period. */
+    periodStart: string;
+  };
+  /**
+   * Total tokens consumed by the previous nightly's consolidation (#246).
+   * Used as the ESTIMATE for the next run's fair-use check (this-period total
+   * + last-run total > cap → throttle). 0/absent on the first metered run,
+   * which means the first run is never throttled (correct: no baseline yet).
+   */
+  llmTokensLastRun?: number;
 }
 
 /**

@@ -1,5 +1,7 @@
 # @gamaze/hicortex — Self-Learning Memory for AI Agents
 
+<img src="https://raw.githubusercontent.com/gamaze-labs/hicortex/main/docs/dashboard-composition.png" alt="Hicortex dashboard — live screenshot: memory-type composition (episodes / lessons / facts / decisions)" width="800">
+
 Your agents learn from every session — successes and mistakes. Hicortex captures experiences, distills lessons, and applies them automatically. Connect multiple agents to shared memory and they improve together, overnight.
 
 Works with **Hermes**, **OpenClaw**, **Claude Code**, **Pi**, and any MCP-compatible agent.
@@ -104,6 +106,12 @@ npx @gamaze/hicortex classify-domains              # classify unfiled/stale memo
 npx @gamaze/hicortex classify-domains --all        # reclassify every memory
 npx @gamaze/hicortex classify-domains --batch 100  # memories per batch (default: 200)
 npx @gamaze/hicortex classify-domains --reset      # restart from the beginning (ignore saved cursor)
+
+# Reclassify memory types (episode/fact/decision) — fixes the 98%-episode default
+npx @gamaze/hicortex classify-types                # reclassify all episodes (default scope)
+npx @gamaze/hicortex classify-types --all          # reclassify every memory
+npx @gamaze/hicortex classify-types --batch 100    # memories per batch (default: 200)
+npx @gamaze/hicortex classify-types --reset        # restart from the beginning
 ```
 
 The run is resumable — interrupt it any time and it continues where it stopped. New memories are classified automatically by the nightly; the backfill is only needed once for a pre-existing corpus or after you reshape your domain list.
@@ -157,6 +165,7 @@ npx @gamaze/hicortex nightly                   # Run distill + consolidate (full
 npx @gamaze/hicortex nightly --capture-only    # Capture only, skip consolidation (safe for sub-daily runs)
 npx @gamaze/hicortex nightly --dry-run         # Preview without changes
 npx @gamaze/hicortex classify-domains          # Backfill domain tags over the corpus (see Memory Domains & Tags)
+npx @gamaze/hicortex classify-types            # Reclassify memory types (episode/fact/decision)
 npx @gamaze/hicortex dedup                     # Preview near-duplicate memory clusters (dry run, no changes)
 npx @gamaze/hicortex dedup --apply             # Merge near-duplicate clusters (backs up the DB first)
 npx @gamaze/hicortex context show [name]       # Print the standing context layer (see Context Layer)
@@ -218,6 +227,7 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `captureCooldownHours` | Success-cooldown (hours) for the **capture watchdog** (0.17). The capture timer polls every ~20 min; the watchdog captures only if more than this has elapsed since the last *successful* capture (`state.lastNightly`). Default `6` (≈4 captures/day). A failed preflight retries on the next poll (~20 min) — so a transient fire-instant network miss costs minutes, not a day (#239) |
 | `consolidationHours` | Hours (0–23, local) for the **consolidation** timer — the full nightly (capture + distill + score + reflect + link). Installed for **server/co-located only** (clients have no local DB). Default `[10, 22]`: the 22:00 evening slot runs after the day's capture waves (same-day results); the 10:00 morning slot runs *after* the morning capture so wake-up pushes are caught. Omitted on clients |
 | `consolidateMaxLlmCalls` | Ceiling on total LLM calls across all classify-tier consolidation stages (content-domain, link discovery, supersession) per run. A runaway **backstop**, not a throughput throttle — on a free local model the binding constraint is the nightly unit's wall-clock timeout, not call count. Default `5000` (was a hard-coded 200 that starved link/supersession during a classification backlog) |
+| `memorySoftCap` | Soft cap on the memory corpus (default 10000). When the corpus exceeds this, the nightly's capacity-eviction stage removes the lowest-`effectiveStrength` memories (ties broken by oldest access) until under the cap — the active forgetting mechanism that bounds DB size, vector-index RAM, and consolidation workload. `0` disables eviction (indefinite growth — the pre-#245 behaviour). The evicted tail is cold by construction (effectiveStrength is the same decay-weighted score the recall ranker uses, so these were not surfacing in the top-k anyway). At 10K memories the load + JS sort is <100 ms |
 | `updateChannel` | Release channel pinned into the generated daemon/timer ExecStart for **npx-thin** installs (global-binary installs use the absolute binary and are unaffected). A dist-tag (`"rc"`, `"next"`) or an exact version (`"0.17.1"`). E.g. `"rc"` → the timer runs `npx -y @gamaze/hicortex@rc nightly`, so the host tracks the rc dist-tag (an internal fleet can ride rc through a pre-promotion soak). Validated as `[\w.\-]+` (rejects anything that'd break the unit/plist templates). Absent → auto-detect (bare on `latest`, else `@next`). (0.17.1) |
 | `nightlyHour` | **Deprecated (0.17) single-slot fallback.** Local hour (0–23) honoured only when `consolidationHours` is absent — yields one daily consolidation slot at that hour (preserves the pre-0.17 "one daily job" intent). New installs should use `consolidationHours` |
 | `preflightTimeoutMs` | **Client mode only.** Per-attempt timeout for the nightly's server-reachability check before it starts capturing (default: 20000 ms, bumped from 15000 in 0.17 to absorb a slow link re-establishing after the client wakes) |

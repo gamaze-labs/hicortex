@@ -753,6 +753,23 @@ class HicortexProvider(MemoryProvider):
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return CONFIG_SCHEMA
 
+    def get_config(self) -> Dict[str, Any]:
+        """Return the live, effective config values (file ← env ← defaults).
+
+        Called by the Hermes dashboard to populate the settings form with
+        CURRENT values — not schema defaults. Without this, the form always
+        shows localhost regardless of what config.json/.env actually contain
+        (#243).
+
+        Secret fields (hicortex_auth_token) are redacted — the dashboard
+        should never receive the raw token. If the operator needs to change
+        it, they re-type it; save_config handles the write.
+        """
+        cfg = load_config()
+        if cfg.get("hicortex_auth_token"):
+            cfg["hicortex_auth_token"] = "***"
+        return cfg
+
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
         from .config import save_config as _save
 

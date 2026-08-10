@@ -1,5 +1,7 @@
 # Hicortex
 
+<img src="docs/dashboard-composition.png" alt="Hicortex dashboard — live screenshot: memory-type composition (episodes / lessons / facts / decisions)" width="800">
+
 [![npm](https://img.shields.io/npm/v/@gamaze/hicortex.svg)](https://www.npmjs.com/package/@gamaze/hicortex)
 [![License: PolyForm NC](https://img.shields.io/badge/License-PolyForm_NC_1.0-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)

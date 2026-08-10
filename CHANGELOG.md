@@ -3,6 +3,29 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.17.4] - 2026-08-10
+
+### Changed
+- **Distiller classifies memory types at extraction time (#216).** Each distilled memory is now tagged `episode` / `fact` / `decision` by the LLM during distillation (single-letter prefix `[E]`/`[F]`/`[D]`, stripped from stored content). Previously everything defaulted to `episode` (98% of the corpus). The existing importance-scoring + decay formula naturally differentiates: facts (durable truths) score higher and decay slower; episodes (one-off events) score lower and fade. No new config keys, no changes to the retrieval/decay code. Lessons remain the reflection stage's product — the distiller never emits them.
+- **`hicortex classify-types` backfill command.** Resumable cursor, batched (default 200), reclassifies existing episode memories. `--all` reclassifies everything; `--reset` restarts.
+
+### Fixed
+- **Hermes dashboard shows live config values (#243).** The plugin's `get_config()` returns the effective config (file ← env ← defaults) so the settings form populates with current values, not schema defaults (localhost). `save_config()` no longer clobbers a real remote URL with localhost on a no-op Save (merge guard). Token redacted in `get_config()`.
+
+## [0.17.3] - 2026-08-09
+
+### Added
+- **Unified console navigation (#249).** Root `GET /` redirects to `/dashboard`. Shared nav bar (Dashboard · Graph · Context · Self-improvement [disabled]) on all three served pages. Consistent dark palette, system fonts, token handoff for cross-page navigation.
+
+## [0.17.2] - 2026-08-09
+
+### Added
+- **Memory soft cap (#245).** `memorySoftCap` config key (default 10000, 0=disabled). When the corpus exceeds the cap, the lowest-effectiveStrength memories are evicted — the least-useful make room for new ones. Shown on the dashboard as a capacity gauge. Runs before the precheck skip (active even on quiet nights).
+- **LLM token usage tracking (#246).** `complete()` parses real token counts from every backend (MLX, OpenAI-compatible, Ollama, Anthropic — all verified). BudgetTracker accumulates per-stage + per-run. state.json tracks per-period usage with monthly reset. `llmTokensPerMonth` (default 0=unlimited) throttles consolidation when over cap. Dashboard shows token usage + per-stage breakdown.
+
+### Added (hosted-service prerequisite)
+- **`--consolidate-only` flag (#110).** The mirror of `--capture-only`: skip capture, run consolidation only. Needed for hosted-service per-tenant nightly runs.
+
 ## [0.17.1] - 2026-08-07
 
 Two rollout-edge fixes surfaced by the 0.17.0 fleet migration.

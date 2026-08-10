@@ -6,8 +6,9 @@
  *   server     Start the MCP HTTP/SSE server (persistent daemon)
  *   init       Detect existing setup and configure for CC/OC
  *   nightly    Run capture + consolidate (manual trigger)
- *              nightly --capture-only  Capture only, skip consolidation
- *              nightly --status        Show nightly pipeline health check
+ *              nightly --capture-only     Capture only, skip consolidation
+ *              nightly --consolidate-only Consolidate only, skip capture (hosted service)
+ *              nightly --status           Show nightly pipeline health check
  *   relink     Resumable link-discovery pass over the entire corpus (issue #143)
  *   dedup      Cluster + merge near-duplicate memories (issue #100)
  *              dedup --apply           Execute the merge (default: dry run)
@@ -71,7 +72,12 @@ switch (command) {
     } else {
       const dryRun = args.includes("--dry-run");
       const captureOnly = args.includes("--capture-only");
+      const consolidateOnly = args.includes("--consolidate-only");
       const watchdog = args.includes("--watchdog");
+      if (captureOnly && consolidateOnly) {
+        console.error("[hicortex] nightly: --capture-only and --consolidate-only are mutually exclusive");
+        process.exit(1);
+      }
       // Timestamp every log line. The nightly writes to a file (launchd /
       // systemd StandardOutput append) with NO per-line timestamp, which made
       // diagnosing capture gaps impossible (the #239 investigation couldn't
@@ -94,7 +100,7 @@ switch (command) {
         }
       }
       import("./nightly.js").then(({ runNightly }) => {
-        runNightly({ dryRun, captureOnly, watchdog, recaptureWindowDays }).catch((err) => {
+        runNightly({ dryRun, captureOnly, consolidateOnly, watchdog, recaptureWindowDays }).catch((err) => {
           console.error("[hicortex] Nightly pipeline failed:", err);
           process.exit(1);
         });
@@ -149,6 +155,32 @@ switch (command) {
     import("./classify-domains.js").then(({ runClassifyDomains }) => {
       runClassifyDomains(classifyOptions).catch((err) => {
         console.error(err instanceof Error ? err.message : `[hicortex] classify-domains failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
+  case "classify-types": {
+    const args = process.argv.slice(3);
+    const intFlag = (name: string): number | undefined => {
+      const idx = args.indexOf(name);
+      if (idx === -1) return undefined;
+      const val = parseInt(args[idx + 1], 10);
+      if (isNaN(val)) {
+        console.error(`[hicortex] classify-types: ${name} requires an integer value`);
+        process.exit(1);
+      }
+      return val;
+    };
+    const classifyTypeOptions = {
+      all: args.includes("--all"),
+      reset: args.includes("--reset"),
+      batchSize: intFlag("--batch"),
+    };
+    import("./type-classify.js").then(({ runClassifyTypes }) => {
+      runClassifyTypes(classifyTypeOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] classify-types failed: ${err}`);
         process.exit(1);
       });
     });
@@ -278,6 +310,7 @@ Commands:
   relink          Resumable link-discovery pass over the ENTIRE corpus (server mode)
   dedup           Cluster + merge near-duplicate memories (server mode; dry run by default)
   classify-domains  Backfill content-based domain tags over the corpus (server mode, needs config.domains)
+  classify-types    Backfill episode→fact/decision type tags over the corpus (server mode)
   lessons-context Fetch lessons and print Markdown to stdout (CC SessionStart hook)
   recall-hook    Pushed recall index for the current prompt (CC UserPromptSubmit/SessionStart hook)
   context         Standing context layer (show|edit) against the configured server
@@ -290,6 +323,7 @@ Options:
   server --host <h>    Host (default: 127.0.0.1)
   nightly --dry-run         Preview without changes
   nightly --capture-only    Capture only, skip consolidation (safe to run multiple times/day)
+  nightly --consolidate-only  Consolidate only, skip capture (hosted-service per-tenant runs)
   nightly --recapture-window <days>   Re-discover sessions quiet since <days> ago (one-shot #189 recovery)
   nightly --status          Show nightly pipeline health
   relink --dry-run          Discovery + counts only, zero writes, cursor untouched
@@ -301,6 +335,9 @@ Options:
   classify-domains --all    Reclassify every memory (default: only NULL/stale-domain rows)
   classify-domains --batch <n>  Memories per batch (default: 200)
   classify-domains --reset  Restart from the beginning (ignore saved cursor)
+  classify-types --all      Reclassify every memory (default: only episodes)
+  classify-types --batch <n>  Memories per batch (default: 200)
+  classify-types --reset    Restart from the beginning (ignore saved cursor)
   context show [name]       Print all context sections, or just <name> (raw, pipeable)
   context edit <name>       Edit a section in $EDITOR; PUT only if changed
   context … --agent <id>    Target a per-agent scope instead of the global set

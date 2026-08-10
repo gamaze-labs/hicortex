@@ -598,6 +598,12 @@ export async function startServer(options: {
       ? `[hicortex] Bearer token auth enabled`
       : `[hicortex] No auth token configured — remote access DISABLED (localhost only). Run init to generate a token.`
   );
+  // Root → dashboard redirect (#249). Registered BEFORE the auth middleware so
+  // the redirect itself is public — it carries no data; the destination
+  // /dashboard has its own shell-exemption pattern. Gives the console one entry
+  // point: http://<host>:8787/ → /dashboard.
+  app.get("/", (_req, res) => res.redirect("/dashboard"));
+
   app.use(createAuthMiddleware(authToken));
 
   // SSE transport management — each connection gets its own McpServer instance
@@ -929,11 +935,16 @@ export async function startServer(options: {
       // Phase 1 — embed every chunk up front (async). If ANY embed fails we
       // never reach the insert, so nothing is stored.
       const createdAt = new Date(date).toISOString();
-      const toStore: Array<{ entry: string; embedding: Float32Array; i: number }> = [];
+      const toStore: Array<{ content: string; memoryType: string; embedding: Float32Array; i: number }> = [];
       for (let i = 0; i < entries.length; i++) {
         const entry = entries[i];
-        if (typeof entry !== "string" || !entry.trim()) continue;
-        toStore.push({ entry, embedding: await embed(entry), i });
+        if (typeof entry !== "object" || !entry.content || !entry.content.trim()) continue;
+        toStore.push({
+          content: entry.content,
+          memoryType: entry.memoryType,
+          embedding: await embed(entry.content),
+          i,
+        });
       }
 
       // Phase 2 — insert all chunks in ONE transaction (fix 4). A segment's
@@ -943,9 +954,9 @@ export async function startServer(options: {
       // legacy whole-session path too — same loop.)
       const insertAll = db!.transaction((): string[] => {
         const out: string[] = [];
-        for (const { entry, embedding, i } of toStore) {
+        for (const { content, memoryType, embedding, i } of toStore) {
           out.push(
-            storage.insertMemory(db!, entry, embedding, {
+            storage.insertMemory(db!, content, embedding, {
               sourceAgent: source_agent ?? "unknown",
               // Attribution + provenance only (0.16.x): client-declared, never
               // filtered. Default null for older clients that don't send them.
@@ -955,7 +966,11 @@ export async function startServer(options: {
               // matches the dedup checks above, so a re-run is idempotent.
               sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
               project: project ?? undefined,
-              memoryType: "episode",
+              // #216: the distiller now classifies each entry as
+              // episode/fact/decision via the [E]/[F]/[D] tag parsed in
+              // distiller.ts. Pre-#216 distiller output (no tag) defaults to
+              // episode in the parser, so this is backward compatible.
+              memoryType,
               // 0.16.x: privacy defaults to null (vestigial column). A legacy
               // client that sends an explicit value is honored; absent → null.
               privacy: typeof privacy === "string" ? privacy : null,
