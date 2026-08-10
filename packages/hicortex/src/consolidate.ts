@@ -1136,8 +1136,17 @@ function stageHubBoost(
 
 /** Default minimum COSINE similarity for a supersession candidate pair. */
 export const DEFAULT_SUPERSESSION_MIN_SIMILARITY = 0.8;
-/** Default max classify-tier LLM calls (pairs evaluated) spent per nightly run. */
-export const DEFAULT_SUPERSESSION_MAX_CALLS = 30;
+/**
+ * Default max classify-tier LLM calls (pairs evaluated) spent per nightly run.
+ * 0 = no separate cap — supersession shares the consolidation budget
+ * (CONSOLIDATE_MAX_LLM_CALLS, default 5000) like every other stage. The old
+ * default of 30 was set when the corpus had 14 decisions; with the distiller
+ * now classifying types correctly (#216), decisions are common and the cap
+ * was throttling supersession to a crawl. On a local free model there is no
+ * per-call cost to defend against — the binding constraint is the wall-clock
+ * timeout (TimeoutStartSec), not call count.
+ */
+export const DEFAULT_SUPERSESSION_MAX_CALLS = 0;
 /** Default multiplier applied to a superseded memory's base_strength. */
 /** Floor under which a superseded memory's base_strength never drops. */
 /** Neighbor pool size before shape/older/similarity filtering narrows to top 5. */
@@ -1338,7 +1347,7 @@ export async function stageSupersession(
   let cursor = startCursor;
 
   for (const candidate of rows) {
-    if (!dryRun && (callsUsed >= maxCalls || budget.exhausted)) break;
+    if (!dryRun && ((maxCalls > 0 && callsUsed >= maxCalls) || budget.exhausted)) break;
     scanned++;
 
     let neighbors: Array<Memory & { distance: number }>;
@@ -1359,7 +1368,7 @@ export async function stageSupersession(
       }
       if (dryRun) continue; // preview only — no LLM call, no write
 
-      if (callsUsed >= maxCalls || !budget.use("supersession")) break;
+      if ((maxCalls > 0 && callsUsed >= maxCalls) || !budget.use("supersession")) break;
       callsUsed++;
 
       const { verdict, usage } = await classifySupersession(llm, neighbor.content, candidate.content);
