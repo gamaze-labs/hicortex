@@ -1,6 +1,6 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.17.4",
+  "version": "0.17.5",
   "description": "Self-learning memory for AI agents — experience captured automatically, distilled into lessons overnight, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, and Pi.",
   "main": "dist/index.js",
   "bin": {

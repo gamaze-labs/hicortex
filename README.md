@@ -10,7 +10,7 @@
 **Memory that shows up before your agent asks.** One memory across every agent, every project, every machine — they stop assuming and start knowing.
 
 - **One brain, every harness** — Claude Code, Hermes, OpenClaw, Pi, and any MCP-compatible agent share the same memory.
-- **Pushed, not pulled** — a compact recall index is injected on *every prompt*, so the decisions, corrections, and context an agent needs are already in front of it. No re-explaining, no copy-paste, nothing to maintain.
+- **Pushed, not pulled** — a compact recall index is injected on *every prompt*, so the decisions, corrections, and context an agent needs are already in front of it. No re-explaining, no copy-paste, nothing to maintain. **Zero LLM calls per turn** — no API cost or rate-limit hit from recall.
 - **Consolidates overnight** — each night it reads the day's sessions, distills what matters, and turns it into lessons, links, and a knowledge graph.
 - **Local-first** — raw sessions never leave the machine; only distilled memory is stored.
 
