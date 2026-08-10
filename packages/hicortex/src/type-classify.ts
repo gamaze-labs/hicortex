@@ -103,7 +103,7 @@ export function buildTypeClassifyPrompt(content: string): string {
     ? content.slice(0, CLASSIFY_CONTENT_MAX_CHARS) + "…"
     : content;
   return (
-    `You are classifying a single memory by its TYPE.\n\n` +
+    `You are classifying a single memory by its TYPE and IMPORTANCE.\n\n` +
     `TYPES:\n` +
     `- episode: a specific event, interaction, or narrative — a one-time ` +
     `occurrence ("tried X, failed because Y", a correction, a debugging session).\n` +
@@ -112,8 +112,14 @@ export function buildTypeClassifyPrompt(content: string): string {
     `- decision: a choice made that future work builds on and a later decision ` +
     `can supersede ("switched from gemma4 to qwen3.5", "adopted the graded-schema ` +
     `tag model"). Not a fact (it can change) and not an episode (it persists).\n\n` +
+    `IMPORTANCE (0.0–1.0):\n` +
+    `- 0.8–1.0: load-bearing — a core fact or decision the agent must know.\n` +
+    `- 0.5–0.8: useful context — relevant to current and future work.\n` +
+    `- 0.2–0.5: marginal — situational, likely to fade.\n` +
+    `- 0.0–0.2: noise — low value, safe to forget.\n` +
+    `Facts and decisions tend to score higher than episodes (they persist).\n\n` +
     `MEMORY:\n${truncated}\n\n` +
-    `Reply with ONLY one word: episode, fact, or decision. No prose, no punctuation.`
+    `Reply with ONLY: type importance (e.g. "fact 0.8"). No prose, no explanation.`
   );
 }
 
@@ -127,7 +133,7 @@ export function buildTypeClassifyPrompt(content: string): string {
  * Returns null on anything unparseable or out-of-vocabulary so the caller can
  * retry once (matching classify-domains' two-attempt discipline).
  */
-export function parseTypeReply(reply: string): "episode" | "fact" | "decision" | null {
+export function parseTypeReply(reply: string): { type: "episode" | "fact" | "decision"; score: number } | null {
   if (!reply) return null;
   let cleaned = reply.trim();
 
@@ -140,13 +146,25 @@ export function parseTypeReply(reply: string): "episode" | "fact" | "decision" |
   // Strip markdown emphasis, surrounding quotes/backticks, trailing punctuation.
   cleaned = cleaned
     .replace(/^[*_`"'\s]+/, "")
-    .replace(/[*_`"'.\s]+$/, "")
-    .trim()
-    .toLowerCase();
+    .replace(/[*_`"']+$/, "")
+    .trim();
 
-  if (VALID_TYPES.has(cleaned)) {
-    return cleaned as "episode" | "fact" | "decision";
+  // Expected format: "type score" (e.g. "fact 0.8"). Parse both.
+  const match = cleaned.toLowerCase().match(/^(episode|fact|decision)\s+([0-9]*\.?[0-9]+)/);
+  if (match) {
+    const type = match[1] as "episode" | "fact" | "decision";
+    let score = parseFloat(match[2]);
+    if (isNaN(score) || score < 0) score = 0.5;
+    if (score > 1) score = 1;
+    return { type, score };
   }
+
+  // Backward compat: bare type word with no score (old prompt output).
+  const bare = cleaned.toLowerCase().replace(/[.\s]+$/, "");
+  if (VALID_TYPES.has(bare)) {
+    return { type: bare as "episode" | "fact" | "decision", score: 0.5 };
+  }
+
   return null;
 }
 
@@ -158,14 +176,14 @@ export function parseTypeReply(reply: string): "episode" | "fact" | "decision" |
 export async function classifyMemoryType(
   content: string,
   llm: LlmClient,
-): Promise<"episode" | "fact" | "decision" | null> {
+): Promise<{ type: "episode" | "fact" | "decision"; score: number } | null> {
   const prompt = buildTypeClassifyPrompt(content);
 
   for (let attempt = 0; attempt < 2; attempt++) {
     let raw: string;
     try {
-      // ~8 tokens covers a single word + a little headroom.
-      const r = await llm.completeClassify(prompt, 8);
+      // ~20 tokens covers "type score" + headroom for models that add labels.
+      const r = await llm.completeClassify(prompt, 20);
       raw = r.text;
     } catch (err) {
       if (attempt === 0) continue; // retry once
@@ -286,10 +304,10 @@ export async function runClassifyTypes(
       let committedRowid = cursor;
 
       // Classify (network) OUTSIDE the write transaction; collect results.
-      const writes: Array<{ id: string; type: string }> = [];
+      const writes: Array<{ id: string; type: string; score: number }> = [];
       for (const row of rows) {
-        const type = await classifyMemoryType(row.content, llm);
-        if (type === null) {
+        const result = await classifyMemoryType(row.content, llm);
+        if (result === null) {
           // Infra error OR two unparseable replies — stop scanning; leave this
           // row untouched for retry. (Two unparseable replies is rare; treating
           // it as an abort rather than a skip means the cursor does not advance
@@ -300,20 +318,22 @@ export async function runClassifyTypes(
           break;
         }
         scannedInBatch++;
-        if (type === row.memory_type) {
+        if (result.type === row.memory_type) {
           batchUnchanged++;
         } else {
           batchReclassified++;
         }
-        writes.push({ id: row.id, type });
+        writes.push({ id: row.id, type: result.type, score: result.score });
         committedRowid = row.__rowid;
       }
 
       // Commit the resolved writes, then persist the cursor at the last fully
       // resolved rowid (crash-safe + infra-abort-safe: a re-run resumes there).
-      const updateStmt = db.prepare("UPDATE memories SET memory_type = ? WHERE id = ?");
+      const updateStmt = db.prepare(
+        "UPDATE memories SET memory_type = ?, base_strength = ? WHERE id = ?",
+      );
       const tx = db.transaction(() => {
-        for (const w of writes) updateStmt.run(w.type, w.id);
+        for (const w of writes) updateStmt.run(w.type, w.score, w.id);
       });
       tx();
       updateState((s) => { s.typeCursor = committedRowid; }, stateDir);
