@@ -5,7 +5,7 @@
  * HICORTEX_DB_PATH convention in db.ts); otherwise defaults to ~/.hicortex.
  * Every module that needs the home dir routes through here, so the override
  * behaves consistently across all commands instead of being honored by some
- * (context-cli, lessons-context) and hardcoded away by others.
+ * (identity-cli, learnings-identity) and hardcoded away by others.
  */
 import { homedir } from "node:os";
 import { join } from "node:path";

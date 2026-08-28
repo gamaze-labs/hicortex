@@ -71,6 +71,14 @@
   .hc-nav-links a:hover { color: var(--accent); }
   .hc-nav-links a[data-nav-active] { color: var(--text); }
   .hc-nav-disabled { color: var(--text-dim); opacity: 0.4; cursor: not-allowed; user-select: none; }
+  /* Account identity (hosted): name + plan pill at the far right. Here the
+     topbar's #meta keeps margin-left:auto (it pushes the whole right group —
+     meta + account); the account span is simply the last item. */
+  .hc-nav-account { display: inline-flex; align-items: center; gap: 8px; color: var(--text); }
+  .hc-nav-account .plan {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    background: rgba(128,128,128,0.18); font-size: 11px; color: var(--text-dim);
+  }
 
   /* ---- left control panel ---- */
   #panel {
@@ -245,13 +253,14 @@
 
 <div id="topbar">
   <h1 class="hc-nav-logo"><a href="/dashboard" style="color:inherit;text-decoration:none">Hicortex</a></h1>
-  <span id="meta"></span>
   <nav class="hc-nav-links">
     <a href="/dashboard">Dashboard</a>
     <a href="/viz" data-nav-active>Graph</a>
-    <a href="/context/ui">Context</a>
+    <a href="/identity/ui">Identity</a>
     <span class="hc-nav-disabled" title="Coming soon — #250">Self-improvement</span>
   </nav>
+  <span id="meta"></span>
+  <span id="nav-account" class="hc-nav-account"></span>
 </div>
 
 <div id="panel">
@@ -259,7 +268,7 @@
   <div class="row" data-tip="Show only memories from one knowledge domain. Node colors match domains (see legend)."><label for="f-domain">Domain</label>
     <select id="f-domain"><option value="">all</option></select>
   </div>
-  <div class="row" data-tip="Show only one memory type (episode, lesson, fact…)."><label for="f-type">Type</label>
+  <div class="row" data-tip="Show only one memory type (Knowledge, Experience, Decisions, Learnings)."><label for="f-type">Type</label>
     <select id="f-type"><option value="">all</option></select>
   </div>
   <div class="row" data-tip="Hide memories weaker than this. Strength decays over time and grows with use and links — node size shows it."><label for="f-strength">Min strength</label>
@@ -328,6 +337,7 @@
        Run <code>hicortex status</code> on the server to get the token.</p>
     <input type="password" id="token-input" placeholder="hctx-…" autocomplete="off">
     <button id="token-submit">Connect</button>
+    <a id="google-login" href="/auth/google/start" style="display:none;margin-top:10px;">Sign in with Google</a>
     <div class="err" id="token-err">Still unauthorized — check the token.</div>
   </div>
 </div>
@@ -375,6 +385,39 @@
   });
 
   // =========================================================================
+  // Account identity in the nav — GET /account (the lightweight endpoint, the
+  // same shape the dashboard payload carries). Fail-soft: 401/fetch error
+  // leaves the span empty (fetchGraph owns the 401 token prompt); an all-null
+  // account (self-hosted default) renders nothing. textContent only — this
+  // page uses innerHTML exclusively for the escaped 3D-force-graph tooltips.
+  // =========================================================================
+  function renderAccount(a) {
+    var host = document.getElementById("nav-account");
+    if (!host) return;
+    host.textContent = "";
+    if (!a || (a.name === null && a.org === null && a.plan === null)) return;
+    var who = [a.name, a.org].filter(function (s) { return typeof s === "string" && s !== ""; });
+    who.forEach(function (s, i) {
+      if (i > 0) host.appendChild(document.createTextNode(" · "));
+      host.appendChild(document.createTextNode(s));
+    });
+    if (typeof a.plan === "string" && a.plan !== "") {
+      var pill = document.createElement("span");
+      pill.className = "plan";
+      pill.textContent = a.plan;
+      host.appendChild(pill);
+    }
+  }
+  function loadAccount() {
+    var headers = {};
+    if (token) headers["Authorization"] = "Bearer " + token;
+    fetch("/account", { headers: headers })
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (data) { if (data) renderAccount(data.account); })
+      .catch(function () { /* leave the span empty — nav is never worth an error */ });
+  }
+
+  // =========================================================================
   // DOM references
   // =========================================================================
   var el3d = document.getElementById("graph-3d");
@@ -388,6 +431,24 @@
   var metaEl = document.getElementById("meta");
   var selDomain = document.getElementById("f-domain");
   var selType = document.getElementById("f-type");
+
+  // #264 final: node data carries the CANONICAL human-term values
+  // (knowledge/experience/decisions/learnings). Legacy raw values are also
+  // mapped so a mid-migrate snapshot renders correctly. Unknown values pass
+  // through unchanged.
+  var TYPE_LABELS = {
+    knowledge: "Knowledge",
+    experience: "Experience",
+    decisions: "Decisions",
+    learnings: "Learnings",
+    // Legacy raw enum (same types, renamed).
+    fact: "Knowledge",
+    episode: "Experience",
+    decision: "Decisions",
+    lesson: "Learnings"
+  };
+  function labelForType(t) { return TYPE_LABELS[t] || t; }
+
   var rngStrength = document.getElementById("f-strength");
   var rngStrengthVal = document.getElementById("f-strength-val");
   var inpLimit = document.getElementById("f-limit");
@@ -572,6 +633,12 @@
     hideStatus();
     overlay.classList.add("open");
     document.getElementById("token-input").focus();
+    // Offer the hosted Google login only when the fronting router has auth
+    // configured — a bearer-only/self-hosted server answers 503 on /auth/*.
+    // (redirect:"manual" makes the 302 an opaque redirect with status 0.)
+    fetch("/auth/google/start", { redirect: "manual" })
+      .then((r) => { if (r.status !== 503) document.getElementById("google-login").style.display = "block"; })
+      .catch(() => {});
   }
   document.getElementById("token-submit").addEventListener("click", submitToken);
   document.getElementById("token-input").addEventListener("keydown", function (e) {
@@ -591,6 +658,7 @@
       }
       overlay.classList.remove("open");
       fetchGraph();
+      loadAccount(); // the initial fail-soft attempt left the nav pill empty on 401
     }).catch(function () {
       document.getElementById("token-err").style.display = "block";
     });
@@ -604,7 +672,7 @@
     dataVersion++;
 
     fillSelect(selDomain, data.domains || []);
-    fillSelect(selType, data.types || []);
+    fillSelect(selType, data.types || [], labelForType);
     buildDomainLegend(data.domains || []);
     buildEdgeLegend(data.edges || []);
     computeLabeled();
@@ -697,12 +765,12 @@
     }
   }
 
-  function fillSelect(sel, values) {
+  function fillSelect(sel, values, labeler) {
     var current = sel.value;
     while (sel.options.length > 1) sel.remove(1);
     values.forEach(function (v) {
       var opt = document.createElement("option");
-      opt.value = v; opt.textContent = v;
+      opt.value = v; opt.textContent = labeler ? labeler(v) : v;
       sel.appendChild(opt);
     });
     sel.value = values.indexOf(current) >= 0 ? current : "";
@@ -733,7 +801,7 @@
 
   function tooltipHtml(n) {
     return "<b>" + esc(labelText(n)) + "</b><br>" +
-      esc((n.domain || "no domain") + " · " + (n.memory_type || "?") +
+      esc((n.domain || "no domain") + " · " + labelForType(n.memory_type || "?") +
           " · strength " + (typeof n.strength === "number" ? n.strength.toFixed(2) : "?"));
   }
 
@@ -1070,7 +1138,7 @@
       ["ID", n.id],
       ["Domain", n.domain || "—"],
       ["Project", n.project || "—"],
-      ["Type", n.memory_type || "—"],
+      ["Type", labelForType(n.memory_type || "—")],
       ["Strength", typeof n.strength === "number" ? n.strength.toFixed(3) : "—"],
       ["Links", String(n.linkCount) + (n.isHub ? " (hub)" : "")],
       ["Created", n.created_at || "—"]
@@ -1144,6 +1212,7 @@
     document.body.classList.toggle("mode-2d", mode === "2d");
     syncModeControl();
     fetchGraph();
+    loadAccount();
   }
   if (document.readyState === "complete" || document.readyState === "interactive") {
     // DOM already parsed — but deferred scripts may still be pending; queue

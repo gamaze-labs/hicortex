@@ -18,15 +18,16 @@ maintained by [Gamaze](https://hicortex.gamaze.com).
 
 ```bash
 git clone https://github.com/gamaze-labs/hicortex.git
-cd hicortex/packages/hicortex
-npm install
-npm run build
-npm test
+cd hicortex
 ```
 
 Requirements:
 - Node.js 20+
 - An LLM provider (Ollama 9b+ recommended for local dev, or any API key)
+
+## Verification
+
+[AGENTS.md](AGENTS.md) at the repository root defines the machine-checkable verification contract. Work is done when the command chain exits with code 0. The contract mirrors what CI runs. Run it before claiming work complete — human and agent contributors alike.
 
 ## What we accept
 

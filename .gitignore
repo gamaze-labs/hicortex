@@ -5,5 +5,12 @@ __pycache__/
 *.pyc
 .DS_Store
 node_modules/
-# prepack build artifact — hermes-plugin/ is bundled from ../../hermes-plugin/hicortex
+# prepack build artifacts — hermes-plugin/, pi-extension/, and opencode-plugin/
+# are bundled from ../../hermes-plugin/hicortex, ../../pi-extension/hicortex,
+# and ../../opencode-plugin/hicortex
 packages/hicortex/hermes-plugin/
+packages/hicortex/pi-extension/
+packages/hicortex/opencode-plugin/
+
+# distill-ab-check harness outputs (scripts/distill-ab-check README)
+distill-ab-out-*/

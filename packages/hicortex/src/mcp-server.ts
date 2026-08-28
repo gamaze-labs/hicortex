@@ -21,27 +21,37 @@ import type Database from "better-sqlite3";
 import { initDb, getStats, resolveDbPath } from "./db.js";
 import { resolveExplicitLlmConfig, applyTierTuningOverlay, LlmClient, findClaudeBinary, claudeCliConfig, type LlmConfig } from "./llm.js";
 import { initFeatures } from "./features.js";
-import { warnIgnoredConfigKeys } from "./config-read.js";
+import { warnIgnoredConfigKeys, readStrictBoolean } from "./config-read.js";
+import { localhostBypassEnabled, writeLocalhostBypassMarker } from "./localhost-bypass.js";
+import { checkHostedBoot, shouldEmitBypassWarning } from "./hosted-boot.js";
+import { initTokenBudget, isTokenBudgetExceeded, recordDistillUsage } from "./token-budget.js";
+import { hicortexHome } from "./paths.js";
 import { loadState, migrateLegacyState } from "./state.js";
-import { embed } from "./embedder.js";
+import { embed, warmEmbedder } from "./embedder.js";
 import * as storage from "./storage.js";
 import { getNeighbors, shortestPath, detectHubs, exportGraph, EXPORT_DEFAULT_LIMIT } from "./graph.js";
-import { createAuthMiddleware, vizHandler, vizVendorHandler, contextUiHandler, dashboardHandler } from "./viz.js";
-import { dashboardDataHandler } from "./dashboard.js";
+import { createAuthMiddleware, vizHandler, vizVendorHandler, identityUiHandler, dashboardHandler } from "./viz.js";
+import { dashboardDataHandler, accountHandler } from "./dashboard.js";
 import {
-  handleContextGet,
-  handleContextPut,
-  resolveContextClients,
-  resolveContextAgents,
+  handleIdentityGet,
+  handleIdentityPut,
+  serveIdentityBody,
+  resolveIdentityClientsConfig,
+  resolveIdentityAgentsConfig,
+  migrateIdentityDir,
   type AgentMode,
-} from "./context-store.js";
+} from "./identity-store.js";
 import * as retrieval from "./retrieval.js";
 import { SessionRecallRegistry } from "./recall-registry.js";
-import { injectMemorySection, isReservedSectionName, MEMORY_SECTION_NAME } from "./memory-instructions.js";
-import { handleRecallIndex, handleMemoryGet, formatMemoryGetText, type RecallIndexOptions } from "./recall-index.js";
+import { isReservedSectionName, MEMORY_SECTION_NAME } from "./memory-instructions.js";
+import { handleRecallIndex, handleMemoryGet, formatMemoryGetText, createRecallRetrieveFn, resolveNoveltyFloorSlots, type RecallIndexOptions } from "./recall-index.js";
+import { labelForType, normalizeMemoryType, ACCEPTED_MEMORY_TYPES } from "./type-labels.js";
+import { publicHealthResponse, detailedHealthResponse, logAndSendInternalError } from "./health.js";
 import { injectSeedLesson } from "./seed-lesson.js";
+import { buildIdentityToolResult } from "./learnings-identity.js";
 import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
 import { countExistingSegment, countExistingSession } from "./dedup.js";
+import { redact } from "./redact.js";
 import { ensureAndPersistAgentId, loadConfigStrict } from "./init.js";
 import type { MemorySearchResult } from "./types.js";
 
@@ -71,13 +81,15 @@ function warnDeprecatedPrivacyParamIfPresent(query: Record<string, unknown>, rou
   );
 }
 let stateDir = "";
-// Resolved contextClients list (spec §2) — the harness names allowed to inject
-// the standing context layer. Echoed by GET /context so each hook self-gates.
-let contextClients: string[] = ["cc"];
-// Resolved contextAgents map (0.13) — agent id → mode (override/global/off).
-// Read once at boot (like contextClients); the drop-in-a-dir presence path is
+// Resolved identityClients list (spec §2) — the harness names allowed to inject
+// the standing identity layer. Echoed by GET /identity so each hook self-gates.
+// (#264: was contextClients; the legacy key is still read with a one-time
+// deprecation warning via resolveIdentityClientsConfig.)
+let identityClients: string[] = ["cc"];
+// Resolved identityAgents map (0.13) — agent id → mode (override/global/off).
+// Read once at boot (like identityClients); the drop-in-a-dir presence path is
 // per-request, so only explicit config entries need a daemon restart to apply.
-let contextAgents: Record<string, AgentMode> = {};
+let identityAgents: Record<string, AgentMode> = {};
 // Pushed-recall dedup registry (#192) + options; configured at boot.
 let recallRegistry = new SessionRecallRegistry();
 let recallIndexOptions: RecallIndexOptions = {};
@@ -87,6 +99,37 @@ let memoryInstructionsEnabled = true;
 // Cache detectChunkSize results keyed by "<provider>/<model>@<baseUrl>" so we
 // probe each endpoint once per server boot rather than once per /distill request.
 const chunkSizeCache = new Map<string, number>();
+
+// #337: /distill readiness-probe outcomes, keyed like chunkSizeCache. The
+// daemon probes the GENERATION path (one 1-token completion) before
+// distilling — liveness-style endpoint checks cannot catch the incident
+// signature (a wedged gateway that keeps answering /v1/models while every
+// completion hangs). Outcomes are cached for llmProbeTtlMs (default 5 min),
+// so a healthy capture cadence pays at most one probe per window and a DEAD
+// endpoint turns into fast cached 503s instead of every request paying the
+// probe timeout. Module-scoped like chunkSizeCache (state spans requests).
+const distillProbeCache = new Map<string, { ok: boolean; at: number }>();
+
+/**
+ * Resolve the /distill probe gate (#337): true when the endpoint recently
+ * proved it can GENERATE (cached outcome inside its TTL, or a fresh probe),
+ * false when the probe failed — the caller answers 503 so the capture client
+ * holds its cursor and retries next run (nothing lost, dup-over-loss).
+ * Structural `llm` parameter (anything with probe()) so wiring tests drive
+ * the real cache + TTL discipline with a counting stub.
+ */
+export async function resolveDistillProbeGate(
+  llm: { probe(timeoutMs?: number): Promise<boolean> },
+  llmConfig: { provider: string; model: string; baseUrl: string; probeTtlMs?: number },
+): Promise<boolean> {
+  const key = `${llmConfig.provider}/${llmConfig.model}@${llmConfig.baseUrl}`;
+  const ttlMs = llmConfig.probeTtlMs ?? 300_000;
+  const cached = distillProbeCache.get(key);
+  if (cached && Date.now() - cached.at < ttlMs) return cached.ok;
+  const ok = await llm.probe();
+  distillProbeCache.set(key, { ok, at: Date.now() });
+  return ok;
+}
 
 let VERSION = "0.3.x";
 try {
@@ -168,11 +211,11 @@ function createMcpServer(): McpServer {
   // -- hicortex_ingest --
   server.tool(
     "hicortex_ingest",
-    "Store a new memory in long-term storage. Use for important facts, decisions, or lessons.",
+    "Store a new memory in long-term storage. Use for Knowledge, Decisions, or Learnings.",
     {
       content: z.string().describe("Memory content to store"),
       project: z.string().optional().describe("Project this memory belongs to"),
-      memory_type: z.enum(["episode", "lesson", "fact", "decision"]).optional().describe("Type of memory (default: episode)"),
+      memory_type: z.enum(["knowledge", "experience", "decisions", "learnings", "fact", "episode", "decision", "lesson"]).optional().describe("Type of memory (default: Experience). Accepted: Knowledge/Experience/Decisions/Learnings (legacy raw enum also accepted, normalized to the canonical term)."),
     },
     async ({ content, project, memory_type }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
@@ -181,7 +224,8 @@ function createMcpServer(): McpServer {
         const id = storage.insertMemory(db, content, embedding, {
           sourceAgent: "claude-code/manual",
           project,
-          memoryType: memory_type ?? "episode",
+          // Normalize legacy raw enum to the canonical term the DB stores.
+          memoryType: memory_type ? normalizeMemoryType(memory_type) : "experience",
         });
         return { content: [{ type: "text" as const, text: `Memory stored (id: ${id.slice(0, 8)})` }] };
       } catch (err) {
@@ -198,7 +242,7 @@ function createMcpServer(): McpServer {
       id: z.string().describe("Memory ID (from search results, first 8 chars or full UUID)"),
       content: z.string().optional().describe("New content text"),
       project: z.string().optional().describe("New project name"),
-      memory_type: z.enum(["episode", "lesson", "fact", "decision"]).optional().describe("New memory type"),
+      memory_type: z.enum(["knowledge", "experience", "decisions", "learnings", "fact", "episode", "decision", "lesson"]).optional().describe("New memory type. Accepted: Knowledge/Experience/Decisions/Learnings (legacy raw enum also accepted, normalized to the canonical term)."),
     },
     async ({ id, content, project, memory_type }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
@@ -210,7 +254,8 @@ function createMcpServer(): McpServer {
         const fields: Record<string, unknown> = {};
         if (content !== undefined) fields.content = content;
         if (project !== undefined) fields.project = project;
-        if (memory_type !== undefined) fields.memory_type = memory_type;
+        // Normalize legacy raw enum to canonical human terms before DB write.
+        if (memory_type !== undefined) fields.memory_type = normalizeMemoryType(memory_type);
 
         if (Object.keys(fields).length === 0) {
           return { content: [{ type: "text" as const, text: "No fields to update" }], isError: true };
@@ -260,25 +305,67 @@ function createMcpServer(): McpServer {
     }
   );
 
-  // -- hicortex_lessons --
+  // -- hicortex_learnings (canonical) + hicortex_lessons (alias) --
+  const learningsHandler = async ({ days, project }: { days?: number; project?: string }) => {
+    if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
+    try {
+      const lessons = storage.getLessons(db, days ?? 7, project);
+      if (lessons.length === 0) {
+        return { content: [{ type: "text" as const, text: "No Learnings found for the specified period." }] };
+      }
+      const text = lessons.map((l) => `- ${l.content.slice(0, 500)}`).join("\n");
+      return { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return { content: [{ type: "text" as const, text: `Learnings fetch failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  };
+  const learningsSchema = {
+    days: z.coerce.number().optional().describe("Look back N days (default 7)"),
+    project: z.string().optional().describe("Filter by project name"),
+  };
+  server.tool(
+    "hicortex_learnings",
+    "Get actionable Learnings from past sessions. Auto-generated insights about mistakes to avoid.",
+    learningsSchema,
+    learningsHandler
+  );
   server.tool(
     "hicortex_lessons",
-    "Get actionable lessons learned from past sessions. Auto-generated insights about mistakes to avoid.",
+    "Get actionable Learnings from past sessions. (Alias for hicortex_learnings.)",
+    learningsSchema,
+    learningsHandler
+  );
+
+  // -- hicortex_identity --
+  // Standing identity layer on-demand (the same data GET /identity returns and
+  // the SessionStart hook injects). Lets an agent re-read its identity after
+  // context compaction, or look up one named section, mid-session. Renders the
+  // same `### <Title>` section markdown the hook injects (shared pipeline in
+  // learnings-identity.ts → buildIdentityToolResult) so the agent sees one
+  // consistent shape. The handler is a thin wrapper over that pure function;
+  // tests exercise it directly (no MCP SDK plumbing re-implemented).
+  server.tool(
+    "hicortex_identity",
+    "Fetch your standing identity — the hand-edited 'who you are + how you work' layer (personality, rules, preferences). Returns all sections or a specific one. Use this to re-read your identity after context compaction or to look up a specific rule. On multi-agent installs, pass `agent` to fetch a specific agent's scoped identity; omit for the global identity.",
     {
-      days: z.coerce.number().optional().describe("Look back N days (default 7)"),
-      project: z.string().optional().describe("Filter by project name"),
+      name: z.string().optional().describe("Fetch a specific identity section by name (e.g. 'rules'). Omit for all sections."),
+      agent: z.string().optional().describe("Fetch a specific agent's identity scope (for per-agent installs). Omit for global."),
     },
-    async ({ days, project }) => {
+    async ({ name, agent }: { name?: string; agent?: string }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
       try {
-        const lessons = storage.getLessons(db, days ?? 7, project);
-        if (lessons.length === 0) {
-          return { content: [{ type: "text" as const, text: "No lessons found for the specified period." }] };
-        }
-        const text = lessons.map((l) => `- ${l.content.slice(0, 500)}`).join("\n");
-        return { content: [{ type: "text" as const, text }] };
+        const identityDir = pathJoin(stateDir, "identity");
+        // Single pipeline shared with REST /identity + the SessionStart hook
+        // (#264 CRITICAL + WARNING-1 + WARNING-2). The pure function owns
+        // handleIdentityGet → serveIdentityBody → renderIdentityBlock.
+        const result = buildIdentityToolResult(identityDir, identityClients, identityAgents, {
+          name,
+          agent,
+          memoryInstructionsEnabled,
+        });
+        return { content: [{ type: "text" as const, text: result.text }], isError: result.isError };
       } catch (err) {
-        return { content: [{ type: "text" as const, text: `Lessons fetch failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Identity fetch failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
       }
     }
   );
@@ -293,7 +380,7 @@ function createMcpServer(): McpServer {
       const moduleIndex = state.moduleIndex;
       if (moduleIndex && moduleIndex.domains.length > 0) {
         const text = moduleIndex.domains.map((d) => {
-          const head = `**${d.name}** (${d.memoryCount} memories, ${d.lessonCount} lessons)`;
+          const head = `**${d.name}** (${d.memoryCount} memories, ${d.lessonCount} Learnings)`;
           // Content-based domains carry a description and no projects; legacy
           // project-grouping domains carry a project list + keywords.
           if (d.description && d.projects.length === 0) {
@@ -384,6 +471,84 @@ function createMcpServer(): McpServer {
 // HTTP server with SSE transport
 // ---------------------------------------------------------------------------
 
+/**
+ * Env override for the body limit (#328 item 2b — hosted tenant-immutable
+ * pin, same ENV-WINS pattern as HICORTEX_TOKEN_CAP in token-budget.ts). The
+ * hosted tenant's /data is tenant-writable, so a `distillBodyLimitMb` in the
+ * tenant's own config.json could raise the limit the provider intended; an
+ * env baked into the container (`-e`, provisioner-written .env) cannot be
+ * mutated by the tenant process. Self-hosted installs may also use it as an
+ * operator knob — precedence below puts it above config in every mode.
+ */
+const DISTILL_BODY_LIMIT_MB_ENV = "HICORTEX_DISTILL_BODY_LIMIT_MB";
+
+/**
+ * Resolve the request body-size limit in MB (#7, #328 item 2b). Pure —
+ * exported for tests. Precedence: HICORTEX_DISTILL_BODY_LIMIT_MB env >
+ * explicit config value > hosted-mode default (5) > self-hosted default (25,
+ * the historical fixed value → no regression). A finite positive value wins
+ * at each step; invalid/absent falls through.
+ */
+export function resolveBodyLimitMb(configVal: unknown, hostedMode: boolean): number {
+  const envCap = Number(process.env[DISTILL_BODY_LIMIT_MB_ENV]);
+  if (Number.isFinite(envCap) && envCap > 0) return envCap;
+  const cfg = Number(configVal);
+  if (Number.isFinite(cfg) && cfg > 0) return cfg;
+  return hostedMode ? 5 : 25;
+}
+
+/**
+ * Express error middleware (#7): translate express.json's default HTML 413
+ * (entity.too.large) into a consistent JSON response. Catches body-parser
+ * errors only — which express.json emits BEFORE any route runs — so by
+ * registration order (this sits ahead of the routes) it never intercepts an
+ * error thrown inside a route handler; those reach Express's default handler.
+ * The `status === 413 || type === "entity.too.large"` check is defense-in-depth
+ * on top of that ordering. Exported so tests exercise the real handler.
+ */
+export function makeBodyLimitErrorHandler(limitMb: number): express.ErrorRequestHandler {
+  return (err, _req, res, next) => {
+    const status = (err as { status?: number }).status;
+    const type = (err as { type?: string }).type;
+    if (status === 413 || type === "entity.too.large") {
+      res.status(413).json({ error: "request body too large", limit_mb: limitMb });
+      return;
+    }
+    next(err);
+  };
+}
+
+/**
+ * #328 item 4 (package-server half, CR-corrected ORDERING): a Content-Length
+ * pre-check that MUST be registered BEFORE express.json. Registered after the
+ * parser (the first #328 pass had it inside createAuthMiddleware, which sits
+ * after the parser) it is inert as a bounding measure — body-parser buffers
+ * the body up to its own limit BEFORE auth runs and refuses oversize itself,
+ * so the check only ever saw bodies the parser had already accepted and
+ * buffered. Registered FIRST it refuses a DECLARED-oversize body before a
+ * single byte is read and before any route/auth work, on every path. The
+ * twin check inside createAuthMiddleware (viz.ts) is kept as a belt — but the
+ * GATE here is the one that actually bounds pre-auth buffering.
+ *
+ * RESIDUAL RISK (deliberate, documented): chunked transfer-encoding sends no
+ * Content-Length, so this gate cannot see it — those requests still buffer up
+ * to the parser limit inside express.json (bounded per request, no
+ * concurrency cap here). Full pre-auth bounding lives in the hosted router's
+ * webhook path (stripe.ts); the tenant data plane trusts its bearer
+ * (self-hosted threat model) or sits behind the provider's edge (hosted).
+ */
+export function makeContentLengthGate(limitBytes: number): express.RequestHandler {
+  return (req, res, next) => {
+    const declared = req.headers["content-length"];
+    const declaredNum = typeof declared === "string" ? Number(declared) : NaN;
+    if (Number.isFinite(declaredNum) && declaredNum > limitBytes) {
+      res.status(413).json({ error: "request body too large" });
+      return;
+    }
+    next();
+  };
+}
+
 export async function startServer(options: {
   port?: number;
   host?: string;
@@ -392,6 +557,60 @@ export async function startServer(options: {
 } = {}): Promise<void> {
   const port = options.port ?? 8787;
   const host = options.host ?? "0.0.0.0";
+
+  // ---------------------------------------------------------------------------
+  // Hosted-mode boot gate (#110 §1-§2, #271 — Phase 0B).
+  //
+  // MUST run BEFORE resolveDbPath/initDb: in hosted mode with HICORTEX_DB_PATH
+  // set, the server must refuse the attacker-chosen DB location WITHOUT first
+  // touching it. The hosted signals (hostedMode from config, bypassMarkerPresent
+  // from the marker file) do NOT depend on the DB, so reading them now is safe.
+  // CR warning 3: this block was previously after initDb, letting a hostile
+  // HICORTEX_DB_PATH create/touch a file at the chosen path before the gate.
+  //
+  // CR warning 1: the marker is a HOME-level file (like config.json, written by
+  // init to HICORTEX_HOME). Read it from hicortexHome() — NOT stateDir, which
+  // is dirname(dbPath) and drifts when HICORTEX_DB_PATH relocates the DB. The
+  // config key hostedMode likewise lives at <hicortexHome>/config.json.
+  //
+  // Decision logic lives in hosted-boot.ts (pure, unit-tested); the side-effect
+  // (console.error + process.exit) is local to boot. The marker state is
+  // captured once here and reused below to gate the localhost bypass in
+  // createAuthMiddleware (no per-request stat). CR warning 4: the upgrade-path
+  // warning is decided by the pure shouldEmitBypassWarning helper (behavior-
+  // tested), not an inline branch.
+  const bootConfig = readConfigFile(hicortexHome());
+  const hostedMode = readStrictBoolean(bootConfig ?? {}, "hostedMode") === true;
+  let bypassMarkerPresent = localhostBypassEnabled();
+  const bootDecision = checkHostedBoot({
+    hostedMode,
+    dbPathEnvSet: !!process.env.HICORTEX_DB_PATH,
+    bypassMarkerPresent,
+  });
+  if (!bootDecision.ok) {
+    console.error(bootDecision.message);
+    process.exit(1);
+  }
+  // Upgrade migration (CR S1): self-hosted server-mode CC MCP registration
+  // carries NO bearer token (init.ts:192 — only client-mode adds the header),
+  // so it relies entirely on the localhost bypass. An existing install that
+  // upgrades without re-running init has no marker → the bypass silently
+  // disappears → every server-mode CC MCP call 401s. Auto-write the marker on
+  // first post-upgrade boot in self-hosted mode to preserve the prior
+  // unconditional-bypass behaviour. Hosted mode is untouched: checkHostedBoot
+  // refuses to start with a marker present, so this block — gated on
+  // !hostedMode — never runs for a hosted tenant. bypassMarkerPresent is
+  // reassigned so createAuthMiddleware below gates the bypass for THIS boot
+  // too (the file write and the in-memory flag stay in sync).
+  if (!hostedMode && !bypassMarkerPresent) {
+    writeLocalhostBypassMarker(hicortexHome());
+    bypassMarkerPresent = true;
+    console.log("[hicortex] Localhost auth-bypass marker written (upgrade migration).");
+  }
+  const bypassWarning = shouldEmitBypassWarning(hostedMode, bypassMarkerPresent);
+  if (bypassWarning) {
+    console.warn(bypassWarning);
+  }
 
   // Initialize core
   const dbPath = resolveDbPath(options.dbPath);
@@ -418,6 +637,25 @@ export async function startServer(options: {
   if (savedConfig) {
     const { agentId } = ensureAndPersistAgentId(pathJoin(stateDir, "config.json"));
     savedConfig.agentId = agentId;
+  }
+  // #5: token-budget enforcement. Mode-agnostic — gates on cap > 0. Self-hosted
+  // uses config llmTokensPerMonth (default 0 = off); hosted uses HICORTEX_TOKEN_CAP
+  // env (provider-set, tenant-immutable) which takes precedence. Initialised here
+  // (after stateDir + savedConfig are known) so the warn-dedup can seed from state.
+  initTokenBudget(stateDir, savedConfig?.llmTokensPerMonth);
+  // #7: request body-size limit. Env (HICORTEX_DISTILL_BODY_LIMIT_MB) wins;
+  // else the config key; else 5 MB hosted / 25 MB self-hosted (the prior
+  // fixed value → no regression). Guards the OOM vector (the body is fully
+  // parsed into memory before the distiller truncates to 80K chars).
+  // Legitimate capture segments are ≤60K chars (~200KB), so this never
+  // constrains real flow — it's an abuse/backstop. Oversized → 413.
+  // #328 item 2b: in HOSTED mode the env is the provider's tenant-immutable
+  // pin — the tenant-writable /data/config.json must not be able to raise it.
+  const bodyLimitMb = resolveBodyLimitMb(savedConfig?.distillBodyLimitMb, hostedMode);
+  // Label the source truthfully (token-budget.ts pattern): only claim env
+  // when the env value was actually used (a malformed env falls through).
+  if (Number(process.env.HICORTEX_DISTILL_BODY_LIMIT_MB) === bodyLimitMb) {
+    console.log(`[hicortex] Body limit: ${bodyLimitMb} MB (HICORTEX_DISTILL_BODY_LIMIT_MB env — overrides config)`);
   }
   if (savedConfig?.llmBackend === "claude-cli") {
     const claudePath = findClaudeBinary();
@@ -502,25 +740,41 @@ export async function startServer(options: {
       "(localhost still works). Run `npx @gamaze/hicortex init` to generate a token."
     );
   }
+  // Optional rotation-grace token (#254): config-only (no env var — rotation is
+  // an explicit, deliberate op). When set, both tokens are accepted so client
+  // reconfiguration never causes failed requests.
+  const authTokenPrevious = savedConfig?.authTokenPrevious as string | undefined;
 
-  // Context layer (0.12): resolve which harnesses may inject the standing
-  // context. Warn once per boot on unknown names so typos (e.g. "herms")
-  // surface instead of silently dropping.
-  const resolvedClients = resolveContextClients(savedConfig?.contextClients);
-  contextClients = resolvedClients.clients;
+  // Identity layer (0.12; renamed from context layer in 0.18 #264): resolve
+  // which harnesses may inject the standing identity. Warn once per boot on
+  // unknown names so typos (e.g. "herms") surface instead of silently dropping.
+  const resolvedClients = resolveIdentityClientsConfig(savedConfig);
+  identityClients = resolvedClients.clients;
+  if (resolvedClients.legacy) {
+    console.warn(
+      "[hicortex] Config uses the legacy 'contextClients' key — renamed to 'identityClients' in 0.18 (#264). " +
+      "The legacy key still works; update your config to silence this warning."
+    );
+  }
   if (resolvedClients.dropped.length > 0) {
     console.warn(
-      `[hicortex] Ignoring unknown contextClients: ${resolvedClients.dropped.join(", ")} ` +
+      `[hicortex] Ignoring unknown identityClients: ${resolvedClients.dropped.join(", ")} ` +
       `(known: cc, hermes, oc)`
     );
   }
 
-  // Per-agent context (0.13): resolve the config-declared modes. Warn once per
+  // Per-agent identity (0.13): resolve the config-declared modes. Warn once per
   // boot on dropped entries (bad key or bad mode) so typos surface. NOTE: this
-  // map is boot-time; editing contextAgents needs a daemon restart. Dropping an
+  // map is boot-time; editing identityAgents needs a daemon restart. Dropping an
   // agents/<id> dir onto disk takes effect immediately (per-request presence).
-  const resolvedAgents = resolveContextAgents(savedConfig?.contextAgents);
-  contextAgents = resolvedAgents.agents;
+  const resolvedAgents = resolveIdentityAgentsConfig(savedConfig);
+  identityAgents = resolvedAgents.agents;
+  if (resolvedAgents.legacy) {
+    console.warn(
+      "[hicortex] Config uses the legacy 'contextAgents' key — renamed to 'identityAgents' in 0.18 (#264). " +
+      "The legacy key still works; update your config to silence this warning."
+    );
+  }
 
   // #192 recall/decay alignment: decay speed + recall breadth + pushed-recall
   // knobs, ALL from config (see retrieval.ts configureRecall for the key list)
@@ -531,7 +785,9 @@ export async function startServer(options: {
   const sessionIntentCfg = retrieval.configureSessionIntent(savedConfig);
   console.log(
     `[hicortex] Recall: k=${recallCfg.searchLimit}/recent=${recallCfg.recentLimit}` +
-    `/window=${recallCfg.recentWindowDays}d/cold=${recallCfg.coldExposureSlots} · ` +
+    `/window=${recallCfg.recentWindowDays}d/cold=${recallCfg.coldExposureSlots}` +
+    `/novelty=${resolveNoveltyFloorSlots(savedConfig?.noveltyFloorSlots, savedConfig?.recallMaxItems)}` +
+    ` · ` +
     `score sim=${scoringCfg.similarity}/str=${scoringCfg.strength}/conn=${scoringCfg.connections}` +
     `/rec=${scoringCfg.recency}, fresh=${scoringCfg.freshnessBoostWeight}@${scoringCfg.freshnessBoostDays}d, ` +
     `superseded×${scoringCfg.supersededDemotion}` +
@@ -546,19 +802,40 @@ export async function startServer(options: {
     maxItems: savedConfig?.recallMaxItems as number | undefined,
     minPromptLength: savedConfig?.recallMinPromptChars as number | undefined,
     titleChars: savedConfig?.recallTitleChars as number | undefined,
+    // #324 novelty floor: slots of recallMaxItems guaranteed to the
+    // pure-prompt (unblended) search's top passing hit(s). 0 disables.
+    noveltyFloorSlots: savedConfig?.noveltyFloorSlots as number | undefined,
   };
   memoryInstructionsEnabled = savedConfig?.memoryInstructions !== false;
   if (resolvedAgents.dropped.length > 0) {
     console.warn(
-      `[hicortex] Ignoring invalid contextAgents entries: ${resolvedAgents.dropped.join(", ")} ` +
+      `[hicortex] Ignoring invalid identityAgents entries: ${resolvedAgents.dropped.join(", ")} ` +
       `(keys must match ^[a-z0-9][a-z0-9_-]*$; modes must be override|global|off)`
     );
   }
 
+  // #264 dir migration: rename <hicortex-home>/context/ → identity/ on boot
+  // when only the legacy dir exists. The fallback read in identity-store.ts
+  // (readSectionsWithFallback) is the safety net for a partial/no migration.
+  const idMig = migrateIdentityDir(stateDir);
+  if (idMig.renamed) {
+    console.log(`[hicortex] Migrated identity dir: ${idMig.from} → ${idMig.to}`);
+  } else if (idMig.reason && idMig.reason !== "no legacy context/ dir" && !idMig.reason.startsWith("identity/ already exists")) {
+    console.warn(`[hicortex] Identity dir migration skipped: ${idMig.reason}`);
+  }
+
   // Express app
   const app = express();
+  // #328 item 4: the Content-Length pre-check MUST precede express.json (the
+  // parser buffers unauthenticated bodies up to its own limit; refusing the
+  // DECLARED oversize first bounds that). See makeContentLengthGate.
+  app.use(makeContentLengthGate(bodyLimitMb * 1024 * 1024));
   // Raise the body limit — whole-session denoised transcripts exceed the 100 kB default.
-  app.use(express.json({ limit: "25mb" }));
+  app.use(express.json({ limit: `${bodyLimitMb}mb` }));
+  // #7: JSON 413 on body-limit exceed (see makeBodyLimitErrorHandler). Server-side
+  // only — the client capture loop treats 413 like any non-2xx (holds cursor);
+  // it never fires for legitimate capture (segments ≤200KB ≪ the limit).
+  app.use(makeBodyLimitErrorHandler(bodyLimitMb));
 
   // CORS: reflect ONLY explicitly-allowlisted origins (config.corsAllowedOrigins),
   // and never send Access-Control-Allow-Credentials. Reflecting any origin with
@@ -604,26 +881,44 @@ export async function startServer(options: {
   // point: http://<host>:8787/ → /dashboard.
   app.get("/", (_req, res) => res.redirect("/dashboard"));
 
-  app.use(createAuthMiddleware(authToken));
+  app.use(createAuthMiddleware(authToken, authTokenPrevious, bypassMarkerPresent, bodyLimitMb * 1024 * 1024));
 
   // SSE transport management — each connection gets its own McpServer instance
   const transports = new Map<string, SSEServerTransport>();
 
-  // Health endpoint
+  // Health endpoint — PUBLIC minimal probe. Unauthenticated (the auth
+  // middleware exempts /health) and carries NO data: just liveness for load
+  // balancers, watchdogs, and anonymous probers. Tenant/install BI (memory
+  // count, link count, DB size, version, the full LLM backend string) lives
+  // on /health/detail, which is auth-gated (localhost bypasses auth so
+  // co-located tooling — `hicortex status`, nightly preflight, `init` detect
+  // — sees it without a token). #253 — spec 2026-07-27-hosted-service §6.
   app.get("/health", (_req, res) => {
-    const s = db ? getStats(db, dbPath) : { memories: 0, links: 0, db_size_bytes: 0, by_type: {} };
-    res.json({
-      status: "ok",
-      version: VERSION,
-      memories: s.memories,
-      links: s.links,
-      db_size_kb: Math.round(s.db_size_bytes / 1024),
-      llm: llmConfig ? `${llmConfig.provider}/${llmConfig.model}` : "not configured",
-    });
+    res.json(publicHealthResponse());
   });
 
-  // REST /lessons — return lessons + memory index for client CLAUDE.md injection
-  app.get("/lessons", (_req, res) => {
+  // Operator-only diagnostics. Goes through the standard auth middleware
+  // (not in the public-path exemption list in viz.ts); localhost bypasses
+  // auth, remote needs the bearer token. Keeps the public LB/watchdog path
+  // cheap (no COUNT(*)) and the diagnostics off the public surface.
+  app.get("/health/detail", (_req, res) => {
+    const s = db ? getStats(db, dbPath) : { memories: 0, links: 0, db_size_bytes: 0, by_type: {} };
+    res.json(
+      detailedHealthResponse({
+        memories: s.memories,
+        links: s.links,
+        dbSizeBytes: s.db_size_bytes,
+        version: VERSION,
+        llmLabel: llmConfig ? `${llmConfig.provider}/${llmConfig.model}` : "not configured",
+      }),
+    );
+  });
+
+  // REST /learnings (canonical, #264) + /lessons (alias) — return lessons +
+  // memory index for client CLAUDE.md injection. Both routes share ONE handler
+  // so the alias can never drift from the canonical shape. The legacy name is
+  // kept indefinitely (existing SessionStart hooks literally fetch /lessons).
+  const learningsIndexHandler = (_req: express.Request, res: express.Response): void => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     try {
       const lessons = storage.getLessons(db, 30);
@@ -654,9 +949,11 @@ export async function startServer(options: {
         moduleIndex: state.moduleIndex ?? null,
       });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "learnings", err);
     }
-  });
+  };
+  app.get("/learnings", learningsIndexHandler);
+  app.get("/lessons", learningsIndexHandler); // #264 backcompat alias
 
   // REST /ingest — accept pre-distilled memories from remote clients
   app.post("/ingest", async (req, res) => {
@@ -669,11 +966,15 @@ export async function startServer(options: {
       return;
     }
 
-    const validTypes = ["episode", "lesson", "fact", "decision"];
+    const validTypes = ACCEPTED_MEMORY_TYPES;
     if (memory_type && !validTypes.includes(memory_type)) {
       res.status(400).json({ error: `Invalid memory_type: ${memory_type}` });
       return;
     }
+    // Normalize legacy raw enum (fact/episode/decision/lesson) to the
+    // canonical term the DB stores (knowledge/experience/decisions/learnings).
+    // Canonical values pass through unchanged.
+    const normalizedType = memory_type ? normalizeMemoryType(memory_type) : memory_type;
 
     // Dedup by source_session (idempotent — skip if already ingested)
     if (source_session) {
@@ -695,7 +996,7 @@ export async function startServer(options: {
         sourceDomain: typeof source_domain === "string" ? source_domain : null,
         sourceSession: source_session ?? undefined,
         project: project ?? undefined,
-        memoryType: memory_type ?? "episode",
+        memoryType: normalizedType ?? "experience",
         // 0.16.x: privacy defaults to null (vestigial column). A legacy client
         // that sends an explicit value is honored; absent → null.
         privacy: typeof privacy === "string" ? privacy : null,
@@ -703,7 +1004,8 @@ export async function startServer(options: {
       });
       res.status(201).json({ id, message: "Memory ingested" });
     } catch (err) {
-      res.status(500).json({ error: "Ingestion failed", message: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({ error: "Ingestion failed" });
+      console.error(`[hicortex] /ingest: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     }
   });
 
@@ -724,7 +1026,7 @@ export async function startServer(options: {
       const results = await retrieval.retrieve(db, embed, query, { limit, project });
       res.json({ results });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "search", err);
     }
   });
 
@@ -736,37 +1038,24 @@ export async function startServer(options: {
   // (SessionStart/compaction).
   app.post("/recall-index", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    // Client-pushed project/privacy scoping (F1) rides through to retrieval,
+    // which handles the filtered over-fetch itself. The search closure itself
+    // lives in recall-index.ts (createRecallRetrieveFn): per-request prompt
+    // embed memo (ONE embed for the blended + pure-prompt searches), the
+    // session-intent centroid blend/EMA fold via retrieval.recallQueryVector
+    // (#192 session-intent keying, 0.15.3), and the #324 pure-prompt branch
+    // that searches unblended and touches no centroid state. Extracted so the
+    // exact behavior is unit-testable without HTTP (blendQueryVector
+    // precedent); this adapter stays thin.
     const r = await handleRecallIndex(
       {
         db,
         registry: recallRegistry,
-        // Client-pushed project/privacy scoping (F1) rides through to
-        // retrieval, which handles the filtered over-fetch itself.
-        // #192 session-intent keying (0.15.3): embed the prompt ONCE here,
-        // blend with the session's rolling centroid, and pass the blended
-        // vector to retrieve() via queryEmbedding so retrieve() does NOT
-        // re-embed. Turn 1 (no centroid yet) and weight=0 both reduce to a
-        // pure-prompt search (the kill-switch). The centroid is updated AFTER
-        // reading the prior one — so turn 1 searches with pure prompt, then
-        // seeds the centroid for turn 2+ to blend against.
-        retrieveFn: async (query, limit, filters, sessionId) => {
-          const { weight, alpha } = retrieval.getSessionIntent();
-          const promptEmb = await embed(query);
-          // weight=0 (kill-switch): the centroid is neither read nor written.
-          const centroid = weight > 0 ? recallRegistry.getCentroid(sessionId) : undefined;
-          const queryVec = retrieval.blendQueryVector(promptEmb, centroid, weight);
-          if (weight > 0) recallRegistry.updateCentroid(sessionId, promptEmb, alpha);
-          return retrieval.retrieve(db!, embed, query, {
-            limit,
-            noStrengthen: true,
-            // #203: project + mission_domains are SOFT affinity (zero-boost
-            // neutral), threaded into computeScore. 0.16.x: privacy is no
-            // longer threaded (vestigial column, never filtered).
-            project: filters?.project,
-            missionDomains: filters?.mission_domains,
-            queryEmbedding: queryVec,
-          });
-        },
+        retrieveFn: createRecallRetrieveFn({
+          db,
+          registry: recallRegistry,
+          embedFn: embed,
+        }),
         options: recallIndexOptions,
       },
       req.body
@@ -785,7 +1074,7 @@ export async function startServer(options: {
       const r = handleMemoryGet(db, { id: req.query.id });
       res.status(r.status).json(r.body);
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "memory", err);
     }
   });
 
@@ -801,45 +1090,52 @@ export async function startServer(options: {
       const results = retrieval.searchRecent(db, { project, limit });
       res.json({ results });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "recent", err);
     }
   });
 
   // -------------------------------------------------------------------------
-  // REST /context — standing context layer (0.12, spec 2026-07-12).
+  // REST /identity — standing identity layer (0.12, spec 2026-07-12; renamed
+  // from /context in 0.18 #264).
   //
-  // GET  → { sections, updated_at, clients } read from <hicortex-home>/context/.
+  // GET  → { sections, updated_at, clients } read from <hicortex-home>/identity/.
   // PUT  → partial upsert of named sections (allowlisted names, atomic).
   //
-  // This is NOT recall. The recall endpoint that previously held this name is
-  // now /recent (§Naming). Stale-client tripwire: old recall callers always
-  // send project/limit/privacy query params; context-layer callers never do —
-  // so those params on GET /context return a loud, self-explaining 400 instead
-  // of silently degrading recall to an empty {sections} response.
+  // This is NOT recall. The recall endpoint that previously held the /context
+  // name is now /recent (§Naming). Stale-client tripwire: old recall callers
+  // always send project/limit/privacy query params; identity-layer callers
+  // never do — so those params on GET /identity return a loud, self-explaining
+  // 400 instead of silently degrading recall to an empty {sections} response.
   //
   // Auth is the standard model (bearer; localhost bypass) via the shared
   // middleware — no special-casing here.
   // -------------------------------------------------------------------------
   // Thin adapters: all logic (tripwire, validation, allowlist, atomicity,
-  // symlink safety, size warn) lives in the pure handlers in context-store.ts,
+  // symlink safety, size warn) lives in the pure handlers in identity-store.ts,
   // which the tests exercise directly — no mirror-app drift.
-  app.get("/context", (req, res) => {
+  //
+  // #264 backcompat: GET/PUT /context remain mounted BELOW as aliases that
+  // route to the SAME handlers (Hermes/OC plugins and pre-0.18 clients keep
+  // working unchanged). Both endpoints read/write the SAME identity dir.
+  const identityDir = pathJoin(stateDir, "identity");
+
+  app.get("/identity", (req, res) => {
     try {
-      const r = handleContextGet(pathJoin(stateDir, "context"), contextClients, req.query as Record<string, unknown>, contextAgents);
-      // #192: product-owned memory instructions ride as a synthetic read-only
-      // `memory` section (config memoryInstructions !== false; agent mode
-      // "off" respected inside the helper). Every harness renders it via the
-      // shared section renderer — zero client changes.
-      if (r.status === 200) {
-        injectMemorySection(r.body as { sections?: Record<string, string>; mode?: string }, memoryInstructionsEnabled);
-      }
+      // serveIdentityBody (#192 + #313): the ONE composition — synthetic
+      // product-owned `memory` section, then the SECTION_PRECEDENCE wire
+      // order. Shared with GET /context and the MCP hicortex_identity tool so
+      // every surface serves byte-identical ordering.
+      const r = serveIdentityBody(
+        handleIdentityGet(identityDir, identityClients, req.query as Record<string, unknown>, identityAgents),
+        memoryInstructionsEnabled,
+      );
       res.status(r.status).json(r.body);
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "identity", err);
     }
   });
 
-  app.put("/context", (req, res) => {
+  app.put("/identity", (req, res) => {
     try {
       // Reserved product section: never writable, loud error (no silent skip).
       const putSections = (req.body as { sections?: Record<string, unknown> } | null)?.sections;
@@ -847,17 +1143,52 @@ export async function startServer(options: {
         res.status(400).json({ error: `Section name '${MEMORY_SECTION_NAME}' is reserved for the product-owned memory instructions (config memoryInstructions to disable them)` });
         return;
       }
-      const r = handleContextPut(pathJoin(stateDir, "context"), req.body, req.query as Record<string, unknown>, contextAgents);
+      const r = handleIdentityPut(identityDir, req.body, req.query as Record<string, unknown>, identityAgents);
       if (r.warn) console.warn(`[hicortex] ${r.warn}`);
       res.status(r.status).json(r.body);
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "identity", err);
+    }
+  });
+
+  // #264 backcompat aliases: /context → /identity handlers (same dir, same
+  // clients/agents). Kept indefinitely so external callers (the Hermes plugin,
+  // pre-0.18 OC clients, operator scripts) never break. The dir is "identity"
+  // in BOTH aliases — the rename + migration is server-side; clients see no
+  // difference in behaviour, only the URL.
+  app.get("/context", (req, res) => {
+    try {
+      // Same serveIdentityBody composition as GET /identity — the alias
+      // serves byte-equal behaviour by construction.
+      const r = serveIdentityBody(
+        handleIdentityGet(identityDir, identityClients, req.query as Record<string, unknown>, identityAgents),
+        memoryInstructionsEnabled,
+      );
+      res.status(r.status).json(r.body);
+    } catch (err) {
+      logAndSendInternalError(res, "context", err);
+    }
+  });
+
+  app.put("/context", (req, res) => {
+    try {
+      const putSections = (req.body as { sections?: Record<string, unknown> } | null)?.sections;
+      if (putSections && Object.keys(putSections).some((n) => isReservedSectionName(n))) {
+        res.status(400).json({ error: `Section name '${MEMORY_SECTION_NAME}' is reserved for the product-owned memory instructions (config memoryInstructions to disable them)` });
+        return;
+      }
+      const r = handleIdentityPut(identityDir, req.body, req.query as Record<string, unknown>, identityAgents);
+      if (r.warn) console.warn(`[hicortex] ${r.warn}`);
+      res.status(r.status).json(r.body);
+    } catch (err) {
+      logAndSendInternalError(res, "context", err);
     }
   });
 
   // REST /distill — canonical capture endpoint (0.9.0+).
   // Every machine (including the server itself) POSTs denoised session text here.
-  // The server distills, embeds, stores. Body limit: 25 MB (raised at app init).
+  // The server distills, embeds, stores. Body limit: see `distillBodyLimitMb`
+  // (default 25 MB self-hosted / 5 MB hosted); oversized → 413 (#7).
   //
   // Accepts text (string, preferred nightly path) OR messages (array, legacy).
   // Performs session-level dedup when session_id is present without segment_id.
@@ -869,14 +1200,39 @@ export async function startServer(options: {
     const { text, messages, source_agent, source_agent_id, source_domain, project, session_id, segment_id, session_date, privacy } = req.body ?? {};
 
     // Resolve the conversation text from either the pre-denoised string or raw messages array.
+    // `fromTextBranch` is captured once so the redaction gate below uses the SAME
+    // discriminator as the resolution (avoids re-redacting the messages-derived
+    // text in the `{text: "", messages: [...]}` edge case — harmless only because
+    // redaction is idempotent, but the comment/code must agree).
+    const fromTextBranch = typeof text === "string" && text.length > 0;
     let conversationText: string;
-    if (typeof text === "string" && text.length > 0) {
+    if (fromTextBranch) {
       conversationText = text;
     } else if (Array.isArray(messages) && messages.length > 0) {
+      // The messages branch already redacts via extractConversationText
+      // (distiller.ts), which calls redact() as its final step.
       conversationText = extractConversationText(messages);
     } else {
       res.status(400).json({ error: "Provide either 'text' (string) or 'messages' (array)" });
       return;
+    }
+
+    // SERVER-SIDE REDACTION (#252): scrub secrets/PII from the text branch
+    // BEFORE it reaches the distillation LLM or storage. Client-side redaction
+    // (capture.ts) is customer-disableable; a processor cannot base a privacy
+    // claim on scrubbing the caller can switch off, and unredacted secrets
+    // would reach the LLM subprocessor. Unconditional + idempotent — safe for
+    // self-hosted too (a second pass over already-redacted text is a no-op;
+    // the [REDACTED] marker is excluded by the generic_secret pattern's
+    // negative lookahead, and format-specific patterns don't match it). The
+    // messages branch is already covered above. Disable-resistance
+    // (hostedMode) is Phase 0b.
+    if (fromTextBranch) {
+      const { text: redacted, count } = redact(conversationText);
+      if (count > 0) {
+        console.log(`[hicortex] Redacted ${count} secret(s) from /distill text`);
+      }
+      conversationText = redacted;
     }
 
     // Segment-exact dedup (#189): an incremental capture POST carries
@@ -909,6 +1265,17 @@ export async function startServer(options: {
       }
     }
 
+    // #337: readiness gate — cached minimal generation probe BEFORE
+    // detectChunkSize + distillSession, so a dead endpoint never even pays the
+    // chunk-size probe. Placed AFTER the dedup short-circuits (a duplicate
+    // costs nothing and must not trip the gate). On failure: 503 with the
+    // diagnosis — the capture client treats non-201/200 as transient and holds
+    // its cursor (capture.ts), so the segment is retried next run, never lost.
+    if (!(await resolveDistillProbeGate(llm, llmConfig))) {
+      res.status(503).json({ error: "LLM endpoint not generating — session will be retried" });
+      return;
+    }
+
     // Cache detectChunkSize per endpoint so we probe at most once per server boot.
     // numCtx is passed so chunk size derives from the request's ACTUAL context
     // window (#231, #228) — the chunker and the request agree by construction.
@@ -925,12 +1292,37 @@ export async function startServer(options: {
       ? `${session_id as string}${segment_id ? `#${segment_id as string}` : ""}`
       : undefined;
 
+    // #5: declared outside the try so the finally can record tokens spent even
+    // when distillSession throws partway through (the LLM calls already happened).
+    let distillUsage = { prompt: 0, completion: 0, total: 0 };
     try {
+      // #5: token-budget gate — refuse (429) BEFORE the LLM call if the tenant is
+      // already at/over the monthly cap. Placed after the dedup short-circuits so
+      // a skipped duplicate neither trips the gate nor consumes budget. The client
+      // capture loop holds its cursor on 429 (dup-over-loss, capture.ts:303).
+      if (isTokenBudgetExceeded(stateDir)) {
+        res.status(429).json({ error: "token budget exceeded", retry: "next billing period" });
+        return;
+      }
       // Collect gate-dropped entries so they can ride back in the response and
       // land in the caller's file-persisted nightly log (#156 audit trail); the
       // server-side per-entry console.log in distillChunk stays as well.
       const dropped: string[] = [];
-      const entries = await distillSession(llm, conversationText, project ?? "unknown", date, chunkSize, dropped);
+      const entries = await distillSession(
+        llm, conversationText, project ?? "unknown", date, chunkSize, dropped,
+        (u) => {
+          distillUsage.prompt += u.prompt_tokens ?? 0;
+          distillUsage.completion += u.completion_tokens ?? 0;
+          distillUsage.total += u.total_tokens ?? 0;
+        },
+        // #339: identify this POST in the NO_EXTRACT over-firing warning —
+        // segment_id (incremental capture), else session_id (legacy), else none.
+        typeof segment_id === "string" && segment_id
+          ? segment_id
+          : typeof session_id === "string" && session_id
+            ? session_id
+            : undefined,
+      );
 
       // Phase 1 — embed every chunk up front (async). If ANY embed fails we
       // never reach the insert, so nothing is stored.
@@ -967,9 +1359,9 @@ export async function startServer(options: {
               sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
               project: project ?? undefined,
               // #216: the distiller now classifies each entry as
-              // episode/fact/decision via the [E]/[F]/[D] tag parsed in
+              // experience/knowledge/decisions via the [E]/[K]/[D] tag parsed in
               // distiller.ts. Pre-#216 distiller output (no tag) defaults to
-              // episode in the parser, so this is backward compatible.
+              // experience in the parser, so this is backward compatible.
               memoryType,
               // 0.16.x: privacy defaults to null (vestigial column). A legacy
               // client that sends an explicit value is honored; absent → null.
@@ -986,9 +1378,22 @@ export async function startServer(options: {
         ids,
         distilled: ids.length,
         dropped: dropped.map((d) => (d.length > 120 ? `${d.slice(0, 120)}…` : d)),
+        // #287: this segment's metered usage — the same breakdown
+        // recordDistillUsage accrues below. Lets the capturing nightly
+        // attribute distill tokens in its dashboard snapshot
+        // (new_this_run.tokens_by_stage.distill). Always present (zeros when
+        // no chunk reached an LLM call); pre-#287 clients ignore it.
+        usage: distillUsage,
       });
     } catch (err) {
-      res.status(500).json({ error: "Distillation failed", message: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({ error: "Distillation failed" });
+      console.error(`[hicortex] /distill: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+    } finally {
+      // #5: record tokens spent against the monthly budget — in finally so a
+      // mid-distil throw (some chunks' LLM calls already happened) still counts.
+      // No-op when cap=0 (enforcement off) or distillUsage.total=0 (gate refused
+      // / no chunk reached an LLM call).
+      if (distillUsage.total > 0) recordDistillUsage(stateDir, distillUsage);
     }
   });
 
@@ -1015,17 +1420,22 @@ export async function startServer(options: {
     const fields: Record<string, unknown> = {};
     if (content !== undefined) fields.content = content;
     if (project !== undefined) fields.project = project;
-    if (memory_type !== undefined) fields.memory_type = memory_type;
     if (privacy !== undefined) fields.privacy = privacy;
+
+    // Validate + normalize memory_type BEFORE adding to `fields` so the
+    // empty-fields check below correctly counts a memory_type-only update.
+    const validTypes = ACCEPTED_MEMORY_TYPES;
+    if (memory_type !== undefined && !validTypes.includes(memory_type)) {
+      res.status(400).json({ error: `Invalid memory_type: ${memory_type}` });
+      return;
+    }
+    // Normalize legacy raw enum (fact/episode/decision/lesson) to the
+    // canonical term the DB stores (knowledge/experience/decisions/learnings).
+    // Canonical values pass through unchanged.
+    if (memory_type !== undefined) fields.memory_type = normalizeMemoryType(memory_type);
 
     if (Object.keys(fields).length === 0) {
       res.status(400).json({ error: "No fields to update" });
-      return;
-    }
-
-    const validTypes = ["episode", "lesson", "fact", "decision"];
-    if (memory_type !== undefined && !validTypes.includes(memory_type)) {
-      res.status(400).json({ error: `Invalid memory_type: ${memory_type}` });
       return;
     }
 
@@ -1044,7 +1454,8 @@ export async function startServer(options: {
 
       res.json({ updated: true, id: fullId });
     } catch (err) {
-      res.status(500).json({ error: "Update failed", message: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({ error: "Update failed" });
+      console.error(`[hicortex] /update: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     }
   });
 
@@ -1071,7 +1482,8 @@ export async function startServer(options: {
       storage.deleteMemory(db, fullId);
       res.json({ deleted: true, id: fullId });
     } catch (err) {
-      res.status(500).json({ error: "Delete failed", message: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({ error: "Delete failed" });
+      console.error(`[hicortex] /delete: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     }
   });
 
@@ -1109,7 +1521,7 @@ export async function startServer(options: {
       ).all() as Array<{ project: string; cnt: number }>;
       res.json({ projects: rows.map((r) => ({ name: r.project, count: r.cnt })) });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "index", err);
     }
   });
 
@@ -1205,7 +1617,7 @@ export async function startServer(options: {
         return;
       }
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      logAndSendInternalError(res, "graph", err);
     }
   });
 
@@ -1229,16 +1641,19 @@ export async function startServer(options: {
   // lives in createAuthMiddleware next to the /viz one.
   app.get("/viz/vendor/:file", vizVendorHandler());
 
-  // GET /context/ui — standing-context editor page (0.12, spec 2026-07-12 §5).
+  // GET /identity/ui — standing-identity editor page (0.12, spec 2026-07-12 §5;
+  // renamed from /context/ui in 0.18 #264).
   //
-  // The PRIMARY edit surface for the context layer. Self-contained HTML (inline
-  // CSS/JS, zero external requests) served from assets/context.html; builds one
-  // tab per section from GET /context and saves via PUT /context. The page
+  // The PRIMARY edit surface for the identity layer. Self-contained HTML (inline
+  // CSS/JS, zero external requests) served from assets/identity.html; builds one
+  // tab per section from GET /identity and saves via PUT /identity. The page
   // SHELL is public (exempted in createAuthMiddleware, like /viz — it carries
-  // no data); the GET/PUT /context data calls stay bearer-only (localhost
+  // no data); the GET/PUT /identity data calls stay bearer-only (localhost
   // bypass). The page collects the token client-side: ?token= URL param
   // (stripped on load) or an in-page prompt on 401, persisted in localStorage.
-  app.get("/context/ui", contextUiHandler());
+  // #264 backcompat: /context/ui remains mounted below as an alias.
+  app.get("/identity/ui", identityUiHandler());
+  app.get("/context/ui", identityUiHandler());
 
   // GET /dashboard — view-only memory analytics page (#224).
   //
@@ -1258,6 +1673,16 @@ export async function startServer(options: {
   // no mutation endpoints on the dashboard surface.
   app.get("/dashboard/data", dashboardDataHandler(
     () => db!,
+    () => readConfigFile(stateDir),
+  ));
+
+  // GET /account — account identity for the console nav (name/org/plan from
+  // config). The LIGHTWEIGHT twin of the account block inside /dashboard/data:
+  // the /viz and /identity/ui pages need only this, not the metric payload;
+  // also the natural whoami for the future OAuth session (#292). Bearer-only
+  // (standard auth middleware, no shell exemption — it carries data); localhost
+  // bypass applies. Handler lives in src/dashboard.ts next to its twin.
+  app.get("/account", accountHandler(
     () => readConfigFile(stateDir),
   ));
 
@@ -1335,6 +1760,22 @@ export async function startServer(options: {
 
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+
+  // #329 item 2: warm the embedder NOW, in the background. The ONNX pipeline
+  // lazy-loads inside the first embed() (~0.5-3s cold) — without this, the
+  // first /recall-index after every restart paid that load inside its own
+  // latency budget and the 1s client hook failed soft (silent recall loss).
+  // Fire-and-forget AFTER listen: never blocks boot, never fatal (a failed
+  // warm-up just logs once; the next real embed lazy-loads as before).
+  //
+  // HOSTED MEMORY IMPLICATION (accepted, #329 CR finding 3): this makes the
+  // embedding model (~150-300MB resident) load in EVERY tenant container from
+  // boot, idle tenants included — previously an idle tenant never loaded it.
+  // Accepted for the current single-tenant-VPS sizing: containers run under
+  // 2g caps, and any ACTIVE tenant loaded the model on first use anyway. If
+  // tenant density grows, revisit (e.g. warm on first authenticated request
+  // instead of boot). Capacity math: hosted/README.md (TENANT_MEMORY_LIMIT).
+  warmEmbedder(embed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1407,7 +1848,7 @@ function fixDaemonVersionPin(): void {
   }
 }
 
-function formatResults(results: MemorySearchResult[]): string {
+export function formatResults(results: MemorySearchResult[]): string {
   if (results.length === 0) return "No memories found.";
   // The id makes every recall surface feed the rest of the toolset: cite-on-use
   // (id + date), hicortex_get lazy-load of truncated content, hicortex_graph
@@ -1415,7 +1856,7 @@ function formatResults(results: MemorySearchResult[]): string {
   return results
     .map(
       (r) =>
-        `[${r.id}] [${r.memory_type}] (${(r.created_at ?? "").slice(0, 10)}, score: ${r.score.toFixed(3)}, strength: ${r.effective_strength.toFixed(3)}) ${r.content.slice(0, 500)}`
+        `[${r.id}] [${labelForType(r.memory_type)}] (${(r.created_at ?? "").slice(0, 10)}, score: ${r.score.toFixed(3)}, strength: ${r.effective_strength.toFixed(3)}) ${r.content.slice(0, 500)}`
     )
     .join("\n\n");
 }

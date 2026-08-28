@@ -6,7 +6,9 @@
  *   2. Remote HC server (HICORTEX_SERVER_URL — any reachable host:port)
  *   3. OC plugin installed (~/.openclaw/openclaw.json)
  *   4. CC MCP already registered (~/.claude/settings.json)
- *   5. Existing DB (~/.hicortex/ or ~/.openclaw/data/)
+ *   5. Hermes present (~/.hermes) / Pi present (~/.pi/agent) /
+ *      opencode present (~/.config/opencode or ~/.local/share/opencode)
+ *   6. Existing DB (~/.hicortex/ or ~/.openclaw/data/)
  *
  * Actions:
  *   - Install persistent daemon (launchd/systemd)
@@ -17,6 +19,7 @@
  */
 
 import { hicortexHome } from "./paths.js";
+import { writeLocalhostBypassMarker } from "./localhost-bypass.js";
 import { sendLifecycleEvent } from "./telemetry.js";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, statSync, symlinkSync, rmSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -25,8 +28,8 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomBytes, randomUUID } from "node:crypto";
 import { removeLessonsBlock } from "./claude-md.js";
-import { parseHours } from "./config-read.js";
-import { sanitizeAgentId } from "./context-store.js";
+import { parseHours, readNonNegativeConfig } from "./config-read.js";
+import { sanitizeAgentId } from "./identity-store.js";
 import type { DomainDef } from "./types.js";
 
 const HICORTEX_HOME = hicortexHome();
@@ -52,6 +55,11 @@ const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
 const CC_COMMANDS_DIR = join(homedir(), ".claude", "commands");
 const OC_CONFIG = join(homedir(), ".openclaw", "openclaw.json");
 const HERMES_HOME = process.env.HERMES_HOME || join(homedir(), ".hermes");
+/** Pi's agent dir — its presence means Pi is installed and will load extensions. */
+const PI_AGENT_DIR = join(homedir(), ".pi", "agent");
+/** opencode's config/data dirs — either present means opencode is installed. */
+const OPENCODE_CONFIG_DIR = join(homedir(), ".config", "opencode");
+const OPENCODE_DATA_DIR = join(homedir(), ".local", "share", "opencode");
 const DEFAULT_PORT = 8787;
 
 // ---------------------------------------------------------------------------
@@ -66,6 +74,8 @@ interface DetectionResult {
   ocPlugin: boolean;
   ccMcpRegistered: boolean;
   hermesFound: boolean;
+  piFound: boolean;
+  opencodeFound: boolean;
   existingDb: boolean;
   dbPath?: string;
   memoryCount?: number;
@@ -78,12 +88,16 @@ async function detect(): Promise<DetectionResult> {
     ocPlugin: false,
     ccMcpRegistered: false,
     hermesFound: false,
+    piFound: false,
+    opencodeFound: false,
     existingDb: false,
   };
 
-  // Check local server
+  // Check local server. /health/detail carries the diagnostics (memories,
+  // version, llm) — /health itself is the public minimal {status:"ok"} probe
+  // (#253). localhost bypasses auth, so co-located detect gets the fields.
   try {
-    const resp = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/health`, {
+    const resp = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/health/detail`, {
       signal: AbortSignal.timeout(2000),
     });
     if (resp.ok) {
@@ -94,7 +108,13 @@ async function detect(): Promise<DetectionResult> {
     }
   } catch { /* not running */ }
 
-  // Check remote server (env var)
+  // Check remote server (env var). detect() runs BEFORE any config/token
+  // exists, so this MUST use the PUBLIC /health probe (liveness only) —
+  // /health/detail sits behind the auth middleware and would 401 on any
+  // authed remote server, making a healthy remote look "unreachable" and
+  // silently mis-routing the install branch (#253 CR fix). The memory count
+  // is not available on the public probe; the local-server path above still
+  // gets it via localhost-bypassed /health/detail.
   const remoteUrl = process.env.HICORTEX_SERVER_URL;
   if (remoteUrl && !result.localServer) {
     try {
@@ -104,14 +124,19 @@ async function detect(): Promise<DetectionResult> {
       if (resp.ok) {
         result.remoteServer = true;
         result.remoteServerUrl = remoteUrl;
-        const data = await resp.json() as { memories?: number };
-        result.memoryCount = data.memories;
       }
     } catch { /* not reachable */ }
   }
 
   // Check Hermes
   result.hermesFound = existsSync(HERMES_HOME);
+
+  // Check Pi (~/.pi/agent — the dir Pi loads extensions from)
+  result.piFound = existsSync(PI_AGENT_DIR);
+
+  // Check opencode (~/.config/opencode or ~/.local/share/opencode — its
+  // global plugins dir / session store; it auto-loads ~/.config/opencode/plugins/)
+  result.opencodeFound = existsSync(OPENCODE_CONFIG_DIR) || existsSync(OPENCODE_DATA_DIR);
 
   // Check OC plugin
   try {
@@ -319,6 +344,68 @@ function cleanupLegacyCcCommands(): void {
       }
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pi setup
+// ---------------------------------------------------------------------------
+
+/**
+ * Install the bundled Pi extension (#348): one dependency-free .ts file Pi
+ * loads from ~/.pi/agent/extensions/. Deliberately NO config write — the
+ * extension self-resolves the server from ~/.hicortex/config.json (the file
+ * init has already written by this point), so there is nothing to keep in
+ * sync and no secret to route elsewhere. Overwrites on re-init so upgrades
+ * land; skips gracefully when the bundled source is absent (e.g. a dev
+ * checkout without the packaged copy).
+ */
+function setupPi(): void {
+  const extensionSource = join(__dirname, "..", "pi-extension", "hicortex", "index.ts");
+
+  if (!existsSync(extensionSource)) {
+    console.log("  ⚠ Pi extension not found in package — skipping Pi setup");
+    return;
+  }
+
+  const extensionsDir = join(PI_AGENT_DIR, "extensions");
+  mkdirSync(extensionsDir, { recursive: true });
+  const target = join(extensionsDir, "hicortex.ts");
+  copyFileSync(extensionSource, target);
+  console.log(`  ✓ Copied Pi extension to ${target}`);
+
+  console.log("  → Restart Pi sessions to load the extension (recall, identity, lessons, 9 tools)");
+}
+
+// ---------------------------------------------------------------------------
+// opencode setup
+// ---------------------------------------------------------------------------
+
+/**
+ * Install the bundled opencode plugin (#347): one dependency-free .ts file
+ * opencode auto-loads from ~/.config/opencode/plugins/. Deliberately NO
+ * write into opencode's own configuration — the plugin self-resolves the
+ * server from ~/.hicortex/config.json (the file init has already written by
+ * this point), so there is nothing to keep in sync and no secret to route
+ * elsewhere. Overwrites on re-init so upgrades land; skips gracefully when
+ * the bundled source is absent (e.g. a dev checkout without the packaged
+ * copy). The plugins directory may hold third-party files — the copy only
+ * ever touches our own hicortex.ts name.
+ */
+function setupOpencode(): void {
+  const pluginSource = join(__dirname, "..", "opencode-plugin", "hicortex", "index.ts");
+
+  if (!existsSync(pluginSource)) {
+    console.log("  ⚠ opencode plugin not found in package — skipping opencode setup");
+    return;
+  }
+
+  const pluginsDir = join(OPENCODE_CONFIG_DIR, "plugins");
+  mkdirSync(pluginsDir, { recursive: true });
+  const target = join(pluginsDir, "hicortex.ts");
+  copyFileSync(pluginSource, target);
+  console.log(`  ✓ Copied opencode plugin to ${target}`);
+
+  console.log("  → Restart opencode sessions to load the plugin (recall, identity, lessons, 9 tools)");
 }
 
 // ---------------------------------------------------------------------------
@@ -771,7 +858,8 @@ function saveConfig(configPath: string, config: Record<string, unknown>): void {
  * and the writer then OVERWROTE the file — `persistAuthToken` minted a fresh
  * token (fleet-wide 401), `scaffoldDefaultDomains` re-seeded the generic
  * vocabulary over the owner list, etc. `authToken` / `licenseKey` /
- * `llmApiKey` / `domains` / `weakPrimaryFloor` / `contextClients` all gone.
+ * `llmApiKey` / `domains` / `weakPrimaryFloor` / `identityClients` (was
+ * `contextClients`) all gone.
  * The early-return guards (existing-key checks) did NOT save them: those only
  * fire on a VALID parse that reads the key, not on a corrupted file.
  *
@@ -988,10 +1076,10 @@ export function ensureAndPersistAgentId(configPath: string): { agentId: string; 
 }
 
 /**
- * Decide the per-agent context id to persist at init (#179; CC default = global,
+ * Decide the per-agent identity id to persist at init (#179; CC default = global,
  * owner decision 20.07.2026). `agentName` is an explicit opt-in only — there is
  * NO hostname default, so an install with no `--agent-name` sends no `?agent=`
- * and shares the global context (one user = one identity across machines).
+ * and shares the global identity (one user = one identity across machines).
  *
  * Empty string == unset everywhere: `--agent-name ""` (or whitespace-only) is
  * the explicit way to opt BACK OUT — it CLEARS any existing `agentName` key and
@@ -1016,7 +1104,7 @@ export function decideAgentName(
       return {
         write: false,
         value: null,
-        error: `Invalid --agent-name '${flag}'. Must contain letters or digits and sanitize to ^[a-z0-9][a-z0-9_-]*$ (max 64 chars). Pass --agent-name "" to clear it (global context).`,
+        error: `Invalid --agent-name '${flag}'. Must contain letters or digits and sanitize to ^[a-z0-9][a-z0-9_-]*$ (max 64 chars). Pass --agent-name "" to clear it (global identity).`,
       };
     }
     return { write: true, value: s };
@@ -1198,6 +1286,10 @@ export function getPackageSpec(configDir: string = HICORTEX_HOME): string {
 function installDaemon(): boolean {
   const os = platform();
   const binaryArgs = resolveBinaryArgs();
+  // #276: verify the supervisor can actually run (node resolvable on the
+  // generated PATH) before writing the plist/unit — turns a silent DOA into a
+  // loud install-time warning.
+  verifySupervisorRuntime(binaryArgs);
 
   if (os === "darwin") {
     return installLaunchd(binaryArgs);
@@ -1250,17 +1342,91 @@ function resolveBinaryArgs(): string[] {
 }
 
 /**
- * Install (or verify) the CC SessionStart hook that runs `hicortex lessons-context`.
- * The hook fetches lessons from the configured server at session start and injects
- * them as context — replacing the old static CLAUDE.md block.
+ * Build the PATH the launchd/systemd supervisors receive (#276). Order:
+ *   1. the binary's own dir — so a SIBLING node wins for nvm/volta/npm-global
+ *      installs (the version the global was installed under);
+ *   2. the dir of the node the supervisor should run under — resolved via
+ *      `which node` (the symlink path, stable across upgrades); see
+ *      resolveNodeDir(). This is the generic rescue: for bun/pnpm/yarn globals
+ *      the bin dir has NO node sibling, and on Apple Silicon node lives in
+ *      /opt/homebrew/bin. Baking the resolved node dir in fixes every package
+ *      manager without enumerating them;
+ *   3. the standard locations — including /opt/homebrew/bin (Apple Silicon
+ *      homebrew) as a belt-and-suspenders fallback for the no-sibling case.
+ * Deduped (preserving first-seen order); empties dropped.
+ */
+export function buildSupervisorPath(binaryArgs: string[]): string {
+  const binDir = dirname(binaryArgs[0]);
+  const nodeDir = resolveNodeDir();
+  return [binDir, nodeDir, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+    .filter((d, i, a) => d && a.indexOf(d) === i)
+    .join(":");
+}
+
+/**
+ * Resolve the dir of the node the supervisor should use (#276). Prefers
+ * `which node` — the SYMLINK path, stable across version upgrades (homebrew
+ * rotates the Cellar target but keeps /opt/homebrew/bin/node) — over
+ * process.execPath, which on macOS is the resolved realpath (the versioned
+ * Cellar dir, e.g. /opt/homebrew/Cellar/node/X.Y.Z/bin) and STALES on a
+ * `brew upgrade node`, re-introducing the silent-death the fix targets. Falls
+ * back to process.execPath's dir only if `which node` is unavailable.
+ */
+function resolveNodeDir(): string {
+  try {
+    const which = execSync("which node", { encoding: "utf-8", stdio: ["pipe", "pipe", "ignore"] }).trim();
+    if (which) return dirname(which);
+  } catch { /* node not on PATH — fall through to execPath */ }
+  return dirname(process.execPath);
+}
+
+/** Dedup flag so the supervisor-runtime warning prints once per `init` run. */
+let supervisorRuntimeWarned = false;
+
+/**
+ * Install-time smoke test (#276): spawn the resolved binary with the SAME PATH
+ * the supervisor will use and confirm it can run (`--version`). Turns the
+ * silent-dead-on-arrival case (node unresolvable under launchd's empty PATH →
+ * the agent dies at the `#!/usr/bin/env node` shebang with exit 127, capture
+ * stops silently, no signal in `status` because the shell PATH masks it) into a
+ * LOUD install-time warning. Does NOT block install — the plist/unit is still
+ * written so a PATH fix + reload recovers it without re-init.
+ */
+function verifySupervisorRuntime(binaryArgs: string[]): void {
+  if (supervisorRuntimeWarned) return;
+  const supervisorEnv = { ...process.env, PATH: buildSupervisorPath(binaryArgs) };
+  try {
+    execSync([...binaryArgs, "--version"].join(" "), { stdio: "pipe", env: supervisorEnv });
+  } catch {
+    supervisorRuntimeWarned = true;
+    console.error(
+      "  ⚠ WARNING: the scheduled daemon/nightly could not run with the generated PATH — " +
+      "`node` was not found, so the supervisor will fail silently at runtime (capture stops). " +
+      "Reinstall via `npm install -g @gamaze/hicortex` (recommended) or ensure node is at a " +
+      "standard location, then re-run `npx @gamaze/hicortex init`.",
+    );
+  }
+}
+
+/**
+ * Install (or verify) the CC SessionStart hook that runs the canonical command
+ * `hicortex learnings-identity` (aliased as the legacy `lessons-context`,
+ * #264). The hook fetches the identity layer + lessons from the configured
+ * server at session start and injects them as a Markdown block — replacing the
+ * old static CLAUDE.md block.
  *
- * Idempotent: skips if a SessionStart hook containing "lessons-context" already exists.
+ * Idempotent: skips if a SessionStart hook containing EITHER `learnings-identity`
+ * OR the legacy `lessons-context` already exists (so re-init never duplicates,
+ * whether the existing hook was written by a pre- or post-#264 install). It does
+ * NOT rewrite an existing legacy `lessons-context` hook — the alias keeps old
+ * installs working as-is.
+ *
  * Uses JSON.parse/JSON.stringify to safely merge into ~/.claude/settings.json.
  *
  * @param settingsPath Override for the settings.json path (used in tests; defaults to CC_SETTINGS).
  */
 export function installSessionStartHook(settingsPath?: string): void {
-  installCcHook("SessionStart", "lessons-context", 10, settingsPath);
+  installCcHook("SessionStart", "learnings-identity", 10, settingsPath, ["lessons-context"]);
 }
 
 /**
@@ -1277,19 +1443,23 @@ export function installRecallHooks(settingsPath?: string): void {
 /**
  * Shared CC-hook installer: add `hicortex <subcommand>` under the given hook
  * event in ~/.claude/settings.json. Idempotent per (event, subcommand): skips
- * if any existing entry for that event already runs the subcommand. `timeout`
- * is CC's hook-process kill timeout in SECONDS (the network timeout inside the
- * command is separate and shorter).
+ * if any existing entry for that event already runs the subcommand — or, when
+ * `aliases` is passed, ANY of the alias names. The alias match is what lets a
+ * post-#264 install recognize a pre-#264 `lessons-context` hook as "already
+ * installed" without rewriting it (the legacy name keeps working via
+ * resolveCommandAlias). `timeout` is CC's hook-process kill timeout in SECONDS
+ * (the network timeout inside the command is separate and shorter).
  */
 function installCcHook(
   eventName: string,
   subcommand: string,
   timeout: number,
-  settingsPath?: string
+  settingsPath?: string,
+  aliases: string[] = [],
 ): void {
   const targetPath = settingsPath ?? CC_SETTINGS;
   const binaryArgs = resolveBinaryArgs();
-  // e.g. "/path/to/hicortex lessons-context" or "npx -y @gamaze/hicortex recall-hook"
+  // e.g. "/path/to/hicortex learnings-identity" or "npx -y @gamaze/hicortex recall-hook"
   const command = [...binaryArgs, subcommand].join(" ");
 
   let settings: Record<string, unknown> = {};
@@ -1315,10 +1485,13 @@ function installCcHook(
   }
   const entries = hooks[eventName] as Array<unknown>;
 
-  // Idempotent: skip if any existing entry's command runs this subcommand.
-  // Word-boundary guard so "recall-hook" never matches a hypothetical
-  // "recall-hook-foo" command.
-  const subcommandRe = new RegExp(`(^|\\s)${subcommand}(\\s|$)`);
+  // Idempotent: skip if any existing entry's command runs this subcommand OR
+  // one of its aliases (e.g. a pre-#264 `lessons-context` hook when installing
+  // the canonical `learnings-identity`). Word-boundary guard so "recall-hook"
+  // never matches a hypothetical "recall-hook-foo" command, and so the
+  // `learnings-identity`/`lessons-context` pair are distinct (no prefix clash).
+  const names = [subcommand, ...aliases];
+  const subcommandRe = new RegExp(`(^|\\s)(?:${names.map(escapeRegex).join("|")})(\\s|$)`);
   const alreadyInstalled = entries.some((entry) => {
     if (typeof entry !== "object" || entry === null) return false;
     const e = entry as Record<string, unknown>;
@@ -1347,6 +1520,15 @@ function installCcHook(
   console.log(`  ✓ Installed ${eventName} hook: ${command}`);
 }
 
+/**
+ * Escape a literal string for safe embedding in a RegExp (alias names like
+ * `lessons-context` happen to be regex-safe, but escape anyway so the
+ * idempotency check can never break if a future alias contains a metachar).
+ */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function installLaunchd(binaryArgs: string[]): boolean {
   const plistDir = join(homedir(), "Library", "LaunchAgents");
   const plistPath = join(plistDir, "com.gamaze.hicortex.plist");
@@ -1361,7 +1543,7 @@ function installLaunchd(binaryArgs: string[]): boolean {
   // PATH must start with the binary's own directory so the sibling node
   // binary (correct version for nvm installs) is found first.
   // launchd has no PATH by default; without this, node itself won't be found.
-  const binDir = dirname(binaryArgs[0]);
+  const supervisorPath = buildSupervisorPath(binaryArgs);
 
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1384,7 +1566,7 @@ ${programArgs}
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${binDir}:/usr/local/bin:/usr/bin:/bin</string>
+    <string>${supervisorPath}</string>
   </dict>
 </dict>
 </plist>`;
@@ -1411,7 +1593,7 @@ function installSystemd(binaryArgs: string[]): boolean {
 
   const execStart = [...binaryArgs, "server"].join(" ");
   // PATH must start with the binary's own directory (see installLaunchd for rationale).
-  const binDir = dirname(binaryArgs[0]);
+  const supervisorPath = buildSupervisorPath(binaryArgs);
 
   const service = `[Unit]
 Description=Hicortex MCP server — long-term memory for AI agents
@@ -1423,7 +1605,7 @@ Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-Environment=PATH=${binDir}:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=${supervisorPath}
 
 [Install]
 WantedBy=default.target
@@ -1469,6 +1651,13 @@ export async function runInit(
   // first — every writer downstream loads through loadConfigStrict.
   if (options.repairConfig) {
     quarantineMalformedConfig(join(HICORTEX_HOME, "config.json"));
+    // CR warning 2 (#271): repair-config is a plausible post-upgrade recovery
+    // action, so it MUST (re)write the localhost-bypass marker itself — defensive
+    // against a future early-return in this block. The full-init path writes it
+    // again at line ~1615 (idempotent: same content, returns false the second
+    // time). Never written in hosted mode (the boot assertion refuses to start
+    // with the marker present).
+    writeLocalhostBypassMarker(HICORTEX_HOME);
   }
 
   if (options.serverUrl) {
@@ -1488,6 +1677,8 @@ export async function runInit(
   if (d.remoteServer) console.log(`  • Remote server at ${d.remoteServerUrl} (${d.memoryCount ?? "?"} memories)`);
   if (d.ocPlugin) console.log("  • OpenClaw plugin installed");
   if (d.hermesFound) console.log(`  • Hermes found at ${HERMES_HOME}`);
+  if (d.piFound) console.log(`  • Pi found at ${PI_AGENT_DIR}`);
+  if (d.opencodeFound) console.log(`  • opencode found at ${OPENCODE_CONFIG_DIR}`);
   if (d.ccMcpRegistered) console.log("  • CC MCP already registered");
   if (d.existingDb) console.log(`  • Database at ${d.dbPath}`);
   if (!d.localServer && !d.remoteServer && !d.ocPlugin && !d.existingDb) {
@@ -1515,6 +1706,8 @@ export async function runInit(
   if (!d.localServer && !d.remoteServer) actions.push("Install Hicortex server daemon");
   if (!d.ccMcpRegistered) actions.push("Register MCP server in CC settings");
   if (d.hermesFound) actions.push("Install Hermes plugin + configure");
+  if (d.piFound) actions.push("Install Pi extension");
+  if (d.opencodeFound) actions.push("Install opencode plugin");
   actions.push("Install SessionStart hook (query-time lessons)");
 
   if (actions.length === 0) {
@@ -1569,9 +1762,20 @@ export async function runInit(
   // then domains sit inert (strict-skip path).
   scaffoldDefaultDomains(configPath);
 
-  // Per-agent context id (#179): server mode writes it ONLY when the operator
+  // Write the localhost auth-bypass marker (#110 §2, #271 — Phase 0B). The
+  // bypass is marker-gated from 0.18: self-hosted init writes the marker so
+  // existing installs keep the bypass after upgrade + re-init; a hosted tenant
+  // dir is fail-closed by default. Idempotent (overwrites an existing marker,
+  // refreshing the note). Never written in hosted mode (the boot assertion
+  // would refuse to start with the marker present).
+  const markerCreated = writeLocalhostBypassMarker(HICORTEX_HOME);
+  if (markerCreated) {
+    console.log("  ✓ Localhost auth-bypass marker written");
+  }
+
+  // Per-agent identity id (#179): server mode writes it ONLY when the operator
   // passes --agent-name. Without the flag no agentName is written and the
-  // co-located CC shares the global context (global by default). Explicit flag
+  // co-located CC shares the global identity (global by default). Explicit flag
   // overwrites on re-init; `--agent-name ""` clears it back to global.
   if (options.agentName !== undefined) {
     const decision = decideAgentName(undefined, options.agentName);
@@ -1581,7 +1785,7 @@ export async function runInit(
     }
     if (decision.clear) {
       clearAgentNameConfig(configPath);
-      console.log("  ✓ Agent name cleared — global context");
+      console.log("  ✓ Agent name cleared — global identity");
     } else if (decision.write && decision.value) {
       writeAgentNameConfig(configPath, decision.value);
       console.log(`  ✓ Agent name set to '${decision.value}'`);
@@ -1633,6 +1837,16 @@ export async function runInit(
     // pass it for remote setups so setupHermes can include it in its instructions.
     const isLocal = serverUrl.includes("127.0.0.1") || serverUrl.includes("localhost");
     setupHermes(serverUrl, isLocal ? "" : authToken);
+  }
+
+  // Setup the Pi extension if detected (self-resolving — no config write)
+  if (d.piFound) {
+    setupPi();
+  }
+
+  // Setup the opencode plugin if detected (self-resolving — no config write)
+  if (d.opencodeFound) {
+    setupOpencode();
   }
 
   // Install CC SessionStart hook for query-time lesson injection.
@@ -1742,7 +1956,7 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
   mkdirSync(HICORTEX_HOME, { recursive: true });
   const configPath = join(HICORTEX_HOME, "config.json");
 
-  // Per-agent context id (#179): explicit opt-in only. resolve the flag via
+  // Per-agent identity id (#179): explicit opt-in only. resolve the flag via
   // decideAgentName (it owns the process.exit on an invalid --agent-name). A
   // no-flag run yields a {write:false} decision → writeClientConfig leaves any
   // existing agentName untouched (preserving what the loaded config carries).
@@ -1752,7 +1966,7 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
     process.exit(1);
   }
   if (nameDecision.clear) {
-    console.log("  ✓ Agent name cleared — global context");
+    console.log("  ✓ Agent name cleared — global identity");
   } else if (nameDecision.write && nameDecision.value && agentName && nameDecision.value !== agentName) {
     console.log(`  ℹ Agent name sanitized to '${nameDecision.value}'`);
   }
@@ -1823,6 +2037,18 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
     setupHermes(serverUrl, authToken);
   }
 
+  // Step 8b: Setup the Pi extension if detected (self-resolving — no config write)
+  if (existsSync(PI_AGENT_DIR)) {
+    console.log("\nPi detected — installing extension...");
+    setupPi();
+  }
+
+  // Step 8c: Setup the opencode plugin if detected (self-resolving — no config write)
+  if (existsSync(OPENCODE_CONFIG_DIR) || existsSync(OPENCODE_DATA_DIR)) {
+    console.log("\nopencode detected — installing plugin...");
+    setupOpencode();
+  }
+
   console.log("\n✓ Hicortex client setup complete!\n");
   // Telemetry disclosure at install time (informed consent, best practice):
   // opt-out telemetry is only acceptable if the user is TOLD about it.
@@ -1834,7 +2060,7 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
   // failures are swallowed inside sendLifecycleEvent.
   await sendLifecycleEvent("install", HICORTEX_HOME, readHomeConfig(HICORTEX_HOME), pkgVersion());
   console.log("How it works:");
-  console.log("  • MCP tools (search, context, ingest) talk to the remote server");
+  console.log("  • MCP tools (search, identity, ingest) talk to the remote server");
   console.log("  • Nightly pipeline denoises CC transcripts, POSTs to server for distillation");
   console.log("  • Lessons fetched live at each CC session start (SessionStart hook)");
   console.log("  • No local database — all memories stored on the server");
@@ -1872,6 +2098,55 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
  * only when `consolidationHours` is absent (preserves "one daily job at H").
  */
 const DEFAULT_CONSOLIDATION_HOURS = [10, 22];
+
+/**
+ * #256 — timer jitter default (seconds). Applied to newly-generated timers so a
+ * fleet of installs on the same default schedule doesn't all hit the LLM
+ * backend at the same minute (thundering-herd avoidance). systemd emits this as
+ * `RandomizedDelaySec`; launchd has no native equivalent so the launchd path
+ * bakes a per-install randomized `Minute` offset into each
+ * `StartCalendarInterval` dict (generated once at init, stable across reboots).
+ *
+ * 3600s = 1h spread on a 2-slot/day consolidation cadence = up to ±30 min around
+ * each slot — enough to flatten the peak without stretching into the next slot
+ * window. Tunable via `timerJitterSeconds` (0 disables). NOTE: only affects
+ * NEWLY generated timers; re-init rewrites the unit files (the 0.17 migration
+ * decision), so an explicit re-init is how an existing install adopts jitter.
+ */
+const DEFAULT_TIMER_JITTER_SEC = 3600;
+
+/**
+ * Resolve the timer-jitter spread (seconds) from config. 0 = disabled. Uses
+ * readNonNegativeConfig (0 is a valid "off", mirroring ollamaFlushEvery).
+ */
+export function resolveTimerJitterSeconds(configDir = HICORTEX_HOME): number {
+  let config: Record<string, unknown> = {};
+  try {
+    config = JSON.parse(readFileSync(join(configDir, "config.json"), "utf-8"));
+  } catch { /* no config yet — use the default */ }
+  // Floor to an integer for a clean contract (systemd accepts fractional
+  // seconds, but a whole-second value is unambiguous across systemd + launchd).
+  return Math.floor(readNonNegativeConfig(config, "timerJitterSeconds", DEFAULT_TIMER_JITTER_SEC));
+}
+
+/**
+ * #256 — per-install randomized Minute offset for the launchd consolidation
+ * plist. launchd has no native `RandomizedDelaySec`; the idiomatic equivalent
+ * is a per-job `Minute` shift baked into each `StartCalendarInterval` dict.
+ * The value is generated ONCE at init time so the plist is stable across
+ * reboots (no flapping), and the SAME offset applies to every slot so the
+ * relative spacing between slots is preserved.
+ *
+ * `jitterSec` < 60 → 0 (cannot span a minute). Inject `rand` for deterministic
+ * tests; defaults to Math.random (init-time generation, not the hot path).
+ */
+export function randomMinuteOffset(jitterSec: number, rand: () => number = Math.random): number {
+  if (!Number.isFinite(jitterSec) || jitterSec < 60) return 0;
+  const max = Math.min(59, Math.floor(jitterSec / 60));
+  if (max <= 0) return 0;
+  return Math.floor(rand() * (max + 1));
+}
+
 /**
  * Capture-watchdog poll interval (minutes). The capture timer fires
  * `nightly --capture-only --watchdog` this often; the watchdog itself throttles
@@ -1955,6 +2230,16 @@ interface ScheduleUnitOpts {
    * Linux only (launchd has no native run-time cap on a oneshot).
    */
   timeoutMin?: number;
+  /**
+   * #256 — timer jitter spread in seconds. systemd: emitted as
+   * `RandomizedDelaySec=<jitterSec>` (one line, applies to all OnCalendar /
+   * OnUnitActiveSec entries). launchd: a per-install randomized `Minute` offset
+   * baked into each `StartCalendarInterval` dict (interval/watchdog plists keep
+   * their StartInterval untouched — no clean jitter knob, and interval timers
+   * don't thundering-herd the way fixed-slot timers do). 0 = disabled. Defaults
+   * to `resolveTimerJitterSeconds(HICORTEX_HOME)` when omitted.
+   */
+  jitterSec?: number;
 }
 
 /**
@@ -1973,8 +2258,12 @@ export function formatOnCalendarLines(hours: number[]): string {
  * The launchd `StartCalendarInterval` ARRAY body — one `<dict>` per hour.
  * launchd fires the job at each dict; a single dict is the 1-slot special case
  * but the array form is uniform across 1..N. Exported for testing.
+ *
+ * `minuteOffset` (#256): a per-install randomized Minute applied uniformly to
+ * every slot (0 = no offset = pre-#256 behaviour). See `randomMinuteOffset`.
  */
-export function formatLaunchdIntervals(hours: number[]): string {
+export function formatLaunchdIntervals(hours: number[], minuteOffset = 0): string {
+  const minute = Math.max(0, Math.min(59, Math.floor(minuteOffset)));
   return [...hours]
     .sort((a, b) => a - b)
     .map(
@@ -1982,10 +2271,30 @@ export function formatLaunchdIntervals(hours: number[]): string {
       <key>Hour</key>
       <integer>${h}</integer>
       <key>Minute</key>
-      <integer>0</integer>
+      <integer>${minute}</integer>
     </dict>`,
     )
     .join("\n");
+}
+
+/**
+ * The systemd `[Timer]` body (everything between `[Timer]` and the next stanza).
+ * Exported for testing the #256 jitter line. `isInterval` selects the watchdog
+ * poll form (OnBootSec + OnUnitActiveSec); otherwise one `OnCalendar` line per
+ * hour. When `jitterSec > 0` a single `RandomizedDelaySec=<n>` is appended — it
+ * applies to every OnCalendar entry AND to OnUnitActiveSec (systemd semantics).
+ */
+export function formatSystemdTimerBody(
+  isInterval: boolean,
+  intervalSec: number,
+  hours: number[],
+  jitterSec: number,
+): string {
+  const base = isInterval
+    ? `OnBootSec=2min\nOnUnitActiveSec=${Math.round(intervalSec / 60)}min`
+    : formatOnCalendarLines(hours);
+  const jitter = jitterSec > 0 ? `\nRandomizedDelaySec=${jitterSec}` : "";
+  return base + jitter;
 }
 
 /**
@@ -1997,9 +2306,12 @@ export function formatLaunchdIntervals(hours: number[]): string {
  */
 function writeScheduleUnit(opts: ScheduleUnitOpts): void {
   const binaryArgs = resolveBinaryArgs();
+  // #276: verify the scheduled nightly/capture can run before writing its unit.
+  verifySupervisorRuntime(binaryArgs);
   const os = platform();
-  // PATH must start with the binary's own directory (see installLaunchd for rationale).
-  const binDir = dirname(binaryArgs[0]);
+  // PATH the supervisor receives — includes the dir of the node running init
+  // (process.execPath) so bun/pnpm/yarn globals resolve node under launchd (#276).
+  const supervisorPath = buildSupervisorPath(binaryArgs);
   // One canonical nightly log path across platforms — status output, docs,
   // and support instructions all reference this single location.
   const logPath = join(HICORTEX_HOME, "nightly.log");
@@ -2025,9 +2337,17 @@ function writeScheduleUnit(opts: ScheduleUnitOpts): void {
     // gets a first capture tick on load (~parity with systemd's OnBootSec=2min),
     // not 20 min later. The cooldown gate makes a load-time fire a cheap no-op
     // if a capture ran recently.
+    //
+    // #256 — jitter: launchd has no native RandomizedDelaySec, so the slot
+    // plist bakes a per-install randomized Minute offset into every dict
+    // (generated here, stable across reboots). The interval/watchdog plist
+    // keeps its StartInterval untouched — interval timers drift naturally and
+    // don't share the fixed-slot thundering-herd risk.
+    const jitterSec = opts.jitterSec ?? resolveTimerJitterSeconds();
+    const minuteOffset = !isInterval ? randomMinuteOffset(jitterSec) : 0;
     const scheduleBlock = isInterval
       ? `  <key>StartInterval</key>\n  <integer>${opts.intervalSec}</integer>\n  <key>RunAtLoad</key>\n  <true/>`
-      : `  <key>StartCalendarInterval</key>\n  <array>\n${formatLaunchdIntervals(opts.hours as number[])}\n  </array>`;
+      : `  <key>StartCalendarInterval</key>\n  <array>\n${formatLaunchdIntervals(opts.hours as number[], minuteOffset)}\n  </array>`;
 
     const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2047,7 +2367,7 @@ ${scheduleBlock}
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>${binDir}:/usr/local/bin:/usr/bin:/bin</string>
+    <string>${supervisorPath}</string>
   </dict>
 </dict>
 </plist>`;
@@ -2078,15 +2398,20 @@ Type=oneshot
 ExecStart=${execStart}
 ${opts.timeoutMin ? `TimeoutStartSec=${opts.timeoutMin}min\n` : ""}StandardOutput=append:${logPath}
 StandardError=append:${logPath}
-Environment=PATH=${binDir}:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=${supervisorPath}
 Environment=HOME=${homedir()}
 WorkingDirectory=${homedir()}`;
 
     // Timer body: OnUnitActiveSec (interval, watchdog) or one OnCalendar line
     // per hour (multi-slot). systemd ORs multiple OnCalendar entries.
-    const timerBody = isInterval
-      ? `OnBootSec=2min\nOnUnitActiveSec=${Math.round((opts.intervalSec as number) / 60)}min`
-      : formatOnCalendarLines(opts.hours as number[]);
+    // #256 — a single RandomizedDelaySec=<jitterSec> applies to all entries.
+    const jitterSec = opts.jitterSec ?? resolveTimerJitterSeconds();
+    const timerBody = formatSystemdTimerBody(
+      isInterval,
+      (opts.intervalSec as number) ?? 0,
+      (opts.hours as number[]) ?? [],
+      jitterSec,
+    );
     const timer = `[Unit]
 Description=${opts.timerDesc}
 

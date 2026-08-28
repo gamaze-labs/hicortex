@@ -4,12 +4,27 @@
  * not from filesystem scanning.
  */
 
-import type { LlmClient } from "./llm.js";
+import type { LlmClient, LlmUsage } from "./llm.js";
 import { distillation } from "./prompts.js";
 import { redact, type RedactionConfig } from "./redact.js";
 
 const MAX_TRANSCRIPT_CHARS = 80_000;
 const MIN_CONVERSATION_CHARS = 200;
+
+// #339 (2026-08-24 postmortem): NO_EXTRACT over-firing visibility threshold.
+// Real summary-led segments that the model wrongly abandoned ran 38-64K
+// denoised chars; genuine pure-status noise is ~2.6K. A segment larger than
+// this whose every chunk returns an empty LLM verdict is far more likely the
+// model pattern-matching a bookkeeping-heavy OPENING to the ephemera gate than
+// a legitimately empty segment — so it gets a warning line. Warning ONLY: no
+// auto-retry (cost); the goal is that silent segment loss shows up in the
+// nightly log instead of in a weeks-later eval.
+//
+// The threshold compares the PRE-CHUNKING conversation length, never the chunk
+// length: default ollama chunking (numCtx 8192 → ~19.6K chars) and the
+// small-model speed cap (20K) both keep every chunk at or below this number,
+// so a chunk-level check would be unreachable exactly where the incident lived.
+const NO_EXTRACT_WARN_MIN_CHARS = 20_000;
 
 // Chunk size limits by model parameter count (for local/CPU inference)
 // Small models are slow on CPU — cap input size to keep inference under ~60s
@@ -262,6 +277,10 @@ export function extractConversationText(
  * `droppedOut`, when provided, is filled with every entry the substance gate
  * discarded (full text). Callers use it to build a durable audit trail (#156);
  * omitting it leaves gate behaviour unchanged.
+ *
+ * `segmentLabel` (optional) identifies the caller's segment in the #339
+ * over-firing warning (e.g. the capture pipeline's segment_id). Purely for
+ * log correlation — omitting it falls back to "chunk".
  */
 export async function distillSession(
   llm: LlmClient,
@@ -269,7 +288,11 @@ export async function distillSession(
   projectName: string,
   date: string,
   chunkSizeChars?: number,
-  droppedOut?: string[]
+  droppedOut?: string[],
+  /** Called with each chunk's token usage (#5 budget metering). Optional. */
+  onUsage?: (usage: LlmUsage) => void,
+  /** Segment identifier for the #339 NO_EXTRACT warning. Optional. */
+  segmentLabel?: string,
 ): Promise<DistilledEntry[]> {
   if (conversation.length < MIN_CONVERSATION_CHARS) {
     return [];
@@ -286,8 +309,9 @@ export async function distillSession(
 
   // If transcript fits in one chunk, distill directly (errors propagate)
   if (transcript.length <= chunkSize) {
-    const { entries, dropped } = await distillChunk(llm, transcript, projectName, date);
+    const { entries, dropped, emptyVerdict } = await distillChunk(llm, transcript, projectName, date, onUsage);
     if (droppedOut) droppedOut.push(...dropped);
+    if (emptyVerdict) warnSuspiciousEmptySegment(segmentLabel, conversation.length);
     return entries;
   }
 
@@ -304,17 +328,19 @@ export async function distillSession(
   const allEntries: DistilledEntry[] = [];
   const seen = new Set<string>();
   let chunkFailures = 0;
+  let emptyVerdicts = 0;
   let lastError: Error | null = null;
 
   for (let i = 0; i < chunks.length; i++) {
     console.log(`[hicortex]     Chunk ${i + 1}/${chunks.length} (${chunks[i].length} chars)`);
     try {
-      const { entries, dropped } = await distillChunk(llm, chunks[i], projectName, date);
+      const { entries, dropped, emptyVerdict } = await distillChunk(llm, chunks[i], projectName, date, onUsage);
+      if (emptyVerdict) emptyVerdicts++;
       if (droppedOut) droppedOut.push(...dropped);
       for (const entry of entries) {
         // Deduplicate by normalized content (type tag does not participate —
         // two chunks extracting the same fact should collapse regardless of
-        // whether one tagged it [F] and the other [E]).
+        // whether one tagged it [K] and the other [E]).
         const key = entry.content.toLowerCase().replace(/\s+/g, " ").slice(0, 100);
         if (!seen.has(key)) {
           seen.add(key);
@@ -341,7 +367,45 @@ export async function distillSession(
     );
   }
 
+  // #339 segment-level net (CR finding 1): fire when the WHOLE segment produced
+  // zero memories and every processed chunk returned an empty LLM verdict. Fires
+  // only with zero chunk failures — failed chunks are already loudly visible,
+  // and "all failed" throws above. The size gate lives INSIDE
+  // warnSuspiciousEmptySegment (strict >, pre-chunking conversation length).
+  if (
+    allEntries.length === 0 &&
+    chunkFailures === 0 &&
+    emptyVerdicts === chunks.length
+  ) {
+    warnSuspiciousEmptySegment(segmentLabel, conversation.length);
+  }
+
   return allEntries;
+}
+
+/**
+ * #339 over-firing visibility net: an empty result this large is the silent-loss
+ * signature (real summary-led segments are 38-64K chars; legitimate pure-status
+ * noise is ~2.6K). Warning-only, content-free — segment id + size, nothing from
+ * the transcript. The empty SUCCESS semantics are unchanged (no throw, no
+ * retry): the cursor advances, but the loss is now VISIBLE in the nightly log
+ * instead of surfacing weeks later in an eval.
+ *
+ * The size check lives here, not at call sites, so no path can skip it. Strict
+ * comparison: exactly NO_EXTRACT_WARN_MIN_CHARS chars is a legitimate small
+ * segment and stays silent.
+ */
+function warnSuspiciousEmptySegment(
+  segmentLabel: string | undefined,
+  segmentChars: number,
+): void {
+  if (segmentChars <= NO_EXTRACT_WARN_MIN_CHARS) return;
+  console.warn(
+    `[hicortex]     Suspicious empty distillation: zero memories for a ${segmentChars}-char ` +
+    `${segmentLabel ? `segment ${segmentLabel}` : "segment"} ` +
+    `(every chunk returned NO_EXTRACT or nothing parseable) — segments this large almost always ` +
+    `contain extractable material; if this repeats, suspect gate over-firing (logged only, not retried)`
+  );
 }
 
 /**
@@ -359,23 +423,35 @@ export async function distillSession(
  *
  * `dropped` carries entries the substance gate rejected (full text) so the
  * caller can surface them in a durable audit trail (#156).
+ *
+ * `emptyVerdict` is true when the chunk was processed successfully but the LLM's
+ * verdict contained nothing extractable: bare NO_EXTRACT, an empty response, or
+ * text that parses to zero bullets (prose — the silent twin of NO_EXTRACT,
+ * #339 CR finding 2). The caller aggregates these for the segment-level
+ * over-firing warning; entries extracted then dropped by the substance gate do
+ * NOT count (their drops are already logged).
  */
 async function distillChunk(
   llm: LlmClient,
   transcript: string,
   projectName: string,
-  date: string
-): Promise<{ entries: DistilledEntry[]; dropped: string[] }> {
+  date: string,
+  onUsage?: (usage: LlmUsage) => void,
+): Promise<{ entries: DistilledEntry[]; dropped: string[]; emptyVerdict: boolean }> {
   const prompt = distillation(projectName, date, transcript);
 
   // NOTE: Intentionally no try/catch here. Transient LLM errors (network
   // failures, 4xx/5xx, model-not-found, timeouts) propagate up to the caller
   // so the nightly pipeline can treat them as "retry later" instead of
   // "processed successfully with zero extractions".
-  const { text: result } = await llm.completeDistill(prompt);
-  if (!result) return { entries: [], dropped: [] };
-  if (result === "NO_EXTRACT" || result.slice(0, 20).includes("NO_EXTRACT")) {
-    return { entries: [], dropped: [] };
+  const { text: result, usage } = await llm.completeDistill(prompt);
+  // #5: report this chunk's token usage to the caller's budget meter. Optional
+  // (absent for callers that don't meter); a missing/undefined usage (claude-cli)
+  // is a no-op — consistent with the existing design that such tenants never
+  // trip a budget.
+  if (usage && onUsage) onUsage(usage);
+  if (!result || isNoExtractResponse(result)) {
+    return { entries: [], dropped: [], emptyVerdict: true };
   }
 
   const parsed = parseDistilledEntries(result);
@@ -384,7 +460,7 @@ async function distillChunk(
   // sometimes ignore constraints (cf. the prior max-15-bullet failure). Count
   // entries that still look actor-led or bracket-led so a format regression
   // shows in nightly logs, not months later in the next eval. Non-blocking.
-  // Note: the type tag ([E]/[F]/[D]) is already stripped by the parser, so a
+  // Note: the type tag ([E]/[K]/[D]) is already stripped by the parser, so a
   // leading bracket here means a payload-bracket or a category-first regression.
   const offTopic = parsed.filter(
     (e) => /^\s*(user|ai|the user|assistant)\b/i.test(e.content) || /^\s*\[/.test(e.content)
@@ -413,7 +489,21 @@ async function distillChunk(
       `[hicortex]     Substance gate: dropped ${dropped.length}/${parsed.length} content-free fragment(s)`
     );
   }
-  return { entries, dropped };
+  // Parsed-zero bypass (#339 CR finding 2): a non-empty response with no
+  // NO_EXTRACT token that still parses to zero bullets is the silent twin of
+  // NO_EXTRACT — an empty verdict for the over-firing net.
+  return { entries, dropped, emptyVerdict: parsed.length === 0 };
+}
+
+/**
+ * The NO_EXTRACT check distillChunk applies to an LLM response. EXPORTED and
+ * shared (not copy-pasted) with scripts/distill-ab-check/, whose counts must
+ * classify empty verdicts exactly as production does (#339 CR finding 3).
+ * Tolerant by design: a literal NO_EXTRACT anywhere in the first 20 chars
+ * counts (models prepend stray whitespace or a short phrase).
+ */
+export function isNoExtractResponse(result: string): boolean {
+  return result === "NO_EXTRACT" || result.slice(0, 20).includes("NO_EXTRACT");
 }
 
 /**
@@ -495,34 +585,50 @@ export function hasMinimalSubstance(entry: string): boolean {
 
 /**
  * A parsed distillation entry: the stored content (type tag STRIPPED) plus the
- * classified memory_type. `memoryType` is one of "episode" | "fact" |
- * "decision" — the three distillation-time types. "lesson" is deliberately
- * absent: lessons are the reflection stage's product, never distillation's
- * (#216). A missing/unknown tag defaults to "episode" so older distiller
+ * classified memory_type. `memoryType` is one of "experience" | "knowledge" |
+ * "decisions" — the three distillation-time types. "learnings" is deliberately
+ * absent: learnings are the reflection stage's product, never distillation's
+ * (#216). A missing/unknown tag defaults to "experience" so older distiller
  * output (pre-#216, no tag) stays backward-compatible.
  */
 export interface DistilledEntry {
   content: string;
-  memoryType: "episode" | "fact" | "decision";
+  memoryType: "experience" | "knowledge" | "decisions";
 }
 
 /**
  * Map a single-letter type tag to the stored memory_type. Unknown/absent →
- * episode (the pre-#216 default). `[L]` is explicitly rejected → episode: the
- * distiller must NEVER emit lessons (that's the reflection stage's job), so a
- * model that emits `[L]` is wrong and we do not propagate it as a lesson.
+ * experience (the pre-#216 default). `[L]` is explicitly rejected →
+ * experience: the distiller must NEVER emit learnings (that's the reflection
+ * stage's job), so a model that emits `[L]` is wrong and we do not propagate
+ * it as a learning.
+ *
+ * The single-letter tags ([E]/[K]/[D]) are unchanged from the raw-enum era —
+ * the model is taught these as "EXPERIENCE/KNOWLEDGE/DECISIONS" concepts in prompts.ts
+ * (ordinary English the model understands), and only the resulting STORED
+ * value changed in #264 (episode→experience, fact→knowledge, decision→
+ * decisions). The tag letters stay stable so neither the prompt nor the
+ * parser needs to change; only this mapping table moves.
+ *
+ * EXPORTED (with parseDistilledEntries) for scripts/distill-ab-check/ (#339 CR
+ * finding 3): the A/B harness computes its counts from each variant build's own
+ * parser instead of a copy-pasted mirror, so harness numbers are by construction
+ * the numbers that build's production would store. tests/distill-ab-parser-contract.test.ts
+ * pins the src and dist parsers against the same corpus.
  */
-function typeFromTag(letter: string | undefined): DistilledEntry["memoryType"] {
+export function typeFromTag(letter: string | undefined): DistilledEntry["memoryType"] {
   switch (letter) {
-    case "F":
+    case "K":
+    case "k":
+    case "F":  // legacy tag (was Fact)
     case "f":
-      return "fact";
+      return "knowledge";
     case "D":
     case "d":
-      return "decision";
-    // E, e, L, l (rejected), undefined, or anything else → episode.
+      return "decisions";
+    // E, e, L, l (rejected), undefined, or anything else → experience.
     default:
-      return "episode";
+      return "experience";
   }
 }
 
@@ -531,10 +637,11 @@ function typeFromTag(letter: string | undefined): DistilledEntry["memoryType"] {
  * Each bullet becomes a separate memory. The leading `[E]`/`[F]`/`[D]` type
  * tag is extracted (→ memoryType), stripped from the stored content, and
  * passed to `insertMemory` via the `memoryType` option (#216). Bullets with
- * no tag default to "episode" (backward compatible with pre-#216 distiller
- * output that never carried a tag).
+ * no tag default to "experience" (backward compatible with pre-#216 distiller
+ * output that never carried a tag). EXPORTED for the A/B harness — see
+ * typeFromTag's comment (#339 CR finding 3).
  */
-function parseDistilledEntries(markdown: string): DistilledEntry[] {
+export function parseDistilledEntries(markdown: string): DistilledEntry[] {
   const entries: DistilledEntry[] = [];
   const lines = markdown.split("\n");
 
@@ -560,14 +667,14 @@ function parseDistilledEntries(markdown: string): DistilledEntry[] {
       // Extract an optional leading single-letter type tag: "[E]", "[F]",
       // "[D]" (case-insensitive). The tag must be the very first token of the
       // bullet — a bracket that appears later is payload, not a type tag.
-      const tagMatch = body.match(/^\[([EFDefdLl])\]\s*/);
+      const tagMatch = body.match(/^\[([EFDKefdklL])\]\s*/);
       if (tagMatch) {
         const memoryType = typeFromTag(tagMatch[1].toUpperCase());
         entries.push({ content: body.slice(tagMatch[0].length), memoryType });
       } else {
-        // No tag → episode (pre-#216 distiller output, or a model that
+        // No tag → experience (pre-#216 distiller output, or a model that
         // skipped the tag). Keep the content verbatim.
-        entries.push({ content: body, memoryType: "episode" });
+        entries.push({ content: body, memoryType: "experience" });
       }
     }
   }

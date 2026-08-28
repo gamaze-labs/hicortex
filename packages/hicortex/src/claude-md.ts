@@ -2,7 +2,8 @@
  * CLAUDE.md block management — removeLessonsBlock only (0.9.0+).
  *
  * Lesson injection was removed in 0.9.0: lessons are now fetched at query time
- * via the CC SessionStart hook (`hicortex lessons-context`) and by the Hermes
+ * via the CC SessionStart hook (`hicortex learnings-identity`, aliased as the
+ * legacy `lessons-context`) and by the Hermes
  * plugin's prefetch/system_prompt_block. File-based injection caused EPERM
  * errors on macOS, stale blocks, and unwinnable multi-file bookkeeping.
  *

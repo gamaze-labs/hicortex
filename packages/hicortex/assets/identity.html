@@ -3,18 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Hicortex — context</title>
+<title>Hicortex — identity</title>
 <!--
-  Hicortex standing-context editor (#165, 0.12 — spec 2026-07-12 §5).
-  Self-contained: inline CSS/JS, ZERO external requests (CSP-safe). The PRIMARY
-  edit surface for the context layer.
+  Hicortex standing-identity editor (#165, 0.12 — spec 2026-07-12 §5; renamed
+  from "context" in 0.18 #264). Self-contained: inline CSS/JS, ZERO external
+  requests (CSP-safe). The PRIMARY edit surface for the identity layer.
 
-  One tab per section, tabs built dynamically from GET /context `sections`
+  One tab per section, tabs built dynamically from GET /identity `sections`
   (the server serves any allowlist-named *.md as a section — nothing hardcoded).
   Each tab is a <textarea>; Save PUTs only the active section (partial upsert).
 
   The page SHELL is public (exempted in createAuthMiddleware like /viz); the
-  GET/PUT /context data calls are bearer-only with a localhost bypass, so on the
+  GET/PUT /identity data calls are bearer-only with a localhost bypass, so on the
   server box no token is needed. Remote browsers hand off a token via
   ?token=<t> (stripped from the URL on load), localStorage, or a 401 prompt.
 
@@ -179,11 +179,18 @@
     font-size: 14px;
   }
   .hc-nav-logo { color: var(--text); font-weight: 600; text-decoration: none; letter-spacing: 0.02em; }
-  .hc-nav-links { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .hc-nav-links { display: flex; align-items: center; gap: 16px; }
   .hc-nav-links a { color: var(--text-dim); text-decoration: none; transition: color 0.12s; }
   .hc-nav-links a:hover { color: var(--accent); }
   .hc-nav-links a[data-nav-active] { color: var(--text); }
   .hc-nav-disabled { color: var(--text-dim); opacity: 0.4; cursor: not-allowed; user-select: none; }
+  /* Account identity (hosted): name + plan pill, far right of the nav (the
+     links sit LEFT next to the logo; this element owns the right side). */
+  .hc-nav-account { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; color: var(--text); }
+  .hc-nav-account .plan {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    background: rgba(128,128,128,0.18); font-size: 11px; color: var(--text-dim);
+  }
 </style>
 </head>
 <body>
@@ -192,14 +199,15 @@
   <div class="hc-nav-links">
     <a href="/dashboard">Dashboard</a>
     <a href="/viz">Graph</a>
-    <a href="/context/ui" data-nav-active>Context</a>
+    <a href="/identity/ui" data-nav-active>Identity</a>
     <span class="hc-nav-disabled" title="Coming soon — #250">Self-improvement</span>
   </div>
+  <span id="nav-account" class="hc-nav-account"></span>
 </nav>
 <header>
-  <h1>Hicortex — context</h1>
+  <h1>Hicortex — identity</h1>
   <label class="meta" for="scope">scope</label>
-  <select id="scope" title="Which agent's context to edit"></select>
+  <select id="scope" title="Which agent's identity to edit"></select>
   <input type="text" id="newagent" placeholder="new-agent-id" autocomplete="off" spellcheck="false">
   <button class="btn secondary small" id="addagent">Add agent</button>
   <span class="meta" id="clients"></span>
@@ -243,6 +251,7 @@
        Run <code>hicortex status</code> on the server to get it.</p>
     <input type="password" id="token-input" placeholder="hctx-…" autocomplete="off">
     <button class="btn" id="token-submit">Connect</button>
+    <a id="google-login" href="/auth/google/start" style="display:none;margin-top:10px;">Sign in with Google</a>
     <div id="token-err">Still unauthorized — check the token.</div>
   </div>
 </div>
@@ -251,7 +260,7 @@
 "use strict";
 (function () {
   // =========================================================================
-  // Section-name allowlist — mirrors the server contract (context-store.ts
+  // Section-name allowlist — mirrors the server contract (identity-store.ts
   // SECTION_NAME_RE / SECTION_NAME_MAX). Client check is UX; the server also
   // enforces it and is the authority.
   // =========================================================================
@@ -282,6 +291,17 @@
     }
   })();
 
+  // Deep link (#313): /identity/ui?agent=<id> opens the editor in that
+  // agent's scope. The param STAYS in the URL (shareable bookmark; unlike
+  // ?token= it is not a secret). It cannot be adopted before the first load —
+  // the bare GET is what populates the `agents` map the scope selector needs —
+  // so it is stashed here and applied in load()'s success path.
+  var pendingScope = null;
+  (function initScopeParam() {
+    var p = new URLSearchParams(window.location.search).get("agent");
+    if (p) pendingScope = p;
+  })();
+
   // Shared console nav (#249): append ?token= to internal nav links on click
   // so navigation between pages doesn't re-authenticate. Reads token from any
   // page-scoped localStorage key (each page historically used its own).
@@ -302,6 +322,37 @@
     var h = extra ? Object.assign({}, extra) : {};
     if (token) h["Authorization"] = "Bearer " + token;
     return h;
+  }
+
+  // =========================================================================
+  // Account identity in the nav — GET /account (the lightweight endpoint the
+  // dashboard payload also carries). Fail-soft: 401/fetch error leaves the
+  // span empty (the main load() owns the 401 token prompt); an all-null
+  // account (self-hosted default) renders nothing. Built with textContent
+  // only — this page never uses innerHTML for server-derived values.
+  // =========================================================================
+  function renderAccount(a) {
+    var host = document.getElementById("nav-account");
+    if (!host) return;
+    host.textContent = "";
+    if (!a || (a.name === null && a.org === null && a.plan === null)) return;
+    var who = [a.name, a.org].filter(function (s) { return typeof s === "string" && s !== ""; });
+    who.forEach(function (s, i) {
+      if (i > 0) host.appendChild(document.createTextNode(" · "));
+      host.appendChild(document.createTextNode(s));
+    });
+    if (typeof a.plan === "string" && a.plan !== "") {
+      var pill = document.createElement("span");
+      pill.className = "plan";
+      pill.textContent = a.plan;
+      host.appendChild(pill);
+    }
+  }
+  function loadAccount() {
+    fetch("/account", { headers: authHeaders() })
+      .then(function (resp) { return resp.ok ? resp.json() : null; })
+      .then(function (data) { if (data) renderAccount(data.account); })
+      .catch(function () { /* leave the span empty — nav is never worth an error */ });
   }
 
   // =========================================================================
@@ -334,26 +385,35 @@
   var active = null;        // active section name
 
   // Display labels for known sections (the API key stays lowercase; the UI
-  // shows a friendlier name). Unknown sections display their raw name.
+  // shows a friendlier name). Unknown sections display their raw name. The
+  // three #313 scope labels mirror SECTION_LABELS in identity-store.ts —
+  // keep in sync ("Global rules" marks the section as fleet-wide).
   var DISPLAY_LABELS = {
+    "agent_identity": "Agent identity",
     "user": "User",
-    "rules": "Rules",
+    "rules": "Global rules",
     "memory": "Memory instructions",
   };
   // Preferred tab order — known sections first in this order, then any custom
-  // sections alphabetically.
-  var TAB_PRIORITY = ["user", "rules", "memory"];
+  // sections alphabetically. Mirrors the #313 served precedence
+  // (SECTION_PRECEDENCE in identity-store.ts): the agent's own identity
+  // first, then the principal, then fleet rules.
+  var TAB_PRIORITY = ["agent_identity", "user", "rules", "memory"];
   var afterAuth = null;     // action to retry after a successful token prompt
 
   // Per-agent scope (0.13). scope = null → the global set; otherwise an agent
-  // id, and edits target PUT /context?agent=<id>. `agents` is the id -> mode
+  // id, and edits target PUT /identity?agent=<id>. `agents` is the id -> mode
   // map from the bare (global) GET; `origins` is the id -> "global"|"agent"
   // provenance from an agent-scope GET (used to dim inherited tabs).
+  // `agents` is PROTOTYPE-LESS (Object.create(null)): a lookup like
+  // agents["constructor"] must miss so a bogus ?agent= id cannot slip through
+  // the registration check via the Object.prototype chain (CR5). Every
+  // assignment from server data re-sanitizes into a fresh prototype-less map.
   var scope = null;
-  var agents = {};
+  var agents = Object.create(null);
   var origins = {};
 
-  // ?agent= query for the active scope. Written so the literal fetch("/context"
+  // ?agent= query for the active scope. Written so the literal fetch("/identity"
   // survives the self-containment test; the server does the resolution.
   function scopeQS() {
     return scope ? "?agent=" + encodeURIComponent(scope) : "";
@@ -385,7 +445,12 @@
       var inherited = scope && origins[name] === "global";
       b.className = "tab" + (name === active ? " active" : "") + (inherited ? " inherited" : "");
       b.type = "button";
-      b.appendChild(document.createTextNode(DISPLAY_LABELS[name] || name));
+      // Own-property lookup (CR-A): a section legitimately named "constructor"
+      // must display its raw name — DISPLAY_LABELS[name] would resolve through
+      // the Object.prototype chain.
+      b.appendChild(document.createTextNode(
+        Object.prototype.hasOwnProperty.call(DISPLAY_LABELS, name) ? DISPLAY_LABELS[name] : name
+      ));
       if (inherited) {
         var inh = document.createElement("span");
         inh.className = "inh";
@@ -447,11 +512,11 @@
   }
 
   // =========================================================================
-  // Load — GET /context, build tabs from the returned sections keys.
+  // Load — GET /identity, build tabs from the returned sections keys.
   // =========================================================================
   function load() {
     setMsg("Loading…", "dim");
-    fetch("/context" + scopeQS(), { headers: authHeaders() })
+    fetch("/identity" + scopeQS(), { headers: authHeaders() })
       .then(function (resp) {
         if (resp.status === 401) { afterAuth = load; showTokenPrompt(); throw new Error("unauthorized"); }
         if (!resp.ok) {
@@ -465,8 +530,12 @@
         overlay.classList.remove("open");
         // The bare (global) response carries the `agents` map; an agent-scope
         // response carries `origins`. Retain the last-known agents list when the
-        // current response omits it so the selector stays populated.
-        if (scope === null && data.agents && typeof data.agents === "object") agents = data.agents;
+        // current response omits it so the selector stays populated. Copied
+        // into a PROTOTYPE-LESS map (CR5): `agents` is keyed by client- and
+        // server-supplied ids, and lookups must never hit Object.prototype.
+        if (scope === null && data.agents && typeof data.agents === "object") {
+          agents = Object.assign(Object.create(null), data.agents);
+        }
         origins = (data.origins && typeof data.origins === "object") ? data.origins : {};
         var incoming = data.sections || {};
         var names = Object.keys(incoming).sort(function (a, b) {
@@ -489,15 +558,33 @@
         populateScopeOptions();
         renderTabs();
         setMsg(order.length ? "" : "", "dim");
+        // Deep link (#313): adopt the stashed ?agent= scope now that the
+        // agents map is loaded. An unknown-but-valid id registers locally as
+        // "override" (same as Add agent — the dir is created on first Save);
+        // an INVALID id is dropped, landing on Global rather than erroring.
+        if (pendingScope) {
+          var want = pendingScope;
+          pendingScope = null;
+          if (validName(want)) {
+            if (!agents[want]) agents[want] = "override";
+            switchScope(want);
+          }
+        }
       })
       .catch(function (err) {
+        // unauthorized: load() is retried after the token prompt (afterAuth)
+        // — the deep link may still adopt on that retry, so keep pendingScope.
         if (err.message === "unauthorized") return;
+        // A FAILED load must not leave the deep link armed: the user may
+        // manually switch scope meanwhile, and the next successful load would
+        // yank them back to the ?agent= scope (CR5). Cancel it here.
+        pendingScope = null;
         setMsg("Failed to load: " + err.message, "err");
       });
   }
 
   // =========================================================================
-  // Save — PUT /context with ONLY the active section (partial upsert).
+  // Save — PUT /identity with ONLY the active section (partial upsert).
   // =========================================================================
   function save() {
     if (!active) return;
@@ -515,7 +602,7 @@
 
     saveBtn.disabled = true;
     setMsg("Saving…", "dim");
-    fetch("/context" + scopeQS(), {
+    fetch("/identity" + scopeQS(), {
       method: "PUT",
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload),
@@ -576,7 +663,7 @@
   }
 
   // =========================================================================
-  // Scope switching — reload the selected agent's (or the global) context.
+  // Scope switching — reload the selected agent's (or the global) identity.
   // Warns before discarding unsaved edits in the current scope.
   // =========================================================================
   function anyDirty() {
@@ -584,6 +671,10 @@
   }
 
   function switchScope(next) {
+    // A manual switch CANCELS a pending ?agent= deep link (CR5): the deep
+    // link only ever applies to the FIRST successful load. The adoption path
+    // also routes through here, after clearing pendingScope itself.
+    pendingScope = null;
     if (anyDirty() && !window.confirm("Discard unsaved changes and switch scope?")) {
       scopeSel.value = scope || "";
       return;
@@ -615,6 +706,11 @@
     setMsg("", "dim");
     overlay.classList.add("open");
     tokenInput.focus();
+    // Offer the hosted Google login only when the fronting router has auth
+    // configured (bearer-only servers answer 503 on /auth/*).
+    fetch("/auth/google/start", { redirect: "manual" })
+      .then(function (r) { if (r.status !== 503) document.getElementById("google-login").style.display = "block"; })
+      .catch(function () {});
   }
   function submitToken() {
     var v = tokenInput.value.trim();
@@ -623,12 +719,13 @@
     try { localStorage.setItem("hicortexToken", v); } catch (e) { /* ignore */ }
     tokenErr.style.display = "none";
     // Verify with a cheap GET before closing; retry the pending action on success.
-    fetch("/context", { headers: authHeaders() }).then(function (resp) {
+    fetch("/identity", { headers: authHeaders() }).then(function (resp) {
       if (resp.status === 401) { tokenErr.style.display = "block"; return; }
       overlay.classList.remove("open");
       var next = afterAuth || load;
       afterAuth = null;
       next();
+      loadAccount(); // the initial fail-soft attempt left the nav pill empty on 401
     }).catch(function () { tokenErr.style.display = "block"; });
   }
 
@@ -656,6 +753,7 @@
   tokenInput.addEventListener("keydown", function (e) { if (e.key === "Enter") submitToken(); });
 
   load();
+  loadAccount();
 })();
 </script>
 </body>

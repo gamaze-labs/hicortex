@@ -10,6 +10,7 @@ import type { LlmClient } from "./llm.js";
 import type { EmbedFn } from "./retrieval.js";
 import { effectiveStrength, l2ToCosine } from "./retrieval.js";
 import * as storage from "./storage.js";
+import { readNonNegativeConfig } from "./config-read.js";
 import { importanceScoring, reflection, domainCuration } from "./prompts.js";
 import { createHash } from "node:crypto";
 import { isPro } from "./features.js";
@@ -101,6 +102,21 @@ export class BudgetTracker {
   callsUsed = 0;
   callsByStage: Record<string, number> = {};
   /**
+   * Per-stage count of LLM-call REQUESTS refused because the budget was
+   * exhausted (#255). Keys are the same stage labels passed to `use()`. The
+   * value is the SUM of the `count` args passed to each refused `use()` call
+   * in that stage (in production every `use()` call passes count=1, so each
+   * refused call adds 1 — but the API accepts a batch count, so a single
+   * refused batch request accrues its full count). Stages break on the first
+   * refusal, so a stage's value is the count of the one request that crossed
+   * the boundary. For item-level skip counts (how many memories or pairs were
+   * left unprocessed), see the per-stage reports — e.g.
+   * `stages.importance.skipped_budget` — which count MEMORIES, not call
+   * requests. Surfaced in summary() and ConsolidationReport as
+   * `deferred_by_stage`.
+   */
+  deferredByStage: Record<string, number> = {};
+  /**
    * Token usage per stage (#246). Keys are the same stage labels passed to
    * `use()`. A stage that made no metered calls (no usage returned — never the
    * path on a healthy openai/ollama endpoint) is absent, NOT zero, so the
@@ -128,9 +144,16 @@ export class BudgetTracker {
 
   use(stage: string, count = 1): boolean {
     if (this.callsUsed + count > this.maxCalls) {
+      // #255: emit as a STRUCTURED event (not a bare prose warn) so a monitor
+      // can grep/parse `event=budget_exhausted` from journald. The line stays
+      // human-readable (key=value tokens after the [hicortex] prefix). Deferred
+      // counts are accrued BEFORE the log so the line reflects the up-to-date
+      // per-stage toll — the refused count is added to this stage's slot.
+      this.deferredByStage[stage] = (this.deferredByStage[stage] ?? 0) + count;
       console.warn(
-        `[hicortex] Budget exhausted: ${this.callsUsed}/${this.maxCalls} used, ` +
-          `requested ${count} more (stage: ${stage})`
+        `[hicortex] event=budget_exhausted stage=${stage} ` +
+          `calls_used=${this.callsUsed} max_calls=${this.maxCalls} ` +
+          `deferred_by_stage=${JSON.stringify(this.deferredByStage)}`
       );
       return false;
     }
@@ -163,6 +186,11 @@ export class BudgetTracker {
       calls_used: this.callsUsed,
       calls_remaining: this.remaining,
       calls_by_stage: { ...this.callsByStage },
+      // #255: exhaustion + per-stage deferred counts flow into the report →
+      // telemetry + dashboard. Always present (post-#255); absent implies a
+      // pre-#255 report (treat as false / no deferrals).
+      exhausted: this.exhausted,
+      deferred_by_stage: { ...this.deferredByStage },
       tokens_by_stage: Object.fromEntries(
         Object.entries(this.tokensByStage).map(([k, v]) => [k, { ...v }]),
       ),
@@ -431,9 +459,9 @@ async function stageReflection(
       const confidence = String(lo.confidence ?? "medium");
       const sourcePattern = String(lo.source_pattern ?? "");
 
-      // No `## Lesson:` prefix: memory_type='lesson' carries the type, and the
+      // No `## Lesson:` prefix: memory_type='learnings' carries the type, and the
       // text is the topic-first first line (display reads the first line, not a
-      // header parse — see lessons-context.ts / index.ts).
+      // header parse — see learnings-identity.ts / index.ts).
       let content = `${lessonText}\n\n`;
       content += `**Type:** ${lessonType}\n`;
       content += `**Severity:** ${severity}\n`;
@@ -459,7 +487,7 @@ async function stageReflection(
         // effectively never fired. See isContradictionCandidate.
         const similarLessons = storage.vectorSearch(db, embedding, 3)
           .filter(
-            (n) => isContradictionCandidate(n.distance) && n.memory_type === "lesson"
+            (n) => isContradictionCandidate(n.distance) && n.memory_type === "learnings"
           );
 
         let contradicted = false;
@@ -493,7 +521,7 @@ async function stageReflection(
           storage.insertMemory(db, content, embedding, {
             sourceAgent: "hicortex/reflection",
             project,
-            memoryType: "lesson",
+            memoryType: "learnings",
             baseStrength: baseStrength[severity] ?? 0.8,
           });
           generated++;
@@ -540,7 +568,7 @@ export function rebuildContentModuleIndex(
   const lessonRows = db
     .prepare(
       `SELECT domain, COUNT(*) AS cnt FROM memories
-       WHERE domain IS NOT NULL AND memory_type = 'lesson' GROUP BY domain`,
+       WHERE domain IS NOT NULL AND memory_type = 'learnings' GROUP BY domain`,
     )
     .all() as Array<{ domain: string; cnt: number }>;
   const memByDomain = new Map(memRows.map((r) => [r.domain, r.cnt]));
@@ -721,7 +749,7 @@ async function stageDomainCuration(
   const lessonRows = db
     .prepare(
       `SELECT project, COUNT(*) as cnt FROM memories
-       WHERE project IS NOT NULL AND memory_type = 'lesson'
+       WHERE project IS NOT NULL AND memory_type = 'learnings'
        GROUP BY project`
     )
     .all() as Array<{ project: string; cnt: number }>;
@@ -1153,9 +1181,6 @@ export const DEFAULT_SUPERSESSION_MAX_CALLS = 0;
 const SUPERSESSION_NEIGHBOR_POOL = 15;
 /** Older-neighbor pairs kept per candidate after filtering. */
 const SUPERSESSION_NEIGHBOR_TOP_K = 5;
-/** Candidate rows read per SQL page (call budget stops the loop well before this in practice). */
-const SUPERSESSION_BATCH_SIZE = 500;
-
 export interface SupersessionOptions {
   minSimilarity?: number;
   maxCalls?: number;
@@ -1181,7 +1206,7 @@ export interface SupersessionStageResult {
  */
 function isSupersedableShape(mem: { memory_type: string; content: string }): boolean {
   return (
-    mem.memory_type === "decision" ||
+    mem.memory_type === "decisions" ||
     mem.content.includes("[Decisions Made]") ||
     mem.content.includes("[Corrections & Rejections]") ||
     mem.content.includes("[Facts Learned]") ||
@@ -1329,14 +1354,14 @@ export async function stageSupersession(
       // in lockstep (an inline SQL copy, so drift here silently narrows scope).
       `SELECT rowid AS __rowid, * FROM memories
        WHERE rowid > ?
-         AND (memory_type = 'decision'
+         AND (memory_type = 'decisions'
               OR content LIKE '%[Decisions Made]%'
               OR content LIKE '%[Corrections & Rejections]%'
               OR content LIKE '%[Facts Learned]%'
               OR content LIKE '%[Project State Changes]%')
-       ORDER BY rowid ASC LIMIT ?`,
+       ORDER BY rowid ASC`,
     )
-    .all(startCursor, SUPERSESSION_BATCH_SIZE) as Array<Memory & { __rowid: number }>;
+    .all(startCursor) as Array<Memory & { __rowid: number }>;
 
   let scanned = 0;
   let evaluated = 0;
@@ -1508,6 +1533,46 @@ export function stageDecayPrune(
  * (recall top-k competes against the long tail). Override via `memorySoftCap`.
  */
 export const DEFAULT_MEMORY_SOFT_CAP = 10000;
+
+/** Env override for the soft cap (#317). Hosted: provider-set via the tenant
+ *  .env, tenant-immutable at runtime (same posture as HICORTEX_TOKEN_CAP).
+ *  Self-hosted: an operator knob — mode-agnostic, never branches on
+ *  hostedMode. */
+const MEMORY_CAP_ENV = "HICORTEX_MEMORY_CAP";
+
+/**
+ * Resolve the effective soft cap (#317): a positive finite HICORTEX_MEMORY_CAP
+ * env wins over the `memorySoftCap` config key, which wins over
+ * DEFAULT_MEMORY_SOFT_CAP. The env is the PRICING boundary — in the hosted
+ * stack the cap is a per-plan parameter the provider pins into the tenant .env
+ * (docker exec inherits container env, so the eviction path sees it), and the
+ * tenant's config.json is bind-mounted writable at /data, so config-only
+ * resolution would let a tenant raise or disable its own cap. Same
+ * env-wins-precedence pattern as resolveTokenCap (token-budget.ts) and
+ * resolveBodyLimitMb (mcp-server.ts).
+ *
+ * Deliberate asymmetry with resolveTokenCap: a MALFORMED/0/negative env falls
+ * through (an env can pin a cap but never disable one), while config 0 is
+ * still honored as the #245 opt-out (indefinite growth) when the env is unset
+ * — env unset → config → default is exactly the pre-#317 behavior, so a
+ * self-hosted install that never hears about the env sees no change. Pure —
+ * exported for tests; every consumer (nightly eviction + snapshot stamp,
+ * dashboard live headline) must route through this ONE function so the
+ * enforced cap and the displayed cap cannot disagree.
+ */
+export function resolveMemorySoftCap(configVal: unknown): number {
+  const envCap = Number(process.env[MEMORY_CAP_ENV]);
+  if (Number.isFinite(envCap) && envCap > 0) return envCap;
+  // Reuse the disk→runtime boundary validator (warn-on-rejected-value) so the
+  // config half behaves byte-for-byte like the pre-#317 readNonNegativeConfig
+  // call sites: absent → default, valid non-negative (incl. 0 = disabled)
+  // passes through, invalid → warn + default.
+  return readNonNegativeConfig(
+    { memorySoftCap: configVal },
+    "memorySoftCap",
+    DEFAULT_MEMORY_SOFT_CAP,
+  );
+}
 
 export function stageMemoryCapEviction(
   db: Database.Database,

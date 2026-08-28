@@ -114,6 +114,39 @@ export async function embedBatch(texts: string[]): Promise<Float32Array[]> {
 }
 
 /**
+ * Fire-and-forget embedder warm-up (#329 item 2), called at the END of server
+ * boot. The ONNX pipeline lazy-loads inside the first embed() (~0.5-3s cold),
+ * so without this the FIRST /recall-index after every restart paid the model
+ * load inside its own latency budget — the 1s client hook budget blows and
+ * that turn silently loses recall.
+ *
+ * Contract (unit-pinned in tests/embedder-warm.test.ts):
+ *   - fires exactly ONE embed call ("warmup"), NEVER awaited — returns
+ *     synchronously so boot/listen is never blocked;
+ *   - a failing warm-up is logged once (console.warn) and swallowed —
+ *     warm-up is an optimization, never a boot dependency. The next real
+ *     embed() retries the lazy load on its own terms.
+ *
+ * `embedFn` is injectable for tests; production passes the module's embed().
+ *
+ * MEMORY NOTE (accepted trade-off, #329 CR finding 3): warming at boot makes
+ * the model (~150-300MB resident) load in every server process from startup —
+ * including idle hosted tenant containers, which previously never loaded it.
+ * Accepted at current hosted sizing (2g per-tenant caps; active tenants load
+ * it on first use anyway). See the warm-site comment in mcp-server.ts.
+ */
+export function warmEmbedder(
+  embedFn: (text: string) => Promise<Float32Array> = embed
+): void {
+  embedFn("warmup").catch((err: unknown) => {
+    console.warn(
+      `[hicortex] Embedder warm-up failed (first search will lazy-load instead): ` +
+        (err instanceof Error ? err.message : String(err))
+    );
+  });
+}
+
+/**
  * Return the embedding dimension count.
  */
 export function dimensions(): number {

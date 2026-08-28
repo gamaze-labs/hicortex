@@ -169,7 +169,7 @@ class HicortexClient:
         content: str,
         source_agent: Optional[str] = None,
         project: Optional[str] = None,
-        memory_type: str = "episode",
+        memory_type: str = "experience",
         privacy: str = "WORK",
     ) -> tuple[int, dict[str, Any]]:
         return self._post(

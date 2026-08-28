@@ -8,12 +8,12 @@
  *   - SessionStart (startup/resume/clear/compact): POST a reset so the
  *     server's per-session shown-set matches the fresh context window.
  *
- * Fail-soft like lessons-context: ANY failure (no config, timeout, non-2xx,
+ * Fail-soft like learnings-identity: ANY failure (no config, timeout, non-2xx,
  * parse error) prints nothing and exits 0 — a broken hook must never block or
  * slow a CC session beyond the fetch timeout (1000 ms, owner-set).
  */
 
-import { resolveConfig } from "./lessons-context.js";
+import { resolveConfig } from "./learnings-identity.js";
 import { basename } from "node:path";
 
 const FETCH_TIMEOUT_MS = 1000;

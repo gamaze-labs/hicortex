@@ -17,6 +17,102 @@ const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
 const CC_COMMANDS_DIR = join(homedir(), ".claude", "commands");
 const CLAUDE_MD = join(homedir(), ".claude", "CLAUDE.md");
 
+/**
+ * Matches a CC SessionStart hook `command` that runs the Hicortex
+ * identity/learnings hook — the canonical `learnings-identity` (#264) OR the
+ * legacy `lessons-context` alias. Exported so the uninstall behavior (which
+ * name variants get cleaned up) is unit-testable without spinning up CC.
+ * Word-boundary guard so "learnings-identity" never matches a hypothetical
+ * "learnings-identity-foo", the two names stay distinct from each other, and
+ * neither collides with the sibling `recall-hook` SessionStart hook.
+ */
+export const SESSION_START_HOOK_COMMAND_RE = /(^|\s)(?:learnings-identity|lessons-context)(\s|$)/;
+
+/** True when a CC hook `command` string runs the Hicortex SessionStart hook. */
+export function isHicortexSessionStartHook(command: string): boolean {
+  return typeof command === "string" && SESSION_START_HOOK_COMMAND_RE.test(command);
+}
+
+/**
+ * Matches a CC hook `command` that runs the Hicortex recall hook — the
+ * `recall-hook` subcommand (#192). Same word-boundary discipline as the
+ * learnings matcher: an unrelated command that merely CONTAINS the substring
+ * ("my-recall-hook", "recall-hooks-old") is never swept up. Used for BOTH
+ * event arrays the installer writes (UserPromptSubmit + SessionStart).
+ */
+export const RECALL_HOOK_COMMAND_RE = /(^|\s)recall-hook(\s|$)/;
+
+/** True when a CC hook `command` string runs the Hicortex recall hook. */
+export function isHicortexRecallHook(command: string): boolean {
+  return typeof command === "string" && RECALL_HOOK_COMMAND_RE.test(command);
+}
+
+/** One hook group removed from settings.json (for per-group logging). */
+export interface RemovedHookGroup {
+  /** CC event array the entries were removed from ("SessionStart", "UserPromptSubmit"). */
+  event: string;
+  /** Which Hicortex hook set: "learnings" (learnings-identity/lessons-context) or "recall". */
+  kind: "learnings" | "recall";
+  /** Number of matcher entries removed. */
+  count: number;
+}
+
+/**
+ * Remove every Hicortex hook entry from a PARSED ~/.claude/settings.json
+ * (#327): the SessionStart learnings hook (canonical + legacy alias) AND the
+ * recall-hook pair (UserPromptSubmit + SessionStart, installed together by
+ * installRecallHooks — leaving either behind is a silent npx spawn per prompt
+ * forever). Mutates `settings` in place; returns what was removed (empty when
+ * nothing matched — a clean no-op). Exact-match discipline throughout: only
+ * entries whose `hooks[].command` matches a Hicortex subcommand are removed;
+ * foreign hooks (and prefix-colliding names) stay untouched.
+ *
+ * Pure on the parsed object so the uninstall behavior is unit-testable
+ * without spinning up CC; runUninstall owns the file I/O.
+ */
+export function removeHicortexCcHooks(settings: Record<string, unknown>): RemovedHookGroup[] {
+  const hooks = settings.hooks as Record<string, unknown> | undefined;
+  if (!hooks || typeof hooks !== "object") return [];
+
+  const groups: Array<{
+    event: string;
+    kind: "learnings" | "recall";
+    match: (command: string) => boolean;
+  }> = [
+    { event: "SessionStart", kind: "learnings", match: isHicortexSessionStartHook },
+    { event: "SessionStart", kind: "recall", match: isHicortexRecallHook },
+    { event: "UserPromptSubmit", kind: "recall", match: isHicortexRecallHook },
+  ];
+
+  const removed: RemovedHookGroup[] = [];
+  for (const g of groups) {
+    const arr = hooks[g.event];
+    if (!Array.isArray(arr)) continue;
+    const filtered = arr.filter((entry) => {
+      if (typeof entry !== "object" || entry === null) return true;
+      const e = entry as Record<string, unknown>;
+      if (Array.isArray(e.hooks)) {
+        return !e.hooks.some(
+          (h: unknown) =>
+            typeof h === "object" &&
+            h !== null &&
+            typeof (h as Record<string, unknown>).command === "string" &&
+            g.match((h as Record<string, unknown>).command as string),
+        );
+      }
+      return true;
+    });
+    if (filtered.length < arr.length) {
+      // Drop the event key entirely when the filter emptied it — no
+      // `"UserPromptSubmit": []` husk left in the settings file.
+      if (filtered.length > 0) hooks[g.event] = filtered;
+      else delete hooks[g.event];
+      removed.push({ event: g.event, kind: g.kind, count: arr.length - filtered.length });
+    }
+  }
+  return removed;
+}
+
 async function ask(question: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   return new Promise((resolve) => {
@@ -112,30 +208,21 @@ export async function runUninstall(): Promise<void> {
   }
   if (removedCmds > 0) console.log(`  ✓ Removed ${removedCmds} legacy CC command${removedCmds > 1 ? "s" : ""} (/learn, /hicortex-activate)`);
 
-  // 4. Remove SessionStart hook (JSON merge — filter out entries containing "lessons-context")
+  // 4. Remove ALL Hicortex CC hooks (#327): the SessionStart learnings hook
+  //    (canonical `learnings-identity` OR the legacy `lessons-context` alias,
+  //    #264 backcompat) AND BOTH `recall-hook` entries (UserPromptSubmit +
+  //    SessionStart — installed as a pair by installRecallHooks; leaving
+  //    either behind keeps a silent npx spawn per prompt forever).
+  //    Fail-soft when absent; word-boundary matchers never touch foreign hooks.
   try {
     const raw = readFileSync(CC_SETTINGS, "utf-8");
     const settings = JSON.parse(raw) as Record<string, unknown>;
-    const hooks = settings.hooks as Record<string, unknown> | undefined;
-    const sessionStart = hooks && Array.isArray(hooks.SessionStart) ? hooks.SessionStart as Array<unknown> : null;
-    if (hooks && sessionStart) {
-      const before = sessionStart.length;
-      const filtered = sessionStart.filter((entry) => {
-        if (typeof entry !== "object" || entry === null) return true;
-        const e = entry as Record<string, unknown>;
-        if (Array.isArray(e.hooks)) {
-          return !e.hooks.some((h: unknown) => {
-            if (typeof h !== "object" || h === null) return false;
-            const hook = h as Record<string, unknown>;
-            return typeof hook.command === "string" && hook.command.includes("lessons-context");
-          });
-        }
-        return true;
-      });
-      if (filtered.length < before) {
-        hooks.SessionStart = filtered;
-        writeFileSync(CC_SETTINGS, JSON.stringify(settings, null, 2));
-        console.log("  ✓ Removed SessionStart lessons-context hook");
+    const removed = removeHicortexCcHooks(settings);
+    if (removed.length > 0) {
+      writeFileSync(CC_SETTINGS, JSON.stringify(settings, null, 2));
+      for (const r of removed) {
+        const name = r.kind === "learnings" ? "learnings-identity" : "recall-hook";
+        console.log(`  ✓ Removed ${r.event} ${name} hook${r.count > 1 ? "s" : ""}`);
       }
     }
   } catch { /* no settings file or parse error — nothing to remove */ }
@@ -143,6 +230,38 @@ export async function runUninstall(): Promise<void> {
   // 5. Remove CLAUDE.md block (old static block from pre-0.9.0; may still exist on upgrades)
   if (removeLessonsBlock(CLAUDE_MD)) {
     console.log("  ✓ Removed Hicortex Learnings block from CLAUDE.md");
+  }
+
+  // 6. Remove the Pi extension (#348). Guarded on the "hicortex" marker the
+  //    installer always ships — "hicortex.ts" is a plausible user filename,
+  //    and uninstall never deletes a file we did not write. Fail-soft when
+  //    absent (no Pi on the machine) or unreadable.
+  const piExtension = join(homedir(), ".pi", "agent", "extensions", "hicortex.ts");
+  if (existsSync(piExtension)) {
+    try {
+      if (readFileSync(piExtension, "utf-8").toLowerCase().includes("hicortex")) {
+        unlinkSync(piExtension);
+        console.log("  ✓ Removed Pi extension (~/.pi/agent/extensions/hicortex.ts)");
+      } else {
+        console.log("  ⚠ Skipping ~/.pi/agent/extensions/hicortex.ts — not a Hicortex file, left untouched");
+      }
+    } catch { /* unreadable — leave it */ }
+  }
+
+  // 7. Remove the opencode plugin (#347). Same marker guard — the plugins
+  //    directory is shared (third-party files live there too), and uninstall
+  //    never deletes a file we did not write. Fail-soft when absent (no
+  //    opencode on the machine) or unreadable.
+  const openCodePlugin = join(homedir(), ".config", "opencode", "plugins", "hicortex.ts");
+  if (existsSync(openCodePlugin)) {
+    try {
+      if (readFileSync(openCodePlugin, "utf-8").toLowerCase().includes("hicortex")) {
+        unlinkSync(openCodePlugin);
+        console.log("  ✓ Removed opencode plugin (~/.config/opencode/plugins/hicortex.ts)");
+      } else {
+        console.log("  ⚠ Skipping ~/.config/opencode/plugins/hicortex.ts — not a Hicortex file, left untouched");
+      }
+    } catch { /* unreadable — leave it */ }
   }
 
   console.log(`\n✓ Uninstalled. Database preserved at ${HICORTEX_HOME}/hicortex.db`);

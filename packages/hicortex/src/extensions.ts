@@ -7,7 +7,7 @@
  * still be swapped in (tests, future experiments).
  *
  *   LessonSelector — lesson selection sites:
- *     lessons-context.ts:fetchLessonsContext (CC SessionStart hook),
+ *     learnings-identity.ts:fetchLessonsIdentity (CC SessionStart hook),
  *     index.ts:before_agent_start (OC in-process plugin).
  *     The default is the domain-aware scoring selector (lesson-selection.ts):
  *     ranks lessons by project match + domain affinity + recency +

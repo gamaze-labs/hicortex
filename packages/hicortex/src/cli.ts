@@ -8,6 +8,7 @@
  *   nightly    Run capture + consolidate (manual trigger)
  *              nightly --capture-only     Capture only, skip consolidation
  *              nightly --consolidate-only Consolidate only, skip capture (hosted service)
+ *              nightly --evict-only       Memory-cap eviction only — pure DB, no LLM (#317)
  *              nightly --status           Show nightly pipeline health check
  *   relink     Resumable link-discovery pass over the entire corpus (issue #143)
  *   dedup      Cluster + merge near-duplicate memories (issue #100)
@@ -16,9 +17,9 @@
  *   uninstall  Clean removal of CC integration
  */
 
-import { readValueFlag } from "./cli-args.js";
+import { readValueFlag, resolveCommandAlias } from "./cli-args.js";
 
-const command = process.argv[2];
+const command = resolveCommandAlias(process.argv[2]);
 
 switch (command) {
   case "server": {
@@ -73,9 +74,14 @@ switch (command) {
       const dryRun = args.includes("--dry-run");
       const captureOnly = args.includes("--capture-only");
       const consolidateOnly = args.includes("--consolidate-only");
+      const evictOnly = args.includes("--evict-only");
       const watchdog = args.includes("--watchdog");
       if (captureOnly && consolidateOnly) {
         console.error("[hicortex] nightly: --capture-only and --consolidate-only are mutually exclusive");
+        process.exit(1);
+      }
+      if (evictOnly && (captureOnly || consolidateOnly)) {
+        console.error("[hicortex] nightly: --evict-only is mutually exclusive with --capture-only and --consolidate-only");
         process.exit(1);
       }
       // Timestamp every log line. The nightly writes to a file (launchd /
@@ -100,7 +106,7 @@ switch (command) {
         }
       }
       import("./nightly.js").then(({ runNightly }) => {
-        runNightly({ dryRun, captureOnly, consolidateOnly, watchdog, recaptureWindowDays }).catch((err) => {
+        runNightly({ dryRun, captureOnly, consolidateOnly, evictOnly, watchdog, recaptureWindowDays }).catch((err) => {
           console.error("[hicortex] Nightly pipeline failed:", err);
           process.exit(1);
         });
@@ -187,6 +193,33 @@ switch (command) {
     break;
   }
 
+  case "backup": {
+    // Backup — transactionally-consistent snapshot of the irreplaceable data
+    // (#6, Phase 0B). Mirrors `dedup`: flags parsed here, the runner (config
+    // load + DB open + createBackup + hook + close) lives in backup.ts so this
+    // switch stays thin and the heavy module is lazily imported.
+    const args = process.argv.slice(3);
+    let outDir: string | undefined;
+    try {
+      outDir = readValueFlag(args, "--out");
+    } catch {
+      console.error("[hicortex] backup: --out requires a directory path");
+      process.exit(1);
+    }
+    const stdout = args.includes("--stdout");
+    // `--out` is the output DIRECTORY (the artifact is auto-named
+    // hicortex-<ISO>.tar.gz inside it) — matches the `backupDir` config and the
+    // natural "put the backup here" invocation. Omit for the default <home>/backups.
+    const backupOptions = { outDir, stdout };
+    import("./backup.js").then(({ runBackupCli }) => {
+      runBackupCli(backupOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] backup failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
   case "dedup": {
     const args = process.argv.slice(3);
     let threshold: number | undefined;
@@ -220,14 +253,17 @@ switch (command) {
     break;
   }
 
-  case "context": {
-    // Standing context layer edit surface (spec §6): show|edit against the
-    // configured server. Secondary to the /context/ui Web UI; for headless boxes.
+  case "identity": {
+    // Standing identity layer edit surface (spec §6; renamed from context in
+    // 0.18 #264): show|edit against the configured server. Secondary to the
+    // /identity/ui Web UI; for headless boxes. The legacy `context` command is
+    // kept as a hidden backcompat alias via resolveCommandAlias so old scripts
+    // and muscle memory keep working.
     const args = process.argv.slice(3);
-    import("./context-cli.js").then(({ runContextCommand, ContextCliError }) => {
-      runContextCommand(args).catch((err) => {
-        if (err instanceof ContextCliError) console.error(err.message);
-        else console.error("[hicortex] context command failed:", err instanceof Error ? err.message : err);
+    import("./identity-cli.js").then(({ runIdentityCommand, IdentityCliError }) => {
+      runIdentityCommand(args).catch((err) => {
+        if (err instanceof IdentityCliError) console.error(err.message);
+        else console.error("[hicortex] identity command failed:", err instanceof Error ? err.message : err);
         process.exit(1);
       });
     });
@@ -276,12 +312,14 @@ switch (command) {
     }).catch(() => process.exit(0));
     break;
 
-  case "lessons-context":
-    // CC SessionStart hook: fetch lessons from the configured server and print
-    // a Markdown block to stdout. Fail-soft — any error = silent exit 0 so a
-    // broken hook never blocks a CC session.
-    import("./lessons-context.js").then(({ fetchLessonsContext }) => {
-      fetchLessonsContext()
+  case "learnings-identity": {
+    // CC SessionStart hook: fetch identity + lessons from the configured server
+    // and print a Markdown block to stdout. Canonical command name since #264;
+    // the legacy `lessons-context` subcommand is kept as a backcompat alias via
+    // resolveCommandAlias so existing installed hooks keep working. Fail-soft —
+    // any error = silent exit 0 so a broken hook never blocks a CC session.
+    import("./learnings-identity.js").then(({ fetchLessonsIdentity }) => {
+      fetchLessonsIdentity()
         .then((block) => {
           if (block) process.stdout.write(block + "\n");
           process.exit(0);
@@ -289,6 +327,7 @@ switch (command) {
         .catch(() => process.exit(0));
     }).catch(() => process.exit(0));
     break;
+  }
 
   default:
     console.log(`Hicortex — Human-like memory for self-improving AI agents
@@ -301,7 +340,7 @@ Commands:
                   Scaffolds 5 editable default memory domains (Work, Personal,
                   People, Health, Finance) in ~/.hicortex/config.json
   init --server <url>  Set up as client (remote server)
-  init --agent-name <name>  Opt in to a per-agent context id (default: unset — shared global context)
+  init --agent-name <name>  Opt in to a per-agent identity id (default: unset — shared global identity)
                             Pass --agent-name "" to clear it back to global
   init --repair-config  Recover from a malformed ~/.hicortex/config.json: move it to
                         config.json.corrupt-<timestamp> and rebuild. Nothing is deleted.
@@ -309,11 +348,14 @@ Commands:
   nightly         Run nightly denoise + capture + consolidate
   relink          Resumable link-discovery pass over the ENTIRE corpus (server mode)
   dedup           Cluster + merge near-duplicate memories (server mode; dry run by default)
+  backup          Snapshot the DB + identity + state to a tar.gz (online, WAL-safe)
   classify-domains  Backfill content-based domain tags over the corpus (server mode, needs config.domains)
   classify-types    Backfill episode→fact/decision type tags over the corpus (server mode)
-  lessons-context Fetch lessons and print Markdown to stdout (CC SessionStart hook)
+  learnings-identity  Fetch identity + lessons and print Markdown to stdout (CC SessionStart hook)
+                      (alias: lessons-context — the pre-#264 name, kept for backcompat)
   recall-hook    Pushed recall index for the current prompt (CC UserPromptSubmit/SessionStart hook)
-  context         Standing context layer (show|edit) against the configured server
+  identity        Standing identity layer (show|edit) against the configured server
+                  (alias: context — the pre-0.18 name, kept for backcompat)
   telemetry       Show exactly what anonymous telemetry sends (read-only)
   status          Show current configuration and stats
   uninstall       Remove CC integration (preserves DB)
@@ -324,6 +366,7 @@ Options:
   nightly --dry-run         Preview without changes
   nightly --capture-only    Capture only, skip consolidation (safe to run multiple times/day)
   nightly --consolidate-only  Consolidate only, skip capture (hosted-service per-tenant runs)
+  nightly --evict-only      Memory-cap eviction only — pure DB, no capture, no LLM (#317)
   nightly --recapture-window <days>   Re-discover sessions quiet since <days> ago (one-shot #189 recovery)
   nightly --status          Show nightly pipeline health
   relink --dry-run          Discovery + counts only, zero writes, cursor untouched
@@ -332,15 +375,18 @@ Options:
   dedup --apply             Execute the merge (default: dry run, report only)
   dedup --threshold <t>     Override config dedupMergeThreshold for one run
   dedup --db <path>         DB path override (defaults to the configured DB)
+  backup --out <dir>        Write the artifact into <dir> as hicortex-<ISO>.tar.gz (default: <home>/backups)
+  backup --stdout           Stream the tar.gz to stdout (offsite pipe: hicortex backup --stdout | rclone rcat …)
   classify-domains --all    Reclassify every memory (default: only NULL/stale-domain rows)
   classify-domains --batch <n>  Memories per batch (default: 200)
   classify-domains --reset  Restart from the beginning (ignore saved cursor)
   classify-types --all      Reclassify every memory (default: only episodes)
   classify-types --batch <n>  Memories per batch (default: 200)
   classify-types --reset    Restart from the beginning (ignore saved cursor)
-  context show [name]       Print all context sections, or just <name> (raw, pipeable)
-  context edit <name>       Edit a section in $EDITOR; PUT only if changed
-  context … --agent <id>    Target a per-agent scope instead of the global set
+  identity show [name]      Print all identity sections, or just <name> (raw, pipeable)
+  identity edit <name>      Edit a section in $EDITOR; PUT only if changed
+  identity … --agent <id>   Target a per-agent scope instead of the global set
+  (the legacy 'context' command remains as a hidden alias for 'identity')
 
 Examples:
   npx @gamaze/hicortex server

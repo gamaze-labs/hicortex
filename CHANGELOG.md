@@ -3,6 +3,177 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.21.0] - 2026-08-27
+
+opencode joins the fleet: opencode agents get the same memory experience as Claude Code, Hermes, OpenClaw, and Pi — pushed recall on every prompt, identity + lessons at session start, and the nine memory tools — via one bundled, dependency-free plugin, and their sessions are captured by a new nightly reader.
+
+### Added — opencode client (`opencode-plugin/hicortex/`)
+- **Pushed recall per prompt.** Each new user prompt is POSTed to `/recall-index` and the returned compact index block is injected as one additional user message carrying it (opencode's messages-transform hook — verified against opencode 1.18.20; the injected message is not persisted to opencode's session store and existing messages are never mutated). One fetch per prompt — tool-loop requests of the same turn re-use the fetched block; the agent lazy-loads full content with `hicortex_get`. Session creation and compaction fire the dedup reset, which the session's next recall fetch awaits — the reset can never land after it.
+- **Identity + lessons in the system prompt.** The hand-edited identity layer is injected as a `## Identity` block when the server's `identityClients` resolves `opencode` (listable explicitly, included in `"all"`), alongside the `## Hicortex Memory` lessons block (top-`lessonsLimit` slice) — appended as one fenced system entry with a marker guard so injection can never double, fetched once per session.
+- **The nine tools in-process.** `hicortex_search` / `hicortex_get` / `hicortex_recent` / `hicortex_ingest` / `hicortex_lessons` / `hicortex_index` / `hicortex_graph` / `hicortex_update` / `hicortex_delete` are registered through the plugin's tool export with plain-JSON argument schemas — direct REST proxies to the server (names and descriptions shared with the other clients). A remote-MCP config remains an unmanaged, pull-only escape hatch.
+- **Fail-soft by construction.** Any failure (no config, timeout, non-2xx, parse error) injects nothing and never blocks or slows a session; injection fetches carry a 1 s timeout, tool fetches 10 s.
+- **Nightly capture.** A new reader distills opencode's SQLite session store (`~/.local/share/opencode/opencode.db`): per-session incremental cursor on message time (epoch milliseconds, exclusive delta, with the shrink guard), conversation text assembled from each message's text parts (tool/reasoning plumbing excluded by type, injected recall blocks skipped so memory never echoes itself), sub-agent sessions excluded, project derived from the session's working directory. No-ops on machines without opencode and shape-guards against schema drift.
+- **Packaging + install.** The plugin ships in the npm tarball (bundled like the Hermes plugin and Pi extension); `init` auto-detects opencode and installs the plugin into its global plugins directory — writing nothing into opencode's own configuration — `status` reports it, and `uninstall` removes it marker-guarded, never touching third-party plugin files.
+
+### Changed
+- **`opencode` is a known identity client** (`identityClients` may list it; `"all"` expands to include it).
+
+## [0.20.0] - 2026-08-26
+
+Pi parity: Pi agents get the same memory experience as Claude Code, Hermes, and OpenClaw — pushed recall on every prompt, identity + lessons at session start, and the nine memory tools — via one bundled, dependency-free extension. No MCP setup, no local database, no local LLM.
+
+### Added — Pi extension (`pi-extension/hicortex/`)
+- **Pushed recall per prompt.** Each user prompt is POSTed to `/recall-index` and the returned compact index block is injected into the turn (terminal UI and non-interactive `pi -p` alike); the agent lazy-loads full content with `hicortex_get`. Session start and compaction fire the dedup reset, which the first turn's recall fetch awaits — the reset can never land after it.
+- **Identity + lessons in the system prompt.** The hand-edited identity layer is injected as a `## Identity` block when the server's `identityClients` resolves `pi` (listable explicitly, included in `"all"`), alongside the `## Hicortex Memory` lessons block (top-`lessonsLimit` slice). Pi resets a system-prompt override to the base prompt whenever no extension returns one, so the blocks are re-applied every turn from a per-session cache — with a marker guard so injection can never double.
+- **The nine tools in-process.** `hicortex_search` / `hicortex_get` / `hicortex_recent` / `hicortex_ingest` / `hicortex_lessons` / `hicortex_index` / `hicortex_graph` / `hicortex_update` / `hicortex_delete` are registered as first-class Pi tools — direct REST proxies to the server (names, descriptions, and schemas shared with the OpenClaw plugin). The third-party MCP adapter previously documented as Pi's bridge is demoted to a generic escape hatch; it still works but is no longer needed.
+- **Fail-soft by construction.** Any failure (no config, timeout, non-2xx, parse error) injects nothing and never blocks or slows a session; injection fetches carry a 1 s timeout, tool fetches 10 s; no terminal-UI calls anywhere, so print mode is safe.
+- **Packaging + install.** The extension ships in the npm tarball (bundled like the Hermes plugin); `init` auto-detects `~/.pi/agent/` and installs the extension, `status` reports it, `uninstall` removes it. Capture is unchanged — Pi sessions keep flowing through the existing nightly reader.
+
+### Changed
+- **`pi` is a known identity client** (`identityClients` may list it; `"all"` expands to include it).
+
+## [0.19.5] - 2026-08-24
+
+The corrected hardening release. 0.19.4 was published to `rc` but **never promoted**: a controlled A/B on real session segments proved its distill-prompt reorder (instructions before transcript) silently dropped entire real sessions — the model over-fired the NO_EXTRACT escape on summary-led and long mixed sessions (a real coding segment: 15 accurate memories → 0). 0.19.5 reverts the reorder and ships the gate fix that makes the failure class visible and guarded. Everything else from the four-cluster review sweep (backup retention, banner lifecycle, uninstall completeness, 429 taxonomy, hosted security hardening, FTS repair, boot warm-up) is included unchanged.
+
+### Fixed — distiller reliability (the 0.19.4 postmortem)
+- **Prompt layout reverted** to transcript-first (the pre-0.19.4 order). The reorder is pinned out by test: it cannot return without passing the new A/B release-gate harness.
+- **NO_EXTRACT gate hardened** (in the restored layout): the escape now explicitly requires a verdict on the WHOLE transcript — never on its opening — with an in-prompt counter-example of a session that opens with bookkeeping and contains real decisions later. Cross-model A/B (local 27B + hosted mistral-small, the production house model): the incident class is eliminated (candidate zeroes nothing the baseline extracts); honest trade-off: a slight increase in ephemera-shaped bullets (+1 on one segment; the borderline noise probe leaks on both variants).
+- **Silent loss made visible**: a zero-memory distillation of a >20K-char segment (bare NO_EXTRACT, empty, or zero-bullet prose — aggregated across chunks) logs a content-free warning naming the segment and its size. Empty stays a legitimate verdict; it just can't be invisible anymore.
+- **Exported parser surface**: `parseDistilledEntries`, `typeFromTag`, `isNoExtractResponse` are now importable from the package — the A/B harness counts with the production parser, and a CI contract test fails if src and dist parsers diverge.
+
+### Added — the A/B release-gate harness (`scripts/distill-ab-check/`)
+Manual, LLM-optional (private repo). Two prompt builds, five canonical synthetic segments (the incident shapes), same model, greedy; FAIL if the candidate zeroes a segment the baseline extracts or manufactures all-ephemera output from the pure-noise probe; WARN on borderline drift. Every future distill-prompt change passes this gate before release — this release is the first to prove the process end-to-end.
+
+## [0.19.4] - 2026-08-23
+
+The hardening release: a four-agent review sweep (correctness, security, performance, field-bug hunt) over the whole 0.19.x line, every finding fixed and re-reviewed.
+
+### Fixed — reliability & data safety
+- **Backup retention** (`backupRetention`, default 7): the backup dir prunes to the N newest artifacts after each successful write — previously unbounded growth (~one full-corpus tarball per night, per install). Consolidate-only runs (hosted tenants) back up once per day via an artifact-age gate — daily coverage preserved, growth bounded.
+- **Uninstall is now complete**: removes ALL installed CC hooks (the per-prompt recall hook pair previously survived — a silent process spawn on every prompt, forever).
+- **429 taxonomy**: the token-budget stop is distinguished from transport rate-limiting — rate-limit 429s back off in-run (Retry-After honored) and latch the run instead of misdiagnosing "memory limit reached" and failing nightlies.
+- **Watermark clamp**: a future-dated last-run (clock error) no longer permanently skips quiet sessions; the warning names the recovery tool.
+
+### Fixed — OpenClaw plugin
+- **Dead-man banner lifecycle**: injected ONCE per outage (not per turn — session-stored appends no longer accumulate duplicates) and explicitly RETRACTED when identity returns (a public agent no longer stays suspended for the rest of the session after one network blip).
+- **Self-hardening installs**: the identity-outage guard line is auto-scaffolded into the agent bootstrap (idempotent, byte-exact backup, kill-switch `scaffoldDeadMan`); a one-time warning fires when the gateway's plugin trust list is unpinned. Conservative path handling (no speculative writes); non-UTF-8 bootstrap files are never touched.
+
+### Fixed — recall quality
+- **The word-search channel was silently broken** on most real prompts (FTS5 parser crash on punctuation — `?`, `-`, `(`, URLs — with the error swallowed): tokens are now quoted literals. Honest scope: with implicit AND semantics, prose recall is unchanged (zero added noise, verified by sample); short keyword queries (the search tool, legacy fallback) now actually get BM25 results. 24-token cap bounds pathological queries; the dual-search path shares one FTS execution.
+- **First prompt after every server restart no longer loses recall** (embedder model warms at boot instead of loading inside the first request).
+- **Novelty-floor backfill**: a topic-switch turn with an empty flavored menu now fills from the clean-search candidates instead of showing a truncated index.
+- **Distiller prompt**: the decision-contract/ephemera contradiction resolved explicitly. (The static-instructions-first reorder was REVERTED before release — a deterministic A/B on real segments showed silent NO_EXTRACT over-firing on summary-led sessions; see prompts.ts.)
+
+### Security — hosted (not in the npm package)
+- Tenant-provisioning DoS caps (max tenants at login, queue, and provisioner; global auth flood cap), per-tenant container resource limits (measured 2 GB), session-id length cap, tenant-immutable body limit (env-pinned, default on with a working off-switch), router survives store faults (503 per request instead of process death), webhook size/concurrency gates, query-token restricted to page shells, checkout status gating and payment-settlement verification including async payment methods (SEPA/bank debit — activate when money lands, not at checkout completion).
+- Deploy-script hygiene: the deploy sync no longer copies operator secret files to the server checkout.
+
+## [0.19.3] - 2026-08-22
+
+### Fixed — recall novelty floor (#324)
+- **Mid-conversation topic switches were invisible to the pushed recall index.** The session-intent blend (60% session flavor / 40% new message) diluted rare salient terms below the relevance floor — a memory that is the top result in a fresh session returns nothing mid-session (two live failures: a boat referenced 50 times in the corpus; a battery-bridging topic with rich matches). The index now also runs a pure (unblended) search per prompt and guarantees its top passing hit(s) slots (`noveltyFloorSlots`, default 2, 0 = off), rendered first. Continuing-intent sessions are byte-identical to before (test-pinned). Cost: one extra search per prompt (~3 ms at a 10K corpus).
+- Engineering: fold-once centroid handling enforced structurally (`recallQueryVector` — the pure branch has no path to centroid state); the pure search uses the same candidate window as the blended search; exposure accounting unchanged; boot log prints the resolved knob; README gains the knob row and corrects three stale defaults.
+
+## [0.19.2] - 2026-08-21
+
+### Added — per-agent `agent_identity` section (#313)
+- **Explicit section precedence** as a tested server-side contract: `agent_identity → user → rules → rest (alphabetical)` — previously ordering rode on directory-read order. One server fix; CC, OC, and Hermes clients all inherit it.
+- **Scope display names** from a single shared map ("Agent identity" / "User" / "Global rules"), pinned against drift on every surface (renderer, UI editor, Hermes mirror).
+- **OC dead-man banner**: a failed `/identity` fetch at session start injects `IDENTITY UNAVAILABLE — public actions suspended` instead of nothing. A 404 is a version-skew note (a pre-identity server must not self-suspend the agent); gated responses stay silent.
+- `/identity/ui?agent=<id>` deep link (the URL param was previously ignored); prototype-chain hardening in the editor and label lookups; purely-numeric section names rejected on API writes (integer-index keys break served ordering; existing files stay readable).
+
+### Changed — distiller ephemerа gate (#319)
+- The distillation prompt now carries a closed **NEVER-RECORD** category: content whose entire value is a state that expires — issue/PR/epic/merge status, version/deploy/test-count statistics, session bookkeeping, transient readings — is **omitted, not down-scored-and-written**. Pure-ephemera segments yield zero memories (absorbed, never re-sent). Grounded in a human-graded corpus calibration: every lowest-graded memory in the sample was a status snapshot, while the distiller's own high-importance scores aligned with human value.
+
+### Fixed — OpenClaw plugin parity with Hermes (#316)
+- **Warn-once on recall HTTP errors** (per distinct status, token hint on 401/403) — previously a bad token killed per-turn recall silently.
+- **Pre-0.14 server fallback**: a 404 on `/recall-index` now latches (logged) and falls back to `/search` rendered in the reference content-bearing shape, with its own 5 s ceiling and failure diagnostics — previously OC degraded to nothing against old servers.
+- **Session-start dedup reset is awaited and ordered** before the first recall fetch; compaction resets can no longer race it.
+- **Once-per-session identity + lessons injection** (previously re-appended every turn): runtime-verified that OC persists the appended system context on the session — memoization is also what prevents duplication. Memos decoupled so a lessons failure retries independently.
+- **Hot-path timeouts to reference** (1.5 s recall + lazy-load); **config parity**: `defaultProject`, `recallLimit` (integer-strict), `HICORTEX_URL`/`HICORTEX_AUTH_TOKEN` env fallbacks; startup probe uses the resolved token; stale retired-Pro `licenseKey` ("free tier 250 cap") removed from the plugin manifest.
+
+## [0.19.1] - 2026-08-21
+
+### Fixed
+- **OC plugin config resolution (#312).** OpenClaw hands the plugin the entire `openclaw.json` as its config; the plugin now resolves its settings through the documented `plugins.entries.hicortex.config` nesting first, falling back to the top-level `hicortex` object and bare keys — all three placements keep working. Pure resolver with per-level guards, boundary validation, and shadow-detection warnings; table-driven tests. Caught live during dogfooding.
+- **OC plugin manifest version was stale** (`0.10.0` through many releases) — now tracks the package version.
+
+### Observability (hosted router; not in the npm package)
+- OAuth callback failures now log their cause — state-mismatch as a tri-state (absent/invalid/valid cookie), state expiry, provider error — and the token endpoint's error body is surfaced in `exchange_failed`. These paths previously redirected silently, making login loops undiagnosable from logs. 60-second per-reason throttling; no cookie or token values are ever logged.
+
+## [0.19.0] - 2026-08-19
+
+### Added — the hosted service (Hicortex Cloud), end to end
+- **Managed users + Google login (#295).** A hosted router fronting the data plane: Google OIDC sign-in (full id_token verification — RS256/JWKS with rotation retry, PKCE S256, single-use nonce+state, unverified emails rejected), HMAC-signed session cookies, and session→tenant bearer injection so browsers never handle raw tokens. MCP/API clients keep bearer auth unchanged. Users store (email NOCASE-unique, google_sub anchor, opaque one-way tenant ids). `GET /account` whoami; email is user-changeable, login never rewrites it.
+- **Automated tenant provisioning (#296).** First login auto-creates the tenant: a pull-based file queue (spec T1 — no inbound privileged endpoint) from the unprivileged router to a host-side provisioner; idempotent steps via execFile argv arrays; crash-safe done-before-unlink protocol; per-tenant run lock with pid-liveness staleness.
+- **Tenant lifecycle (#297).** 14-day trial → dormant intact read-only (capture paused, recall served, cold container with wake-on-access) → deletion 90 days after last activity with warning emails at day 60/83 (Resend; 3-attempt backstop so nobody is swept un-warned on mail failures). Verified backup artifact archived before any deletion; double re-checks + snapshot-guarded flip on the destructive path.
+- **Stripe billing (#298).** Checkout (monthly / annual "pay for 9, get 12", founder price allowlist-gated), signature-verified webhook (constant-time HMAC, replay window, event dedup), livemode pinned via env (test events can never activate production rows), activation wires the per-tenant consolidation timer and starts the container. No Stripe SDK — one REST call + node:crypto.
+- **Backups (#281).** `hicortex backup` CLI + nightly stage: `db.backup()` snapshot, identity tree, state/cursors packaged as a tar.gz artifact; `backupCommand` offsite hook; non-destructive restore drill verified live.
+- **House LLM defaults (#308).** Provisioner stamps `HOUSE_LLM_*` (all-or-nothing env) into new tenants at creation — hosted signups can capture from minute one.
+- **Dashboard account identity (#286, #293).** `displayName`/`planLabel` config keys; name + plan pill in the nav on every console page; "Upgrade" entry appears for plan-less accounts. Cold long-tail relabeled "never recalled".
+
+### Changed
+- **True monthly token totals (#287/#288).** The distill meter now always records (cap only gates enforcement), and `/distill` responses carry per-segment usage so nightly snapshots attribute distill + consolidation into one honest per-run total. Dashboard shows a used-vs-cap gauge for capped installs.
+- **Distiller decision contract (#290/#291).** `[D]` memories now require explicit owner confirmation in the transcript; AI proposals are recorded as experience ("AI proposed X → user declined"), with a SELF-CHECK re-tag rule. The classify-types prompt mirrors the contract; the actual failing transcript is a permanent env-gated eval.
+- **Identity-framed memory instructions (#286).** The reserved `memory` section injected inside `## Identity` opens with the persistent-identity framing while staying explicitly a memory system.
+- **Hosted hardening from the live e2e (#306).** Router image builds sqlite natively; the tenant map is directory-mounted (atomic renames are visible to a running router); `?token=` fallback for browser pages (#285); `deploy-router.sh` repeatable deploy.
+
+### Fixed
+- **`?token=` dashboard access (#285)** — browser pages can't set headers on page load; query fallback with URL stripping.
+- Router DoS hardening: `/auth/*` per-address rate limit + pending-state cap (an unauthenticated flood could previously grow memory unbounded and take the bearer plane down); malformed `tenants.json` entries can no longer crash-loop the router.
+
+### Notes
+- The hosted stack runs on the router/provisioner packages (`hosted/`) — self-hosted installs get the package-side changes above and remain otherwise untouched (hostedMode stays default-off).
+- Known hosted gap (documented): backups land on the same host; wire `backupCommand` for offsite before relying on them in anger.
+
+## [0.18.3] - 2026-08-13
+
+### Fixed
+- **Supervisor PATH now resolves `node` (#276 — silent capture death).** The launchd/systemd supervisors were baked with a PATH that never included the `node` binary's directory. For global installs via bun/pnpm/yarn (whose bin directory has no `node` sibling — especially on Apple Silicon, where node lives in `/opt/homebrew/bin`), the scheduled nightly/capture agent died at the `#!/usr/bin/env node` shebang (exit 127) and capture stopped **silently** — invisible in `status` because the shell PATH masked it. The supervisor PATH now includes the resolved node directory (via `which node`, the stable symlink — not the versioned Cellar realpath, which would stale on a `brew upgrade`), plus an install-time smoke test that warns loudly if node is unresolvable. macOS + Linux. **Recovery: re-run `npx @gamaze/hicortex init`** to regenerate the supervisor files.
+
+### Added (hosted-service infrastructure — default-off, inert for self-hosted)
+- **`hostedMode` + multi-tenant data plane.** Opt-in infrastructure for running Hicortex as a hosted service: a token-routing reverse proxy, per-tenant Docker isolation with bind-mount storage, per-tenant LLM token-budget enforcement on `/distill`, and a per-token request-rate limit at the router. All gated behind `hostedMode: false` (the self-hosted default) — no behavior change for existing installs.
+
+## [0.18.2] - 2026-08-12
+
+### Changed
+- **Unified terminology: DB column values renamed.** `memory_type` column values changed from raw enum (`fact`/`episode`/`decision`/`lesson`) to human terms (`knowledge`/`experience`/`decisions`/`learnings`). Migration v13 converts automatically on upgrade. Old values still accepted on `/ingest`/`/update` requests (backward compat).
+- **REST API returns human labels.** All JSON responses (`/search`, `/recent`, `/memory`) now return `"knowledge"` instead of `"fact"`. Request validation accepts both vocabularies.
+- **`[F]` distiller tag → `[K]`.** The knowledge type tag letter changed from `[F]` (Fact) to `[K]` (Knowledge). Legacy `[F]` still accepted. Prompt section heading: "### Knowledge Learned".
+- **`hicortex_identity` MCP tool** — agents can fetch identity sections on-demand, including the synthetic `memory` section + per-agent scoping via the `agent` parameter.
+- **`hicortex_learnings` MCP tool + `/learnings` REST endpoint** (canonical). `hicortex_lessons` / `/lessons` kept as aliases.
+- **Hermes plugin injects `## Identity`** (was `## Context`) + `Learnings:` heading (was `Lessons:`).
+- **`hicortex status` shows human type labels.**
+
+## [0.18.1] - 2026-08-12
+
+### Added
+- **`hicortex_identity` MCP tool.** Agents can now fetch their standing identity on-demand during a session (not just at SessionStart). Supports per-agent scoping via the `agent` parameter. Includes the product-owned `memory` section (same as REST `/identity`).
+
+### Changed
+- **`hicortex_learnings` MCP tool (canonical) + REST `/learnings` endpoint.** `hicortex_lessons` / `/lessons` kept as backcompat aliases. Unified terminology — all surfaces now say "Learnings."
+
+## [0.18.0] - 2026-08-12
+
+### Changed
+- **Context Layer → Agent Identity (#264).** The hand-edited "who you are + how to work" layer is now the **identity layer**. CLI: `hicortex identity show|edit` (`context` kept as alias). API: `/identity` (`/context` backcompat alias). Files: `~/.hicortex/identity/` (auto-migrated from `context/`). Config: `identityClients`/`identityAgents` (old keys still accepted). Injected block: `## Identity`.
+- **Human-term type labels.** Memory types shown as Knowledge / Experience / Decisions / Learnings across docs and UI. Internal `memory_type` enum unchanged.
+- **`learnings-identity` canonical command** (`lessons-context` kept as alias for existing hooks).
+
+### Fixed
+- **Server-side redaction on /distill (#252).** Secrets scrubbed before storage/LLM, not just client-side.
+- **/health minimised (#253).** Public endpoint returns `{status:"ok"}` only; diagnostics at authed `/health/detail`. Error responses sanitised (no internal endpoint leakage).
+- **Constant-time token comparison + rotation grace (#254).** `authTokenPrevious` enables zero-downtime token rotation.
+- **Consolidation-budget exhaustion monitoring (#255).** Dashboard shows calls-used/max + token-usage bars; exhaustion surfaced as a structured event.
+- **Timer jitter (#256).** Generated timers include randomised delay to avoid thundering-herd across a fleet.
+- **Nightly self-capture sends authToken.** No longer relies solely on the localhost bypass.
+
+## [0.17.6] - 2026-08-10
+
+### Fixed
+- **`classify-types --all` no longer destroys lessons (#257).** The `--all` scope had no `memory_type != 'lesson'` guard, so a `--all --reset` run reclassified every lesson to fact/episode/decision (the prompt only emits episode/fact/decision, so the model never replied "lesson" and the "keeps its type" backstop never fired). The `--all` scope now excludes lessons (NULL-type rows are still classified — that is the backfill's job). Corrected the misleading docstring; added a regression test and a NULL-type coverage test.
+
 ## [0.17.4] - 2026-08-10
 
 ### Changed
