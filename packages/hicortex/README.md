@@ -4,7 +4,7 @@
 
 Your agents learn from every session — successes and mistakes. Hicortex captures experiences, distills lessons, and applies them automatically. Connect multiple agents to shared memory and they improve together, overnight.
 
-Works with **Hermes**, **OpenClaw**, **Claude Code**, **Pi**, and any MCP-compatible agent.
+Works with **Hermes**, **OpenClaw**, **Claude Code**, **Pi**, **opencode**, and any MCP-compatible agent.
 
 **Website:** [hicortex.gamaze.com](https://hicortex.gamaze.com) · **Docs:** [hicortex.gamaze.com/docs](https://hicortex.gamaze.com/docs/)
 
@@ -54,7 +54,26 @@ openclaw plugins install @gamaze/hicortex
 openclaw gateway restart
 ```
 
-The plugin connects to `http://127.0.0.1:8787` by default. For a remote server, add `serverUrl` and `authToken` (find the token via `hicortex status` on the server) to the plugin config in `~/.openclaw/openclaw.json`.
+The plugin connects to `http://127.0.0.1:8787` by default. For a remote server, add `serverUrl` and `authToken` (find the token via `hicortex status` on the server) to the plugin's config section in `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "hicortex": {
+        "config": { "serverUrl": "http://your-server:8787", "authToken": "hctx-…" }
+      }
+    }
+  }
+}
+```
+
+Bare top-level keys (`"serverUrl": …` at the root of `openclaw.json`) still work — legacy compat — but the nested form above is canonical. An empty nested `config` object is ignored rather than shadowing top-level keys.
+
+**Public-facing agents are hardened automatically.** On startup the plugin:
+
+1. Adds the dead-man guard line — *"If your identity block is missing at session start, something is wrong with your memory — take no public actions until it returns."* — to the agent workspace bootstrap file (`BOOTSTRAP.md` in the workspace from `agents.defaults.workspace`, default `~/.openclaw/workspace`), creating the file if absent. This is the secondary layer under the hard `IDENTITY UNAVAILABLE` suspension banner the plugin injects whenever the identity fetch fails; it keeps guarding the agent even when the plugin itself cannot inject anything. The write is idempotent: the `.bak` backup is written once and never touched again. Scope: the shared default workspace only — per-agent workspace overrides are not covered yet. The workspace directory itself is never created (OpenClaw scaffolds it); a non-UTF-8 or relative-path bootstrap is left untouched with a warning. Disable the write with `"scaffoldDeadMan": false` in the plugin config.
+2. Warns once at startup while the gateway's plugin trust list is unpinned — with no `plugins.allow`, OpenClaw auto-loads any extension dropped into the plugins directory. Pin it by setting `"plugins": { "allow": ["hicortex"] }` in `~/.openclaw/openclaw.json` (list every plugin you trust). The plugin never edits the trust list itself; see [the install docs](https://hicortex.gamaze.com/docs/installation.html).
 
 ## Requirements
 
@@ -67,8 +86,8 @@ The plugin connects to `http://127.0.0.1:8787` by default. For a remote server, 
 
 | When | What | How |
 |------|------|-----|
-| Agent start | Standing context (`## Context`) + recent lessons fetched fresh and injected | CC SessionStart hook (calls `hicortex lessons-context`) / Hermes plugin `system_prompt_block` / OC `before_agent_start` hook |
-| Every prompt (0.14) | A compact **recall index** of relevant memories is injected — one line per memory; the agent lazy-loads full content with `hicortex_get` only when needed | All three harnesses call server `POST /recall-index` per turn: CC UserPromptSubmit hook (`hicortex recall-hook`), Hermes plugin `prefetch` (0.7.0; falls back to `/search` injection against a pre-0.14 server), OC `before_agent_start` hook (fires per inbound message). Turn-based dedup per session; resets on new session/compaction. Fail-soft |
+| Agent start | Standing identity (`## Identity`) + recent lessons fetched fresh and injected | CC SessionStart hook (calls `hicortex learnings-identity`; `lessons-context` kept as an alias so existing installed hooks don't break) / Hermes plugin `system_prompt_block` / OC `before_agent_start` hook |
+| Every prompt (0.14) | A compact **recall index** of relevant memories is injected — one line per memory; the agent lazy-loads full content with `hicortex_get` only when needed | All five harnesses call server `POST /recall-index` per turn: CC UserPromptSubmit hook (`hicortex recall-hook`), Hermes plugin `prefetch` (0.7.0; falls back to `/search` injection against a pre-0.14 server), OC `before_agent_start` hook (fires per inbound message), Pi extension `before_agent_start` (0.20), opencode plugin messages-transform hook (0.21). Turn-based dedup per session; resets on new session/compaction. Fail-soft |
 | Nightly | Denoise sessions → POST /distill → server distills + embeds + stores → consolidate (score, reflect, link, decay) | Automatic pipeline — no manual steps |
 
 **Exposure vs use (0.14):** appearing in the recall index only marks a memory as *shown* (it stops decaying while topically active); fetching it with `hicortex_get` marks it as *used* (durable strengthening). Memory importance is driven by what agents actually use, not by what was pushed at them.
@@ -118,42 +137,43 @@ The run is resumable — interrupt it any time and it continues where it stopped
 
 ## Agent Tools (MCP)
 
-9 tools available via MCP:
+10 canonical tools available via MCP (plus `hicortex_lessons` as a backcompat alias of `hicortex_learnings`):
 
 - **hicortex_search** — Semantic search across all stored memories
 - **hicortex_get** — Fetch one memory's full content by id (0.14) — the lazy-load counterpart of the recall index; fetching marks the memory as used
 - **hicortex_recent** — Get recent decisions and project state (queryless recall; renamed in 0.12)
 - **hicortex_ingest** — Store a memory directly
-- **hicortex_lessons** — Get actionable lessons from reflection
+- **hicortex_learnings** — Get actionable Learnings from reflection (`hicortex_lessons` is kept as a backcompat alias)
 - **hicortex_index** — Get the knowledge domain index (what topics are stored)
 - **hicortex_graph** — Graph traversal: neighbors, hubs, shortest paths
 - **hicortex_update** — Fix incorrect memories (re-embeds on content change)
 - **hicortex_delete** — Remove memories with cascade cleanup
+- **hicortex_identity** — Fetch your standing identity layer on demand (all sections, or one by name; pass `agent` on multi-agent installs to scope to a specific agent)
 
 Explicit learnings: call `hicortex_ingest` directly (capture is otherwise automatic, nightly).
 
-## Context Layer
+## Identity Layer
 
-Beyond auto-distilled memories and lessons, Hicortex holds a **hand-edited context layer** — standing "who you are + how to work" Markdown injected into every session at start. Unlike memories, it is **never distilled, scored, or decayed**: what you write stays verbatim until you change it.
+Beyond auto-distilled memories and lessons, Hicortex holds a **hand-edited identity layer** — standing "who you are + how to work" Markdown injected into every session at start. Unlike memories, it is **never distilled, scored, or decayed**: what you write stays verbatim until you change it.
 
-- **Storage:** plain files on the server at `~/.hicortex/context/*.md` — one file per section (recommended starter sections `user.md` + `rules.md`, which you create — nothing is pre-populated; add more by dropping in a file). It lives outside the memories table; consolidation never touches it.
-- **Edit:** the web editor at `http://localhost:8787/context/ui` (one tab per section, Save), or the CLI `hicortex context show [name]` / `hicortex context edit <name>`.
-- **Delivery:** injected into the harnesses listed in `contextClients` (default `["cc"]`; `"all"` or any subset of `cc`/`hermes`/`oc` — all three are supported since 0.13).
+- **Storage:** plain files on the server at `~/.hicortex/identity/*.md` — one file per section (recommended starter sections `user.md` + `rules.md`, which you create — nothing is pre-populated; add more by dropping in a file). It lives outside the memories table; consolidation never touches it.
+- **Edit:** the web editor at `http://localhost:8787/identity/ui` (one tab per section, Save), or the CLI `hicortex identity show [name]` / `hicortex identity edit <name>`.
+- **Delivery:** injected into the harnesses listed in `identityClients` (default `["cc"]`; `"all"` or any subset of `cc`/`hermes`/`oc`/`pi`/`opencode` — CC/Hermes/OpenClaw since 0.13, Pi since 0.20, opencode since 0.21).
 - **Deletion** is filesystem-only — remove the file on the server (as the daemon user).
 
-### Per-agent context (0.13)
+### Per-agent identity (0.13)
 
-One server serves a fleet of distinct-persona agents. Each agent can have its **own** context, resolved server-side into one of three modes:
+One server serves a fleet of distinct-persona agents. Each agent can have its **own** identity, resolved server-side into one of three modes:
 
 - **`override`** (default when an `agents/<id>/` dir exists) — the agent's sections win **per section name**, falling back to the global set for any section it doesn't define.
 - **`global`** — the shared global set (the 0.12 behavior).
 - **`off`** — inject nothing for that agent.
 
-- **Agent id:** Hermes and OC scope per profile/agent automatically. **CC is global by default** — it sends no `?agent=`, so all your CC machines share one global context (one user = one identity across machines). `agentName` is an explicit opt-in: set it with `init --agent-name <name>` and CC will send `?agent=<config.agentName>`; clear it with `init --agent-name ""` to return to global. The id is on the same strict allowlist as section names (it becomes a path). Shown by `hicortex status` (or `(not set — global context)` when unset).
-- **Storage:** per-agent sections live at `~/.hicortex/context/agents/<id>/*.md`; the global reader never descends into `agents/`.
-- **Config:** `contextAgents` maps agent id → mode; a dropped-in `agents/<id>/` dir alone means `override` with no config. Editing `contextAgents` needs a daemon restart; dropping in a dir takes effect immediately.
-- **Edit:** the web editor's scope selector (`Global` | `<agent>`; inherited sections shown dimmed), or `hicortex context show|edit --agent <id>`.
-- **Backward compatible:** no `?agent=` and no `contextAgents`/`agents/` dir → every agent gets the global set.
+- **Agent id:** Hermes and OC scope per profile/agent automatically. **CC is global by default** — it sends no `?agent=`, so all your CC machines share one global identity (one user = one identity across machines). `agentName` is an explicit opt-in: set it with `init --agent-name <name>` and CC will send `?agent=<config.agentName>`; clear it with `init --agent-name ""` to return to global. The id is on the same strict allowlist as section names (it becomes a path). Shown by `hicortex status` (or `(not set — global identity)` when unset).
+- **Storage:** per-agent sections live at `~/.hicortex/identity/agents/<id>/*.md`; the global reader never descends into `agents/`.
+- **Config:** `identityAgents` maps agent id → mode; a dropped-in `agents/<id>/` dir alone means `override` with no config. Editing `identityAgents` needs a daemon restart; dropping in a dir takes effect immediately.
+- **Edit:** the web editor's scope selector (`Global` | `<agent>`; inherited sections shown dimmed), or `hicortex identity show|edit --agent <id>`.
+- **Backward compatible:** no `?agent=` and no `identityAgents`/`agents/` dir → every agent gets the global set.
 
 ## CLI Commands
 
@@ -163,16 +183,17 @@ npx @gamaze/hicortex init                      # Set up server mode
 npx @gamaze/hicortex init --server <url>       # Set up client mode
 npx @gamaze/hicortex nightly                   # Run distill + consolidate (full nightly)
 npx @gamaze/hicortex nightly --capture-only    # Capture only, skip consolidation (safe for sub-daily runs)
+npx @gamaze/hicortex nightly --evict-only      # Memory-cap eviction only — pure DB, no capture, no LLM (idempotent; honors --dry-run)
 npx @gamaze/hicortex nightly --dry-run         # Preview without changes
 npx @gamaze/hicortex classify-domains          # Backfill domain tags over the corpus (see Memory Domains & Tags)
 npx @gamaze/hicortex classify-types            # Reclassify memory types (episode/fact/decision)
 npx @gamaze/hicortex dedup                     # Preview near-duplicate memory clusters (dry run, no changes)
 npx @gamaze/hicortex dedup --apply             # Merge near-duplicate clusters (backs up the DB first)
-npx @gamaze/hicortex context show [name]       # Print the standing context layer (see Context Layer)
-npx @gamaze/hicortex context edit <name>       # Edit a context section in $EDITOR
-npx @gamaze/hicortex context show --agent <id> # Show a specific agent's resolved context (0.13)
-npx @gamaze/hicortex init --agent-name <name>  # Opt in to a per-agent context id (default: unset — shared global context)
-npx @gamaze/hicortex init --agent-name ""      # Clear it back to global context
+npx @gamaze/hicortex identity show [name]       # Print the standing identity layer (see Identity Layer)
+npx @gamaze/hicortex identity edit <name>       # Edit an identity section in $EDITOR
+npx @gamaze/hicortex identity show --agent <id> # Show a specific agent's resolved identity (0.13)
+npx @gamaze/hicortex init --agent-name <name>   # Opt in to a per-agent identity id (default: unset — shared global identity)
+npx @gamaze/hicortex init --agent-name ""       # Clear it back to global identity
 npx @gamaze/hicortex init --repair-config      # Recover from a malformed config.json (see below)
 npx @gamaze/hicortex telemetry                 # Show exactly what anonymous telemetry sends
 npx @gamaze/hicortex status                    # Show config, DB stats
@@ -214,18 +235,27 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `maxTokens` | Max output tokens for all phases (default 8192). A ceiling, not a target — the model stops early when done. |
 | `ollamaFlushEvery` | Flush ollama's accumulated memory every N scoring calls. **Off by default (0)** — opt-in only for an **ollama** install whose runner RSS growth (~171 MB/call) swap-thrashes long consolidations on a RAM-constrained box; N=15 caps a cycle at ~2.5 GB. Gated on the provider being ollama (local **or** remote) — no effect for non-ollama providers. Only you can judge whether your ollama endpoint actually suffers the growth (a managed/cloud ollama host may not), so it stays off until you set it. |
 | `ollamaFlushWaitMs` | Milliseconds to wait after an ollama flush for the runner to exit + release memory (default 180000 = 3 min). |
+| `llmTimeoutMs` | The ONE timeout ceiling on every LLM call in every phase (default 900000 = 15 min). The LLM request paths disable the HTTP client's hidden 5-minute response-header timer, so this knob is the only bound — one place to tune when the endpoint is slow, no per-phase special cases. |
+| `llmBreakerThreshold` | Consecutive fully-failed LLM calls (after their built-in retry ladder) that open the per-endpoint circuit breaker (default 3; **0 disables the breaker**). While open, calls fail fast with no network I/O; an HTTP error with a response body, a malformed-reply parse error, or a rate-limit 429 never counts — only the endpoint being unreachable/hung does. |
+| `llmBreakerCooldownMs` | How long the breaker stays open before one half-open trial call goes out (default 600000 = 10 min). A failing trial re-opens it; a succeeding one resets the counter. |
+| `llmProbeTimeoutMs` | Patience of the readiness probe — one minimal 1-token generation request the nightly sends before consolidating and the daemon sends before distilling (default 60000 = 1 min). Catches a gateway that answers health/model-list queries while generation is dead; a failed probe skips consolidation (`endpoint_down`, retried next run) and answers `/distill` with a 503 so capture holds its cursor. |
+| `llmProbeTtlMs` | How long the daemon caches a `/distill` probe outcome (default 300000 = 5 min). A healthy capture cadence pays at most one probe per window; a dead endpoint turns into fast cached 503s instead of every request paying the probe timeout. |
 | `authToken` | Bearer token for endpoint auth. Generated on first `init` in server mode. Find the active token with `hicortex status` or in `~/.hicortex/config.json`. |
-| `corsAllowedOrigins` | Browser origins allowed to read cross-origin responses, e.g. `["https://ui.example.com"]`. **Empty by default** — the server sends no `Access-Control-Allow-Origin` and never `Allow-Credentials`, so no external web page can read its data. The bundled `/viz` and `/context/ui` pages are same-origin and need no entry. |
+| `corsAllowedOrigins` | Browser origins allowed to read cross-origin responses, e.g. `["https://ui.example.com"]`. **Empty by default** — the server sends no `Access-Control-Allow-Origin` and never `Allow-Credentials`, so no external web page can read its data. The bundled `/viz` and `/identity/ui` pages are same-origin and need no entry. |
 | `licenseKey` | Commercial license key (optional; for display in `hicortex status`) |
+| `backupRetention` | How many of the newest backup artifacts (`hicortex-*.tar.gz`) the backup dir keeps after each successful write (default: 7; `0` keeps all). See [Backups](#backups) |
+| _env_ `HICORTEX_DISTILL_BODY_LIMIT_MB` | Environment override for the `/distill` body limit — **wins over the `distillBodyLimitMb` config key in every mode** (that is the point: a deployment operator pins it so tenant-writable config cannot raise it). Unset = config/default applies. |
+| _env_ `HICORTEX_MEMORY_CAP` | Environment override for the memory soft cap — a **positive** value wins over the `memorySoftCap` config key in every mode; `0`/negative/malformed fall through to the config key, then the 10000 default (an env can pin a cap, never disable one — config `memorySoftCap: 0` still disables when the env is unset). Mode-agnostic operator knob: nightly eviction, the dashboard-snapshot capacity stamp, and the live dashboard gauge all resolve through the same resolver, so the enforced and displayed caps can never disagree. Drives `nightly --evict-only` the same way. |
 | `domains` | Your memory domain list (`[{name, description}]`). Scaffolded by `init`; edit freely — see [Memory Domains & Tags](#memory-domains--tags) |
 | `weakPrimaryFloor` | Minimum similarity for a no-fit memory to keep a weak domain association (default: 0.45) |
 | `moduleIndexTokenBudget` | Max tokens for domain index in lessons context (default: 500) |
 | `lessonsLimit` | Max lessons injected into an agent's session-start context (default: 10). Lessons are ranked per session by project/domain affinity + recency + strength + access, so each session sees its most-relevant slice. Lower = leaner system prompts. |
-| `contextClients` | Which harnesses inject the [context layer](#context-layer) at session start (default `["cc"]`; `"all"` or any subset of `cc`/`hermes`/`oc`) |
-| `contextAgents` | Per-agent context modes (0.13): `{ "<id>": "override" \| "global" \| "off" }`. Absent + no `agents/<id>/` dir → every agent gets the global set. Boot-time (restart to apply) — see [Per-agent context](#per-agent-context-013) |
-| `agentName` | This install's per-agent context id sent as `?agent=`. **Unset by default** (CC shares the global context — no `?agent=` sent). Explicit opt-in via `init --agent-name <name>`; `init --agent-name ""` clears it. An empty/whitespace value equals unset |
+| `identityClients` | Which harnesses inject the [identity layer](#identity-layer) at session start (default `["cc"]`; `"all"` or any subset of `cc`/`hermes`/`oc`/`pi`/`opencode`) |
+| `identityAgents` | Per-agent identity modes (0.13): `{ "<id>": "override" \| "global" \| "off" }`. Absent + no `agents/<id>/` dir → every agent gets the global set. Boot-time (restart to apply) — see [Per-agent identity](#per-agent-identity-013) |
+| `agentName` | This install's per-agent identity id sent as `?agent=`. **Unset by default** (CC shares the global identity — no `?agent=` sent). Explicit opt-in via `init --agent-name <name>`; `init --agent-name ""` clears it. An empty/whitespace value equals unset |
 | `captureCooldownHours` | Success-cooldown (hours) for the **capture watchdog** (0.17). The capture timer polls every ~20 min; the watchdog captures only if more than this has elapsed since the last *successful* capture (`state.lastNightly`). Default `6` (≈4 captures/day). A failed preflight retries on the next poll (~20 min) — so a transient fire-instant network miss costs minutes, not a day (#239) |
 | `consolidationHours` | Hours (0–23, local) for the **consolidation** timer — the full nightly (capture + distill + score + reflect + link). Installed for **server/co-located only** (clients have no local DB). Default `[10, 22]`: the 22:00 evening slot runs after the day's capture waves (same-day results); the 10:00 morning slot runs *after* the morning capture so wake-up pushes are caught. Omitted on clients |
+| `timerJitterSeconds` | Max random delay (seconds) added to **generated** consolidation timers (#256), so a fleet doesn't all fire on the same minute (thundering-herd → LLM-backend contention). systemd: a single `RandomizedDelaySec=<n>`; launchd has no native equivalent so a per-install randomized `Minute` offset is baked into every `StartCalendarInterval` dict (sub-60s values no-op on launchd). Default `3600` (≈±30 min spread on the 2-slot/day cadence); `0` disables. Affects timers on the next `init` (re-init rewrites the unit files; installs that don't re-init keep their existing timers) |
 | `consolidateMaxLlmCalls` | Ceiling on total LLM calls across all classify-tier consolidation stages (content-domain, link discovery, supersession) per run. A runaway **backstop**, not a throughput throttle — on a free local model the binding constraint is the nightly unit's wall-clock timeout, not call count. Default `5000` (was a hard-coded 200 that starved link/supersession during a classification backlog) |
 | `memorySoftCap` | Soft cap on the memory corpus (default 10000). When the corpus exceeds this, the nightly's capacity-eviction stage removes the lowest-`effectiveStrength` memories (ties broken by oldest access) until under the cap — the active forgetting mechanism that bounds DB size, vector-index RAM, and consolidation workload. `0` disables eviction (indefinite growth — the pre-#245 behaviour). The evicted tail is cold by construction (effectiveStrength is the same decay-weighted score the recall ranker uses, so these were not surfacing in the top-k anyway). At 10K memories the load + JS sort is <100 ms |
 | `updateChannel` | Release channel pinned into the generated daemon/timer ExecStart for **npx-thin** installs (global-binary installs use the absolute binary and are unaffected). A dist-tag (`"rc"`, `"next"`) or an exact version (`"0.17.1"`). E.g. `"rc"` → the timer runs `npx -y @gamaze/hicortex@rc nightly`, so the host tracks the rc dist-tag (an internal fleet can ride rc through a pre-promotion soak). Validated as `[\w.\-]+` (rejects anything that'd break the unit/plist templates). Absent → auto-detect (bare on `latest`, else `@next`). (0.17.1) |
@@ -244,11 +274,12 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `searchLimit` / `recentLimit` | Default result counts for search (8) and recent (12) |
 | `recentWindowDays` | Candidate window for recent recall (default: 180) |
 | `coldExposureSlots` | Top-k slots reservable for never-accessed memories so the long tail gets exposure (default: 2) |
-| `recallMaxItems` | Max lines in the pushed recall index (default: 6) |
-| `recallMinSimilarity` | Relevance floor for index entries (default: 0.55; text-search matches always pass) |
+| `recallMaxItems` | Max lines in the pushed recall index (default: 5) |
+| `noveltyFloorSlots` | Slots of `recallMaxItems` guaranteed to the top passing hit(s) of the pure-prompt (unblended) search — the novelty floor. Keeps a session whose earlier turns set a strong intent from burying a topic-switching prompt's best matches: the floor's picks render first, turn-based re-show suppression still applies, and the total never exceeds `recallMaxItems` (default: 2; set 0 to disable) |
+| `recallMinSimilarity` | Relevance floor for index entries (default: 0.62; text-search matches always pass) |
 | `recallReshowTurns` | Turns before an already-shown memory may reappear in the same session (default: 30) |
 | `recallMinPromptChars` | Prompts shorter than this skip the recall index (default: 20) |
-| `recallTitleChars` | Chars of each memory's first line shown in an index entry (default: 150, range 40–400). Raised from 100 on 2026-08-02: with topic-first memory titles, 150 chars carries the subject *and* its claim, where 100 cut the claim mid-sentence. Costs roughly +74 tokens per 6-line block |
+| `recallTitleChars` | Chars of each memory's first line shown in an index entry (default: 100, range 40–400). Reverted from 150 on 2026-08-03: a full-corpus relevance eval found 100 and 150 statistically identical while 100 saves ~13% of the block's tokens |
 | `sessionIntentWeight` | Blend weight of the session-intent rolling centroid in the recall search vector: `query = (1-w)·prompt + w·centroid` (default: 0.33; set 0 to disable — pure-prompt recall, the kill-switch). The first turn of a session searches with pure prompt and seeds the centroid; subsequent turns blend so recall follows the session's intent instead of being query-literal. The EMA rate (0.4) is a shipped constant, not configurable |
 | `dedupMergeThreshold` | Minimum cosine similarity for `hicortex dedup` to cluster memories as near-duplicates (default: 0.92) |
 | `supersessionMinSimilarity` | Minimum cosine similarity for a nightly supersession candidate pair (default: 0.80) |
@@ -268,9 +299,9 @@ Full docs: [hicortex.gamaze.com/docs/configuration.html](https://hicortex.gamaze
 | `/recall-index` | POST | Yes | Pushed recall index (0.14): `{session_id, prompt}` → compact one-line-per-memory block (or `null`); `{session_id, reset: true}` clears the session's dedup state. Appearing in the index marks memories *shown*, never *used* |
 | `/memory` | GET | Yes | Fetch one memory by `?id=` (0.14). Marks it as used (strengthens) — the lazy-load counterpart of `/recall-index`. Response includes a server-rendered `citation` (id, date, origin agent) — agents are instructed to cite memories that shape their answers, so memory influence is always visible to the user (0.14.1) |
 | `/recent` | GET | Yes | Recent memories, queryless recall (renamed from `/context` in 0.12) |
-| `/context` | GET / PUT | Yes | Standing [context layer](#context-layer): read all sections / partial-upsert named sections. `?agent=<id>` selects a [per-agent scope](#per-agent-context-013) (server resolves override/global/off + merge); invalid id → 400. Recall-style query params on GET → 400 (use `/recent`) |
-| `/context/ui` | GET | No* | Web editor for the context layer (shell served without auth, like `/viz`; data via `/context`) |
-| `/lessons` | GET | Yes | Lessons + memory index (used by CC SessionStart hook) |
+| `/identity` | GET / PUT | Yes | Standing [identity layer](#identity-layer): read all sections / partial-upsert named sections. `?agent=<id>` selects a [per-agent scope](#per-agent-identity-013) (server resolves override/global/off + merge); invalid id → 400. Recall-style query params on GET → 400 (use `/recent`). (`/context` remains as a backcompat alias.) |
+| `/identity/ui` | GET | No* | Web editor for the identity layer (shell served without auth, like `/viz`; data via `/identity`) |
+| `/learnings` | GET | Yes | Learnings + memory index (used by CC SessionStart hook). `/lessons` is a backcompat alias for the same handler |
 | `/ingest` | POST | Yes | Legacy: accept a single pre-distilled memory from older clients |
 | `/sse` | GET | Yes | MCP SSE stream for agent connections |
 | `/messages` | POST | Yes | MCP message endpoint |
@@ -298,7 +329,11 @@ Optional config (add to plugin entry in `~/.openclaw/openclaw.json`):
 |-------|---------|-------------|
 | `serverUrl` | `http://127.0.0.1:8787` | Hicortex server URL. Change for remote servers. |
 | `authToken` | _(none)_ | Bearer token. Localhost bypasses auth; required for remote servers. Get the token from `hicortex status` on the server. |
-| `licenseKey` | _(none)_ | Commercial license key. Optional; only affects the display in `hicortex status`. |
+| `defaultProject` | _(none)_ | Project name sent on recall, search, recent, and ingest whenever the gateway supplies no project (Hermes `default_project` parity). |
+| `recallLimit` | `8` | Max memories per recall on the pre-0.14 `/search` fallback. The pushed recall index is sized by SERVER config (`recallMaxItems`) — the server accepts no client limit. |
+| `scaffoldDeadMan` | `true` | Auto-scaffold the dead-man identity-guard line into the agent workspace bootstrap (`BOOTSTRAP.md`) at startup. Set `false` to disable the write and any file creation entirely. |
+
+If `serverUrl`/`authToken` are absent from the config, the `HICORTEX_URL` and `HICORTEX_AUTH_TOKEN` environment variables are used as fallbacks (config always wins).
 
 ## LLM Configuration
 
@@ -311,11 +346,74 @@ LLM selection is **user-controlled**: `npx @gamaze/hicortex init` detects candid
 | Custom provider | `llmBaseUrl` + `llmApiKey` | Any OpenAI-compatible endpoint |
 | Hicortex env vars | `HICORTEX_LLM_BASE_URL` + `HICORTEX_LLM_API_KEY` | Override at runtime |
 
-If no LLM is configured, the server starts in **recall-only mode**: search, lessons, and context work; `/distill` and consolidation are disabled. Run `npx @gamaze/hicortex init` to configure.
+If no LLM is configured, the server starts in **recall-only mode**: search, lessons, and identity work; `/distill` and consolidation are disabled. Run `npx @gamaze/hicortex init` to configure.
 
 ## Database
 
 Canonical location: `~/.hicortex/hicortex.db`. The OC plugin no longer owns its own database — it is a thin client to the server. Previously, OC installations at `~/.openclaw/data/hicortex.db` were migrated automatically on upgrade; this migration path remains in the server's `resolveDbPath` for any pre-0.10.0 installations.
+
+## Backups
+
+The live DB runs with WAL on, so a plain `cp`/`tar` of `hicortex.db` is **torn** (the `-wal` file holds uncommitted pages → a copy that looks fine until you restore it). `hicortex backup` uses SQLite's online-backup API (`db.backup()`) to fold the WAL into a single consistent snapshot, then packages it with the hand-edited identity layer and capture state into one `tar.gz`.
+
+**Run a backup:**
+
+```bash
+npx @gamaze/hicortex backup
+# → writes ~/.hicortex/backups/hicortex-<ISO>.tar.gz
+```
+
+The artifact contains the irreplaceable data only: `hicortex.db`, the whole `identity/` tree (global + per-agent `agents/<id>/`), `state.json`, and `capture-cursors.json`. It deliberately **excludes** `config.json` (secrets: `authToken`/`llmApiKey`), `models/`, logs, and the `backups/` dir itself.
+
+**Offsite copy via a hook.** Set `backupCommand` in `~/.hicortex/config.json` and it runs after every backup with the artifact path appended as the last arg (cloud creds + alerting stay in your wrapper, out of the product):
+
+```jsonc
+{
+  "backupDir": "/mnt/backups/hicortex",          // optional; default <home>/backups
+  "backupCommand": "rclone copyto",              // invoked: rclone copyto <path> remote:hicortex/
+  "backupRetention": 7                           // keep the N newest artifacts (default 7; 0 = keep all)
+}
+```
+
+**Retention.** After every successful write, the backup dir is pruned to the `backupRetention` newest artifacts — without it each nightly adds a tar.gz forever. Only files matching the product's own `hicortex-*.tar.gz` pattern are ever removed; anything else you keep in the dir is untouched. That pattern is the pruner's — **do not name your own copies `hicortex-*.tar.gz`**: a manual copy kept in the backup dir under that shape counts against retention and will be deleted once it falls past the boundary. Name operator copies differently (e.g. `manual-2026-08-19.tar.gz`). Applies to the nightly stage and `hicortex backup` alike (not to `--stdout`, which writes nothing on disk).
+
+A failing, missing, or timed-out hook (5 min) reports failure and **never throws** — the artifact is already on disk; only the offsite copy didn't land. Both `hicortex backup` (non-zero exit) and the nightly stage surface the failure.
+
+**Stream to stdout** (pipe to any offsite transport, no on-disk artifact):
+
+```bash
+npx @gamaze/hicortex backup --stdout | rclone rcat remote:hicortex/$(date -I).tar.gz
+```
+
+`--stdout` is mutually exclusive with `--out`/`backupDir`.
+
+**Nightly stage.** Every full nightly run takes a backup automatically after consolidation and runs the hook if configured — and prunes per `backupRetention`. `--consolidate-only` runs back up too, but at most once a day: the stage is skipped only while the newest existing artifact is younger than ~20 hours (so a timer that fires several times a day still yields exactly one backup per day, bounded by retention). `--capture-only` never backs up (it is frequent and stateless). Backup failure does NOT fail the nightly — capture + consolidation have already succeeded; the failure surfaces as `backupOk:false` in the dashboard snapshot and telemetry for alerting.
+
+**Restore (manual):**
+
+```bash
+# 0. Stop the server (so no writer is touching the DB).
+# 1. Save a current artifact (if the server is still up):
+npx @gamaze/hicortex backup --stdout > save.tar.gz
+# 2. Extract it:
+mkdir /tmp/restore && tar xzf save.tar.gz -C /tmp/restore
+# 3. Drop the snapshot into place + restore the identity/state files.
+#    IMPORTANT: restore the DB to the path the server ACTUALLY uses — check
+#    `hicortex status` for the resolved DB path. It is ~/.hicortex/hicortex.db
+#    by default, BUT if you set HICORTEX_DB_PATH or run a hosted tenant (where
+#    the DB lives at /data/hicortex.db), restore there instead:
+DB=~/.hicortex/hicortex.db          # ← verify with `hicortex status`
+cp /tmp/restore/hicortex.db "$DB"
+cp -r /tmp/restore/identity/* "$(dirname "$DB")/identity/" 2>/dev/null || \
+  cp -r /tmp/restore/identity/* ~/.hicortex/identity/
+cp /tmp/restore/state.json "$(dirname "$DB")/state.json" 2>/dev/null || \
+  cp /tmp/restore/state.json ~/.hicortex/state.json
+cp /tmp/restore/capture-cursors.json "$(dirname "$DB")/capture-cursors.json" 2>/dev/null || \
+  cp /tmp/restore/capture-cursors.json ~/.hicortex/capture-cursors.json
+# 4. Restart the server and verify (hicortex status).
+```
+
+**Restore drill — required before relying on this.** A backup you haven't restored is unverified. Before the first paying customer (and periodically after), run the full restore procedure above into a throwaway `HICORTEX_HOME` and confirm the server opens the DB, recall returns seeded memories, and the identity layer renders. A future `hicortex restore` command is planned; the manual drill is the bar for now.
 
 ## Development
 
@@ -337,7 +435,7 @@ The nightly and the server behave differently on purpose: a malformed config mak
 
 **Tools not visible to agent (OC):** The plugin auto-adds tools to `tools.allow` on startup. Restart the gateway after install.
 
-**OC plugin: "Server unreachable":** The plugin requires a running Hicortex server. Run `npx @gamaze/hicortex init` on the same machine, or set `serverUrl` in the plugin config to point at a remote server.
+**OC plugin: "Server unreachable":** The plugin requires a running Hicortex server. Run `npx @gamaze/hicortex init` on the same machine, or set `serverUrl` in the plugin config (`plugins.entries.hicortex.config` in `~/.openclaw/openclaw.json`; bare top-level keys also work) to point at a remote server.
 
 **LLM auto-config failed:** Check logs for `[hicortex] WARNING`. Add `llmBaseUrl` to plugin config or set `HICORTEX_LLM_BASE_URL` env var (applies to server setup, not the OC plugin itself).
 

@@ -35,7 +35,7 @@ export async function injectSeedLesson(
     storage.insertMemory(database, SEED_LESSON, embedding, {
       sourceAgent: "hicortex/seed",
       project: "global",
-      memoryType: "lesson",
+      memoryType: "learnings",
       baseStrength: 0.95,
     });
     log("[hicortex] Seed lesson injected: Daily Self-Improvement Protocol");

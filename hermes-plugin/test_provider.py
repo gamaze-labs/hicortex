@@ -176,10 +176,10 @@ def test_context_injected_above_lessons_and_agent_passed():
         lessons_payload=_LESSONS,
     )
     out = _mk(client, "test-agent").system_prompt_block()
-    assert "## Context" in out
+    assert "## Identity" in out
     assert "I am the test agent." in out
     # Context is prepended ABOVE the lessons block.
-    assert out.index("## Context") < out.index("## Hicortex long-term memory")
+    assert out.index("## Identity") < out.index("## Hicortex long-term memory")
     # The resolved profile is sent as ?agent=.
     assert client.context_calls == ["test-agent"]
 
@@ -190,7 +190,7 @@ def test_context_gated_out_when_hermes_not_in_clients():
         lessons_payload=_LESSONS,
     )
     out = _mk(client, "test-agent").system_prompt_block()
-    assert "## Context" not in out
+    assert "## Identity" not in out
     assert "## Hicortex long-term memory" in out  # lessons intact
 
 
@@ -201,7 +201,7 @@ def test_context_global_mode_still_echoes_agent_injects():
         lessons_payload=_LESSONS,
     )
     out = _mk(client, "test-agent").system_prompt_block()
-    assert "## Context" in out
+    assert "## Identity" in out
     assert "Be terse." in out
 
 
@@ -212,7 +212,7 @@ def test_old_server_guard_no_echo_no_inject():
         lessons_payload=_LESSONS,
     )
     out = _mk(client, "test-agent").system_prompt_block()
-    assert "## Context" not in out
+    assert "## Identity" not in out
     assert "leaked global." not in out
     assert "## Hicortex long-term memory" in out  # lessons intact
 
@@ -224,7 +224,7 @@ def test_bare_fetch_skips_echo_guard_and_injects_global():
         lessons_payload=_LESSONS,
     )
     out = _mk(client, None).system_prompt_block()
-    assert "## Context" in out
+    assert "## Identity" in out
     assert "global user." in out
     assert client.context_calls == [None]  # no agent id sent
 
@@ -235,19 +235,62 @@ def test_empty_sections_off_mode_no_context_block():
         lessons_payload=_LESSONS,
     )
     out = _mk(client, "second-agent").system_prompt_block()
-    assert "## Context" not in out
+    assert "## Identity" not in out
     assert "## Hicortex long-term memory" in out
 
 
 def test_context_fetch_failure_leaves_lessons_intact():
     client = CtxClient(raise_context=True, lessons_payload=_LESSONS)
     out = _mk(client, "test-agent").system_prompt_block()
-    assert "## Context" not in out
+    assert "## Identity" not in out
     assert "## Hicortex long-term memory" in out
     assert "Lesson A" in out
 
 
-def test_context_section_ordering_user_then_rules_then_alpha():
+def test_context_section_ordering_agent_identity_first_then_user_rules_alpha():
+    # #313 precedence contract (mirrors the TS SECTION_PRECEDENCE — keep in
+    # sync): agent_identity → user → rules → rest alphabetical. Headings use
+    # the #313 scope labels (SECTION_LABELS mirror): "Agent identity" / "User"
+    # / "Global rules".
+    client = CtxClient(
+        context_payload={
+            "sections": {"zebra": "Z.", "rules": "R.", "user": "U.", "apple": "A.", "agent_identity": "AI."},
+            "clients": ["hermes"], "agent": "test-agent", "mode": "override",
+        },
+        lessons_payload=_LESSONS,
+    )
+    out = _mk(client, "test-agent").system_prompt_block()
+    order = [
+        out.index("### Agent identity"),
+        out.index("### User"),
+        out.index("### Global rules"),
+        out.index("### Apple"),
+        out.index("### Zebra"),
+    ]
+    assert order == sorted(order)
+
+
+def test_context_section_scope_labels_with_titlecase_fallback():
+    # #313 CR1: known sections render their scope labels ("Global rules" —
+    # the section is fleet-wide); unknown sections keep the title-case
+    # fallback ("My Notes").
+    client = CtxClient(
+        context_payload={
+            "sections": {"rules": "R.", "my_notes": "N.", "agent_identity": "AI."},
+            "clients": ["hermes"], "agent": "test-agent", "mode": "override",
+        },
+        lessons_payload=_LESSONS,
+    )
+    out = _mk(client, "test-agent").system_prompt_block()
+    assert "### Agent identity" in out
+    assert "### Global rules" in out
+    assert "### Rules\n" not in out  # bare title-case form is gone
+    assert "### My Notes" in out
+
+
+def test_context_section_ordering_no_agent_identity_backcompat():
+    # Regression (#313 AC): global sections render exactly as before — user,
+    # rules, then the rest alphabetically — when no agent_identity is served.
     client = CtxClient(
         context_payload={
             "sections": {"zebra": "Z.", "rules": "R.", "user": "U.", "apple": "A."},
@@ -256,7 +299,7 @@ def test_context_section_ordering_user_then_rules_then_alpha():
         lessons_payload=_LESSONS,
     )
     out = _mk(client, "test-agent").system_prompt_block()
-    order = [out.index("### User"), out.index("### Rules"), out.index("### Apple"), out.index("### Zebra")]
+    order = [out.index("### User"), out.index("### Global rules"), out.index("### Apple"), out.index("### Zebra")]
     assert order == sorted(order)
 
 
@@ -330,7 +373,7 @@ def test_malformed_clients_does_not_break_lessons():
             lessons_payload=_LESSONS,
         )
         out = _mk(client, "test-agent").system_prompt_block()
-        assert "## Context" not in out, f"clients={bad!r} should gate out"
+        assert "## Identity" not in out, f"clients={bad!r} should gate out"
         assert "## Hicortex long-term memory" in out, f"clients={bad!r} broke lessons"
 
 
@@ -353,7 +396,7 @@ def test_context_and_lessons_run_concurrently():
     t0 = time.monotonic()
     out = p.system_prompt_block()
     elapsed = time.monotonic() - t0
-    assert "## Context" in out and "## Hicortex long-term memory" in out
+    assert "## Identity" in out and "## Hicortex long-term memory" in out
     # ~0.2s concurrent vs ~0.4s serial — 0.35s threshold leaves CI margin.
     assert elapsed < 0.35, f"fetches appear serial ({elapsed:.2f}s)"
 

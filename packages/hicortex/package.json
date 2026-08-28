@@ -1,7 +1,7 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.17.5",
-  "description": "Self-learning memory for AI agents — experience captured automatically, distilled into lessons overnight, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, and Pi.",
+  "version": "0.21.0",
+  "description": "Persistent agent identity for AI agents — a hand-edited identity layer, nightly-distilled experience, and lessons injected every session, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, Pi, and opencode.",
   "main": "dist/index.js",
   "bin": {
     "hicortex": "dist/cli.js"
@@ -28,6 +28,8 @@
     "assets/",
     "skills/",
     "hermes-plugin/",
+    "pi-extension/",
+    "opencode-plugin/",
     "openclaw.plugin.json",
     "domains.example.json",
     "README.md",
@@ -40,13 +42,14 @@
     "eval": "node dist/eval/run-eval.js",
     "eval:recall-sweep": "node dist/eval/recall-sweep.js",
     "eval:relevance": "node dist/eval/relevance-eval.js",
-    "prepack": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true",
-    "prepublishOnly": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true"
+    "prepack": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true && rm -rf ./pi-extension && mkdir -p ./pi-extension && cp -r ../../pi-extension/hicortex ./pi-extension/ && rm -rf ./opencode-plugin && mkdir -p ./opencode-plugin && cp -r ../../opencode-plugin/hicortex ./opencode-plugin/",
+    "prepublishOnly": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true && rm -rf ./pi-extension && mkdir -p ./pi-extension && cp -r ../../pi-extension/hicortex ./pi-extension/ && rm -rf ./opencode-plugin && mkdir -p ./opencode-plugin && cp -r ../../opencode-plugin/hicortex ./opencode-plugin/"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/express": "^5.0.6",
     "@types/node": "^22.0.0",
+    "@types/tar-stream": "^3.1.4",
     "typescript": "^5.4.0",
     "vitest": "^3.0.0"
   },
@@ -69,6 +72,8 @@
     "@modelcontextprotocol/sdk": "^1.28.0",
     "better-sqlite3": "^12.11.1",
     "express": "^4.21.0",
-    "sqlite-vec": "^0.1.7"
+    "sqlite-vec": "^0.1.7",
+    "tar-stream": "^2.2.0",
+    "undici": "^8.10.0"
   }
 }

@@ -1,0 +1,10 @@
+# Reduce the Docker build context (the tenant Dockerfile builds with context =
+# repo root). Excludes only trees no Docker build here needs — safe for both the
+# hosted tenant image (Dockerfile.tenant) and the control-plane web/ image.
+**/node_modules
+**/dist
+**/dist-pro
+.git
+data
+**/*.log
+**/.DS_Store

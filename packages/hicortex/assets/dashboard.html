@@ -105,7 +105,7 @@
     color: var(--text); font-weight: 600; text-decoration: none;
     letter-spacing: 0.02em;
   }
-  .hc-nav-links { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .hc-nav-links { display: flex; align-items: center; gap: 16px; }
   .hc-nav-links a {
     color: var(--text-dim); text-decoration: none; transition: color 0.12s;
   }
@@ -113,6 +113,13 @@
   .hc-nav-links a[data-nav-active] { color: var(--text); }
   .hc-nav-disabled {
     color: var(--text-dim); opacity: 0.4; cursor: not-allowed; user-select: none;
+  }
+  /* Account identity (hosted): "Name · Org" + a plan pill, far right (the
+     links sit LEFT next to the logo; this element owns the right side). */
+  .hc-nav-account { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; color: var(--text); }
+  .hc-nav-account .plan {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    background: rgba(128,128,128,0.18); font-size: 11px; color: var(--text-dim);
   }
 </style>
 </head>
@@ -122,9 +129,10 @@
   <div class="hc-nav-links">
     <a href="/dashboard" data-nav-active>Dashboard</a>
     <a href="/viz">Graph</a>
-    <a href="/context/ui">Context</a>
+    <a href="/identity/ui">Identity</a>
     <span class="hc-nav-disabled" title="Coming soon — #250">Self-improvement</span>
   </div>
+  <span id="nav-account" class="hc-nav-account"></span>
 </nav>
 <h1>Hicortex — memory dashboard</h1>
 <div class="sub">View-only analytics. All metrics derived from the live corpus + nightly snapshots.</div>
@@ -183,6 +191,10 @@
   <div id="digest-dedup"></div>
   <h2 id="digest-tokens-section" style="margin-top:16px;display:none;">Token usage breakdown by stage</h2>
   <div id="digest-tokens"></div>
+  <div id="digest-budget-section" style="margin-top:16px;display:none;">
+    <div class="sub" style="margin-bottom:6px;">Consolidation + LLM usage — two usage-vs-budget bars: per-run LLM calls spent vs the consolidation ceiling, and this billing period's tokens vs the monthly fair-use cap. The amber pill appears only when the call cap was hit. The tokens bar renders only when a monthly cap is configured (cap &gt; 0); uncapped installs (the self-hosted default) show the absolute token count instead.</div>
+    <div id="digest-budget"></div>
+  </div>
 </div>
 
 <div class="sub muted" style="margin-top:24px;">
@@ -194,7 +206,7 @@
 <script>
 "use strict";
 // ---------------------------------------------------------------------------
-// Token handling — mirror /viz + /context/ui: ?token= handoff (stripped on
+// Token handling — mirror /viz + /identity/ui: ?token= handoff (stripped on
 // load), localStorage persistence, 401 prompt. Same-origin fetch only.
 // ---------------------------------------------------------------------------
 const TOKEN_KEY = "hicortex-dashboard-token";
@@ -215,6 +227,16 @@ async function fetchData(path) {
   if (token) headers["Authorization"] = "Bearer " + token;
   const resp = await fetch(path, { headers });
   if (resp.status === 401) {
+    // Offer the hosted Google login when the router has auth configured
+    // (bearer-only servers answer 503 on /auth/*); the raw token prompt
+    // stays for power users and self-hosted installs.
+    try {
+      const probe = await fetch("/auth/google/start", { redirect: "manual" });
+      if (probe.status !== 503 && confirm("Sign in with Google? (Cancel to enter a token instead)")) {
+        location.href = "/auth/google/start";
+        throw new Error("redirecting to login");
+      }
+    } catch (e) { if (String(e.message).includes("redirecting")) throw e; }
     token = prompt("Hicortex auth token:") || "";
     if (token) {
       localStorage.setItem(TOKEN_KEY, token);
@@ -226,6 +248,32 @@ async function fetchData(path) {
   return resp.json();
 }
 
+
+// Upgrade → Stripe Checkout (#298). Annual is the default plan (pricing
+// decision: annual pre-selected, "pay for 9, get 12"). Failures alert generic.
+function wireUpgrade() {
+  const btn = $("nav-upgrade");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      const resp = await fetch("/stripe/checkout", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ plan: "annual" }),
+      });
+      if (resp.status === 401) { location.href = "/auth/google/start"; return; }
+      const body = await resp.json().catch(() => ({}));
+      if (resp.ok && body.url) { location.href = body.url; return; }
+      alert("Checkout unavailable (" + resp.status + ") — try again later.");
+      btn.disabled = false;
+    } catch {
+      alert("Checkout unreachable — try again later.");
+      btn.disabled = false;
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -233,6 +281,22 @@ let state = null;
 let compKey = "by_type";
 
 const $ = (id) => document.getElementById(id);
+
+// #264 final: the data blob carries the CANONICAL human-term keys
+// (knowledge/experience/decisions/learnings). Legacy raw keys are also mapped
+// so a snapshot taken mid-migrate renders correctly. Unknown keys pass through.
+const TYPE_LABELS = {
+  knowledge: "Knowledge",
+  experience: "Experience",
+  decisions: "Decisions",
+  learnings: "Learnings",
+  // Legacy raw enum (same types, renamed).
+  fact: "Knowledge",
+  episode: "Experience",
+  decision: "Decisions",
+  lesson: "Learnings"
+};
+function labelForType(t) { return TYPE_LABELS[t] || t; }
 
 // ---------------------------------------------------------------------------
 // Render: headline
@@ -262,9 +326,10 @@ function renderHeadline(h) {
   }
   // LLM tokens this period (#246): hidden when `used` is 0 (no metered run yet
   // — nothing to show). When capped (cap > 0), render a usage bar with the
-  // percentage; amber at ≥85%, red at ≥100%. When uncapped (self-hosted
-  // default), show just the count. Both shapes include "this month" so the
-  // billing-period framing is uniform.
+  // percentage; amber at ≥85%, red at ≥100% — the same gauge pattern as the
+  // soft-cap capacity stat. When uncapped (self-hosted default), show just the
+  // count (no denominator → no bar, matching the digest section's convention).
+  // The total includes distill + consolidation since #287 (always-recorded).
   let tokenStat = "";
   const tok = h.tokens;
   if (tok && tok.used > 0) {
@@ -275,10 +340,10 @@ function renderHeadline(h) {
       const near = pct >= 85 && !over;
       const barColor = over ? "var(--bad, #e05555)" : near ? "var(--warn, #e0b055)" : "var(--ok, #61c98f)";
       tokenStat = `
-        <div class="stat" style="flex-basis:240px;">
+        <div class="stat">
           <div class="v" style="font-size:18px;">${escapeHtml(usedStr)} <span class="muted" style="font-size:13px;">/ ${escapeHtml(formatTokens(tok.cap))}</span></div>
           <div class="l">LLM tokens this month ${over ? "(over cap)" : ""}</div>
-          <div style="margin-top:6px;height:6px;background:rgba(128,128,128,0.2);border-radius:3px;overflow:hidden;">
+          <div style="margin-top:6px;max-width:360px;height:6px;background:rgba(128,128,128,0.2);border-radius:3px;overflow:hidden;">
             <div style="width:${pct.toFixed(1)}%;height:100%;background:${barColor};"></div>
           </div>
         </div>`;
@@ -293,7 +358,7 @@ function renderHeadline(h) {
   $("headline").innerHTML = `
     <div class="stat"><div class="v">${h.total_memories}</div><div class="l">Total memories</div></div>
     <div class="stat"><div class="v">${ups}</div><div class="l">Uses per showing (headline)</div></div>
-    <div class="stat"><div class="v warn">${h.cold_count}</div><div class="l">Cold long-tail (never shown/used)</div></div>
+    <div class="stat"><div class="v warn">${h.cold_count}</div><div class="l">Cold long-tail (never recalled)</div></div>
     ${capStat}
     ${tokenStat}
   `;
@@ -419,7 +484,10 @@ function renderComposition(comp, key) {
     // attacker-influenced (any authenticated /distill client sets source_agent
     // verbatim). Injected into both a title="..." attribute and text — close
     // the attribute and add an on* handler otherwise.
-    const ek = escapeHtml(k);
+    // #264 WS2: when the composition key is by_type, show the human-term label
+    // (Knowledge/Experience/...) instead of the raw enum value.
+    const display = compKey === "by_type" ? labelForType(k) : k;
+    const ek = escapeHtml(display);
     return `<div class="bar-row"><span class="k" title="${ek}">${ek}</span><span class="track"><span class="fill" style="width:${pct}%"></span></span><span class="n">${v}</span></div>`;
   }).join("");
 }
@@ -434,7 +502,7 @@ function linkId(id) {
   // is a server hex token but escape the text anyway (defense-in-depth).
   return `<a href="/memory?id=${encodeURIComponent(id)}" title="Open memory">${escapeHtml(id.slice(0, 8))}</a>`;
 }
-function renderDigest(digest) {
+function renderDigest(digest, tokens) {
   $("digest-date").textContent = digest.date || "—";
   const s = digest.stages;
   const stages = [
@@ -444,6 +512,8 @@ function renderDigest(digest) {
     `<span class="stage-pill">supersession: ${s.supersession}</span>`,
     s.evicted !== undefined && s.evicted > 0 ? `<span class="stage-pill warn">evicted: ${s.evicted}</span>` : "",
     s.tokens !== undefined ? `<span class="stage-pill">tokens: ${escapeHtml(formatTokens(s.tokens))}</span>` : "",
+    // #255 CR: budget exhaustion pill lives in the dedicated budget-usage bar
+    // below (alert state on top of the continuous used/max bar), not here.
   ].join(" ");
   $("digest-stages").innerHTML = stages;
   // Per-stage token breakdown (#246) — only when the day's run metered tokens
@@ -462,6 +532,102 @@ function renderDigest(digest) {
   } else {
     $("digest-tokens").innerHTML = `<div class="empty">No token usage that day (no metered LLM run).</div>`;
     $("digest-tokens-section").style.display = "none";
+  }
+
+  // #255 CR + tokens-vs-cap: TWO usage-vs-budget bars in this section.
+  //
+  // Bar 1 — Consolidation calls (per-run): budget_calls_used / budget_max_calls.
+  //   Renders whenever the day's run carried both (consolidation ran). The
+  //   amber "budget exhausted" pill sits on top as the alert state.
+  //
+  // Bar 2 — LLM tokens (monthly): tokens.used / tokens.cap, where cap is the
+  //   configured `llmTokensPerMonth` fair-use cap. CONDITIONAL (see the
+  //   section doc): cap > 0 → render a used/cap bar in the SAME green/amber/
+  //   red style; cap <= 0 (the self-hosted default, "unlimited") → render the
+  //   absolute usage figure only (no broken "X / 0" bar). Hidden entirely
+  //   when used is 0 (no metered run yet) — mirroring the headline stat.
+  //
+  // The section shows when EITHER bar renders. XSS-safe: only numbers flow
+  // in (Number + toLocaleString / formatTokens), the only string (deferred
+  // JSON) is escapeHtml'd.
+  const used = s.budget_calls_used;
+  const cap = s.budget_max_calls;
+  const haveCallsBar = typeof used === "number" && typeof cap === "number" && cap > 0;
+
+  // Tokens monthly accrual comes from headline.tokens (state.llmTokensThisPeriod,
+  // the same source the throttle check reads). cap <= 0 = unlimited.
+  const tokUsed = tokens && typeof tokens.used === "number" ? tokens.used : 0;
+  const tokCap = tokens && typeof tokens.cap === "number" ? tokens.cap : 0;
+  const haveTokensBar = tokUsed > 0 && tokCap > 0;
+  const haveTokensAbsolute = tokUsed > 0 && !(tokCap > 0); // uncapped: figure only
+
+  if (haveCallsBar || haveTokensBar || haveTokensAbsolute) {
+    const pieces = [];
+
+    // Bar 1: Consolidation calls.
+    if (haveCallsBar) {
+      const pct = Math.min(100, (used / cap) * 100);
+      const exhausted = s.budget_exhausted === true;
+      const over = used >= cap;
+      const near = pct >= 85 && !over;
+      const barColor = over ? "var(--bad, #e05555)" : near ? "var(--warn, #e0b055)" : "var(--ok, #61c98f)";
+      const deferred = s.budget_deferred_by_stage ?? {};
+      const pill = exhausted
+        ? ` <span class="stage-pill warn" title="Consolidation budget exhausted — LLM-bound stages deferred remaining work. Per-stage refused-request counts: ${escapeHtml(JSON.stringify(deferred))}">budget exhausted</span>`
+        : "";
+      pieces.push(`
+        <div style="margin-bottom:10px;">
+          <div class="muted" style="font-size:12px;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.04em;">Consolidation calls (this run)</div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div style="flex:1;min-width:200px;">
+              <div class="muted" style="font-size:13px;margin-bottom:4px;">
+                ${used.toLocaleString()} / ${cap.toLocaleString()} LLM calls${exhausted ? " — exhausted" : ""}
+              </div>
+              <div style="height:6px;background:rgba(128,128,128,0.2);border-radius:3px;overflow:hidden;">
+                <div style="width:${pct.toFixed(1)}%;height:100%;background:${barColor};"></div>
+              </div>
+            </div>${pill}
+          </div>
+        </div>`);
+    }
+
+    // Bar 2: LLM tokens (monthly). Conditional on cap > 0 for the bar form;
+    // otherwise show the absolute usage figure (uncapped installs).
+    if (haveTokensBar) {
+      const pct = Math.min(100, (tokUsed / tokCap) * 100);
+      const over = tokUsed >= tokCap;
+      const near = pct >= 85 && !over;
+      const barColor = over ? "var(--bad, #e05555)" : near ? "var(--warn, #e0b055)" : "var(--ok, #61c98f)";
+      pieces.push(`
+        <div>
+          <div class="muted" style="font-size:12px;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.04em;">LLM tokens (monthly)</div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+            <div style="flex:1;min-width:200px;">
+              <div class="muted" style="font-size:13px;margin-bottom:4px;">
+                ${escapeHtml(formatTokens(tokUsed))} / ${escapeHtml(formatTokens(tokCap))} tokens${over ? " — over cap" : ""}
+              </div>
+              <div style="height:6px;background:rgba(128,128,128,0.2);border-radius:3px;overflow:hidden;">
+                <div style="width:${pct.toFixed(1)}%;height:100%;background:${barColor};"></div>
+              </div>
+            </div>
+          </div>
+        </div>`);
+    } else if (haveTokensAbsolute) {
+      // Unlimited case (cap <= 0, the self-hosted default): no denominator to
+      // draw a bar against, so show the absolute usage figure only. Never
+      // render a broken "X / 0" bar.
+      pieces.push(`
+        <div>
+          <div class="muted" style="font-size:12px;margin-bottom:4px;text-transform:uppercase;letter-spacing:0.04em;">LLM tokens (monthly) <span style="text-transform:none;letter-spacing:0;">— uncapped</span></div>
+          <div class="muted" style="font-size:13px;">${escapeHtml(formatTokens(tokUsed))} tokens this month</div>
+        </div>`);
+    }
+
+    $("digest-budget").innerHTML = pieces.join("");
+    $("digest-budget-section").style.display = "";
+  } else {
+    $("digest-budget").innerHTML = "";
+    $("digest-budget-section").style.display = "none";
   }
 
   if (digest.sample.length === 0) {
@@ -501,6 +667,54 @@ function escapeHtml(s) {
 }
 
 // ---------------------------------------------------------------------------
+// Render: account identity (hosted) — "Name · Org" + plan pill in the nav.
+// Rendered ONLY when at least one field is non-null (all-null = self-hosted
+// default → no element, no empty pill). Values are operator-set config, but
+// escapeHtml anyway (same posture as every other innerHTML sink here).
+// ---------------------------------------------------------------------------
+function renderAccount(a) {
+  const host = $("nav-account");
+  // Trial users (no plan) get the Upgrade pill — the checkout entry (#298 drill,
+  // #299's first brick). Session-authenticated: the browser's hicortex-session
+  // cookie rides this same-origin fetch; the router maps it to the tenant.
+  const upgrade =
+    a && a.plan === null
+      ? ' <button id="nav-upgrade" type="button" style="background:var(--accent);color:#fff;border:none;border-radius:4px;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer;">Upgrade</button>'
+      : "";
+  if (!a || (a.name === null && a.org === null && a.plan === null)) {
+    host.innerHTML = upgrade || "";
+    if (upgrade) wireUpgrade();
+    return;
+  }
+  const who = [a.name, a.org]
+    .filter((s) => typeof s === "string" && s !== "")
+    .map(escapeHtml)
+    .join(' <span class="muted">·</span> ');
+  const plan = typeof a.plan === "string" && a.plan !== ""
+    ? `<span class="plan">${escapeHtml(a.plan)}</span>`
+    : "";
+  host.innerHTML = (who ? who + " " : "") + plan + upgrade;
+  if (upgrade) wireUpgrade();
+}
+
+// Account data source: the dedicated lightweight GET /account (same shape as
+// the account block /dashboard/data still carries — kept there for the stable
+// payload contract). Fetched independently so the nav renders fail-soft and
+// the code path matches /viz + /identity/ui: 401 or fetch error leaves the
+// span empty, never blocks the page. Runs AFTER the main fetch so a 401
+// token prompt issued by fetchData() has already updated `token`.
+async function loadAccount() {
+  const headers = {};
+  if (token) headers["Authorization"] = "Bearer " + token;
+  try {
+    const resp = await fetch("/account", { headers });
+    if (!resp.ok) return; // fail-soft — the nav pill is never worth an error
+    const data = await resp.json();
+    renderAccount(data.account);
+  } catch (e) { /* network error → leave the span empty */ }
+}
+
+// ---------------------------------------------------------------------------
 // Load + wire controls
 // ---------------------------------------------------------------------------
 async function load() {
@@ -515,9 +729,12 @@ async function load() {
     return;
   }
   renderHeadline(state.headline);
+  loadAccount();
+  // Same range-filtered series as growth/composition — the chart re-renders on
+  // every range switch because the range select triggers this full reload.
   renderGrowth(state.series, $("split").value, $("filter").value);
   renderComposition(state.composition, compKey);
-  renderDigest(state.digest);
+  renderDigest(state.digest, state.headline.tokens);
 
   // Populate the growth-filter from source_agent + domain union (best-effort —
   // a v1 affordance; the series already carries per-day totals, so the filter

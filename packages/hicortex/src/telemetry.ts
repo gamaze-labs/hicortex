@@ -6,11 +6,11 @@
  *   v        — package version
  *   pv       — payload schema version
  *   mode     — server or client
- *   agent    — cc, pi, oc, or mixed (detected from session sources); OMITTED
- *              when the agent type is genuinely unknown (pre-flight abort — no
- *              transcripts read yet). The admin summary buckets a missing agent
- *              as "?", distinct from any real type, so an aborting Hermes/OC
- *              client is never miscounted as "cc".
+ *   agent    — cc, hermes, pi, oc, opencode, or mixed (detected from session
+ *              sources); OMITTED when the agent type is genuinely unknown
+ *              (pre-flight abort — no transcripts read yet). The admin summary
+ *              buckets a missing agent as "?", distinct from any real type, so
+ *              an aborting Hermes/OC client is never miscounted as "cc".
  *   mem      — total memory count
  *   lessons  — total lesson count
  *   lessonsGenerated — lessons created THIS run (server mode only; the per-run
@@ -94,15 +94,19 @@ export interface TelemetryPayload {
    * Consolidation outcome for THIS full nightly (server mode only —
    * capture-only runs send no nightly ping, so the field is absent there).
    * `runConsolidation`'s status: "completed" | "skipped" | "failed", plus
-   * "no_llm" when consolidation was skipped because no LLM was configured, and
+   * "no_llm" when consolidation was skipped because no LLM was configured,
    * "throttled" (#246) when the run was skipped because the
-   * `llmTokensPerMonth` fair-use cap was projected to be exceeded.
+   * `llmTokensPerMonth` fair-use cap was projected to be exceeded, and
+   * "endpoint_down" (#337) when the pre-consolidation readiness probe failed
+   * or the LLM circuit breaker was open after the run — a TRANSIENT state
+   * (retried next run), never reported as "completed" even though the stages
+   * fail soft.
    * "skipped" = the built-in nothing-to-do short-circuit (no new + no unscored
    * memories → zero LLM calls), NOT a failure. Lets the fleet aggregate tell a
    * real consolidation run from a no-op without repurposing `ok` (which is the
    * capture-health signal). 0.17+.
    */
-  consolidation?: "completed" | "skipped" | "failed" | "no_llm" | "throttled";
+  consolidation?: "completed" | "skipped" | "failed" | "no_llm" | "throttled" | "endpoint_down";
   /**
    * Total LLM tokens consumed by THIS nightly's consolidation (#246) — the
    * BudgetTracker total. Server-mode only (capture-only + client runs make no
@@ -111,6 +115,27 @@ export interface TelemetryPayload {
    * wire (that lives in the dashboard snapshot, not the telemetry ping).
    */
   tokens_this_run?: number;
+  /**
+   * True when the per-tenant consolidation budget (`consolidateMaxLlmCalls`)
+   * was exhausted this run (#255) — LLM-bound stages deferred remaining work.
+   * A quality-degradation signal concentrated on heavy users; absent on a
+   * pre-#255 ping, a capture-only/no-LLM/throttled/skipped run, or when the
+   * budget was NOT exhausted (additive optional — the aggregate treats absent
+   * as "no exhaustion / not measurable"). Per-stage deferred counts live in
+   * the dashboard snapshot, not on the wire (mirrors `tokens_this_run`).
+   */
+  budget_exhausted?: boolean;
+  /**
+   * Backup stage outcome (#6, Phase 0B). Present on every full nightly (absent
+   * on capture-only / dry-run / client runs — no backup stage runs there).
+   * `ok` is false when EITHER the snapshot write OR the operator's
+   * `backupCommand` hook failed — the aggregate data-loss-risk signal (a
+   * sustained drop in `backup.ok` means offsite copies are silently not
+   * landing). `bytes` is the compressed artifact size (0 when the snapshot
+   * itself failed before producing a file). The operator's hook owns active
+   * alerting (email/Discord); this field is the passive fleet-health signal.
+   */
+  backup?: { ok: boolean; bytes: number };
 }
 
 /**

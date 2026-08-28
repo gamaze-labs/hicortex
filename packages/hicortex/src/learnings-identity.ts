@@ -1,31 +1,43 @@
 /**
- * lessons-context — query-time context injection for the CC SessionStart hook.
+ * learnings-identity — query-time identity + lessons injection for the CC
+ * SessionStart hook. (Canonical command name `learnings-identity` since #264;
+ * the legacy `lessons-context` subcommand is kept as a backcompat alias via
+ * resolveCommandAlias so existing installed hooks keep working. Fetches the
+ * identity layer + the lessons block.)
  *
  * Replaces file-based injection (injectLessons / injectLessonsFromServer).
  * Reads ~/.hicortex/config.json to find the server URL, then fetches TWO
  * endpoints concurrently and prints a compact Markdown block to stdout so CC
  * picks it up as session context:
  *
- *   GET /context  → the standing context layer (user info + rules; 0.12).
- *                   Injected as a `## Context` block ONLY when this harness
- *                   ("cc") is in the server-resolved `clients` list (self-gate).
+ *   GET /identity → the standing identity layer (user info + rules; 0.12,
+ *                   renamed from /context in 0.18 #264). Injected as a
+ *                   `## Identity` block ONLY when this harness ("cc") is in
+ *                   the server-resolved `clients` list (self-gate).
  *   GET /lessons  → episodic memory lessons + memory index, rendered as the
  *                   existing `## Hicortex Memory` block.
  *
  * The two fetches run in Promise.all, each with its OWN 3 s timeout and
- * INDEPENDENT fail-soft: a /context failure must never cost the lessons block,
- * and vice versa. Sequential fetches would double worst-case SessionStart
- * latency (~6 s) — see spec §7.
+ * INDEPENDENT fail-soft: an /identity failure must never cost the lessons
+ * block, and vice versa. Sequential fetches would double worst-case
+ * SessionStart latency (~6 s) — see spec §7.
  *
  * Fail-soft by design: ANY failure (missing config, network error, non-2xx,
  * parse error) results in silent exit-0. A broken hook must never block a
- * CC session, and a broken /context fetch must never blank the whole output.
+ * CC session, and a broken /identity fetch must never blank the whole output.
  */
 
 import { readFileSync } from "node:fs";
 import { join, basename } from "node:path";
 import { homedir } from "node:os";
-import { resolveAgentIdentity } from "./context-store.js";
+import {
+  handleIdentityGet,
+  resolveAgentIdentity,
+  SECTION_LABELS,
+  SECTION_PRECEDENCE,
+  serveIdentityBody,
+  type AgentMode,
+} from "./identity-store.js";
 import { lessonsLimit } from "./features.js";
 import { getLessonSelector } from "./extensions.js";
 import { loadState } from "./state.js";
@@ -34,7 +46,7 @@ import type { ModuleIndex } from "./types.js";
 
 const DEFAULT_PORT = 8787;
 
-/** Harness name this hook injects for — used to self-gate on GET /context `clients`. */
+/** Harness name this hook injects for — used to self-gate on GET /identity `clients`. */
 const THIS_HARNESS = "cc";
 
 interface LessonsResponse {
@@ -44,11 +56,11 @@ interface LessonsResponse {
 }
 
 /**
- * The GET /context response shape, shared by the CC hook and the OC plugin so
+ * The GET /identity response shape, shared by the CC hook and the OC plugin so
  * their gating cannot drift. `agent`/`mode` are echoed by a 0.13 server whenever
  * `?agent=` was sent (in EVERY mode); a pre-0.13 server omits them.
  */
-export interface ContextResponse {
+export interface IdentityResponse {
   sections?: Record<string, string>;
   updated_at?: string;
   clients?: string[];
@@ -60,7 +72,7 @@ export interface ResolvedConfig {
   serverUrl: string;
   authToken: string | undefined;
   home: string;
-  /** Per-agent context id sent as ?agent= (0.13); null → global (no param). */
+  /** Per-agent identity id sent as ?agent= (0.13); null → global (no param). */
   agentName: string | null;
   /** Max lessons to inject (config.lessonsLimit, default 10). */
   lessonsLimit?: number;
@@ -86,10 +98,10 @@ export function resolveConfig(): ResolvedConfig | null {
     ? (config.serverUrl as string).replace(/\/+$/, "")
     : `http://127.0.0.1:${(config.port as number | undefined) ?? DEFAULT_PORT}`;
 
-  // Per-agent context id (0.13) via the shared resolver, so the id sent here
+  // Per-agent identity id (0.13) via the shared resolver, so the id sent here
   // always matches what `hicortex status` reports. No configured agentName →
   // agentId null → NO ?agent= (bare fetch): CC's default is the shared global
-  // context. A configured agentName that sanitizes to null → agentId null too
+  // identity. A configured agentName that sanitizes to null → agentId null too
   // (NO ?agent=), never a 400 that the fail-soft hook would silently swallow.
   const agentName = resolveAgentIdentity(config).agentId;
 
@@ -143,7 +155,7 @@ async function fetchLessonsBlock(cfg: ResolvedConfig): Promise<string | null> {
   parts.push("Use `hicortex_recent` at session start for recent project state.");
 
   if (lessonLines.length > 0) {
-    parts.push("", "### Lessons (updated nightly)");
+    parts.push("", "### Learnings (updated nightly)");
     parts.push(...lessonLines);
   }
 
@@ -152,14 +164,14 @@ async function fetchLessonsBlock(cfg: ResolvedConfig): Promise<string | null> {
     parts.push("", "### Memory Index");
     for (const domain of moduleIndex.domains) {
       const kwStr = domain.keywords.length > 0 ? `: ${domain.keywords.join(", ")}` : "";
-      parts.push(`${domain.name} (${domain.memoryCount} memories, ${domain.lessonCount} lessons)${kwStr}`);
+      parts.push(`${domain.name} (${domain.memoryCount} memories, ${domain.lessonCount} Learnings)${kwStr}`);
       if (domain.projects.length > 0) parts.push(`  ${domain.projects.join(" | ")}`);
     }
-    parts.push(`${index.total} memories, ${index.lessonCount} lessons, ${index.sourceCount} agents. Search with \`hicortex_search\`.`);
+    parts.push(`${index.total} memories, ${index.lessonCount} Learnings, ${index.sourceCount} agents. Search with \`hicortex_search\`.`);
   } else if (index.projects.length > 0) {
     parts.push("", "### Memory Index");
     parts.push(index.projects.map(p => `${p.name}: ${p.count}`).join(" | "));
-    parts.push(`${index.total} memories, ${index.lessonCount} lessons, ${index.sourceCount} agents. Search with \`hicortex_search\`.`);
+    parts.push(`${index.total} memories, ${index.lessonCount} Learnings, ${index.sourceCount} agents. Search with \`hicortex_search\`.`);
   }
 
   return parts.join("\n");
@@ -168,7 +180,7 @@ async function fetchLessonsBlock(cfg: ResolvedConfig): Promise<string | null> {
 /**
  * Title-case a section name for its heading: split on `-`/`_`, capitalize each
  * word ("user" → "User", "my_notes" → "My Notes").
- * Exported so the OC plugin (index.ts) renders the `## Context` block
+ * Exported so the OC plugin (index.ts) renders the `## Identity` block
  * identically to the CC hook rather than duplicating the logic.
  */
 export function titleCaseSection(name: string): string {
@@ -180,39 +192,50 @@ export function titleCaseSection(name: string): string {
 }
 
 /**
- * Stable section ordering: `user` first, then `rules` (the seeded primary
- * sections, spec §8), then every other section alphabetically. Server-side
- * enumeration order (readdirSync) is FS-dependent, so we sort here for a
- * deterministic injection block. Exported for reuse by the OC plugin.
+ * Stable section ordering for the rendered `## Identity` block: the #313
+ * precedence contract — `agent_identity` (the agent's own self + role
+ * conduct) first, then `user` (the principal), then `rules` (fleet-wide house
+ * rules), then every other section alphabetically. The list is imported from
+ * identity-store (SECTION_PRECEDENCE) so the server's SERVED order and every
+ * client's RENDERED order are the same definition — they cannot drift.
+ * Server-side enumeration order (readdirSync) is FS-dependent, so we sort
+ * here for a deterministic injection block. Exported for reuse by the OC
+ * plugin; the Python Hermes plugin mirrors this helper — keep them in sync.
  */
 export function orderSectionNames(names: string[]): string[] {
-  const primaries = ["user", "rules"].filter((p) => names.includes(p));
-  const rest = names.filter((n) => n !== "user" && n !== "rules").sort();
+  const primaries = SECTION_PRECEDENCE.filter((p) => names.includes(p));
+  const rest = names.filter((n) => !(SECTION_PRECEDENCE as readonly string[]).includes(n)).sort();
   return [...primaries, ...rest];
 }
 
 /**
- * Render the `## Context` block from a resolved section map, or null when there
+ * Render the `## Identity` block from a resolved section map, or null when there
  * is nothing to inject (no sections, or every section blank after trimming).
  * Pure — no gating, no I/O. Shared verbatim by the CC hook and the OC plugin so
- * both harnesses emit an identical block. Sections are ordered (user, rules,
- * then alphabetical) and rendered under title-cased `###` headings.
+ * both harnesses emit an identical block. Sections are ordered (agent_identity,
+ * user, rules, then alphabetical) and rendered under `###` headings labeled by
+ * the #313 scope map (SECTION_LABELS: "Agent identity" / "User" / "Global
+ * rules"); unknown section names fall back to title-case.
  */
-export function renderContextBlock(sections: Record<string, string>): string | null {
+export function renderIdentityBlock(sections: Record<string, string>): string | null {
   if (!sections || typeof sections !== "object" || Array.isArray(sections)) return null;
   const names = orderSectionNames(Object.keys(sections));
   const bodyParts: string[] = [];
   for (const name of names) {
     const body = sections[name];
     if (typeof body !== "string" || body.trim() === "") continue;
-    bodyParts.push(`### ${titleCaseSection(name)}`, "", body.trim());
+    // Own-property lookup (CR-A): "constructor" is allowlist-VALID, and a
+    // plain SECTION_LABELS[name] would resolve through the Object.prototype
+    // chain and render the inherited function's source as the heading.
+    const label = Object.hasOwn(SECTION_LABELS, name) ? SECTION_LABELS[name] : titleCaseSection(name);
+    bodyParts.push(`### ${label}`, "", body.trim());
   }
   if (bodyParts.length === 0) return null;
-  return ["## Context", "", ...bodyParts].join("\n");
+  return ["## Identity", "", ...bodyParts].join("\n");
 }
 
 /**
- * Gate a GET /context response and render the `## Context` block, or null when
+ * Gate a GET /identity response and render the `## Identity` block, or null when
  * nothing should be injected: `harness` not in the server-resolved `clients`,
  * an empty/blank section set, or — when `requireAgentEcho` — a response that
  * does not echo `agent`. The SINGLE gate used by both CC and OC so the two can
@@ -221,17 +244,88 @@ export function renderContextBlock(sections: Record<string, string>): string | n
  *
  * `requireAgentEcho` is the old-server guard, and it is the CALLER's decision:
  *   - OC passes `agentId !== null` — when it actually sent an id, a 0.12 server
- *     that ignores `?agent=` (200 global, no echo) must NOT leak global context
+ *     that ignores `?agent=` (200 global, no echo) must NOT leak global identity
  *     into every persona; on a bare fetch (no id) the guard is off (amendment
  *     A2).
  *   - CC passes `false` ALWAYS and deliberately (see the call site): a thin CC
  *     client auto-upgrades via npx BEFORE the server does, so during the upgrade
  *     window it talks to a 0.12 server that cannot hold ANY per-agent config —
  *     global IS the operator's intended state there, and a guard would instead
- *     blank ALL context for every CC session in that window.
+ *     blank ALL identity for every CC session in that window.
  */
-export function gateAndRenderContext(
-  data: ContextResponse,
+/**
+ * Result of `buildIdentityToolResult` — the MCP tool handler maps this to its
+ * `{content:[{type:"text",text}],isError?}` shape. Pure value: no MCP SDK
+ * types leak here so the function is unit-testable with no harness.
+ */
+export interface IdentityToolResult {
+  text: string;
+  isError?: boolean;
+}
+
+/**
+ * Build the `hicortex_identity` MCP tool result from the SAME pure pipeline the
+ * REST `GET /identity` route and the SessionStart hook use (#264 CRITICAL fix:
+ * previously the tool was a closure inside `createMcpServer()` that tests
+ * re-implemented locally, so the production path was never exercised).
+ *
+ * Pipeline (kept identical to REST + hook by CONSTRUCTION, not by mirroring):
+ *  1. `handleIdentityGet` — the real GET /identity handler, with the optional
+ *     `agent` param forwarded so per-agent installs resolve the right scope
+ *     (WARNING-2: previously the tool always passed `{}` → global, so an agent
+ *     with an override saw the wrong identity).
+ *  2. `serveIdentityBody` — the ONE composition helper (REST uses it too):
+ *     injects the synthetic product-owned `memory` section (WARNING-1: the
+ *     REST route + SessionStart hook inject it; the tool did not,
+ *     contradicting its "same data" docs) and applies the SECTION_PRECEDENCE
+ *     wire order.
+ *  3. optional `name` filter, then `renderIdentityBlock` for the `### <Label>`
+ *     markdown the hook injects.
+ *
+ * Pure: no I/O of its own (the only I/O is `handleIdentityGet` reading the
+ * identity dir, which is the same I/O the REST route does). Takes the resolved
+ * `identityClients` / `identityAgents` the daemon already holds at boot.
+ */
+export function buildIdentityToolResult(
+  identityDir: string,
+  identityClients: string[],
+  identityAgents: Record<string, AgentMode>,
+  opts: { name?: string; agent?: string; memoryInstructionsEnabled: boolean },
+): IdentityToolResult {
+  // WARNING-2: forward `agent` so per-agent installs resolve the right scope.
+  // An invalid id makes handleIdentityGet return a 400 → surfaced as isError.
+  const query: Record<string, unknown> = opts.agent ? { agent: opts.agent } : {};
+  // WARNING-1: inject the synthetic `memory` section exactly like REST + the
+  // SessionStart hook — via the ONE composition helper (serveIdentityBody,
+  // #313 CR3) so the tool's served order is the routes' served order.
+  const r = serveIdentityBody(
+    handleIdentityGet(identityDir, identityClients, query, identityAgents),
+    opts.memoryInstructionsEnabled,
+  );
+  if (r.status !== 200) {
+    const errBody = r.body as { error?: string };
+    return {
+      text: `Identity fetch failed: ${JSON.stringify(errBody.error ?? r.body)}`,
+      isError: true,
+    };
+  }
+
+  const sections = (r.body as { sections?: Record<string, string> }).sections ?? {};
+  const filtered = opts.name
+    ? (sections[opts.name] !== undefined ? { [opts.name]: sections[opts.name] } : {})
+    : sections;
+  const block = renderIdentityBlock(filtered);
+  if (block === null) {
+    const text = opts.name
+      ? `No identity section named '${opts.name}'.`
+      : "No identity sections configured.";
+    return { text };
+  }
+  return { text: block };
+}
+
+export function gateAndRenderIdentity(
+  data: IdentityResponse,
   harness: string,
   opts: { requireAgentEcho: boolean },
 ): string | null {
@@ -239,56 +333,63 @@ export function gateAndRenderContext(
   const clients = Array.isArray(data.clients) ? data.clients : [];
   if (!clients.includes(harness)) return null;
   if (opts.requireAgentEcho && typeof data.agent !== "string") return null;
-  return renderContextBlock(data.sections ?? {});
+  return renderIdentityBlock(data.sections ?? {});
 }
 
 /**
- * Fetch /context and build the `## Context` block, or null when nothing should
+ * Fetch /identity and build the `## Identity` block, or null when nothing should
  * be injected: non-2xx, this harness not in `clients`, no sections, or all
  * sections empty. Throws propagate to the caller's fail-soft catch.
  */
-async function fetchContextBlock(cfg: ResolvedConfig): Promise<string | null> {
+async function fetchIdentityBlock(cfg: ResolvedConfig): Promise<string | null> {
   // Send ?agent= only when we have a valid id; the server does the merge and
   // returns the resolved sections, so the hook stays dumb (no client-side mode
   // logic). A null id (CC's default: no configured agentName, or a configured
-  // value that sanitizes to nothing) → bare /context → the shared global set.
+  // value that sanitizes to nothing) → bare /identity → the shared global set.
   const url = cfg.agentName
-    ? `${cfg.serverUrl}/context?agent=${encodeURIComponent(cfg.agentName)}`
-    : `${cfg.serverUrl}/context`;
+    ? `${cfg.serverUrl}/identity?agent=${encodeURIComponent(cfg.agentName)}`
+    : `${cfg.serverUrl}/identity`;
   const resp = await fetch(url, {
     headers: authHeaders(cfg.authToken),
     signal: AbortSignal.timeout(3000),
   });
   if (!resp.ok) return null;
-  const data = await resp.json() as ContextResponse;
+  const data = await resp.json() as IdentityResponse;
 
   // CC deliberately passes requireAgentEcho: false (NOT the OC/Hermes old-server
   // guard). A thin CC client auto-upgrades via npx BEFORE the server does, so
-  // mid-upgrade it may hit a 0.12 server that returns global context with no
+  // mid-upgrade it may hit a 0.12 server that returns global identity with no
   // `agent` echo — and a 0.12 server cannot hold per-agent config, so global is
-  // the intended state. Guarding here would blank ALL CC context in that window.
-  return gateAndRenderContext(data, THIS_HARNESS, { requireAgentEcho: false });
+  // the intended state. Guarding here would blank ALL CC identity in that window.
+  return gateAndRenderIdentity(data, THIS_HARNESS, { requireAgentEcho: false });
 }
 
 /**
- * Fetch context + lessons concurrently and return the combined Markdown block,
+ * Fetch identity + lessons concurrently and return the combined Markdown block,
  * or null when neither yields anything (nothing to inject; caller prints
- * nothing and exits 0). The `## Context` block is prepended before the existing
+ * nothing and exits 0). The `## Identity` block is prepended before the existing
  * `## Hicortex Memory` block.
  */
-export async function fetchLessonsContext(): Promise<string | null> {
+export async function fetchLessonsIdentity(): Promise<string | null> {
   const cfg = resolveConfig();
   if (!cfg) return null;
 
   // Independent fail-soft: each branch degrades to null without affecting the
   // other. Promise.all runs them concurrently — each carries its own 3 s
   // timeout, so worst-case latency stays ~3 s, not ~6 s (spec §7).
-  const [contextBlock, lessonsBlock] = await Promise.all([
-    fetchContextBlock(cfg).catch(() => null),
+  const [identityBlock, lessonsBlock] = await Promise.all([
+    fetchIdentityBlock(cfg).catch(() => null),
     fetchLessonsBlock(cfg).catch(() => null),
   ]);
 
-  const blocks = [contextBlock, lessonsBlock].filter((b): b is string => b !== null && b !== "");
+  const blocks = [identityBlock, lessonsBlock].filter((b): b is string => b !== null && b !== "");
   if (blocks.length === 0) return null;
   return blocks.join("\n\n");
 }
+
+/** Backcompat alias (#264). */
+export const fetchLessonsContext = fetchLessonsIdentity;
+/** Backcompat aliases (#264) for the renamed symbols. */
+export const renderContextBlock = renderIdentityBlock;
+export const gateAndRenderContext = gateAndRenderIdentity;
+export type ContextResponse = IdentityResponse;

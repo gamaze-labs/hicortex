@@ -91,6 +91,17 @@ export interface PostResult {
   dropped?: string[];
   skipped?: boolean;
   error?: string;
+  /**
+   * Parsed `Retry-After` of a 429 response, in ms (#327). Absent when the
+   * response carried no parseable header. Honored (capped) by the in-run
+   * rate-limit retry; a token-budget 429 ignores it (terminal, not transient).
+   */
+  retryAfterMs?: number;
+  /**
+   * The segment's metered LLM usage from the 201 body (#287). Absent on a
+   * pre-#287 daemon (or any non-201) — callers must treat absent as zero.
+   */
+  usage?: { prompt: number; completion: number; total: number };
 }
 
 export type PostFn = (body: DistillBody) => Promise<PostResult>;
@@ -120,9 +131,27 @@ export interface CaptureResult {
   hadTransientFailure: boolean;
   /**
    * Set when the loop stopped early on a terminal server response: "limit"
-   * (429 memory cap) or "auth" (401). The caller decides watermark handling.
+   * (token-budget 429, mcp-server.ts's `"token budget exceeded"` gate) or
+   * "auth" (401). A rate-limit 429 never sets this — it is transient (#327).
+   * The caller decides watermark handling.
    */
   stopped?: "limit" | "auth";
+  /**
+   * Run-global rate-429 latch (#327 CR): true when at least one session
+   * SURRENDERED to a rate-limit 429 (the transient kind — postWithRateRetry
+   * exhausted its in-run retries) and the remaining sessions were skipped
+   * without POSTing. Mirrors `stopped`'s role but is transient, not terminal:
+   * hadTransientFailure is also set, so the watermark holds and every skipped
+   * session retries next run with its cursor untouched.
+   */
+  rateLimited: boolean;
+  /**
+   * Sum of the successful segments' reported LLM usage (#287) — the run's
+   * distill spend, for the dashboard snapshot's token totals. Zero-filled when
+   * the daemon predates the usage field (an old server) or nothing distilled,
+   * so callers gate on `total > 0`, not on presence.
+   */
+  distillUsage: { prompt: number; completion: number; total: number };
 }
 
 /**
@@ -217,11 +246,88 @@ export function packSegments(
   return segments;
 }
 
+// ---------------------------------------------------------------------------
+// 429 taxonomy (#327) — two producers share one status code
+// ---------------------------------------------------------------------------
+//   - The tenant server's token-budget gate (mcp-server.ts:1205) answers
+//     429 `{"error":"token budget exceeded"}` — TERMINAL for the billing
+//     period; retrying cannot help, so capture stops with stopped:"limit".
+//   - A rate limit (e.g. a hosted router's per-token limiter answering
+//     429 `{"error":"rate limit exceeded"}` + Retry-After) is TRANSIENT —
+//     the window passes in seconds/minutes. Treating it as the terminal
+//     limit-stop left nightlies failing forever with the wrong diagnosis.
+// The body's error string is the discriminator: only the budget gate says
+// "token budget".
+
+/** True when a 429 result is the tenant token-budget gate (terminal). */
+export function isTokenBudget429(result: PostResult): boolean {
+  return typeof result.error === "string" && /token budget/i.test(result.error);
+}
+
+/** In-run retries for a rate-limit 429 before giving up as transient. */
+export const RATE_LIMIT_RETRIES = 3;
+
+/**
+ * Backoff schedule (ms) between rate-429 retries: 5s, 15s, 30s — short enough
+ * to ride out a per-token limiter window inside one nightly, long enough to
+ * let a busy shared backend drain. Overridable via
+ * HICORTEX_RATE_LIMIT_BACKOFF_MS (comma-separated ms list — tests only).
+ */
+const RATE_LIMIT_BACKOFF_MS = [5_000, 15_000, 30_000];
+
+/**
+ * Cap on an honored Retry-After. The header is advisory and can name a window
+ * far beyond one nightly (an hourly limiter saying 3600); waiting it out
+ * in-run would stall the run for hours with the capture lock held. Past the
+ * cap we give up as transient — the cursor holds and the next run retries.
+ */
+const RATE_LIMIT_RETRY_AFTER_CAP_MS = 5 * 60 * 1000;
+
+function rateLimitBackoffSchedule(): number[] {
+  const env = process.env.HICORTEX_RATE_LIMIT_BACKOFF_MS;
+  if (env && env.trim()) {
+    const parsed = env.split(",").map((s) => Number(s.trim()));
+    if (parsed.length > 0 && parsed.every((n) => Number.isFinite(n) && n >= 0)) {
+      return parsed;
+    }
+  }
+  return RATE_LIMIT_BACKOFF_MS;
+}
+
+/**
+ * POST one segment, retrying in-run while the answer is a TRANSIENT
+ * (non-budget) 429. Returns the final result — a budget-429 passes through
+ * untouched (the caller's terminal branch) and a rate-429 that survived every
+ * retry is returned as-is for the caller's transient branch. Network errors
+ * propagate to the caller's existing catch (message preserved).
+ */
+async function postWithRateRetry(post: PostFn, body: DistillBody): Promise<PostResult> {
+  const schedule = rateLimitBackoffSchedule();
+  for (let attempt = 0; ; attempt++) {
+    const result = await post(body);
+    if (result.status !== 429 || isTokenBudget429(result)) return result;
+    if (attempt >= RATE_LIMIT_RETRIES || attempt >= schedule.length) return result;
+    const waitMs =
+      result.retryAfterMs != null && result.retryAfterMs > 0
+        ? Math.min(result.retryAfterMs, RATE_LIMIT_RETRY_AFTER_CAP_MS)
+        : schedule[attempt];
+    console.log(
+      `[hicortex]     Rate limited (${result.error ?? "429"}) — retrying segment in ` +
+        `${Math.round(waitMs / 1000)}s (retry ${attempt + 1}/${RATE_LIMIT_RETRIES})`,
+    );
+    await sleep(waitMs);
+  }
+}
+
 /**
  * Capture a list of session delta batches: pack, POST in order, advance
  * per-session cursors on success. Segments of one session POST in order; the
  * first hard failure stops THAT session (cursor holds at the last confirmed
- * boundary) while other sessions continue. A 429/401 stops the whole loop.
+ * boundary) while other sessions continue. A budget-429/401 stops the whole
+ * loop; a rate-429 is retried in-run before giving up as transient — and a
+ * SURRENDERED rate-429 latches the whole run: remaining sessions skip
+ * without POSTing (their cursors hold; next run retries) instead of each
+ * re-paying the Retry-After ladder (#327).
  */
 export async function captureBatches(
   batches: TranscriptBatch[],
@@ -232,8 +338,17 @@ export async function captureBatches(
   let sessionsSent = 0;
   let hadTransientFailure = false;
   let stopped: "limit" | "auth" | undefined;
+  // Run-global rate-429 latch (#327 CR): once one session has paid the full
+  // Retry-After ladder and surrendered, the limiter window is exhausted for
+  // THIS run — letting each remaining session re-pay the ladder (worst case
+  // ~15 min each at the 5-min cap, with the capture lock held) can stretch a
+  // 20-session run to hours for zero accepted segments.
+  let rateLimited = false;
+  // #287: distill tokens reported by successful 201s only — skips (200) and
+  // failures metered nothing client-side.
+  const distillUsage = { prompt: 0, completion: 0, total: 0 };
 
-  for (const batch of batches) {
+  for (const [batchIdx, batch] of batches.entries()) {
     const short = batch.sessionId.slice(0, 8);
     const segments = packSegments(batch.entries, batch.startCursor, batch.entryCursors, segmentMaxChars);
 
@@ -298,7 +413,7 @@ export async function captureBatches(
 
       let result: PostResult;
       try {
-        result = await post(body);
+        result = await postWithRateRetry(post, body);
       } catch (err) {
         console.error(`[hicortex]     Capture failed: ${err instanceof Error ? err.message : String(err)} — will retry next run`);
         hadTransientFailure = true;
@@ -308,6 +423,11 @@ export async function captureBatches(
       if (result.status === 201) {
         memoriesIngested += result.distilled ?? 0;
         sessionPosted = true;
+        if (result.usage) {
+          distillUsage.prompt += result.usage.prompt;
+          distillUsage.completion += result.usage.completion;
+          distillUsage.total += result.usage.total;
+        }
         if (advancesBoundary) lastConfirmedEnd = seg.segEnd;
         console.log(`[hicortex]     → ${result.distilled ?? 0} memories (segment ${body.segment_id})`);
         for (const d of result.dropped ?? []) {
@@ -318,9 +438,23 @@ export async function captureBatches(
         // confirmed and advance past it (only at a boundary, per fix 11).
         if (advancesBoundary) lastConfirmedEnd = seg.segEnd;
         if (result.skipped) console.log(`[hicortex]     Segment ${body.segment_id} already ingested`);
-      } else if (result.status === 429) {
+      } else if (result.status === 429 && isTokenBudget429(result)) {
         console.log(`[hicortex]   Memory limit reached: ${result.error}. Stopping capture.`);
         stopped = "limit";
+        break;
+      } else if (result.status === 429) {
+        // Rate-limit 429 that already burned its in-run retries (postWithRateRetry).
+        // Transient, NOT a limit stop (#327): hold the cursor, let the next run
+        // retry — a misdiagnosed "memory limit" here failed nightlies forever.
+        console.error(
+          `[hicortex]     Rate limited: ${result.error ?? "429"} — giving up this run, ` +
+          `will retry next run (cursor held)`,
+        );
+        hadTransientFailure = true;
+        // Latch the WHOLE run (see the declaration above): remaining sessions
+        // are skipped below, cursors untouched — they retry next run instead
+        // of each re-paying the full Retry-After ladder.
+        rateLimited = true;
         break;
       } else if (result.status === 401) {
         console.error(`[hicortex]     Auth failed. Check authToken in ~/.hicortex/config.json`);
@@ -353,9 +487,19 @@ export async function captureBatches(
     }
 
     if (stopped) break;
+    if (rateLimited) {
+      const remaining = batches.length - batchIdx - 1;
+      if (remaining > 0) {
+        console.error(
+          `[hicortex]   Rate limited earlier this run — skipping ${remaining} remaining ` +
+          `session(s); they retry next run (cursors untouched)`,
+        );
+      }
+      break;
+    }
   }
 
-  return { memoriesIngested, sessionsSent, hadTransientFailure, stopped };
+  return { memoriesIngested, sessionsSent, hadTransientFailure, stopped, rateLimited, distillUsage };
 }
 
 // ---------------------------------------------------------------------------

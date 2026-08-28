@@ -23,8 +23,8 @@ import type express from "express";
 import type Database from "better-sqlite3";
 
 import { formatIndexLine } from "./recall-index.js";
-import { readPositiveConfig, readNonNegativeConfig } from "./config-read.js";
-import { DEFAULT_MEMORY_SOFT_CAP } from "./consolidate.js";
+import { readPositiveConfig, readNonNegativeConfig, readAccount } from "./config-read.js";
+import { resolveMemorySoftCap } from "./consolidate.js";
 import { loadState } from "./state.js";
 
 // ---------------------------------------------------------------------------
@@ -50,13 +50,61 @@ export interface DashboardMetrics {
      *  cap; undefined on backfill rows (a stage outcome, not reconstructable). */
     evicted?: number;
     /**
-     * Total LLM tokens consumed by this run's consolidation (#246). Undefined
-     * in lockstep with `tokens_by_stage` (and on backfill rows, which can't
-     * reconstruct a per-run meter).
+     * Total LLM tokens consumed by this run (#246 consolidation meter; #287
+     * widened to the TRUE total — distill + consolidation). Undefined in
+     * lockstep with `tokens_by_stage` (and on backfill rows, which can't
+     * reconstruct a per-run meter). Older snapshots are consolidation-only:
+     * historical rows can't be reconstructed, which is accepted (#287).
+     * Inherent under-count, same acceptance: attribution is response-based,
+     * so tokens a FAILED distill already spent (500 after spend, response
+     * lost after commit) reach the monthly meter but never a run's total —
+     * after such a night, the month's bars sum slightly below the headline.
      */
     tokens?: number;
-    /** Per-stage breakdown of `tokens` (#246). Undefined on backfill rows. */
+    /**
+     * Per-stage breakdown of `tokens` (#246; #287 adds a `distill` entry for
+     * capture-time distillation). Undefined on backfill rows.
+     */
     tokens_by_stage?: Record<string, { prompt: number; completion: number; total: number }>;
+    /**
+     * Always-on consolidation-budget usage metric (#255 CR). `calls_used` is
+     * how many LLM calls the run actually spent; `max_calls` is the configured
+     * `consolidateMaxLlmCalls` ceiling. Forwarded whenever consolidation ran
+     * (the digest renders a continuous used/max bar, like the token-usage
+     * metric, so you can see the budget climbing before exhaustion). Undefined
+     * on backfill rows and on runs where consolidation didn't execute
+     * (capture-only / no_llm / throttled / skipped) — the page renders no bar.
+     */
+    budget_calls_used?: number;
+    budget_max_calls?: number;
+    /**
+     * True when this run's consolidation budget (`consolidateMaxLlmCalls`)
+     * was exhausted — LLM-bound stages deferred remaining work (#255).
+     * Forwarded ONLY on exhaustion (the alert state on top of the always-on
+     * usage bar). Undefined on healthy runs (where budget_calls_used is still
+     * present), backfill rows, and non-run nights.
+     */
+    budget_exhausted?: boolean;
+    /**
+     * Per-stage count of refused LLM-call requests on an exhausted run (#255).
+     * Mirrors ConsolidationReport.budget.deferred_by_stage. Forwarded in
+     * lockstep with `budget_exhausted` (exhausted runs only) so the snapshot
+     * shape is clean on healthy runs.
+     */
+    budget_deferred_by_stage?: Record<string, number>;
+    /**
+     * #6 backup stage outcome (Phase 0B). Present whenever the backup stage
+     * ran (full nightly); absent on capture-only / dry-run / backfill rows.
+     * `ok` is false when the snapshot OR the operator's offsite hook failed —
+     * the page flags a night the offsite copy didn't land. `bytes` is the
+     * compressed artifact size; `path` is the on-disk artifact (for "where
+     * did the last backup land?" debugging — not a restore button).
+     */
+    backup?: {
+      ok: boolean;
+      bytes: number;
+      path?: string;
+    };
   };
   /** Corpus capacity (#245). `memory_soft_cap` is the configured ceiling (0 =
    *  disabled); always present in real snapshots, undefined on backfilled
@@ -82,6 +130,13 @@ export interface DashboardSnapshot {
 
 /** The /dashboard/data response — the full payload the page renders. */
 export interface DashboardData {
+  /**
+   * Account identity (hosted): who the viewer is, so a user holding two
+   * tenant tokens can tell whose data the page shows. Each field is null when
+   * its config key (displayName/orgName/planLabel) is absent — the page
+   * renders nothing when ALL are null (the self-hosted default).
+   */
+  account: { name: string | null; org: string | null; plan: string | null };
   headline: {
     total_memories: number;
     uses_per_showing: number | null;
@@ -121,10 +176,22 @@ export interface DashboardData {
       supersession: number;
       added: number;
       evicted?: number;
-      /** Total tokens consumed that run (#246). Undefined = no metered run. */
+      /** Total tokens consumed that run (#246; #287: distill + consolidation).
+       *  Undefined = no metered run. */
       tokens?: number;
-      /** Per-stage breakdown of `tokens` (#246). */
+      /** Per-stage breakdown of `tokens` (#246; #287 adds `distill`). */
       tokens_by_stage?: Record<string, { prompt: number; completion: number; total: number }>;
+      /**
+       * Always-on consolidation-budget usage (#255 CR). Present whenever the
+       * day's snapshot carries them (consolidation ran). The page renders a
+       * used/max bar in the same style as the token-usage metric.
+       */
+      budget_calls_used?: number;
+      budget_max_calls?: number;
+      /** True when the run exhausted its consolidation budget (#255). */
+      budget_exhausted?: boolean;
+      /** Per-stage refused-request counts on an exhausted run (#255). */
+      budget_deferred_by_stage?: Record<string, number>;
     };
     dedup_merges: {
       loser_id: string;
@@ -165,7 +232,7 @@ export function computeDashboardMetrics(db: Database.Database): DashboardMetrics
   ).c;
   const lesson = (
     db
-      .prepare("SELECT COUNT(*) AS c FROM memories WHERE memory_type = 'lesson'")
+      .prepare("SELECT COUNT(*) AS c FROM memories WHERE memory_type = 'learnings'")
       .get() as { c: number }
   ).c;
   const link = (
@@ -228,6 +295,44 @@ export interface NightlyDelta {
    * `tokensThisRun`.
    */
   tokensByStage?: Record<string, { prompt: number; completion: number; total: number }>;
+  /**
+   * Distill tokens metered by the daemon across this run's capture POSTs
+   * (#287) — summed from the /distill responses by the capture loop. Merged
+   * into the snapshot so `new_this_run.tokens` is the run's TRUE total
+   * (distill + consolidation) and `distill` joins `tokens_by_stage`. Zero
+   * (a daemon predating the usage field, or nothing distilled) is a no-op:
+   * the row keeps its consolidation-only shape.
+   */
+  distillUsage?: { prompt: number; completion: number; total: number };
+  /**
+   * Always-on consolidation-budget usage (#255 CR). Forwarded whenever
+   * consolidation ran so the dashboard renders a continuous used/max bar.
+   * `callsUsed` = LLM calls spent this run; `maxCalls` = configured ceiling.
+   * Undefined in lockstep (both set together when consolidation ran).
+   */
+  budgetCallsUsed?: number;
+  budgetMaxCalls?: number;
+  /**
+   * True when this run's consolidation budget was exhausted (#255) — same as
+   * ConsolidationReport.budget.exhausted. Undefined when consolidation didn't
+   * run (capture-only / no_llm / throttled / skipped) or didn't exhaust.
+   */
+  budgetExhausted?: boolean;
+  /**
+   * Per-stage refused-request counts on an exhausted run (#255) — same shape
+   * as ConsolidationReport.budget.deferred_by_stage. Undefined in lockstep
+   * with `budgetExhausted`.
+   */
+  budgetDeferredByStage?: Record<string, number>;
+  /**
+   * #6 backup stage (Phase 0B). Hoisted from the nightly backup block. Present
+   * whenever the backup stage ran (full nightly); undefined on capture-only /
+   * dry-run. `backupOk` flips to false on snapshot OR hook failure so the
+   * digest can flag a night the offsite copy didn't land.
+   */
+  backupPath?: string;
+  backupBytes?: number;
+  backupOk?: boolean;
 }
 
 /**
@@ -247,17 +352,66 @@ export function writeSnapshot(
   memorySoftCap?: number,
 ): DashboardSnapshot {
   const metrics = computeDashboardMetrics(db);
+  // #287: merge the run's two meters into the customer-facing total. `tokens`
+  // = consolidation (tokensThisRun) + distill (distillUsage.total); the distill
+  // share joins the stage map under its own key. Both fields stay in lockstep —
+  // emitted when EITHER phase metered, omitted when neither did (the page
+  // treats undefined as "no data for this day"). A zero/absent distillUsage
+  // (old daemon, nothing distilled) changes nothing: tokens/tokens_by_stage
+  // come through exactly as the consolidation report produced them.
+  const hasDistill = (delta.distillUsage?.total ?? 0) > 0;
+  const metered = delta.tokensThisRun !== undefined || hasDistill;
+  const mergedTokens = metered
+    ? (delta.tokensThisRun ?? 0) + (hasDistill ? delta.distillUsage!.total : 0)
+    : undefined;
+  const mergedStages = metered
+    ? { ...(delta.tokensByStage ?? {}), ...(hasDistill ? { distill: delta.distillUsage } : {}) }
+    : undefined;
+  // Shape fidelity: `tokens_by_stage` with zero keys never existed pre-#287
+  // (the key was simply absent) — keep it that way so consumers that treat
+  // "present" as "has a breakdown" stay right.
+  const emitStages =
+    mergedStages && Object.keys(mergedStages).length > 0 ? mergedStages : undefined;
   metrics.new_this_run = {
     added: delta.added,
     lessonsGenerated: delta.lessonsGenerated,
     dedup: delta.dedup,
     supersession: delta.supersession,
     evicted: delta.evicted,
-    // #246: forward only when consolidation actually metered tokens this run.
-    // Absent on capture-only / throttled / no-LLM / no-metered-call runs — the
-    // page treats undefined as "no data for this day", matching adoption.
-    ...(delta.tokensThisRun !== undefined ? { tokens: delta.tokensThisRun } : {}),
-    ...(delta.tokensByStage !== undefined ? { tokens_by_stage: delta.tokensByStage } : {}),
+    // #246: forward only when a phase actually metered tokens this run. Absent
+    // on capture-only / throttled / no-LLM / no-metered-call runs — the page
+    // treats undefined as "no data for this day", matching adoption.
+    ...(mergedTokens !== undefined ? { tokens: mergedTokens } : {}),
+    ...(emitStages !== undefined ? { tokens_by_stage: emitStages } : {}),
+    // #255 CR: always-on usage metric — forward calls_used + max_calls
+    // whenever consolidation ran (regardless of exhaustion) so the page can
+    // render a continuous used/max bar. Presence = a run happened; absence =
+    // consolidation didn't execute (capture-only / no_llm / throttled / skipped).
+    ...(delta.budgetCallsUsed !== undefined ? { budget_calls_used: delta.budgetCallsUsed } : {}),
+    ...(delta.budgetMaxCalls !== undefined ? { budget_max_calls: delta.budgetMaxCalls } : {}),
+    // #255: the alert state. budget_exhausted + budget_deferred_by_stage are
+    // gated on the SAME condition (exhausted=true) so the snapshot shape is
+    // clean on healthy runs — no empty {} leaking through (W4). The healthy
+    // signal is carried by budget_calls_used above, not by a false flag here.
+    ...(delta.budgetExhausted
+      ? {
+          budget_exhausted: true,
+          ...(delta.budgetDeferredByStage !== undefined
+            ? { budget_deferred_by_stage: delta.budgetDeferredByStage }
+            : {}),
+        }
+      : {}),
+    // #6 backup stage — forwarded as a nested object only when the stage ran
+    // (backupOk !== undefined). Absent on capture-only / dry-run / backfill.
+    ...(delta.backupOk !== undefined
+      ? {
+          backup: {
+            ok: delta.backupOk === true,
+            bytes: delta.backupBytes ?? 0,
+            ...(delta.backupPath ? { path: delta.backupPath } : {}),
+          },
+        }
+      : {}),
   };
   if (memorySoftCap !== undefined) {
     metrics.capacity = { memory_soft_cap: memorySoftCap };
@@ -389,7 +543,7 @@ export function backfillSnapshots(db: Database.Database): number {
       const dayRows = byDay.get(d)!;
       for (const r of dayRows) {
         mem++;
-        if (r.memory_type === "lesson") lesson++;
+        if (r.memory_type === "learnings") lesson++;
         byType[r.memory_type] = (byType[r.memory_type] ?? 0) + 1;
         const domKey = r.domain ?? "(unscoped)";
         byDomain[domKey] = (byDomain[domKey] ?? 0) + 1;
@@ -522,7 +676,10 @@ export function handleDashboardData(
   // Headline = live corpus (the chart shows history; the headline shows now).
   // `memory_soft_cap` (#245): resolve from the live config (the source of
   // truth for "what cap is in force right now"), defaulting to the production
-  // default. The page renders no gauge when it's 0 (disabled).
+  // default. The page renders no gauge when it's 0 (disabled). #317: routes
+  // through resolveMemorySoftCap so a HICORTEX_MEMORY_CAP env pin is honored
+  // here too — the DISPLAYED cap can never disagree with the ENFORCED cap
+  // (both consumers share the one resolver).
   //
   // `tokens` (#246): period accrual from state.json (the same single source
   // the throttle check reads, so the dashboard always agrees with the runtime
@@ -533,11 +690,7 @@ export function handleDashboardData(
     total_memories: live.totals.mem,
     uses_per_showing: live.adoption?.uses_per_showing ?? null,
     cold_count: live.adoption?.cold_count ?? 0,
-    memory_soft_cap: readNonNegativeConfig(
-      config ?? {},
-      "memorySoftCap",
-      DEFAULT_MEMORY_SOFT_CAP,
-    ),
+    memory_soft_cap: resolveMemorySoftCap(config?.memorySoftCap),
     tokens: {
       used: tokenState?.total ?? 0,
       cap: readNonNegativeConfig(config ?? {}, "llmTokensPerMonth", 0),
@@ -590,7 +743,7 @@ export function handleDashboardData(
     .prepare(
       `SELECT id, content, created_at
          FROM memories
-        WHERE memory_type = 'lesson' AND created_at BETWEEN ? AND ?
+        WHERE memory_type = 'learnings' AND created_at BETWEEN ? AND ?
         ORDER BY created_at ASC`,
     )
     .all(dayStart, dayEnd) as Array<{
@@ -650,10 +803,19 @@ export function handleDashboardData(
       supersession: dayMetrics?.new_this_run?.supersession ?? supersessionCount,
       added: dayMetrics?.new_this_run?.added ?? sampleRows.length,
       evicted: dayMetrics?.new_this_run?.evicted,
-      // #246: only present when the day's nightly metered tokens. Both fields
-      // are forwarded together — the page renders either the breakdown or nothing.
+      // #246/#287: only present when the day's nightly metered tokens (distill
+      // or consolidation). Both fields are forwarded together — the page
+      // renders either the breakdown or nothing.
       tokens: dayMetrics?.new_this_run?.tokens,
       tokens_by_stage: dayMetrics?.new_this_run?.tokens_by_stage,
+      // #255 CR: always-on usage metric — present whenever consolidation ran
+      // (under-cap OR exhausted). The page renders a continuous used/max bar.
+      budget_calls_used: dayMetrics?.new_this_run?.budget_calls_used,
+      budget_max_calls: dayMetrics?.new_this_run?.budget_max_calls,
+      // #255: budget exhaustion — only present when the run actually hit the
+      // cap (undefined on backfill / non-run / under-cap nights).
+      budget_exhausted: dayMetrics?.new_this_run?.budget_exhausted,
+      budget_deferred_by_stage: dayMetrics?.new_this_run?.budget_deferred_by_stage,
     },
     dedup_merges: dedupRows.map((r) => ({
       loser_id: r.loser_id,
@@ -666,6 +828,10 @@ export function handleDashboardData(
   return {
     status: 200,
     body: {
+      // Account identity — read defensively like the numeric knobs above:
+      // null when absent/not a string (page renders nothing, never "null").
+      // Shared readAccount() so GET /account renders the identical shape.
+      account: readAccount(config),
       range: rangeParam,
       headline,
       series,
@@ -681,7 +847,7 @@ export function handleDashboardData(
 
 /**
  * Express adapter for GET /dashboard/data. Wraps the pure handler so the
- * route stays thin (same convention as context-store handlers in viz.ts).
+ * route stays thin (same convention as identity-store handlers in viz.ts).
  * Failures surface as a 500 with the usual {error} shape — no silent degrade.
  */
 export function dashboardDataHandler(
@@ -696,6 +862,26 @@ export function dashboardDataHandler(
         getConfig(),
       );
       res.status(status).json(body);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+/**
+ * Express adapter for GET /account — the account identity ONLY (name/org/plan
+ * from config), so the /viz and /identity/ui pages can render the nav account
+ * element without pulling the full /dashboard/data payload. Same readAccount()
+ * construction as the dashboard payload — one shape, two surfaces. Also the
+ * natural whoami for the future OAuth session (#292). Failures surface as a
+ * 500 with the usual {error} shape (same as dashboardDataHandler).
+ */
+export function accountHandler(
+  getConfig: () => Record<string, unknown> | null | undefined,
+): express.RequestHandler {
+  return (_req, res) => {
+    try {
+      res.status(200).json({ account: readAccount(getConfig()) });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

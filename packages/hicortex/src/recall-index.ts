@@ -18,12 +18,45 @@
  * per-session TURN-based dedup (SessionRecallRegistry), short-prompt skip,
  * and a hard item cap. On a prompt with no relevant memories the block is
  * null and the hook prints nothing.
+ *
+ * Novelty floor (#324): the session-intent blend (#192 session-intent keying)
+ * can dilute a topic-switching prompt below the relevance floor — the live
+ * failure was a technically-primed session asking about "my Sargo" and getting
+ * ZERO relevant memories while a fresh session with the identical prompt got
+ * the perfect top hit. So a second, PURE-prompt search (no centroid blend,
+ * SAME candidate window as the blended search) runs alongside the blended
+ * one, and its top hit(s) that pass the floor are GUARANTEED slots in the
+ * index (dedup by id against the blended picks, capped by
+ * `noveltyFloorSlots`; rendered first). When the pure top hits are already
+ * among the blended picks — the common continuing-intent case — the output is
+ * unchanged. Turn suppression still wins: a recently shown novelty pick is
+ * suppressed like any other (the guarantee is about candidate inclusion, not
+ * forcing re-shows).
+ *
+ * #329 item 3 — the pure search is SKIPPED when it would be byte-identical
+ * to the blended one: turn 1 (no centroid yet — nothing to blend) or
+ * sessionIntentWeight 0 (blend disabled). The blended result IS the pure
+ * result there, so the floor is trivially satisfied by the blended picks and
+ * the second search (embeds aside, its whole DB + FTS half) is pure waste.
+ *
+ * #329 item 4 — novelty backfill: when the blended picks are empty/short,
+ * unclaimed maxItems slots are filled from the remaining filtered
+ * pure-prompt tail (gate + suppression already applied). Without it the
+ * topic-switch turn — the one the floor exists for — got the MOST truncated
+ * menu: novelty slots + a diluted remainder, while further pure candidates
+ * that had already passed every gate sat unused.
  */
 
 import type Database from "better-sqlite3";
 import type { MemorySearchResult, Memory } from "./types.js";
 import * as storage from "./storage.js";
 import { SessionRecallRegistry } from "./recall-registry.js";
+import { labelForType } from "./type-labels.js";
+import {
+  retrieve,
+  getSessionIntent,
+  recallQueryVector,
+} from "./retrieval.js";
 
 export interface RecallIndexOptions {
   /** Minimum measured cosine for vector-only candidates (config
@@ -53,6 +86,12 @@ export interface RecallIndexOptions {
    *  identical (0.6pts apart, N=40, full CI overlap); 100 saves ~13% tokens
    *  per block. */
   titleChars?: number;
+  /** Slots of `maxItems` guaranteed to the pure-prompt (unblended) search's
+   *  top passing hit(s) — the #324 novelty floor. Config `noveltyFloorSlots`,
+   *  default 2 (mirrors coldExposureSlots sizing: small, a floor not a
+   *  takeover). 0 disables the pure-prompt search entirely (the kill-switch).
+   *  Clamped to [0, maxItems]. */
+  noveltyFloorSlots?: number;
 }
 
 /** Relevance-gate floor for vector-only candidates (config `recallMinSimilarity`).
@@ -66,6 +105,25 @@ const DEFAULT_MIN_PROMPT_LENGTH = 20;
 /** Default index-line title length. 100 (reverted from 150 on 2026-08-03:
  *  eval #3 §5 showed 100 vs 150 statistically identical; 100 saves ~13% tokens). */
 const DEFAULT_TITLE_CHARS = 100;
+/** Default #324 novelty-floor slots (config `noveltyFloorSlots`). 2 mirrors
+ *  coldExposureSlots sizing — enough to guarantee the pure-prompt top hit
+ *  plus a runner-up, never a takeover of the index. The floor only SPENDS
+ *  slots when a pure-prompt hit differs from the blended picks (topic
+ *  switch); continuing-intent sessions pay nothing. Exported for the boot
+ *  log's knob line (mcp-server resolves config-vs-default here, once). */
+export const DEFAULT_NOVELTY_FLOOR_SLOTS = 2;
+/** Resolve the EFFECTIVE novelty floor (raw ?? default, clamped to
+ *  [0, maxItems]) — one definition shared by the handler and the boot knob
+ *  line so the logged value is what handleRecallIndex actually uses.
+ *  maxItems may be the handler's already-resolved number OR raw config
+ *  (boot-log site) — raw is resolved with the handler's exact constants. */
+export function resolveNoveltyFloorSlots(rawSlots: unknown, rawMaxItems: unknown): number {
+  const maxItems =
+    typeof rawMaxItems === "number"
+      ? rawMaxItems
+      : clampInt(rawMaxItems, DEFAULT_MAX_ITEMS, 1, 20);
+  return clampInt(rawSlots, DEFAULT_NOVELTY_FLOOR_SLOTS, 0, maxItems);
+}
 /** Over-fetch multiplier: retrieve `maxItems × 3` candidates so gating + dedup
  *  still leave a full menu. Kept at 3 after maxItems 6→5 and the higher floor —
  *  permit-short is intended (returning fewer than maxItems when fewer clear the
@@ -77,6 +135,17 @@ export interface RecallIndexResult {
   status: number;
   body: Record<string, unknown>;
 }
+
+/**
+ * Hard cap on `session_id` length (#328 item 2a). The id is retained as a Map
+ * key by SessionRecallRegistry for the process lifetime (maxSessions=500 LRU
+ * + a per-session shown-set + intent centroid), so an unbounded id is an OOM
+ * vector: ~4.9MB ids × 500 sessions ≈ 2.4GB of retained keys from an
+ * authenticated-but-hostile tenant. Real session ids (CC UUIDs, plugin
+ * session keys) are ≤64 chars — 128 is generous headroom. Longer → 400 with
+ * a clear error; the client treats it like any bad request.
+ */
+export const MAX_SESSION_ID_CHARS = 128;
 
 /** First content line, de-markdowned and truncated — the index line title. */
 export function memoryTitle(content: string, maxLen = DEFAULT_TITLE_CHARS): string {
@@ -120,7 +189,7 @@ export function formatIndexLine(
     formatDate(r.created_at),
     r.domain ?? r.project ?? undefined,
     r.source_agent ?? undefined,
-    r.memory_type,
+    labelForType(r.memory_type),
   ]
     .filter(Boolean)
     .join(", ");
@@ -164,19 +233,117 @@ export interface RecallFilters {
   mission_domains?: string[];
 }
 
+/** The search-closure contract handleRecallIndex consumes (see
+ *  RecallIndexDeps.retrieveFn). Named so the production factory
+ *  (createRecallRetrieveFn) and test doubles share one type. */
+export type RecallRetrieveFn = (
+  query: string,
+  limit: number,
+  filters: RecallFilters | undefined,
+  sessionId: string,
+  purePrompt?: boolean
+) => Promise<MemorySearchResult[]>;
+
 export interface RecallIndexDeps {
   db: Database.Database;
   registry: SessionRecallRegistry;
-  /** Search closure. `sessionId` is forwarded so the closure (in mcp-server)
-   *  can resolve/update the session-intent centroid and pass a blended query
-   *  vector into retrieve() — see #192 session-intent keying (0.15.3). */
-  retrieveFn: (
-    query: string,
-    limit: number,
-    filters: RecallFilters | undefined,
-    sessionId: string
-  ) => Promise<MemorySearchResult[]>;
+  /** Search closure. `sessionId` is forwarded so the closure resolves/updates
+   *  the session-intent centroid and passes a blended query vector into
+   *  retrieve() — see #192 session-intent keying (0.15.3).
+   *
+   *  `purePrompt` (#324 novelty floor): request the PURE-prompt search — the
+   *  closure must search with the prompt embedding UNBLENDED (no session
+   *  centroid) and must NOT fold the prompt into the centroid a second time
+   *  (the blended call owns this turn's EMA update). Older closures that
+   *  ignore the flag degrade to blended-only recall — no novelty floor, but
+   *  no breakage. */
+  retrieveFn: RecallRetrieveFn;
   options?: RecallIndexOptions;
+}
+
+/**
+ * The PRODUCTION /recall-index retrieveFn (what mcp-server wires into
+ * handleRecallIndex), extracted from the route handler so the #324 path is
+ * testable without HTTP — same precedent as blendQueryVector/recallQueryVector
+ * ("extracted from the /recall-index closure so the exact decision is
+ * unit-testable").
+ *
+ * Per call:
+ *   - embed the prompt ONCE per request — a single-entry promise memo keyed
+ *     on the query text. The blended and pure-prompt searches of one request
+ *     carry the same prompt, so they share one embed; the factory is built
+ *     per request, so the memo never outlives it.
+ *   - resolve the search vector via retrieval.recallQueryVector (blend + EMA
+ *     fold, or the pure prompt with NO centroid state for #324);
+ *   - retrieve() with noStrengthen (exposure is recorded by
+ *     handleRecallIndex via touchMemoriesShown, never here).
+ *
+ * #329 CR finding 1b: the FTS candidate list is ALSO computed once per
+ * request (ftsOnce, keyed on query + candidate window) and threaded into both
+ * retrieve() calls via the ftsCandidates provider — the blended and pure
+ * searches of one request carry identical query text and window, so their FTS
+ * halves were byte-identical SQL executed twice. `ftsFn` is the DI seam for
+ * tests (production: storage.searchFts); a throwing FTS computation memoizes
+ * to an empty shared list — the same vector-only degradation retrieve()'s
+ * catch always produced, never an error.
+ */
+export function createRecallRetrieveFn(deps: {
+  db: Database.Database;
+  registry: SessionRecallRegistry;
+  embedFn: (text: string) => Promise<Float32Array>;
+  /** FTS resolution override (tests). Defaults to storage.searchFts. */
+  ftsFn?: typeof storage.searchFts;
+}): RecallRetrieveFn {
+  let embMemo: { query: string; p: Promise<Float32Array> } | null = null;
+  const embedOnce = (query: string): Promise<Float32Array> => {
+    if (!embMemo || embMemo.query !== query) {
+      embMemo = { query, p: deps.embedFn(query) };
+    }
+    return embMemo.p;
+  };
+  const ftsResolve = deps.ftsFn ?? storage.searchFts;
+  let ftsMemo: {
+    query: string;
+    limit: number;
+    rows: Array<Memory & { rank: number }>;
+  } | null = null;
+  const ftsOnce = (
+    query: string,
+    limit: number
+  ): Array<Memory & { rank: number }> => {
+    if (!ftsMemo || ftsMemo.query !== query || ftsMemo.limit !== limit) {
+      try {
+        ftsMemo = { query, limit, rows: ftsResolve(deps.db, query, limit) };
+      } catch {
+        // Same degradation retrieve()'s own catch always produced — the FTS
+        // list is dropped and the search proceeds vector-only.
+        ftsMemo = { query, limit, rows: [] };
+      }
+    }
+    return ftsMemo.rows;
+  };
+  return async (query, limit, filters, sessionId, purePrompt) => {
+    const { weight, alpha } = getSessionIntent();
+    const promptEmb = await embedOnce(query);
+    const queryVec = recallQueryVector(deps.registry, sessionId, promptEmb, {
+      weight,
+      alpha,
+      purePrompt,
+    });
+    return retrieve(deps.db, deps.embedFn, query, {
+      limit,
+      noStrengthen: true,
+      // #203: project + mission_domains are SOFT affinity (zero-boost
+      // neutral), threaded into computeScore.
+      project: filters?.project,
+      missionDomains: filters?.mission_domains,
+      queryEmbedding: queryVec,
+      // #329: shared per-request FTS list. The recall path never passes
+      // sourceAgent, so the memo is keyed on (query, fetchLimit) only —
+      // exactly the two things retrieve() would pass to searchFts.
+      ftsCandidates: (fetchLimit) => ftsOnce(query, fetchLimit),
+    });
+  };
 }
 
 /** Normalize a request-supplied string-list param: array of strings or a CSV
@@ -206,6 +373,16 @@ export async function handleRecallIndex(
   if (!sessionId) {
     return { status: 400, body: { error: "Missing 'session_id'" } };
   }
+  // Length cap (#328 item 2a) — BEFORE the reset branch so an oversized id
+  // never reaches ANY registry call (reset() itself only deletes, but the
+  // next non-reset call with the same id would beginTurn it into a retained
+  // Map key). Clear error so a misbehaving client can self-diagnose.
+  if (sessionId.length > MAX_SESSION_ID_CHARS) {
+    return {
+      status: 400,
+      body: { error: `'session_id' too long (max ${MAX_SESSION_ID_CHARS} chars, got ${sessionId.length})` },
+    };
+  }
 
   // Reset: SessionStart (startup/resume/clear/compact) — fresh context, so the
   // shown-set is stale by definition.
@@ -228,6 +405,9 @@ export async function handleRecallIndex(
     0,
     1
   );
+  // #324: clamped to [0, maxItems] — the floor is a reservation inside the
+  // item cap, never an expansion of it.
+  const noveltySlots = resolveNoveltyFloorSlots(deps.options?.noveltyFloorSlots, maxItems);
 
   const turn = deps.registry.beginTurn(sessionId);
 
@@ -242,9 +422,46 @@ export async function handleRecallIndex(
     mission_domains: parseStringListParam(req.mission_domains),
   };
 
+  // #324 + #329 item 3: when the floor is armed AND would differ from the
+  // blended search, TWO searches run per recall — the blended (session-intent)
+  // query that has always run, and a PURE-prompt query with no centroid blend.
+  // Issued together so the second adds no wall-clock latency beyond its own DB
+  // work (the prompt is embedded once — the closure memoizes). Same failure
+  // domain (same db + embedder): either failing fails the request explicitly;
+  // no silent blended-only degradation.
+  //
+  // The SKIP (#329 item 3): on turn 1 the registry has no centroid yet (the
+  // blended call reads-before-fold — recallQueryVector), and at
+  // sessionIntentWeight 0 the centroid is never read at all. In both cases
+  // the blended query vector IS the pure prompt vector, so the second search
+  // would return byte-identical candidates — skip it (the floor is trivially
+  // satisfied: every pure hit is by construction among the blended picks).
+  // The decision is made BEFORE any retrieveFn call, i.e. on the centroid
+  // state of the PREVIOUS turns — exactly the turn-1/turn-2 distinction.
+  const runPureSearch =
+    noveltySlots > 0 &&
+    getSessionIntent().weight > 0 &&
+    deps.registry.getCentroid(sessionId) !== undefined;
+
   let results: MemorySearchResult[];
+  let pureResults: MemorySearchResult[];
   try {
-    results = await deps.retrieveFn(prompt, maxItems * CANDIDATE_MULTIPLIER, filters, sessionId);
+    const blended = deps.retrieveFn(
+      prompt,
+      maxItems * CANDIDATE_MULTIPLIER,
+      filters,
+      sessionId
+    );
+    const pure = runPureSearch
+      ? deps.retrieveFn(
+          prompt,
+          maxItems * CANDIDATE_MULTIPLIER,
+          filters,
+          sessionId,
+          true
+        )
+      : Promise.resolve([] as MemorySearchResult[]);
+    [results, pureResults] = await Promise.all([blended, pure]);
   } catch (err) {
     return {
       status: 500,
@@ -252,10 +469,60 @@ export async function handleRecallIndex(
     };
   }
 
-  const picked = results
+  // Blended (session-intent) picks: relevance gate + turn-based suppression,
+  // top maxItems — exactly what the index would show with no novelty floor.
+  const blendedPicks = results
     .filter((r) => passesRelevanceGate(r, minSimilarity))
     .filter((r) => deps.registry.isShowable(sessionId, r.id))
     .slice(0, maxItems);
+
+  // #324 novelty floor: the best match(es) for the CURRENT PROMPT ALONE are
+  // guaranteed a place in the index. The blend exists to follow session
+  // intent, not to veto the prompt — so pure-prompt hits that pass the floor
+  // enter even when the blended query diluted them out of `results`
+  // entirely. Dedup is against the blended PICKS (the no-floor outcome): when
+  // the pure top hit is already shown by the blended path — the common
+  // continuing-intent case — the floor costs nothing and the output is
+  // unchanged. Suppression applies BEFORE the guarantee (suppression wins:
+  // the floor is about candidate inclusion, not forcing re-shows). FTS-sourced
+  // pure hits pass the gate unconditionally, same as the blended path.
+  //
+  // The gate + suppression are applied ONCE to the pure list: the head feeds
+  // the novelty floor, the tail feeds the #329 backfill below.
+  const pureFiltered = pureResults
+    .filter((r) => passesRelevanceGate(r, minSimilarity))
+    .filter((r) => deps.registry.isShowable(sessionId, r.id));
+  const blendedIds = new Set(blendedPicks.map((r) => r.id));
+  const noveltyPicks = pureFiltered
+    .filter((r) => !blendedIds.has(r.id))
+    .slice(0, noveltySlots);
+
+  // The floor takes precedence (#324 vs #192 cold slots): novelty picks hold
+  // their slots; blended picks keep the remainder, evicted from the TAIL
+  // (lowest rank first) so the session-intent head survives. Cold-exposure
+  // slots continue to apply inside each retrieve()'s own top-k. Total never
+  // exceeds maxItems. Render order: novelty picks FIRST — on a topic switch
+  // they are the most relevant lines to the CURRENT turn, and the head of the
+  // block carries the most weight for a reader scanning the menu.
+  let picked = [
+    ...noveltyPicks,
+    ...blendedPicks.slice(0, Math.max(0, maxItems - noveltyPicks.length)),
+  ];
+
+  // #329 item 4 — backfill: a topic-switch turn dilutes the blended picks, so
+  // picked can land below maxItems even though FURTHER pure candidates have
+  // already passed the gate + suppression + dedup (they sit in the pure tail
+  // beyond the first noveltyFloorSlots). Fill the unclaimed slots from that
+  // tail — without it, the turn the floor exists for got the most truncated
+  // menu. Continuing-intent sessions are untouched: blended picks full →
+  // nothing to backfill (zero-delta output preserved).
+  if (picked.length < maxItems) {
+    const pickedIds = new Set(picked.map((r) => r.id));
+    const backfill = pureFiltered
+      .filter((r) => !pickedIds.has(r.id))
+      .slice(0, maxItems - picked.length);
+    picked = [...picked, ...backfill];
+  }
 
   if (picked.length === 0) {
     return { status: 200, body: { block: null, shown: [], turn } };
@@ -317,10 +584,15 @@ export function handleMemoryGet(
   // `citation` is server-rendered so every plugin surfaces the same built-in
   // provenance norm (owner directive 27.07) — see #193.
   const date = (mem.created_at ?? "").slice(0, 10);
+  // Shallow-copy and apply the human-term label to memory_type so the REST
+  // response surfaces the user-facing vocabulary, not the raw DB enum. The
+  // underlying DB row (`mem`) is NOT mutated — the DB IS the raw-enum source
+  // of truth; the label is a presentation concern applied at the boundary.
+  const memory = { ...mem, memory_type: labelForType(mem.memory_type) };
   return {
     status: 200,
     body: {
-      memory: mem,
+      memory,
       citation: `(memory ${String(mem.id).slice(0, 8)}, ${date}, from ${mem.source_agent ?? "unknown"}, FETCHED)`,
     },
   };
@@ -348,8 +620,10 @@ export function formatMemoryGetText(
   const mem = r.body.memory as Memory;
   const citation = r.body.citation as string; // carries FETCHED (#204)
   const date = (mem.created_at ?? "").slice(0, 10);
+  // #264 WS2: render the human-term label (Knowledge/Experience/...), not the
+  // internal enum, in the citation header shown to the agent/user.
   const header =
-    `[memory ${mem.id} | ${mem.memory_type ?? "episode"} | ${mem.project ?? "-"} | from ${mem.source_agent ?? "unknown"} | ${date}]\n` +
+    `[memory ${mem.id} | ${labelForType(mem.memory_type ?? "experience")} | ${mem.project ?? "-"} | from ${mem.source_agent ?? "unknown"} | ${date}]\n` +
     `Cite as ${citation} where this shapes your answer; it may be stale — newer memories supersede older.`;
   return { status: 200, text: `${header}\n\n${mem.content ?? ""}` };
 }

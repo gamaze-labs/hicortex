@@ -123,25 +123,41 @@ def _title_case_section(name: str) -> str:
     return " ".join(w[:1].upper() + w[1:] for w in words)
 
 
+# #313 scope labels — mirror of the TS ``SECTION_LABELS`` in
+# identity-store.ts (keep in sync). "Global rules" marks the section as
+# fleet-wide; unknown section names fall back to title-case.
+_SECTION_LABELS = {
+    "agent_identity": "Agent identity",
+    "user": "User",
+    "rules": "Global rules",
+}
+
+
 def _order_section_names(names: Iterable[str]) -> List[str]:
-    """Stable ordering: user, rules, then the rest alphabetically."""
+    """Stable ordering — the #313 precedence contract, mirroring the TS
+    ``SECTION_PRECEDENCE`` (keep in sync): ``agent_identity`` (the agent's own
+    self + role conduct, per-agent only) first, then ``user`` (the principal),
+    then ``rules`` (fleet-wide house rules), then the rest alphabetically."""
     names = list(names)
-    primaries = [p for p in ("user", "rules") if p in names]
-    rest = sorted(n for n in names if n not in ("user", "rules"))
+    primaries = [p for p in ("agent_identity", "user", "rules") if p in names]
+    rest = sorted(n for n in names if n not in ("agent_identity", "user", "rules"))
     return primaries + rest
 
 
 def _render_context_block(sections: Dict[str, Any]) -> str:
-    """Render the ``## Context`` block, or "" when every section is blank."""
+    """Render the ``## Identity`` block, or "" when every section is blank.
+    Headings use the #313 scope labels (``_SECTION_LABELS``); unknown sections
+    fall back to title-case."""
     body_parts: List[str] = []
     for name in _order_section_names(sections.keys()):
         body = sections.get(name)
         if not isinstance(body, str) or not body.strip():
             continue
-        body_parts.extend([f"### {_title_case_section(name)}", "", body.strip()])
+        label = _SECTION_LABELS.get(name) or _title_case_section(name)
+        body_parts.extend([f"### {label}", "", body.strip()])
     if not body_parts:
         return ""
-    return "\n".join(["## Context", "", *body_parts])
+    return "\n".join(["## Identity", "", *body_parts])
 
 
 class HicortexProvider(MemoryProvider):
@@ -397,7 +413,7 @@ class HicortexProvider(MemoryProvider):
         return "\n\n".join(b for b in blocks if b)
 
     def _context_block(self, client: HicortexClient) -> str:
-        """Fetch the standing context layer and render a ``## Context`` block,
+        """Fetch the standing context layer and render a ``## Identity`` block,
         or "" when nothing should be injected. Gates (ALL): "hermes" in the
         server-resolved ``clients``; when an agent id was SENT, the response
         echoes ``agent`` (old-server guard — a pre-0.13 server ignores ?agent=
@@ -444,7 +460,7 @@ class HicortexProvider(MemoryProvider):
             "the recall index), and `hicortex_recent` for recent memories by project.",
         ]
         if lessons:
-            lines.append("Lessons:")
+            lines.append("Learnings:")
             for l in lessons:
                 c = (l.get("content") or "").strip().replace("\n", " ")
                 # Legacy lessons were stored with a "## Lesson:" prefix; new ones are
@@ -455,7 +471,7 @@ class HicortexProvider(MemoryProvider):
                 lines.append(f"- {c[:200]}")
         if idx.get("total"):
             lines.append(
-                f"({idx.get('total')} memories, {idx.get('lessonCount')} lessons "
+                f"({idx.get('total')} memories, {idx.get('lessonCount')} learnings "
                 f"across {idx.get('sourceCount')} agents)"
             )
         return "\n".join(lines)
@@ -523,7 +539,7 @@ class HicortexProvider(MemoryProvider):
                 "name": "hicortex_ingest",
                 "description": (
                     "Store a new memory in long-term storage. "
-                    "Use for important facts, decisions, or lessons."
+                    "Use for Knowledge, Decisions, or Learnings."
                 ),
                 "parameters": {
                     "type": "object",
@@ -532,8 +548,8 @@ class HicortexProvider(MemoryProvider):
                         "project": {"type": "string", "description": "Project this memory belongs to"},
                         "memory_type": {
                             "type": "string",
-                            "enum": ["episode", "lesson", "fact", "decision"],
-                            "description": "Type of memory (default: episode)",
+                            "enum": ["knowledge", "experience", "decisions", "learnings", "fact", "episode", "decision", "lesson"],
+                            "description": "Type of memory (default: experience). Accepted: Knowledge/Experience/Decisions/Learnings (legacy raw enum also accepted, normalized server-side).",
                         },
                     },
                     "required": ["content"],
@@ -542,7 +558,7 @@ class HicortexProvider(MemoryProvider):
             {
                 "name": "hicortex_lessons",
                 "description": (
-                    "Get actionable lessons learned from past sessions. "
+                    "Get actionable Learnings distilled from past sessions. "
                     "Auto-generated insights about mistakes to avoid."
                 ),
                 "parameters": {
@@ -603,8 +619,8 @@ class HicortexProvider(MemoryProvider):
                         "project": {"type": "string", "description": "New project name"},
                         "memory_type": {
                             "type": "string",
-                            "enum": ["episode", "lesson", "fact", "decision"],
-                            "description": "New memory type",
+                            "enum": ["knowledge", "experience", "decisions", "learnings", "fact", "episode", "decision", "lesson"],
+                            "description": "New memory type. Accepted: Knowledge/Experience/Decisions/Learnings (legacy raw enum also accepted, normalized server-side).",
                         },
                     },
                     "required": ["id"],
@@ -677,7 +693,7 @@ class HicortexProvider(MemoryProvider):
                     content=content,
                     source_agent="hermes/manual",
                     project=args.get("project") or self._project,
-                    memory_type=args.get("memory_type", "episode"),
+                    memory_type=args.get("memory_type", "experience"),
                 )
                 if status not in (200, 201):
                     return json.dumps({"error": resp.get("error", f"HTTP {status}")})
@@ -688,7 +704,7 @@ class HicortexProvider(MemoryProvider):
                 data = client.lessons()
                 lessons = (data.get("lessons") or [])
                 if not lessons:
-                    return json.dumps({"message": "No lessons found."})
+                    return json.dumps({"message": "No Learnings found."})
                 return json.dumps([{"content": l.get("content", "")[:500]} for l in lessons])
 
             elif tool_name == "hicortex_index":

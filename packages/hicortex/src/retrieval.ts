@@ -22,6 +22,7 @@ import type Database from "better-sqlite3";
 import type { Memory, MemorySearchResult } from "./types.js";
 import * as storage from "./storage.js";
 import { l2Normalize, weightedAdd } from "./schema-prototypes.js";
+import { labelForType } from "./type-labels.js";
 
 /** Default decay half-life (days) at importance 0.5. #192: was 0.0005/h
  *  (~115-day half-life at base 0.5) — aggressive enough to bury the long tail
@@ -303,6 +304,46 @@ export function blendQueryVector(
   return centroid && weight > 0
     ? l2Normalize(weightedAdd(promptEmb, 1 - weight, centroid, weight))
     : promptEmb;
+}
+
+/**
+ * The /recall-index closure's PER-CALL search-vector decision (#199 + #324),
+ * extracted next to blendQueryVector (same precedent: the exact decision must
+ * be unit-testable without a closure-integration harness).
+ *
+ *   - purePrompt (#324 novelty floor): return the prompt embedding UNBLENDED
+ *     and touch NO centroid state — neither read nor the EMA fold. The folded
+ *     turn is owned by the blended call; a second fold here would double-count
+ *     the prompt and skew every later turn's blend (the single worst
+ *     regression this extraction exists to lock out).
+ *   - blended (default): read the prior centroid (weight>0 only), blend, then
+ *     fold this turn's prompt ONCE (weight>0 only) — read-before-update so
+ *     turn 1 searches pure and seeds the centroid for turn 2.
+ *
+ * `registry` is the structural surface needed (SessionRecallRegistry
+ * satisfies it) — keeps this module decoupled from the registry class.
+ */
+export interface CentroidStore {
+  getCentroid(sessionId: string): Float32Array | undefined;
+  updateCentroid(
+    sessionId: string,
+    promptEmbedding: Float32Array,
+    alpha: number
+  ): Float32Array;
+}
+
+export function recallQueryVector(
+  registry: CentroidStore,
+  sessionId: string,
+  promptEmb: Float32Array,
+  opts: { weight: number; alpha: number; purePrompt?: boolean }
+): Float32Array {
+  if (opts.purePrompt) return promptEmb;
+  // weight=0 (kill-switch): the centroid is neither read nor written.
+  const centroid = opts.weight > 0 ? registry.getCentroid(sessionId) : undefined;
+  const queryVec = blendQueryVector(promptEmb, centroid, opts.weight);
+  if (opts.weight > 0) registry.updateCentroid(sessionId, promptEmb, opts.alpha);
+  return queryVec;
 }
 
 /**
@@ -597,7 +638,7 @@ function formatResult(
     score: Math.round(score * 1e6) / 1e6,
     effective_strength: Math.round(effStr * 1e6) / 1e6,
     access_count: memory.access_count ?? 0,
-    memory_type: memory.memory_type ?? "episode",
+    memory_type: labelForType(memory.memory_type ?? "experience"),
     project: memory.project ?? null,
     source_agent: memory.source_agent ?? null,
     created_at: memory.created_at ?? "",
@@ -706,6 +747,18 @@ export async function retrieve(
      *  and get pure-prompt behavior (the query string is embedded here). The
      *  FTS path still uses the raw `query` text regardless. */
     queryEmbedding?: Float32Array;
+    /** #329 CR finding 1b: caller-provided FTS candidate resolution, called
+     *  INSTEAD of running storage.searchFts here. The /recall-index closure
+     *  passes a per-request memoized provider so the blended and pure
+     *  searches of ONE request — same query text, same candidate window —
+     *  execute the FTS half exactly once and share the list. The provider
+     *  receives the fetchLimit/sourceAgent THIS call would have used, so the
+     *  shared list is always computed with the right window. Callers that
+     *  omit it get the previous behavior (retrieve runs searchFts itself). */
+    ftsCandidates?: (
+      fetchLimit: number,
+      sourceAgent?: string
+    ) => Array<Memory & { rank: number }>;
   }
 ): Promise<MemorySearchResult[]> {
   const limit = options?.limit ?? recallDefaults.searchLimit;
@@ -739,8 +792,12 @@ export async function retrieve(
   try {
     // sourceAgent is pushed into the FTS SQL (hard filter). project is NOT (it
     // is a soft affinity boost in computeScore as of #203). privacy is NOT
-    // (0.16.x: vestigial column, never filtered).
-    ftsCandidates = storage.searchFts(db, query, fetchLimit, sourceAgent);
+    // (0.16.x: vestigial column, never filtered). With a caller-provided
+    // provider (#329 request-level memo) the same list is shared across the
+    // retrieves of one recall request instead of re-executed.
+    ftsCandidates = options?.ftsCandidates
+      ? options.ftsCandidates(fetchLimit, sourceAgent)
+      : storage.searchFts(db, query, fetchLimit, sourceAgent);
   } catch {
     // FTS5 search can fail on special characters; fall back to vector-only
   }

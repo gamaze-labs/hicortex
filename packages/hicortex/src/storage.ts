@@ -72,7 +72,7 @@ export function insertMemory(
       opts.sourceDomain ?? null,
       opts.project ?? null,
       opts.privacy ?? null,
-      opts.memoryType ?? "episode"
+      opts.memoryType ?? "experience"
     );
 
   if (result.changes > 0) {
@@ -468,6 +468,46 @@ export function getBm25Weights(): Bm25Weights {
 }
 
 /**
+ * Cap on tokens fed to an FTS5 MATCH expression (#329 CR finding 1a).
+ * Quoting made pasted term lists LEGAL queries — and an all-common-tokens AND
+ * is expensive: measured at 100K rows, a 50-token AND runs ~518ms and a
+ * 200-token one 6.3s, and the /recall-index hot path would pay it twice per
+ * prompt. Beyond ~24 tokens the implicit AND is semantic noise anyway (a
+ * memory matching 24+ ANDed prompt tokens is either the exact text or
+ * nothing), so the FIRST 24 tokens are used. 24 is a shipped bound, not a
+ * config knob — change it deliberately, with a perf measurement.
+ */
+export const FTS_MATCH_MAX_TOKENS = 24;
+
+/**
+ * FTS5 MATCH-safety quoting (#329 item 1). The raw prompt is NOT valid FTS5
+ * query syntax: ordinary prompt punctuation (?, -, (, :, URLs, apostrophes, a
+ * leading AND/OR) crashes the FTS5 parser, and retrieval.retrieve's catch then
+ * silently drops the ENTIRE FTS candidate list — the perf sweep measured 8/12
+ * realistic prompts affected, and it is why relevance eval #3 saw 0 FTS rows
+ * in 2,208 candidates. Fix: tokenize on whitespace, strip embedded double
+ * quotes (a raw `"` would terminate our own quoting), and wrap each token in
+ * double quotes — a quoted token is a phrase of LITERAL strings, immune to
+ * FTS5 query syntax (`"what" "is" "the" "deployment" "status"`). Punctuation
+ * INSIDE a token is kept: the tokenizer strips it identically on both sides,
+ * so `"status?"` still matches content containing "status". Joined with spaces
+ * (implicit AND — the same semantics clean prompts always had; a PROSE prompt
+ * whose content holds only most of the tokens matches nothing, which is why
+ * FTS fires on short keyword prompts, not prose recall). Capped at the first
+ * FTS_MATCH_MAX_TOKENS tokens. A query that quotes away to nothing yields ""
+ * and the caller skips the SQL entirely.
+ */
+export function buildFtsMatchExpression(query: string): string {
+  return query
+    .split(/\s+/)
+    .map((token) => token.replace(/"/g, ""))
+    .filter((token) => token.length > 0)
+    .slice(0, FTS_MATCH_MAX_TOKENS)
+    .map((token) => `"${token}"`)
+    .join(" ");
+}
+
+/**
  * Full-text search using FTS5 fielded BM25 (BM25F) ranking.
  * Returns memories with a rank field (lower is better — see sign note below).
  *
@@ -493,8 +533,13 @@ export function searchFts(
   limit = 10,
   sourceAgent?: string
 ): Array<Memory & { rank: number }> {
+  // #329: quote the query into literal phrases — a raw prompt crashes the
+  // FTS5 parser on punctuation and the caller's catch drops the whole list.
+  const matchExpr = buildFtsMatchExpression(query);
+  if (!matchExpr) return [];
+
   const conditions = ["memories_fts MATCH ?"];
-  const params: unknown[] = [query];
+  const params: unknown[] = [matchExpr];
 
   if (sourceAgent) {
     conditions.push("m.source_agent = ?");
@@ -658,7 +703,7 @@ export function insertMemoriesBatch(
         mem.sourceDomain ?? null,
         mem.project ?? null,
         mem.privacy ?? null,
-        mem.memoryType ?? "episode"
+        mem.memoryType ?? "experience"
       );
       insertVec.run(id, embedToBlob(mem.embedding));
       count++;
@@ -728,7 +773,7 @@ export function getLessons(
     const rows = db
       .prepare(
         `SELECT * FROM memories
-         WHERE memory_type = 'lesson' AND created_at > ? AND project = ?
+         WHERE memory_type = 'learnings' AND created_at > ? AND project = ?
          ORDER BY created_at DESC`
       )
       .all(cutoff, project) as Array<Record<string, unknown>>;
@@ -738,7 +783,7 @@ export function getLessons(
   const rows = db
     .prepare(
       `SELECT * FROM memories
-       WHERE memory_type = 'lesson' AND created_at > ?
+       WHERE memory_type = 'learnings' AND created_at > ?
        ORDER BY created_at DESC`
     )
     .all(cutoff) as Array<Record<string, unknown>>;

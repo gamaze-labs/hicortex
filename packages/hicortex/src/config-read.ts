@@ -1,7 +1,8 @@
 /**
  * Strict config readers for primitive values. Pure functions — no LlmConfig
- * dependency — shared by the nightly preflight knobs and the distill-tier
- * overlay (llm.ts / mcp-server.ts).
+ * dependency — shared by the nightly preflight knobs, the distill-tier
+ * overlay (llm.ts / mcp-server.ts), and the dashboard account identity
+ * (dashboard.ts).
  *
  * The point is to reject wrong-typed config values AT THE BOUNDARY (disk →
  * runtime) with a warn, rather than casting them straight through. The trap
@@ -106,6 +107,55 @@ export function parseHours(
     }
   }
   return out.length > 0 ? out.sort((a, b) => a - b) : null;
+}
+
+/**
+ * Read an optional non-empty string from a config object. Returns the trimmed
+ * string when valid, `null` when the key is absent, blank, OR present-but-not-
+ * a-string (with a warn in the latter case). Used for display-only keys (e.g.
+ * dashboard account identity) where "not set" and "invalid" mean the same
+ * thing: render nothing.
+ */
+export function readStringConfig(
+  config: Record<string, unknown>,
+  key: string,
+): string | null {
+  const v = config[key];
+  if (v === undefined) return null;
+  if (typeof v === "string") {
+    const t = v.trim();
+    return t.length > 0 ? t : null;
+  }
+  console.warn(`[hicortex] config "${key}" = ${String(v)} is not a string — ignored.`);
+  return null;
+}
+
+/**
+ * Account identity shown in the console nav (name + plan pill). The display
+ * keys are operator-set config (hosted installs); each field is null when
+ * absent, blank, or wrong-typed (readStringConfig) — the page renders nothing
+ * for an all-null account (the self-hosted default), never the string "null".
+ *
+ * ONE construction shared by the /dashboard/data payload and GET /account so
+ * the nav element cannot drift between them (same reason the digest reuses
+ * formatIndexLine).
+ */
+export interface AccountIdentity {
+  name: string | null;
+  org: string | null;
+  plan: string | null;
+}
+
+/** Read the account identity (displayName/orgName/planLabel) from config. */
+export function readAccount(
+  config: Record<string, unknown> | null | undefined,
+): AccountIdentity {
+  const c = config ?? {};
+  return {
+    name: readStringConfig(c, "displayName"),
+    org: readStringConfig(c, "orgName"),
+    plan: readStringConfig(c, "planLabel"),
+  };
 }
 
 /**

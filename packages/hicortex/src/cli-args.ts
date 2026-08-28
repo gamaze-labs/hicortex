@@ -23,3 +23,17 @@ export function readValueFlag(argv: string[], flag: string): string | undefined 
   }
   return val;
 }
+
+/**
+ * Normalize a raw CLI command word. Hidden aliases resolve to their canonical
+ * name so the cli.ts dispatch switch only spells the canonical form. Aliases
+ * today (#264 rename): `context` → `identity` and `lessons-context` →
+ * `learnings-identity`; kept so old scripts, installed hooks, and muscle memory
+ * keep working. Pure + side-effect-free (unlike cli.ts, which dispatches on
+ * import) so it can be unit-tested directly.
+ */
+export function resolveCommandAlias(raw: string | undefined): string | undefined {
+  if (raw === "context") return "identity";
+  if (raw === "lessons-context") return "learnings-identity";
+  return raw;
+}

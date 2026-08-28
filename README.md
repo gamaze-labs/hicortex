@@ -9,9 +9,9 @@
 
 **Memory that shows up before your agent asks.** One memory across every agent, every project, every machine — they stop assuming and start knowing.
 
-- **One brain, every harness** — Claude Code, Hermes, OpenClaw, Pi, and any MCP-compatible agent share the same memory.
+- **One brain, every harness** — Claude Code, Hermes, OpenClaw, Pi, opencode, and any MCP-compatible agent share the same memory.
 - **Pushed, not pulled** — a compact recall index is injected on *every prompt*, so the decisions, corrections, and context an agent needs are already in front of it. No re-explaining, no copy-paste, nothing to maintain. **Zero LLM calls per turn** — no API cost or rate-limit hit from recall.
-- **Consolidates overnight** — each night it reads the day's sessions, distills what matters, and turns it into lessons, links, and a knowledge graph.
+- **Consolidates overnight** — each night it reads the day's sessions, distills what matters, and turns it into Learnings, links, and a knowledge graph.
 - **Local-first** — raw sessions never leave the machine; only distilled memory is stored.
 
 ## Install
@@ -28,7 +28,7 @@ For multi-machine setups, point thin clients at a shared server — no local DB 
 npx @gamaze/hicortex init --server https://your-server.example.com
 ```
 
-Pi connects via [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter); Hermes and OpenClaw via their plugins. See the [install docs](https://hicortex.gamaze.com/docs/installation).
+`init` auto-detects the other harnesses and installs their clients: a Pi extension (`~/.pi/agent/extensions/hicortex.ts` — pushed recall, identity + lessons, the nine tools; or copy `pi-extension/hicortex/index.ts` there manually), an opencode plugin (`~/.config/opencode/plugins/hicortex.ts` — the same trio; or copy `opencode-plugin/hicortex/index.ts` there manually), the Hermes plugin, and the OpenClaw plugin. [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) remains a generic MCP escape hatch for any harness (verified against the SSE endpoint) — Pi no longer needs it. See the [install docs](https://hicortex.gamaze.com/docs/installation).
 
 ## How it works
 
@@ -48,7 +48,7 @@ Memories strengthen when agents use them, fade when they don't, and link to rela
 - **Memory analytics** at `/dashboard` — growth, recall adoption, and a nightly digest of what was learned.
 - **Knowledge graph** at `/viz` — memories clustered by domain, connected by relationship edges.
 - **Domains & tags** — multi-tag classification with a configurable vocabulary; your categories drift with your data.
-- **Lessons from reflection** — nightly reflection extracts general, reusable lessons, not just episode logs.
+- **Learnings from reflection** — nightly reflection extracts general, reusable Learnings, not just Experience logs.
 - **Dedup & supersession** — near-duplicates merged; stale decisions and corrections superseded, not re-surfaced.
 - **Standing context layer** — hand-edited "who you are / how to work" Markdown, injected every session, never decayed.
 
@@ -64,9 +64,10 @@ TypeScript · Node.js 20+ · SQLite + sqlite-vec + FTS5 (semantic + full-text in
 
 ```bash
 git clone https://github.com/gamaze-labs/hicortex.git
-cd hicortex/packages/hicortex
-npm install && npm run build && npm test
+cd hicortex
 ```
+
+[AGENTS.md](AGENTS.md) at the repository root defines the machine-checkable verification contract. "Done" means the full command chain exits with code 0. The contract mirrors what CI runs. Contributors — human or agent — run it before claiming work complete.
 
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 

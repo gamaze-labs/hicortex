@@ -22,11 +22,13 @@ That's the whole surface. No `sync_turn`, no compaction/session-end capture — 
 
 ### Pushed recall index (0.7.0, server ≥ 0.14)
 
-Instead of injecting full memory content every turn, `prefetch` sends the user's message to the server's `POST /recall-index` and injects the returned **index block** verbatim — one line per memory (id, title, date), capped and relevance-gated server-side. The agent fetches full content with `hicortex_get(id)` only when a line is actually relevant; that fetch is what strengthens the memory (exposure ≠ use). All tuning knobs (`recallMaxItems`, `recallMinSimilarity`, `recallReshowTurns`, `recallMinPromptChars`, …) live in the **server** config — the plugin carries none. Dedup is turn-based and server-side per session; the plugin resets it at `initialize` (the Hermes `MemoryProvider` interface exposes no compaction signal, so a mid-session context rebuild cannot trigger a reset — the server's turn-based re-show window covers that gap). Against a pre-0.14 server (404) the plugin falls back to the 0.6.x `GET /search` full-content prefetch, fail-soft, re-probing the endpoint every 10 minutes so a later server upgrade is picked up without a gateway restart. The recall calls carry the profile's configured `default_project` (and `mission_domains`) and use a short dedicated timeout (1.5 s) so a slow server can never stall a turn. (`privacy_filter` is deprecated since 0.7.2 — the server ignores privacy; see [Configuration](#configuration).)
+Instead of injecting full memory content every turn, `prefetch` sends the user's message to the server's `POST /recall-index` and injects the returned **index block** verbatim — one line per memory (id, title, date), capped and relevance-gated server-side. The agent fetches full content with `hicortex_get(id)` only when a line is actually relevant; that fetch is what strengthens the memory (exposure ≠ use). All tuning knobs (`recallMaxItems`, `recallMinSimilarity`, `recallReshowTurns`, `recallMinPromptChars`, …) live in the **server** config — the plugin carries none. Dedup is turn-based and server-side per session; the plugin resets it at `initialize` (the Hermes `MemoryProvider` interface exposes no compaction signal, so a mid-session context rebuild cannot trigger a reset — the server's turn-based re-show window covers that gap). Against a pre-0.14 server (404) the plugin falls back to the 0.6.x `GET /search` full-content prefetch, fail-soft, re-probing the endpoint every 10 minutes so a later server upgrade is picked up without a gateway restart. The recall calls carry the profile's configured `default_project` (and `mission_domains`) and use a short dedicated timeout (1.5 s) so a slow server can never stall a turn. (`privacy_filter` is deprecated since 0.7.2 — the server ignores privacy; see [Configuration](#configure-activate).)
 
 ### Per-agent standing context (0.13)
 
 `system_prompt_block()` also injects the hand-edited **standing context layer** (`## Context`, above the lessons block) — "who you are + how to work", distinct from episodic memory. The server resolves it **per agent**: this profile's own sections override the global set (`override`), or it can be `global` or `off`. See the main repo's `/context` layer docs.
+
+> **Note (#264 rename):** the server-side layer was renamed Context → Identity in 0.18. The `/context` endpoint remains as an alias so this plugin keeps working unchanged; the heading is still rendered as `## Context` here and will switch to `## Identity` in a follow-up plugin release. No action needed.
 
 The plugin sends its **profile name** as `?agent=`, resolved in this order:
 
@@ -79,7 +81,7 @@ Run it once per profile if you use Hermes profiles. Hermes allows **one** extern
 Config fields (`hicortex_url`, `default_project`, `recall_limit`, `privacy_filter`, `agent_name`) can also be written to `$HERMES_HOME/plugins/hicortex/config.json` directly. `agent_name` pins the per-agent context id for this profile (leave blank to auto-derive — see [Per-agent standing context](#per-agent-standing-context-013)). The auth token is a **secret** — set it via env, not the JSON file:
 
 ```bash
-export HICORTEX_AUTH_TOKEN=hctx-default-token   # or your custom token
+export HICORTEX_AUTH_TOKEN=hctx-<your-token>   # or your custom token
 ```
 
 Env overrides: `HICORTEX_URL`, `HICORTEX_AUTH_TOKEN`.

@@ -18,6 +18,15 @@
  */
 
 import { readPositiveConfig, readStrictBoolean, readNonNegativeConfig } from "./config-read.js";
+// #337: the openai-compat + anthropic request paths fetch through undici's OWN
+// fetch with an explicit dispatcher (below). Node's global fetch is also undici
+// under the hood, but with a hidden 5-minute response-HEADER timer that fires
+// FIRST on non-streaming completions — a completion only sends its headers after
+// generation finishes, so a legitimate >5-min generation is abandoned client-side
+// while the server keeps generating for the dead client (the 2026-08-23/24
+// incident's amplification mechanism). The ollama path already streams to dodge
+// this; these paths get the dispatcher instead.
+import { fetch as undiciFetch, Agent } from "undici";
 
 export interface LlmConfig {
   baseUrl: string;
@@ -35,6 +44,22 @@ export interface LlmConfig {
   ollamaFlushEvery?: number;
   /** Ms to wait after an ollama flush for the runner to release. */
   ollamaFlushWaitMs?: number;
+  /** ONE per-call timeout ceiling for every phase (#337). Default 900000 — the
+   *  AbortSignal.timeout value passed by all four phase wrappers (the old
+   *  600000 scoring special-case is gone). See HicortexConfig.llmTimeoutMs. */
+  timeoutMs?: number;
+  /** Consecutive ladder-exhausted total failures before the circuit breaker
+   *  opens (#337). Default 3; 0 disables. See HicortexConfig.llmBreakerThreshold. */
+  breakerThreshold?: number;
+  /** How long an OPEN breaker stays open before the next call becomes a trial
+   *  (#337). Default 600000. See HicortexConfig.llmBreakerCooldownMs. */
+  breakerCooldownMs?: number;
+  /** Timeout for the readiness probe's single generation attempt (#337).
+   *  Default 60000. See HicortexConfig.llmProbeTimeoutMs. */
+  probeTimeoutMs?: number;
+  /** TTL the daemon caches a probe outcome for (#337). Default 300000.
+   *  See HicortexConfig.llmProbeTtlMs. */
+  probeTtlMs?: number;
 }
 
 /**
@@ -124,6 +149,26 @@ export function applyTierTuningOverlay(
   }
   if (savedConfig.ollamaFlushWaitMs !== undefined) {
     llmConfig.ollamaFlushWaitMs = readPositiveConfig(savedConfig, "ollamaFlushWaitMs", 180000);
+  }
+  // #337 resilience knobs. Same boundary discipline as the keys above: absent =
+  // call-site defaults (timeout 900 s, threshold 3, cooldown 10 min, probe
+  // timeout 60 s, probe TTL 5 min), wrong-typed values warn and fall back.
+  // breakerThreshold uses readNonNegativeConfig because 0 is a VALID value
+  // ("disable the breaker") — the same reason ollamaFlushEvery uses it.
+  if (savedConfig.llmTimeoutMs !== undefined) {
+    llmConfig.timeoutMs = readPositiveConfig(savedConfig, "llmTimeoutMs", 900000);
+  }
+  if (savedConfig.llmBreakerThreshold !== undefined) {
+    llmConfig.breakerThreshold = readNonNegativeConfig(savedConfig, "llmBreakerThreshold", 3);
+  }
+  if (savedConfig.llmBreakerCooldownMs !== undefined) {
+    llmConfig.breakerCooldownMs = readPositiveConfig(savedConfig, "llmBreakerCooldownMs", 600000);
+  }
+  if (savedConfig.llmProbeTimeoutMs !== undefined) {
+    llmConfig.probeTimeoutMs = readPositiveConfig(savedConfig, "llmProbeTimeoutMs", 60000);
+  }
+  if (savedConfig.llmProbeTtlMs !== undefined) {
+    llmConfig.probeTtlMs = readPositiveConfig(savedConfig, "llmProbeTtlMs", 300000);
   }
 }
 
@@ -263,6 +308,33 @@ export async function probeOllama(
 // LLM Client class
 // ---------------------------------------------------------------------------
 
+// #337: one timeout ceiling. undici (Node's fetch implementation) silently
+// enforces a ~5-minute response-header timer and a body timer on every request.
+// On a NON-STREAMING completion the headers only arrive when generation
+// finishes, so that hidden timer — not our AbortSignal — was the real ceiling,
+// and when it fired the server kept generating for the abandoned client. This
+// module-scoped Agent disables both timers for the LLM request paths that opt
+// in (completeAnthropic + completeOpenAiCompat), making `llmTimeoutMs` the only
+// ceiling. Module scope = one connection pool shared by every LlmClient in the
+// process (the ollama path keeps global fetch — it already streams, so the
+// header timer can't fire there; claude-cli is a subprocess with its own
+// timeout).
+const llmDispatcher = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+
+/**
+ * Structural response shape the client reads: what global fetch's Response and
+ * undici's Response (a distinct type) both provide on the paths we exercise.
+ * Widening handleRateLimit + the error branches to this keeps the undici swap
+ * type-safe without `any` casts.
+ */
+interface LlmFetchResponse {
+  readonly ok: boolean;
+  readonly status: number;
+  readonly headers: { get(name: string): string | null };
+  text(): Promise<string>;
+  json(): Promise<unknown>;
+}
+
 const DEFAULT_RATE_LIMIT_RETRY_MS = 5 * 60 * 60 * 1000 + 60_000; // 5h01m safety margin
 
 export class RateLimitError extends Error {
@@ -311,6 +383,50 @@ export interface LlmResult {
 // module-level map keeps the state shared correctly if that ever changes.
 const rateLimitedUntilByEndpoint = new Map<string, number>();
 
+// #337: per-endpoint circuit-breaker state, keyed like the rate-limit map.
+// `failures` counts consecutive ladder-exhausted TOTAL failures (the class the
+// retry ladder matches — fetch-failed/ECONNREFUSED/timeout/"Headers Timeout");
+// HTTP errors WITH a response, parse errors, and RateLimitError throw before
+// the ladder can be exhausted and never accrue. Any success resets. At
+// `llmBreakerThreshold` consecutive failures the breaker opens: calls then
+// throw LlmCircuitOpenError with NO network I/O until the cooldown elapses,
+// after which exactly one call is a trial (a failure re-opens, a success
+// resets). This is what bounds a wedged endpoint to K ladder-exhausted calls
+// instead of the ~200-call nightly retrying into it for hours (incident
+// 2026-08-23/24). `openedAt` stays set (breakerOpen stays true) until a
+// SUCCESS resets it — tripped-but-past-cooldown is still "not proven healthy".
+interface BreakerState {
+  failures: number;
+  openedAt: number | null;
+}
+const breakerByEndpoint = new Map<string, BreakerState>();
+
+/** Thrown when the per-endpoint circuit breaker is open (#337) — no network I/O happened. */
+export class LlmCircuitOpenError extends Error {
+  constructor(endpoint: string, cooldownRemainingMs: number) {
+    super(
+      `LLM circuit breaker open for ${endpoint} — failing fast ` +
+        `(endpoint deemed down; next trial in ~${Math.round(cooldownRemainingMs / 1000)}s)`
+    );
+    this.name = "LlmCircuitOpenError";
+  }
+}
+
+/**
+ * The TOTAL-failure class the retry ladder matches (#337, unchanged strings —
+ * this is the same matcher the ladder has always used, now also the breaker's
+ * definition of "endpoint may be down"). A fast HTTP 500, a parse error, or a
+ * rate limit is NOT in this class: those prove the endpoint ANSWERS.
+ */
+function isTotalFailure(message: string): boolean {
+  return (
+    message.includes("fetch failed") ||
+    message.includes("ECONNREFUSED") ||
+    message.includes("timeout") ||
+    message.includes("Headers Timeout")
+  );
+}
+
 export class LlmClient {
   private config: LlmConfig;
   private ollamaCallCount = 0;
@@ -333,7 +449,48 @@ export class LlmClient {
     return Date.now() < this.rateLimitedUntil;
   }
 
-  private handleRateLimit(resp: Response): never {
+  /**
+   * True once the endpoint's circuit breaker has tripped and no success has
+   * reset it since (#337). Note this stays true past the cooldown until a
+   * trial succeeds — "past cooldown" means calls are LET THROUGH (one trial),
+   * not "healthy". The nightly reads this after runConsolidation to override
+   * a fail-soft "completed" report with "endpoint_down".
+   */
+  get breakerOpen(): boolean {
+    const st = breakerByEndpoint.get(this.endpointKey);
+    return st !== undefined && st.openedAt !== null;
+  }
+
+  /** Record one ladder-exhausted TOTAL failure; open the breaker at threshold. */
+  private recordBreakerFailure(): void {
+    const threshold = this.config.breakerThreshold ?? 3;
+    if (threshold <= 0) return; // 0 disables — never open, never fast-fail
+    const st = breakerByEndpoint.get(this.endpointKey) ?? { failures: 0, openedAt: null };
+    st.failures += 1;
+    if (st.failures >= threshold) {
+      // (Re)open. Re-opening (a failed trial past cooldown) restarts the
+      // cooldown window from NOW — the endpoint just proved itself still dead.
+      st.openedAt = Date.now();
+      // One structured line per opening — the runbook's grep target. Same
+      // key=value style as event=budget_exhausted (consolidate.ts).
+      console.warn(
+        `[hicortex] event=circuit_open endpoint=${this.endpointKey} ` +
+          `failures=${st.failures} threshold=${threshold} ` +
+          `cooldown_ms=${this.config.breakerCooldownMs ?? 600_000}`
+      );
+    }
+    breakerByEndpoint.set(this.endpointKey, st);
+  }
+
+  /** Any success resets the endpoint's breaker (closed + counter zeroed). */
+  private resetBreaker(): void {
+    const st = breakerByEndpoint.get(this.endpointKey);
+    if (st && (st.failures !== 0 || st.openedAt !== null)) {
+      breakerByEndpoint.set(this.endpointKey, { failures: 0, openedAt: null });
+    }
+  }
+
+  private handleRateLimit(resp: LlmFetchResponse): never {
     // Parse Retry-After header if present (seconds)
     const retryAfter = resp.headers.get("retry-after");
     const retryMs = retryAfter
@@ -357,7 +514,11 @@ export class LlmClient {
    */
   async completeFast(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
-    const result = await this.complete(this.config.model, prompt, tokens, 600_000);
+    // #337: ONE ceiling for every phase (llmTimeoutMs, default 900 s). The old
+    // 600 s scoring special-case assumed fast-tier calls are short — but the
+    // ceiling only ever mattered when the endpoint was wedged, and a wedged
+    // endpoint wedges scoring too. One knob, one place.
+    const result = await this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
     const flushEvery = this.config.ollamaFlushEvery ?? 0;
     if (this.config.provider === "ollama" && flushEvery > 0) {
       this.ollamaCallCount++;
@@ -375,7 +536,7 @@ export class LlmClient {
    */
   async completeReflect(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
-    return this.complete(this.config.model, prompt, tokens, 900_000);
+    return this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
   }
 
   /**
@@ -384,7 +545,7 @@ export class LlmClient {
    */
   async completeDistill(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
-    return this.complete(this.config.model, prompt, tokens, 900_000);
+    return this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
   }
 
   /**
@@ -393,7 +554,31 @@ export class LlmClient {
    */
   async completeClassify(prompt: string, maxTokens?: number): Promise<LlmResult> {
     const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
-    return this.complete(this.config.model, prompt, tokens, 900_000);
+    return this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
+  }
+
+  /**
+   * Readiness probe (#337): ONE minimal generation request (max output 1
+   * token) through the normal provider dispatch. Asks the question liveness
+   * checks CANNOT: "can this endpoint GENERATE right now?" — the incident
+   * gateway kept answering /v1/models for hours while every completion hung.
+   * Single attempt: no retry ladder (a dead endpoint must cost one fast
+   * failure, not a 3.5-min ladder), and it never accrues to the circuit
+   * breaker (probing is diagnosis, not traffic). Catch-all → false; the
+   * callers translate that into "endpoint_down" / a 503, never an exception.
+   */
+  async probe(timeoutMs?: number): Promise<boolean> {
+    try {
+      await this.completeOnce(
+        this.config.model,
+        "Reply with OK.",
+        1,
+        timeoutMs ?? this.config.probeTimeoutMs ?? 60_000,
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async complete(
@@ -402,6 +587,17 @@ export class LlmClient {
     maxTokens: number,
     timeoutMs: number,
   ): Promise<LlmResult> {
+    // Breaker BEFORE anything else (#337) — an open breaker must cost zero
+    // network I/O and zero ladder time. Past the cooldown we fall through:
+    // this call IS the trial.
+    const breakerSt = breakerByEndpoint.get(this.endpointKey);
+    if (breakerSt !== undefined && breakerSt.openedAt !== null) {
+      const elapsed = Date.now() - breakerSt.openedAt;
+      const cooldownMs = this.config.breakerCooldownMs ?? 600_000;
+      if (elapsed < cooldownMs) {
+        throw new LlmCircuitOpenError(this.endpointKey, cooldownMs - elapsed);
+      }
+    }
     if (this.isRateLimited) {
       throw new RateLimitError(this.rateLimitedUntil - Date.now());
     }
@@ -409,19 +605,28 @@ export class LlmClient {
     let lastErr: Error | undefined;
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
       try {
-        return await this.completeOnce(model, prompt, maxTokens, timeoutMs);
+        const result = await this.completeOnce(model, prompt, maxTokens, timeoutMs);
+        this.resetBreaker(); // any success closes the endpoint's breaker
+        return result;
       } catch (err) {
         lastErr = err instanceof Error ? err : new Error(String(err));
-        const msg = lastErr.message;
-        if (attempt < retryDelays.length && (msg.includes("fetch failed") || msg.includes("ECONNREFUSED") || msg.includes("timeout") || msg.includes("Headers Timeout"))) {
+        if (attempt < retryDelays.length && isTotalFailure(lastErr.message)) {
           const delay = retryDelays[attempt];
-          console.log(`[hicortex] LLM call failed (${msg.slice(0, 60)}), retry ${attempt + 1}/${retryDelays.length} in ${delay / 1000}s...`);
+          console.log(`[hicortex] LLM call failed (${lastErr.message.slice(0, 60)}), retry ${attempt + 1}/${retryDelays.length} in ${delay / 1000}s...`);
           await new Promise(r => setTimeout(r, delay));
-        } else {
+        } else if (!isTotalFailure(lastErr.message)) {
+          // Non-retryable (HTTP error with a response, parse error,
+          // RateLimitError): fail this call now — and it NEVER accrues to the
+          // breaker; an endpoint that answers is not breaker-down.
           throw lastErr;
         }
+        // else: total-class failure on the LAST attempt — the ladder is
+        // exhausted; fall out of the loop to count + throw below.
       }
     }
+    // Ladder exhausted on total-class errors — the only path that accrues to
+    // the breaker (#337).
+    this.recordBreakerFailure();
     throw lastErr!;
   }
 
@@ -611,7 +816,7 @@ export class LlmClient {
     const hasVersion = /\/v\d+\/?$/.test(baseUrl);
     const url = hasVersion ? `${baseUrl}/messages` : `${baseUrl}/v1/messages`;
 
-    const resp = await fetch(url, {
+    const resp = await undiciFetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -624,6 +829,8 @@ export class LlmClient {
         max_tokens: maxTokens,
       }),
       signal: AbortSignal.timeout(timeoutMs),
+      // #337: disable undici's hidden header/body timers (see llmDispatcher).
+      dispatcher: llmDispatcher,
     });
 
     if (resp.status === 429) this.handleRateLimit(resp);
@@ -697,11 +904,13 @@ export class LlmClient {
       body.chat_template_kwargs = { enable_thinking: thinking };
     }
 
-    const resp = await fetch(url, {
+    const resp = await undiciFetch(url, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(timeoutMs),
+      // #337: disable undici's hidden header/body timers (see llmDispatcher).
+      dispatcher: llmDispatcher,
     });
 
     if (resp.status === 429) this.handleRateLimit(resp);

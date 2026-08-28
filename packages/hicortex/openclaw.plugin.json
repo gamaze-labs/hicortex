@@ -2,7 +2,7 @@
   "id": "hicortex",
   "name": "Hicortex — Long-term Memory That Learns",
   "description": "Your agents remember past decisions, avoid repeated mistakes, and get smarter every day. Nightly reflection generates actionable lessons that automatically update agent behavior.",
-  "version": "0.10.0",
+  "version": "0.19.5",
   "kind": "lifecycle",
   "skills": ["./skills/hicortex-memory"],
   "configSchema": {
@@ -17,9 +17,19 @@
         "type": "string",
         "description": "Bearer token for the Hicortex server. Localhost bypasses auth automatically. Required for remote servers — use the authToken from ~/.hicortex/config.json on the server."
       },
-      "licenseKey": {
+      "defaultProject": {
         "type": "string",
-        "description": "Hicortex license key (hctx-...). Leave empty for free tier (250 memory cap)."
+        "description": "Optional default project name scoping recall, search, and ingest when the gateway supplies no project (Hermes default_project parity)."
+      },
+      "recallLimit": {
+        "type": "number",
+        "default": 8,
+        "description": "Max memories per recall on the pre-0.14 /search fallback (default 8). The pushed recall index is sized by SERVER config (recallMaxItems) — the server accepts no client limit."
+      },
+      "scaffoldDeadMan": {
+        "type": "boolean",
+        "default": true,
+        "description": "Auto-scaffold the dead-man identity-guard line into the agent workspace bootstrap (BOOTSTRAP.md) at startup — the secondary defense under the identity-unavailable banner the plugin injects when the identity fetch fails. Idempotent: the .bak backup is written once and never touched again. Set false to keep the plugin from writing any bootstrap file."
       }
     },
     "required": []
@@ -34,10 +44,17 @@
       "sensitive": true,
       "placeholder": "Required for remote servers"
     },
-    "licenseKey": {
-      "label": "License Key",
-      "placeholder": "hctx-... (optional, free tier without key)",
-      "sensitive": true
+    "defaultProject": {
+      "label": "Default Project",
+      "placeholder": "Optional — scopes recall/ingest when the gateway sends no project"
+    },
+    "recallLimit": {
+      "label": "Recall Limit",
+      "placeholder": "8"
+    },
+    "scaffoldDeadMan": {
+      "label": "Scaffold Dead-Man Guard",
+      "placeholder": "true"
     }
   }
 }

@@ -110,7 +110,7 @@ CREATE TABLE IF NOT EXISTS memories (
     source_session TEXT,
     project TEXT,
     privacy TEXT DEFAULT 'WORK',
-    memory_type TEXT DEFAULT 'episode',
+    memory_type TEXT DEFAULT 'experience',
     updated_at TIMESTAMP
 );
 
@@ -515,6 +515,29 @@ const MIGRATIONS: Migration[] = [
           metrics TEXT NOT NULL
         )
       `);
+    },
+  },
+  {
+    version: 13,
+    name: "memory_type_unified_terminology",
+    up: (db) => {
+      // #264 final step: rename the memory_type COLUMN VALUES from the raw
+      // internal enum (fact/episode/decision/lesson) to the unified human
+      // terms (knowledge/experience/decisions/learnings). The column itself,
+      // its default, and every SQL query/filter were updated in the same
+      // change; this migration converts existing rows in place. Idempotent:
+      // re-running against an already-migrated DB matches 0 rows per clause.
+      // The CREATE TABLE default is now 'experience' (was 'episode'); legacy
+      // rows with the old default value are rewritten here.
+      //
+      // Ordering is irrelevant (each clause keys on a distinct old value) and
+      // no clause can fire on another clause's output (the new values are
+      // disjoint from the old). The transaction wrapper in migrate() makes the
+      // whole migration atomic.
+      db.exec("UPDATE memories SET memory_type = 'knowledge'  WHERE memory_type = 'fact'");
+      db.exec("UPDATE memories SET memory_type = 'experience' WHERE memory_type = 'episode'");
+      db.exec("UPDATE memories SET memory_type = 'decisions'  WHERE memory_type = 'decision'");
+      db.exec("UPDATE memories SET memory_type = 'learnings'  WHERE memory_type = 'lesson'");
     },
   },
 ];
