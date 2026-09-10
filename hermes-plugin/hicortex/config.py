@@ -36,65 +36,25 @@ CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "hicortex_auth_token",
         "label": "Auth token",
         "description": (
-            "Bearer token for the server. Omit (leave blank) when targeting "
-            "localhost — the server bypasses auth there. Default token: "
-            "hctx-default-token."
+            "Bearer token for the server. Leave blank when targeting "
+            "localhost — the server bypasses auth there. To find a remote "
+            "server's token, run `hicortex status` on the server machine "
+            "(or check ~/.hicortex/config.json there)."
         ),
         "secret": True,
         "env_var": "HICORTEX_AUTH_TOKEN",
     },
-    {
-        "key": "default_project",
-        "label": "Default project",
-        "description": "Optional project name to scope recall and capture.",
-        "required": False,
-    },
-    {
-        "key": "recall_limit",
-        "label": "Recall limit",
-        "description": (
-            "Max memories returned per recall (default 5). Applies to the "
-            "tools and the legacy pre-0.14 /search prefetch fallback only — "
-            "the pushed recall index is sized by SERVER config (recallMaxItems)."
-        ),
-        "default": "5",
-        "required": False,
-    },
-    {
-        "key": "privacy_filter",
-        "label": "Privacy filter (DEPRECATED)",
-        "description": (
-            "DEPRECATED since plugin 0.7.2 / server 0.16.2. The server no "
-            "longer filters on privacy — the column is vestigial. This setting "
-            "is now a harmless no-op: it is still accepted for backward "
-            "compat but ignored. For work/personal isolation, run a separate "
-            "Hicortex server per scope. (Historically: comma-separated privacy "
-            "levels to include, e.g. WORK,PERSONAL.)"
-        ),
-        "default": "WORK,PERSONAL",
-        "required": False,
-    },
-    {
-        "key": "agent_name",
-        "label": "Agent name (per-agent context)",
-        "description": (
-            "Identity sent as ?agent= when fetching the standing context layer, "
-            "so this profile gets its own context (0.13). Leave blank to "
-            "auto-derive from the running profile (HERMES_PROFILE / HERMES_HOME)."
-        ),
-        "required": False,
-    },
-    {
-        "key": "mission_domains",
-        "label": "Mission domains",
-        "description": (
-            "Comma-separated knowledge domains this agent works in (e.g. Health, "
-            "or Finance,Work). Recall boosts memories tagged into these domains "
-            "(soft — never excludes others). Pick from the domains in your "
-            "Hicortex config; leave blank for a general-purpose agent."
-        ),
-        "required": False,
-    },
+    # 0.7.6: setup asks ONLY url + token. default_project joined the
+    # config-only knobs (0.7.5 removed recall_limit / agent_name /
+    # mission_domains) after live-install feedback: "no human will understand
+    # what it is" — a memory-attribution bucket is not a setup question.
+    # Config-only knobs (set directly in config.json, all have correct
+    # defaults): default_project (blank = unattributed), recall_limit (5;
+    # tools + legacy fallback only — the pushed index is SERVER-sized via
+    # recallMaxItems), agent_name (blank auto-derives from the running
+    # profile), mission_domains (blank = off).
+    # privacy_filter was removed outright in 0.7.4 (dead since server 0.16.2;
+    # tolerated at load with a one-time warning if an old file carries it).
     # NOTE: recall-only plugin — no capture config. Capture is handled by the
     # nightly server-side reader of each agent's session store.
 ]
@@ -130,7 +90,8 @@ def load_config() -> Dict[str, Any]:
     # Defaults
     cfg.setdefault("hicortex_url", "http://localhost:8787")
     cfg.setdefault("recall_limit", 5)
-    cfg.setdefault("privacy_filter", "WORK,PERSONAL")
+    # No privacy_filter default — the setting is dead (see schema note) and
+    # must not be injected into new configs.
 
     # 0.16.2 deprecation: privacy_filter is a no-op now (server ignores privacy
     # entirely). Warn once per process if the profile explicitly sets it.

@@ -9,7 +9,7 @@
 
 **Memory that shows up before your agent asks.** One memory across every agent, every project, every machine — they stop assuming and start knowing.
 
-- **One brain, every harness** — Claude Code, Hermes, OpenClaw, Pi, opencode, and any MCP-compatible agent share the same memory.
+- **One brain, every harness** — Claude Code, Hermes, OpenClaw, Pi, OpenCode, and any MCP-compatible agent share the same memory.
 - **Pushed, not pulled** — a compact recall index is injected on *every prompt*, so the decisions, corrections, and context an agent needs are already in front of it. No re-explaining, no copy-paste, nothing to maintain. **Zero LLM calls per turn** — no API cost or rate-limit hit from recall.
 - **Consolidates overnight** — each night it reads the day's sessions, distills what matters, and turns it into Learnings, links, and a knowledge graph.
 - **Local-first** — raw sessions never leave the machine; only distilled memory is stored.
@@ -28,7 +28,7 @@ For multi-machine setups, point thin clients at a shared server — no local DB 
 npx @gamaze/hicortex init --server https://your-server.example.com
 ```
 
-`init` auto-detects the other harnesses and installs their clients: a Pi extension (`~/.pi/agent/extensions/hicortex.ts` — pushed recall, identity + lessons, the nine tools; or copy `pi-extension/hicortex/index.ts` there manually), an opencode plugin (`~/.config/opencode/plugins/hicortex.ts` — the same trio; or copy `opencode-plugin/hicortex/index.ts` there manually), the Hermes plugin, and the OpenClaw plugin. [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) remains a generic MCP escape hatch for any harness (verified against the SSE endpoint) — Pi no longer needs it. See the [install docs](https://hicortex.gamaze.com/docs/installation).
+`init` auto-detects the other harnesses and installs their clients: a Pi extension (`~/.pi/agent/extensions/hicortex.ts` — pushed recall, identity + lessons, the nine tools; or copy `pi-extension/hicortex/index.ts` there manually), an OpenCode plugin (`~/.config/opencode/plugins/hicortex.ts` — the same trio; or copy `opencode-plugin/hicortex/index.ts` there manually), the Hermes plugin, and the OpenClaw plugin. [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) remains a generic MCP escape hatch for any harness (verified against the SSE endpoint) — Pi no longer needs it. See the [install docs](https://hicortex.gamaze.com/docs/installation).
 
 ## How it works
 

@@ -3,24 +3,48 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [0.21.0] - 2026-08-27
+## [0.20.3] — 2026-09-10
 
-opencode joins the fleet: opencode agents get the same memory experience as Claude Code, Hermes, OpenClaw, and Pi — pushed recall on every prompt, identity + lessons at session start, and the nine memory tools — via one bundled, dependency-free plugin, and their sessions are captured by a new nightly reader.
+npm package-page fixes; no product code changes. The npm page for ≤0.20.1 showed an empty README even though the README shipped inside every tarball (44.6 kB, verified). Root cause, established live across two republish attempts (0.20.2 tarball publish, 0.20.3 directory publish — the readme stayed 0 bytes both times): the registry `readme` field the page renders is a standalone packument field, set when the package was created and never touched by publishing. It is updated directly through the registry API (`scripts/update-npm-readme.sh`, #364). For scale: typescript, @angular/core, and vite also carry 0-byte packument readmes — the field is broadly decoupled from the tarball.
 
-### Added — opencode client (`opencode-plugin/hicortex/`)
-- **Pushed recall per prompt.** Each new user prompt is POSTed to `/recall-index` and the returned compact index block is injected as one additional user message carrying it (opencode's messages-transform hook — verified against opencode 1.18.20; the injected message is not persisted to opencode's session store and existing messages are never mutated). One fetch per prompt — tool-loop requests of the same turn re-use the fetched block; the agent lazy-loads full content with `hicortex_get`. Session creation and compaction fire the dedup reset, which the session's next recall fetch awaits — the reset can never land after it.
-- **Identity + lessons in the system prompt.** The hand-edited identity layer is injected as a `## Identity` block when the server's `identityClients` resolves `opencode` (listable explicitly, included in `"all"`), alongside the `## Hicortex Memory` lessons block (top-`lessonsLimit` slice) — appended as one fenced system entry with a marker guard so injection can never double, fetched once per session.
-- **The nine tools in-process.** `hicortex_search` / `hicortex_get` / `hicortex_recent` / `hicortex_ingest` / `hicortex_lessons` / `hicortex_index` / `hicortex_graph` / `hicortex_update` / `hicortex_delete` are registered through the plugin's tool export with plain-JSON argument schemas — direct REST proxies to the server (names and descriptions shared with the other clients). A remote-MCP config remains an unmanaged, pull-only escape hatch.
-- **Fail-soft by construction.** Any failure (no config, timeout, non-2xx, parse error) injects nothing and never blocks or slows a session; injection fetches carry a 1 s timeout, tool fetches 10 s.
-- **Nightly capture.** A new reader distills opencode's SQLite session store (`~/.local/share/opencode/opencode.db`): per-session incremental cursor on message time (epoch milliseconds, exclusive delta, with the shrink guard), conversation text assembled from each message's text parts (tool/reasoning plumbing excluded by type, injected recall blocks skipped so memory never echoes itself), sub-agent sessions excluded, project derived from the session's working directory. No-ops on machines without opencode and shape-guards against schema drift.
-- **Packaging + install.** The plugin ships in the npm tarball (bundled like the Hermes plugin and Pi extension); `init` auto-detects opencode and installs the plugin into its global plugins directory — writing nothing into opencode's own configuration — `status` reports it, and `uninstall` removes it marker-guarded, never touching third-party plugin files.
+### Fixed — packaging
+- **README headline now leads with the decided positioning** ("Shared Fleet Memory for AI Agents"); the retired "Self-Learning Memory" opener no longer fronts the npm surface.
+- **repository URL** remains `github.com/gamaze-labs/hicortex` (public mirror) — republish carries it to the registry metadata.
+- **`scripts/update-npm-readme.sh`** — direct registry readme update (GET packument → replace `readme` from the local README.md → PUT on the current Couch-style revision, with a pre-write backup and post-write verification). The mechanism that actually changes the npm page; publishing cannot, so it is not wired into the release workflow — run it whenever the README changes materially.
 
-### Changed
-- **`opencode` is a known identity client** (`identityClients` may list it; `"all"` expands to include it).
+## [0.20.2] — 2026-09-09
 
-## [0.20.0] - 2026-08-26
+Published to the `rc` channel only, superseded by 0.20.3 the next day: the README shipped in the tarball but the npm page stayed empty — the publish mechanism, not the payload, was the problem (see 0.20.3). Content identical to 0.20.3.
 
-Pi parity: Pi agents get the same memory experience as Claude Code, Hermes, and OpenClaw — pushed recall on every prompt, identity + lessons at session start, and the nine memory tools — via one bundled, dependency-free extension. No MCP setup, no local database, no local LLM.
+## [Unreleased]
+
+Website deploy hardening (#362, from the #351 deployment-chain audit) plus a test-suite fix that a red main forced in.
+
+### Added — website
+- **`GET /health` liveness endpoint on the license API** (`web/api/app.py`): unauthenticated, returns static `{"status":"ok"}` JSON, touches no database and no rate limiter — deliberately dependency-free so it answers even when everything else is broken. Mirrors the TS server's no-auth `/health` convention. Unblocks external uptime probes and the deployment platform's healthcheck (path `/health`, expect 200 — enable after deploy).
+
+### Changed — website build reproducibility
+- **The website Docker build installs from a fully pinned `web/requirements.txt`** (exact `==` pins on the complete closure, resolved from the previous unpinned install line with zero deliberate version changes) instead of an unpinned inline `pip install`. An upstream major release can no longer break the deploy chain with nothing pinned to fall back on; the previous site is now always rebuildable.
+
+### Fixed — tests
+- **De-time-bombed two dashboard tests** that pinned hard-coded snapshot dates and read back through the default 30-day window — main's CI went red the day the first date aged out of the window, unrelated to any code change. The read-backs now use `range: "all"`, matching the tests' write→read-shape intent.
+
+## [0.20.1] - 2026-09-01
+
+A consolidation-correctness patch (found by live soak evidence), plus the Hermes setup experience rebuilt from a real install's feedback.
+
+### Fixed — consolidation correctness
+- **The no-fit forgetting mechanism no longer stalls on quiet nights** (#194/#357/#358). A latent split-brain: the consolidation skip decision read the *ambient* state file instead of the run's own watermark — in tests that state was always empty (so tests passed), while in production a night with no new memories skipped consolidation entirely, leaving untagged memories undecayed forever. The skip decision now honors the run's `stateDir` and counts untagged (no-fit scope) rows as pending work.
+- **`lastConsolidated` no longer advances when the LLM circuit breaker is open** (#357). The stages fail soft, so a mid-consolidation endpoint death left `report.status` "completed" and the timestamp advanced before the nightly's `endpoint_down` override ran — state and reported status disagreed. The advance is now gated on the same `breakerOpen` signal the nightly reads; the two sites are cross-referenced to stay in lockstep.
+
+### Changed — Hermes install experience (plugin 0.7.4–0.7.8, from live-install feedback)
+- **`hermes memory setup` asks exactly two questions: server URL + auth token.** Removed from the prompts as unanswerable-at-setup or server-owned: the deprecated privacy filter (a no-op since 0.16.2), recall limit (the pushed index is sized by server config), agent name (auto-derives from the running profile), mission domains (server's vocabulary, blank = off), and the project name (a memory-attribution bucket no new user can place). All remain config-file knobs for fleet re-installs.
+- **The token prompt says where the token lives** (`hicortex status` on the server machine) instead of a stale "default token" that never existed; localhost says leave blank.
+- **`init` now completes the Hermes side**: detects `~/.hermes`, copies the bundled plugin (never over a `hermes plugins install` git checkout), pre-fills the server URL (re-point-safe: init-owned URLs follow the new server; hand-set URLs are kept with a loud notice), prints the token for the one paste Hermes requires, and reminds that re-running `init` redoes the step after a later Hermes install.
+
+## [0.20.0] - 2026-08-29
+
+Two new harnesses join the fleet — **Pi** and **opencode** — both with the full memory experience: pushed recall on every prompt, identity + lessons at session start, and the nine memory tools. Plus serialized LLM calls and the LLM client resilience set. Every harness client in this release was live-validated in its real environment (real Pi sessions, real opencode runs) before shipping.
 
 ### Added — Pi extension (`pi-extension/hicortex/`)
 - **Pushed recall per prompt.** Each user prompt is POSTed to `/recall-index` and the returned compact index block is injected into the turn (terminal UI and non-interactive `pi -p` alike); the agent lazy-loads full content with `hicortex_get`. Session start and compaction fire the dedup reset, which the first turn's recall fetch awaits — the reset can never land after it.
@@ -28,9 +52,30 @@ Pi parity: Pi agents get the same memory experience as Claude Code, Hermes, and 
 - **The nine tools in-process.** `hicortex_search` / `hicortex_get` / `hicortex_recent` / `hicortex_ingest` / `hicortex_lessons` / `hicortex_index` / `hicortex_graph` / `hicortex_update` / `hicortex_delete` are registered as first-class Pi tools — direct REST proxies to the server (names, descriptions, and schemas shared with the OpenClaw plugin). The third-party MCP adapter previously documented as Pi's bridge is demoted to a generic escape hatch; it still works but is no longer needed.
 - **Fail-soft by construction.** Any failure (no config, timeout, non-2xx, parse error) injects nothing and never blocks or slows a session; injection fetches carry a 1 s timeout, tool fetches 10 s; no terminal-UI calls anywhere, so print mode is safe.
 - **Packaging + install.** The extension ships in the npm tarball (bundled like the Hermes plugin); `init` auto-detects `~/.pi/agent/` and installs the extension, `status` reports it, `uninstall` removes it. Capture is unchanged — Pi sessions keep flowing through the existing nightly reader.
+- **Echo-safe by construction.** Injected recall blocks are written as `custom_message` records, which the nightly Pi reader skips by type — memory never distills its own injections.
+
+### Added — opencode client (`opencode-plugin/hicortex/`)
+- **Pushed recall per prompt.** Each new user prompt is POSTed to `/recall-index` and the returned compact index block is injected as one additional user message carrying it (opencode's messages-transform hook — live-validated on opencode 1.18.23; the injected message is not persisted to opencode's session store and existing messages are never mutated). One fetch per prompt — tool-loop requests of the same turn re-use the fetched block; the agent lazy-loads full content with `hicortex_get`. Session creation and compaction fire the dedup reset, which the session's next recall fetch awaits — the reset can never land after it.
+- **Identity + lessons in the system prompt.** The hand-edited identity layer is injected as a `## Identity` block when the server's `identityClients` resolves `opencode` (listable explicitly, included in `"all"`), alongside the `## Hicortex Memory` lessons block (top-`lessonsLimit` slice) — appended as one fenced system entry with a marker guard so injection can never double, fetched once per session.
+- **The nine tools in-process.** `hicortex_search` / `hicortex_get` / `hicortex_recent` / `hicortex_ingest` / `hicortex_lessons` / `hicortex_index` / `hicortex_graph` / `hicortex_update` / `hicortex_delete` are registered through the plugin's tool export with plain-JSON argument schemas — direct REST proxies to the server (names and descriptions shared with the other clients). A remote-MCP config remains an unmanaged, pull-only escape hatch.
+- **Fail-soft by construction.** Any failure (no config, timeout, non-2xx, parse error) injects nothing and never blocks or slows a session; injection fetches carry a 1 s timeout, tool fetches 10 s.
+- **Nightly capture.** A new reader distills opencode's SQLite session store (`~/.local/share/opencode/opencode.db`): per-session incremental cursor on message time (epoch milliseconds, exclusive delta, with the shrink guard), conversation text assembled from each message's text parts (tool/reasoning plumbing excluded by type, injected recall blocks skipped so memory never echoes itself), sub-agent sessions excluded, project derived from the session's working directory. No-ops on machines without opencode and shape-guards against schema drift.
+- **Packaging + install.** The plugin ships in the npm tarball (bundled like the Hermes plugin and Pi extension); `init` auto-detects opencode and installs the plugin into its global plugins directory — writing nothing into opencode's own configuration — `status` reports it, and `uninstall` removes it marker-guarded, never touching third-party plugin files.
+
+### Added — serialized LLM calls (`llmSingleFlight`, #355)
+- **At most ONE in-flight LLM request per endpoint, ever — default on.** One Hicortex server is several callers at once: the daemon distills concurrent inbound captures, and the nightly's consolidation is a separate process on its own timers. Local single-user model servers can stall or OOM — taking the whole machine down — under two concurrent large-context requests, which was previously a matter of timer luck. A per-endpoint lock file (in the hicortex home, recording its own lease; dead-pid reclaim, fail-open on filesystem errors) makes the turns structural across processes; queued calls wait up to `llmSingleFlightWaitMs` (default: `max(900 s, llmTimeoutMs)`) and then fail as endpoint-down through the normal retry-ladder/circuit-breaker rules. Under contention the readiness probe queues too, with its wait capped by its own probe budget — `/distill` answers 503 quickly (captures cursor-hold and retry, lossless). **Opt out with `"llmSingleFlight": false`** if your endpoint is a multi-tenant service that parallelizes well and you want faster batches — batches then run concurrently at the endpoint's own risk.
+
+### Added — LLM client resilience (#337/#345; also shipped as the 0.19.6 patch)
+- **One timeout ceiling** (`llmTimeoutMs`, default 900000) — the only bound on every LLM call in every phase; the HTTP layer's hidden 5-minute response-header timer is disabled on the LLM paths.
+- **Per-endpoint circuit breaker** (`llmBreakerThreshold` 3, `llmBreakerCooldownMs` 10 min; 0 disables) — after consecutive unreachable-endpoint failures, calls fail fast with no network I/O; one succeeding call resets it. HTTP errors with a body, parse errors, and 429s never count.
+- **Readiness probe** (`llmProbeTimeoutMs` 60 s, `llmProbeTtlMs` 5 min) — one minimal generation before nightly consolidation and before `/distill` distills; a gateway that answers health checks while generation is dead is caught in seconds. The nightly reports `endpoint_down` (retried next run); `/distill` answers 503 so capture holds its cursor.
+
+### Added — memory cap as an operator parameter (#317)
+- **`HICORTEX_MEMORY_CAP`** (env) wins over the config `memorySoftCap` in every mode — a deployment operator can pin the soft cap so tenant-writable config can never raise or disable it. Nightly capacity eviction removes the lowest-strength memories until under the cap (`0` disables); `nightly --evict-only` runs eviction alone (pure DB, no capture, no LLM); the dashboard capacity stamp and live gauge resolve through the same source, so enforced and displayed caps can never disagree.
 
 ### Changed
-- **`pi` is a known identity client** (`identityClients` may list it; `"all"` expands to include it).
+- **`pi` and `opencode` are known identity clients** (`identityClients` may list them; `"all"` expands to include them).
+- **`AGENTS.md` at the repo root** defines the machine-checkable verification contract for contributors (human or agent): "done" means the full command chain exits 0.
 
 ## [0.19.5] - 2026-08-24
 

@@ -285,19 +285,25 @@ export function parseJsonLenient<T>(text: string, fallback: T): T {
 // Stage 1: Pre-check
 // ---------------------------------------------------------------------------
 
-function readLastConsolidated(): string {
-  return loadState().lastConsolidated ?? "";
+function readLastConsolidated(stateDir?: string): string {
+  // stateDir-optional for backcompat; runConsolidation threads its own
+  // stateDir so the skip decision reads the SAME state the run writes
+  // (previously this read the ambient home — a split-brain where a test or
+  // CLI caller with an isolated stateDir decided "skip" from the operator's
+  // real ~/.hicortex watermark).
+  return loadState(stateDir).lastConsolidated ?? "";
 }
 
 function stagePrecheck(
-  db: Database.Database
+  db: Database.Database,
+  stateDir?: string
 ): {
   skip: boolean;
   reason: string;
   newMemories: Memory[];
   lastDt: string;
 } {
-  const lastTs = readLastConsolidated();
+  const lastTs = readLastConsolidated(stateDir);
   const lastDt = lastTs || "1970-01-01T00:00:00.000Z";
   const newMemories = storage.getMemoriesSince(db, lastDt);
 
@@ -1714,7 +1720,7 @@ export async function runConsolidation(
   };
 
   // Stage 1: Pre-check
-  const precheck = stagePrecheck(db);
+  const precheck = stagePrecheck(db, stateDir);
 
   // Also check for unscored memories
   const unscored = storage.getUnscoredMemories(db);
@@ -1724,7 +1730,20 @@ export async function runConsolidation(
     ...unscored.filter((m) => !newIds.has(m.id)),
   ];
 
-  const skip = scoreMemories.length === 0;
+  // #194 no-fit scope: untagged rows (domain IS NULL) stay in the
+  // re-evaluation scope — the decay/re-attempt contract ("re-halves once per
+  // run while still below the floor") is work even on a quiet night with
+  // nothing new. The skip below gated on new+unscored only, which the tests
+  // never caught because stagePrecheck used to read the AMBIENT (always
+  // empty in the suite) state instead of the run's own watermark — threading
+  // stateDir (#357) exposed the divergence between test and production.
+  const nofitInScope = (
+    db.prepare("SELECT COUNT(*) AS n FROM memories WHERE domain IS NULL").get() as {
+      n: number;
+    }
+  ).n;
+
+  const skip = scoreMemories.length === 0 && nofitInScope === 0;
 
   report.stages.precheck = {
     skip,
@@ -1832,8 +1851,18 @@ export async function runConsolidation(
     console.error("[hicortex] Consolidation pipeline error:", err);
   }
 
-  // Update last-consolidated timestamp
-  if (!dryRun && report.status === "completed") {
+  // Update last-consolidated timestamp. #357: the stages fail SOFT, so a run
+  // against an endpoint that died mid-way still reports status "completed"
+  // here — advancing the timestamp made state.json disagree with the
+  // nightly's breaker-open override to endpoint_down (observed 0.20.0 soak:
+  // endpoint_down reported, lastConsolidated advanced anyway). Gate on the
+  // SAME signal the nightly's override reads (llm.breakerOpen) so the two
+  // sites agree for the breaker case — keep this condition and the override
+  // in nightly.ts in sync if either ever grows. (Sibling soft-fail paths —
+  // e.g. a sustained-429 run, which never accrues to the breaker because a
+  // 429 proves the endpoint answers — still advance; that is the #337
+  // taxonomy working as designed.)
+  if (!dryRun && report.status === "completed" && !llm.breakerOpen) {
     updateState((s) => {
       s.lastConsolidated = new Date().toISOString();
       return s;
