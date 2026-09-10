@@ -18,6 +18,11 @@
  */
 
 import { readPositiveConfig, readStrictBoolean, readNonNegativeConfig } from "./config-read.js";
+// #355: single-flight guard + canonical home (where the per-endpoint flight
+// lock files live — the daemon and the nightly share the home, so the lock
+// serializes them across processes).
+import { acquireLlmFlight, DEFAULT_STALE_MS, type LlmFlightGuard } from "./llm-flight.js";
+import { hicortexHome } from "./paths.js";
 // #337: the openai-compat + anthropic request paths fetch through undici's OWN
 // fetch with an explicit dispatcher (below). Node's global fetch is also undici
 // under the hood, but with a hidden 5-minute response-HEADER timer that fires
@@ -60,6 +65,15 @@ export interface LlmConfig {
   /** TTL the daemon caches a probe outcome for (#337). Default 300000.
    *  See HicortexConfig.llmProbeTtlMs. */
   probeTtlMs?: number;
+  /** Single-flight serialization: at most ONE in-flight LLM request per
+   *  endpoint, ever (#355). Default true — a correctness property for local
+   *  single-user model servers (two concurrent large-context calls stall/OOM
+   *  the server and the machine under it). See HicortexConfig.llmSingleFlight. */
+  singleFlight?: boolean;
+  /** How long a queued call waits for the in-flight call before failing as
+   *  endpoint-down (#355). Default 900000 — the same ceiling as llmTimeoutMs.
+   *  See HicortexConfig.llmSingleFlightWaitMs. */
+  singleFlightWaitMs?: number;
 }
 
 /**
@@ -169,6 +183,20 @@ export function applyTierTuningOverlay(
   }
   if (savedConfig.llmProbeTtlMs !== undefined) {
     llmConfig.probeTtlMs = readPositiveConfig(savedConfig, "llmProbeTtlMs", 300000);
+  }
+  // #355 single-flight. Default ON (a correctness property, not a tuning
+  // option); the wait budget defaults to the timeout ceiling so a queued call
+  // never gives up before the in-flight call's own ceiling expires.
+  const singleFlight = readStrictBoolean(savedConfig, "llmSingleFlight");
+  if (singleFlight !== undefined) {
+    llmConfig.singleFlight = singleFlight;
+  }
+  if (savedConfig.llmSingleFlightWaitMs !== undefined) {
+    llmConfig.singleFlightWaitMs = readPositiveConfig(
+      savedConfig,
+      "llmSingleFlightWaitMs",
+      900000,
+    );
   }
 }
 
@@ -426,6 +454,10 @@ function isTotalFailure(message: string): boolean {
     message.includes("Headers Timeout")
   );
 }
+// Exported for the #355 contract test: the single-flight wait-timeout error's
+// message must keep matching this matcher, or wait-timeouts silently stop
+// being retryable/breaker-counted (a wording change would declassify them).
+export { isTotalFailure };
 
 export class LlmClient {
   private config: LlmConfig;
@@ -569,11 +601,13 @@ export class LlmClient {
    */
   async probe(timeoutMs?: number): Promise<boolean> {
     try {
+      const budget = timeoutMs ?? this.config.probeTimeoutMs ?? 60_000;
       await this.completeOnce(
         this.config.model,
         "Reply with OK.",
         1,
-        timeoutMs ?? this.config.probeTimeoutMs ?? 60_000,
+        budget,
+        budget, // flight-wait cap = the probe's own budget (2nd-review finding 4)
       );
       return true;
     } catch {
@@ -631,6 +665,66 @@ export class LlmClient {
   }
 
   private async completeOnce(
+    model: string,
+    prompt: string,
+    maxTokens: number,
+    timeoutMs: number,
+    /** Optional cap on the single-flight WAIT budget (the probe passes its
+     *  own timeout so a busy endpoint costs one bounded failure, not the full
+     *  900 s queue budget — the #337 "one fast failure" contract). */
+    maxFlightWaitMs?: number,
+  ): Promise<LlmResult> {
+    // #355 single-flight: at most ONE in-flight request per endpoint, ever —
+    // wrapping the per-attempt dispatch (not the ladder) so the lock is
+    // released between retries and a crashed attempt cannot outlive its call.
+    // The probe serializes too: a probe racing a real call would be exactly
+    // the two-concurrent-callers pattern this guard exists to prevent.
+    // Fail-open by construction: acquireLlmFlight never throws; a filesystem
+    // refusal degrades to unserialized dispatch.
+    const waitMs = Math.min(this.flightWaitMs(timeoutMs), maxFlightWaitMs ?? Infinity);
+    const guard = await this.acquireFlightGuard(timeoutMs, waitMs);
+    if (guard?.kind === "timeout") {
+      // Message deliberately contains "timeout" so isTotalFailure() matches:
+      // the ladder retries it and the breaker accrues on exhaustion — a
+      // persistently contended endpoint is indistinguishable from a slow one.
+      throw new Error(
+        `single-flight wait timeout after ${waitMs}ms for ${this.endpointKey} — ` +
+          `another LLM call holds the flight lock (treated as endpoint-down)`,
+      );
+    }
+    try {
+      return await this.dispatchOnce(model, prompt, maxTokens, timeoutMs);
+    } finally {
+      if (guard?.kind === "acquired") guard.release();
+    }
+  }
+
+  /** The single-flight wait budget for a call with ceiling `timeoutMs`.
+   *  An explicit `llmSingleFlightWaitMs` wins; otherwise the default is
+   *  max(900 s, llmTimeoutMs) so a waiter never gives up before a legitimate
+   *  in-flight call's own (possibly raised) ceiling expires (2nd-review
+   *  finding 2 — a hardcoded 900 s made a raised-timeout install treat a
+   *  healthy-busy endpoint as down). */
+  private flightWaitMs(timeoutMs: number): number {
+    return this.config.singleFlightWaitMs ?? Math.max(900_000, timeoutMs);
+  }
+
+  /** Resolve the flight guard for this call, or undefined when disabled.
+   *  `staleMs` is derived from THIS call's timeout ceiling (≥ the 30-min
+   *  floor, 2× timeout) so a raised `llmTimeoutMs` can never get a live
+   *  call's lock reclaimed mid-flight (CR #355 finding 3). The lock file
+   *  records its own lease, so reclaim is judged by the HOLDER's lease, not
+   *  this waiter's parameter (2nd-review finding 3). */
+  private async acquireFlightGuard(
+    timeoutMs: number,
+    waitMs: number,
+  ): Promise<LlmFlightGuard | undefined> {
+    if (this.config.singleFlight === false) return undefined; // kill switch
+    const staleMs = Math.max(DEFAULT_STALE_MS, 2 * timeoutMs);
+    return acquireLlmFlight(hicortexHome(), this.endpointKey, waitMs, staleMs);
+  }
+
+  private async dispatchOnce(
     model: string,
     prompt: string,
     maxTokens: number,

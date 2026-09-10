@@ -749,8 +749,9 @@ def test_privacy_filter_deprecation_silent_when_absent(tmp_path, monkeypatch, ca
         cfg = config_mod.load_config()
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert warnings == []
-    # The default is still applied (backward-compat value), just silently.
-    assert cfg.get("privacy_filter") == "WORK,PERSONAL"
+    # 0.7.4: the dead setting is no longer injected either — absent stays
+    # absent (only files that explicitly carry it are tolerated + warned).
+    assert "privacy_filter" not in cfg
     assert config_mod._privacy_filter_deprecation_warned is False
 
 

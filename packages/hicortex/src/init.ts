@@ -412,7 +412,21 @@ function setupOpencode(): void {
 // Hermes setup
 // ---------------------------------------------------------------------------
 
-function setupHermes(serverUrl: string, authToken: string): void {
+
+/**
+ * The client config's serverUrl BEFORE this run re-points it — the value init
+ * last wrote into the Hermes plugin's config (so the plugin step can tell an
+ * init-owned URL from a user-set one). Exported for tests.
+ */
+export function readPreviousServerUrl(configPath: string): string | undefined {
+  try {
+    const { config: prev } = loadConfigStrict(configPath);
+    if (typeof prev.serverUrl === "string" && prev.serverUrl) return prev.serverUrl;
+  } catch { /* no prior config, or unreadable — nothing init-owned to carry */ }
+  return undefined;
+}
+
+export function setupHermes(serverUrl: string, authToken: string, previousServerUrl?: string): void {
   const pluginSource = join(__dirname, "..", "hermes-plugin", "hicortex");
 
   if (!existsSync(pluginSource)) {
@@ -423,24 +437,82 @@ function setupHermes(serverUrl: string, authToken: string): void {
   const pluginsDir = join(HERMES_HOME, "plugins", "hicortex");
   mkdirSync(pluginsDir, { recursive: true });
 
-  // Copy plugin files
-  const pluginFiles = readdirSync(pluginSource);
-  for (const f of pluginFiles) {
-    const src = join(pluginSource, f);
-    if (statSync(src).isFile()) {
-      copyFileSync(src, join(pluginsDir, f));
+  // If the plugin was installed via `hermes plugins install` (a git checkout
+  // that actually contains the plugin — .git alone could be an empty/partial
+  // dir), do NOT copy over it — that would mix a managed checkout with
+  // copied files and break its own update path. The config below is still
+  // written: Hermes' own `memory setup` writes config.json into that tree
+  // too, so the file is expected there regardless of install path.
+  const isGitInstall = existsSync(join(pluginsDir, ".git")) && existsSync(join(pluginsDir, "plugin.yaml"));
+  if (isGitInstall) {
+    console.log("  ✓ Hermes plugin already installed (git checkout) — leaving its files, updating config only");
+  } else {
+    const pluginFiles = readdirSync(pluginSource);
+    for (const f of pluginFiles) {
+      // NEVER copy a bundled config.json over the user's: a stray one in a
+      // developer tree ships via prepack, and clobbering here would defeat
+      // the merge logic below (it runs AFTER this loop).
+      if (f === "config.json") continue;
+      const src = join(pluginSource, f);
+      if (statSync(src).isFile()) {
+        copyFileSync(src, join(pluginsDir, f));
+      }
+    }
+    console.log(`  ✓ Copied Hermes plugin to ${pluginsDir}`);
+  }
+
+  // Plugin config.json: MERGE, never blindly clobber. The URL is overwritten
+  // when it is INIT-OWNED — unset, a local default (either host spelling:
+  // init has written both `localhost` and `127.0.0.1` variants historically),
+  // or exactly what init last wrote (previousServerUrl — the client config's
+  // serverUrl BEFORE this run re-pointed it). A value the USER set by hand to
+  // something else is preserved WITH A LOUD DIVERGENCE WARNING — silently
+  // keeping a stale endpoint on a re-point is the failure this guards
+  // (CR: re-point must reach the plugin like it reaches CC's MCP entry).
+  // The auth token is a SECRET and is deliberately NOT written here —
+  // `hermes memory setup` routes it to $HERMES_HOME/.env, and localhost
+  // bypasses auth entirely.
+  const stripTrailingSlash = (v: string): string => v.replace(/\/+$/, "");
+  const localDefaults = [`http://localhost:${DEFAULT_PORT}`, `http://127.0.0.1:${DEFAULT_PORT}`];
+  // Normalize before comparing (trailing-slash variants of the same URL must
+  // not read as user-set — the client flow strips, the env-var flow does not).
+  const normalizedPrevious = previousServerUrl ? stripTrailingSlash(previousServerUrl) : undefined;
+  const isInitOwnedUrl = (v: unknown): boolean => {
+    if (typeof v !== "string" || v === "") return true;
+    const nv = stripTrailingSlash(v);
+    return localDefaults.includes(nv) || nv === normalizedPrevious;
+  };
+
+  const configPath = join(pluginsDir, "config.json");
+  let config: Record<string, unknown> = {};
+  if (existsSync(configPath)) {
+    try {
+      config = loadConfigStrict(configPath).config;
+    } catch {
+      // Corrupt/unreadable plugin config: REPLACE (this file holds no secrets
+      // by design — only URL/knobs; reset to defaults) — loudly, never
+      // silently, never fatally. (The underlying error's copy speaks of
+      // ~/.hicortex config semantics that do not apply to this file, so it
+      // is deliberately not echoed.)
+      console.log("  ⚠ Plugin config.json unreadable — replacing it (URL re-prefilled; optional knobs reset to defaults; no secrets live in this file)");
+      config = {};
     }
   }
-  console.log(`  ✓ Copied Hermes plugin to ${pluginsDir}`);
-
-  // Write plugin config.json (server URL only). The auth token is a SECRET and
-  // is deliberately NOT written here — `hermes memory setup` routes it to
-  // $HERMES_HOME/.env, and localhost bypasses auth entirely. Capture threshold
-  // omitted → the plugin's own default applies.
-  const config: Record<string, unknown> = { hicortex_url: serverUrl };
-  const configPath = join(pluginsDir, "config.json");
-  writeFileSync(configPath, JSON.stringify(config, null, 2));
-  console.log(`  ✓ Plugin config → ${serverUrl}`);
+  const normalizedServerUrl = stripTrailingSlash(serverUrl);
+  let keptExistingUrl = false;
+  if (isInitOwnedUrl(config.hicortex_url)) {
+    config.hicortex_url = normalizedServerUrl;
+  } else if (stripTrailingSlash(config.hicortex_url as string) !== normalizedServerUrl) {
+    keptExistingUrl = true;
+    console.log(`  ℹ Kept existing plugin URL ${config.hicortex_url} (differs from this install's ${normalizedServerUrl})`);
+    console.log("    Edit ~/.hermes/plugins/hicortex/config.json if that is not what you want.");
+  }
+  try {
+    writeFileSync(configPath, JSON.stringify(config, null, 2));
+    console.log(keptExistingUrl ? `  ℹ Plugin config stays on ${config.hicortex_url}` : `  ✓ Plugin config → ${config.hicortex_url}`);
+  } catch (e) {
+    console.log(`  ⚠ Could not write plugin config (${e instanceof Error ? e.message : e}) — Hermes setup skipped config pre-fill`);
+  }
 
   // For profile-based setups, symlink the shared plugin into each profile's
   // plugin dir (non-destructive). Discovery scans $HERMES_HOME/plugins/, so
@@ -470,14 +542,24 @@ function setupHermes(serverUrl: string, authToken: string): void {
   // Activation is left to Hermes' own tooling. We NEVER edit config.yaml —
   // Hermes' `memory setup` discovers this plugin automatically and writes the
   // config with its own YAML-aware writer (routing the token to .env).
-  const isRemote = !(serverUrl.includes("127.0.0.1") || serverUrl.includes("localhost"));
-  console.log("  → Activate with:  hermes memory setup   (select 'hicortex')");
+  // The token is PRINTED here for the remote case (the user's own terminal —
+  // same visibility as `hicortex status`); Hermes has no non-interactive
+  // setup path, so one paste is the floor. When a user-set URL was KEPT, the
+  // token hint names that server's token requirement instead (this install's
+  // token belongs to a different server).
+  console.log("  → Activate with:  hermes memory setup hicortex");
   if (existsSync(profilesDir)) {
     console.log("    Run once per profile if you use Hermes profiles.");
   }
-  if (isRemote) {
-    console.log("    Remote server: enter the auth token when prompted (stored in $HERMES_HOME/.env).");
+  if (keptExistingUrl) {
+    console.log("    The kept URL's server needs ITS token — run `hicortex status` on that machine if you don't have it.");
+  } else if (authToken) {
+    console.log(`    When prompted for the token, paste:  ${authToken}`);
+    console.log("    (stored by Hermes in $HERMES_HOME/.env — never in the plugin's config.json)");
+  } else {
+    console.log("    Local server: leave the token blank — localhost bypasses auth.");
   }
+  console.log("    Installed Hermes AFTER Hicortex? Re-running `npx @gamaze/hicortex init` redoes this step.");
 }
 
 /**
@@ -1974,6 +2056,11 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
   // writeClientConfig: strict-load → apply overrides → save. Throws on a
   // malformed existing config (0.16.x BLOCKER — never wipe the client's
   // authToken/licenseKey). ENOENT → fresh client config.
+  // The PRE-overwrite serverUrl is captured first: it is what init last
+  // wrote into the Hermes plugin's config, so the plugin step can tell an
+  // init-owned URL (update it — re-point must reach Hermes like it reaches
+  // CC's MCP entry) from a user-set one (keep + warn).
+  const previousServerUrl = readPreviousServerUrl(configPath);
   const { config } = writeClientConfig(configPath, { serverUrl, authToken }, nameDecision);
 
   console.log(`  ✓ Client config saved to ${configPath}`);
@@ -2034,7 +2121,7 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
   // Step 8: Setup Hermes if detected
   if (existsSync(HERMES_HOME)) {
     console.log("\nHermes detected — installing plugin...");
-    setupHermes(serverUrl, authToken);
+    setupHermes(serverUrl, authToken, previousServerUrl);
   }
 
   // Step 8b: Setup the Pi extension if detected (self-resolving — no config write)

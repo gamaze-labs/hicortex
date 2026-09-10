@@ -224,7 +224,10 @@ class HicortexProvider(MemoryProvider):
             self._recall_limit = int(cfg.get("recall_limit", 5))
         except (TypeError, ValueError):
             self._recall_limit = 5
-        self._privacy = cfg.get("privacy_filter", "WORK,PERSONAL")
+        # privacy_filter removed (0.7.4): the server ignores privacy entirely;
+        # the dead setting is no longer read. _privacy stays at its inert
+        # default for the (equally ignored) wire parameter.
+        self._privacy = "WORK,PERSONAL"
         # #203 scope: declared knowledge domains for this role-bound agent
         # (e.g. a health-focused agent → Health). Soft affinity boost on
         # recall; never excludes.

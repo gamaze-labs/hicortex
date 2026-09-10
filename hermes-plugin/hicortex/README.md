@@ -78,7 +78,7 @@ hermes memory setup   # select "hicortex", enter the server URL/token when promp
 
 Run it once per profile if you use Hermes profiles. Hermes allows **one** external memory provider at a time, so disable Honcho (or any other) first, then restart the gateway.
 
-Config fields (`hicortex_url`, `default_project`, `recall_limit`, `privacy_filter`, `agent_name`) can also be written to `$HERMES_HOME/plugins/hicortex/config.json` directly. `agent_name` pins the per-agent context id for this profile (leave blank to auto-derive — see [Per-agent standing context](#per-agent-standing-context-013)). The auth token is a **secret** — set it via env, not the JSON file:
+Setup asks exactly two questions: the **server URL** and the **auth token**. Everything else has a correct default and is configured — if ever needed — directly in `$HERMES_HOME/plugins/hicortex/config.json`: `default_project` (blank = memories unattributed), `recall_limit` (default 5; sizes the tools and the legacy `/search` fallback only — the pushed recall index is sized by SERVER config `recallMaxItems`), `agent_name` (blank auto-derives from the running profile; pin it only for fleet re-installs — see [Per-agent standing context](#per-agent-standing-context-013)), and `mission_domains` (blank = off; an optional recall boost keyed to the server's domain vocabulary). The auth token is a **secret** — set it via env, not the JSON file:
 
 ```bash
 export HICORTEX_AUTH_TOKEN=hctx-<your-token>   # or your custom token
@@ -86,7 +86,7 @@ export HICORTEX_AUTH_TOKEN=hctx-<your-token>   # or your custom token
 
 Env overrides: `HICORTEX_URL`, `HICORTEX_AUTH_TOKEN`.
 
-> **`privacy_filter` is DEPRECATED** (plugin 0.7.2 / server 0.16.2). The server no longer filters on privacy — the `privacy` column is vestigial (stored, never filtered). The setting is still accepted for backward compatibility but is now a harmless no-op; setting it emits a one-time-per-process warning in the gateway log. For work/personal isolation, run a **separate Hicortex server** per scope rather than relying on in-server privacy filtering.
+> **`privacy_filter` is REMOVED from setup** (plugin 0.7.4; deprecated since 0.7.2 / server 0.16.2). The server no longer filters on privacy — the `privacy` column is vestigial (stored, never filtered) — so the setting was a no-op the setup flow still prompted for. New setups never see the question; existing config.json files that still carry the key are tolerated (one-time warning in the gateway log; safe to delete the line). For work/personal isolation, run a **separate Hicortex server** per scope rather than relying on in-server privacy filtering.
 
 ## Topology
 

@@ -1,10 +1,14 @@
-# @gamaze/hicortex — Self-Learning Memory for AI Agents
+# @gamaze/hicortex — Shared Fleet Memory for AI Agents
 
 <img src="https://raw.githubusercontent.com/gamaze-labs/hicortex/main/docs/dashboard-composition.png" alt="Hicortex dashboard — live screenshot: memory-type composition (episodes / lessons / facts / decisions)" width="800">
 
-Your agents learn from every session — successes and mistakes. Hicortex captures experiences, distills lessons, and applies them automatically. Connect multiple agents to shared memory and they improve together, overnight.
+**Many agents. One shared memory. Wisdom compounds.**
 
-Works with **Hermes**, **OpenClaw**, **Claude Code**, **Pi**, **opencode**, and any MCP-compatible agent.
+Hicortex is shared long-term memory for AI agents. Install once, and every agent you run — Claude Code, Hermes, OpenClaw, Pi, OpenCode, any MCP client — draws on one memory: sessions are captured automatically, distilled into knowledge, decisions and learnings overnight, and a compact recall index is pushed into each prompt in every supported coding agent. What one agent learns, the whole fleet knows.
+
+**Install — one command, ~2 minutes:** `npx @gamaze/hicortex init`
+
+Self-hosted: raw sessions never leave your machine. Zero LLM calls at recall. Free for personal use.
 
 **Website:** [hicortex.gamaze.com](https://hicortex.gamaze.com) · **Docs:** [hicortex.gamaze.com/docs](https://hicortex.gamaze.com/docs/)
 
@@ -240,6 +244,8 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `llmBreakerCooldownMs` | How long the breaker stays open before one half-open trial call goes out (default 600000 = 10 min). A failing trial re-opens it; a succeeding one resets the counter. |
 | `llmProbeTimeoutMs` | Patience of the readiness probe — one minimal 1-token generation request the nightly sends before consolidating and the daemon sends before distilling (default 60000 = 1 min). Catches a gateway that answers health/model-list queries while generation is dead; a failed probe skips consolidation (`endpoint_down`, retried next run) and answers `/distill` with a 503 so capture holds its cursor. |
 | `llmProbeTtlMs` | How long the daemon caches a `/distill` probe outcome (default 300000 = 5 min). A healthy capture cadence pays at most one probe per window; a dead endpoint turns into fast cached 503s instead of every request paying the probe timeout. |
+| `llmSingleFlight` | **Serialized LLM calls — default `true`.** At most ONE request in flight per endpoint at any moment, across every process (the daemon distilling concurrent captures, the nightly consolidating, CLI backfills take turns via a per-endpoint lock file). One Hicortex server is several callers at once, and local single-user model servers (a Mac mini or laptop serving one big-context model) can stall or crash — taking the machine with them — under two concurrent large requests. Queued calls wait their turn; batches run back-to-back. **Set `false` if your endpoint is a beefy multi-tenant service that parallelizes well and you want faster consolidation** — you opt into responsibility for the endpoint's concurrency safety. |
+| `llmSingleFlightWaitMs` | How long a queued call waits for the in-flight call before failing as endpoint-down and retrying per the normal ladder/breaker rules (default: `max(900000, llmTimeoutMs)` — a waiter never gives up before a legitimate in-flight call's own, possibly raised, ceiling expires). Only meaningful with serialization on. Note under contention: the readiness probe queues too, but its wait is capped by its own probe budget — during a long consolidation batch, `/distill` answers 503 quickly (captures cursor-hold and retry, lossless) rather than holding the socket for the full queue budget. |
 | `authToken` | Bearer token for endpoint auth. Generated on first `init` in server mode. Find the active token with `hicortex status` or in `~/.hicortex/config.json`. |
 | `corsAllowedOrigins` | Browser origins allowed to read cross-origin responses, e.g. `["https://ui.example.com"]`. **Empty by default** — the server sends no `Access-Control-Allow-Origin` and never `Allow-Credentials`, so no external web page can read its data. The bundled `/viz` and `/identity/ui` pages are same-origin and need no entry. |
 | `licenseKey` | Commercial license key (optional; for display in `hicortex status`) |

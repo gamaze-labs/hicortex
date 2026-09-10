@@ -799,8 +799,11 @@ export async function runNightly(options: {
             consolidationStatus = report.status;
             // #337: the stages fail soft, so a run against an endpoint that died
             // MID-run would otherwise report "completed". An open breaker is the
-            // honest signal — override to endpoint_down (lastConsolidated still
-            // only advances on a clean "completed", so the work is re-run).
+            // honest signal — override to endpoint_down. lastConsolidated only
+            // advances on a clean completed AND a closed breaker (the same
+            // llm.breakerOpen signal, gated in consolidate.ts — keep the two
+            // sites in lockstep), so the importance/reflection/domain work is
+            // re-run on the next pass.
             if (llm.breakerOpen) {
               console.error(
                 `[hicortex] LLM circuit breaker OPEN after consolidation — ` +
