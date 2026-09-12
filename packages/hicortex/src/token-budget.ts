@@ -26,7 +26,7 @@
  * hardening if it ever matters.
  */
 import { loadState, updateState } from "./state.js";
-import { shouldThrottleTokens } from "./consolidate.js";
+import { shouldThrottleTokens, isStaleTokenPeriod } from "./consolidate.js";
 
 /** Env override (hosted: provider-set, tenant-immutable at runtime). */
 const TOKEN_CAP_ENV = "HICORTEX_TOKEN_CAP";
@@ -105,11 +105,9 @@ export function recordDistillUsage(
   let periodStart = "";
   updateState((s) => {
     const prev = s.llmTokensThisPeriod;
-    // Monthly reset (year+month) — matches shouldThrottleTokens's staleness check.
-    const stale =
-      !prev?.periodStart ||
-      new Date(prev.periodStart).getUTCFullYear() !== new Date().getUTCFullYear() ||
-      new Date(prev.periodStart).getUTCMonth() !== new Date().getUTCMonth();
+    // Monthly reset — the ONE staleness helper (#405; was a hand-rolled copy
+    // of shouldThrottleTokens's check).
+    const stale = isStaleTokenPeriod(prev?.periodStart);
     if (stale) {
       s.llmTokensThisPeriod = {
         prompt: usage.prompt,

@@ -21,11 +21,11 @@ let VERSION = "0.0.0";
 try { VERSION = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version; } catch {}
 
 import { initDb, resolveDbPath } from "./db.js";
-import { readPositiveConfig, readNonNegativeConfig, warnIgnoredConfigKeys } from "./config-read.js";
+import { readNonNegativeConfig, warnIgnoredConfigKeys } from "./config-read.js";
 import { resolveSavedLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
-import { runConsolidation, CONSOLIDATE_MAX_LLM_CALLS, resolveMemorySoftCap, stageMemoryCapEviction, shouldThrottleTokens } from "./consolidate.js";
+import { runConsolidation, resolveNightlyLlmCallBudget, resolveMemorySoftCap, stageMemoryCapEviction, shouldThrottleTokens, isStaleTokenPeriod } from "./consolidate.js";
 import { parseConfigDomains } from "./domain-classify.js";
 import { resolveWeakPrimaryFloor } from "./nofit.js";
 import { readCcTranscripts, type TranscriptBatch } from "./transcript-reader.js";
@@ -39,6 +39,7 @@ import { loadState, updateState, migrateLegacyState } from "./state.js";
 import { migrateIdentityDir } from "./identity-store.js";
 import { openCursorStore, pruneCursors } from "./capture-cursors.js";
 import { captureBatches, acquireCaptureLock, type PostFn, type PostResult, type DistillBody } from "./capture.js";
+import { createRunDeadline, resolveNightlyTimeBudgetMinutes, type RunDeadline } from "./run-deadline.js";
 import { writeSnapshot, backfillSnapshots } from "./dashboard.js";
 import { isTelemetryEnabled, getTelemetryId, sendTelemetry, TELEMETRY_PAYLOAD_VERSION } from "./telemetry.js";
 import { ensureAndPersistAgentId, loadConfigStrict } from "./init.js";
@@ -142,7 +143,7 @@ export function computeSince(
 
 /** POST /distill transport for server mode — localhost. Sends authToken so
  *  self-capture works regardless of the localhost-bypass marker (#271 root-cause fix). */
-function makeLocalPost(port: number, authToken?: string): PostFn {
+function makeLocalPost(port: number, authToken?: string, deadline?: RunDeadline): PostFn {
   return async (body: DistillBody): Promise<PostResult> => {
     const resp = await fetch(`http://127.0.0.1:${port}/distill`, {
       method: "POST",
@@ -152,14 +153,17 @@ function makeLocalPost(port: number, authToken?: string): PostFn {
       },
       body: JSON.stringify(body),
       // Synchronous 35B distillation of a large segment can take minutes.
-      signal: AbortSignal.timeout(20 * 60 * 1000),
+      // #405: never wait past the run deadline — the capture loop's
+      // between-segments check is the clean stop; this is the hard bound
+      // for the POST in flight when the deadline expires mid-wait.
+      signal: AbortSignal.timeout(postTimeoutMs(deadline)),
     });
     return normalizePostResult(resp);
   };
 }
 
 /** POST /distill transport for client mode — remote URL + optional bearer token. */
-function makeRemotePost(serverUrl: string, authToken?: string): PostFn {
+function makeRemotePost(serverUrl: string, authToken?: string, deadline?: RunDeadline): PostFn {
   return async (body: DistillBody): Promise<PostResult> => {
     const resp = await fetch(`${serverUrl}/distill`, {
       method: "POST",
@@ -168,10 +172,20 @@ function makeRemotePost(serverUrl: string, authToken?: string): PostFn {
         ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(20 * 60 * 1000),
+      signal: AbortSignal.timeout(postTimeoutMs(deadline)),
     });
     return normalizePostResult(resp);
   };
+}
+
+/**
+ * Per-POST timeout: 20 min (synchronous distillation of a large segment can
+ * take minutes), clamped to the run deadline's remaining time when one is in
+ * force (#405) — a POST launched near expiry never outlives the deadline.
+ */
+function postTimeoutMs(deadline?: RunDeadline): number {
+  const CAP_MS = 20 * 60 * 1000;
+  return Math.max(1, Math.min(CAP_MS, deadline ? deadline.remainingMs() : Infinity));
 }
 
 async function normalizePostResult(resp: Response): Promise<PostResult> {
@@ -255,9 +269,6 @@ function captureLockWaitMs(): number {
   return Number.isFinite(env) && env >= 0 ? env : CAPTURE_LOCK_WAIT_MS;
 }
 
-// readPositiveConfig moved to ./config-read.ts (shared with the distill-tier
-// overlay in llm.ts / mcp-server.ts). Validates positive-number config knobs
-// at the disk→runtime boundary with a warn-on-rejected-value.
 
 const NIGHTLY_LOG_MAX_BYTES = 1024 * 1024; // 1 MB — years of normal runs
 
@@ -512,6 +523,23 @@ export async function runNightly(options: {
   }
   console.log(`[hicortex] DB: ${dbPath}`);
 
+  // #405: the ONE pipeline deadline. Full and consolidate-only runs create
+  // it at start and share it across capture + every consolidation stage
+  // (checked at safe boundaries; a hit defers cleanly — see run-deadline.ts).
+  // Capture-only/watchdog runs do NOT: they keep their 30-min systemd
+  // backstop (capture is no-LLM and short). Dry-run is exempt (writes
+  // nothing, spends nothing). 0/invalid config → the 240 default — a
+  // deadline always exists (the old reconsolidationMaxMinutes 0=off is gone).
+  const deadline = !dryRun && !captureOnly
+    ? createRunDeadline(resolveNightlyTimeBudgetMinutes(savedConfig))
+    : undefined;
+  if (deadline) {
+    console.log(
+      `[hicortex] Nightly time budget: ${Math.round((deadline.deadlineAt - Date.now()) / 60_000)} min ` +
+        `(deadline at ${new Date(deadline.deadlineAt).toISOString()})`,
+    );
+  }
+
   // Init DB — consolidation reads the DB directly; capture goes via HTTP.
   const db = initDb(dbPath);
 
@@ -560,8 +588,11 @@ export async function runNightly(options: {
     } else {
     // Full nightly waits out a transient --capture-only overlap (each segment
     // POST can block up to 20 min); capture-only fails fast. dry-run writes
-    // nothing so it needs no lock.
-    const lockWaitMs = captureLockWaitMs();
+    // nothing so it needs no lock. #405: the wait never outlives the run
+    // deadline — waiting the full 30 min with 5 min left would burn the
+    // whole pipeline on a lock queue. captureLockWaitMs() keeps its env
+    // override (tests); min() clamps to whatever remains.
+    const lockWaitMs = Math.max(0, Math.min(captureLockWaitMs(), deadline ? deadline.remainingMs() : Infinity));
     const releaseLock = dryRun
       ? (() => {})
       : await acquireCaptureLock(stateDir, captureOnly ? 0 : lockWaitMs);
@@ -627,11 +658,12 @@ export async function runNightly(options: {
         // source_agent_id / source_domain are per-client provenance from
         // config.json (agentId / sourceDomain) — attribution only, no filtering.
         const result = await captureBatches(batches, {
-          post: makeLocalPost(port, savedConfig?.authToken as string | undefined),
+          post: makeLocalPost(port, savedConfig?.authToken as string | undefined, deadline),
           cursorStore,
           dryRun,
           sourceAgentId: savedConfig?.agentId as string | undefined,
           sourceDomain: savedConfig?.sourceDomain as string | undefined,
+          deadline,
         });
         memoriesIngested = result.memoriesIngested;
         distillUsage = result.distillUsage;
@@ -682,11 +714,13 @@ export async function runNightly(options: {
     // nothing-to-do short-circuit (zero LLM calls), NOT a failure.
     // "throttled" (#246) = the llmTokensPerMonth fair-use cap was projected to
     // be exceeded, so consolidation was skipped before any LLM call.
-    // "endpoint_down" (#337) = the pre-consolidation readiness probe failed, or
-    // the LLM circuit breaker was open after the run — transient (retried next
-    // run), and NEVER "completed": the stages fail soft, so without this
-    // override a dead-endpoint run would report clean.
-    let consolidationStatus: "completed" | "skipped" | "failed" | "no_llm" | "throttled" | "endpoint_down" | undefined;
+    // "endpoint_down" (#337) = the LLM circuit breaker was open after the run —
+    // transient (retried next run), and NEVER "completed": the stages fail
+    // soft, so without this override a dead-endpoint run would report clean.
+    // "deferred" (#405) = the run-wide wall-clock deadline fired — at least one
+    // stage stopped at a safe boundary and drains next run (lastConsolidated
+    // held, exactly like endpoint_down).
+    let consolidationStatus: "completed" | "skipped" | "failed" | "no_llm" | "throttled" | "endpoint_down" | "deferred" | undefined;
     // #246: total consolidation tokens consumed this run (hoisted for telemetry
     // + the dashboard snapshot). Undefined when consolidation didn't run at all
     // (capture-only / no_llm / throttled) so the optional field is omitted.
@@ -740,12 +774,11 @@ export async function runNightly(options: {
             // estimate so the next month starts clean.
             if (!dryRun) {
               updateState((s) => {
-                const now = new Date();
-                const cur = s.llmTokensThisPeriod;
-                const startD = cur?.periodStart ? new Date(cur.periodStart) : now;
-                if (startD.getUTCFullYear() !== now.getUTCFullYear() ||
-                    startD.getUTCMonth() !== now.getUTCMonth()) {
-                  s.llmTokensThisPeriod = { prompt: 0, completion: 0, total: 0, periodStart: now.toISOString() };
+                // #405: the ONE monthly-reset staleness helper — shared by
+                // shouldThrottleTokens, this file's post-consolidation
+                // accrual write, and token-budget.ts recordDistillUsage.
+                if (isStaleTokenPeriod(s.llmTokensThisPeriod?.periodStart)) {
+                  s.llmTokensThisPeriod = { prompt: 0, completion: 0, total: 0, periodStart: new Date().toISOString() };
                   s.llmTokensLastRun = 0;
                   console.log("[hicortex] Token fair-use period reset (new month) — throttle cleared.");
                 }
@@ -755,27 +788,15 @@ export async function runNightly(options: {
         }
 
         if (consolidationStatus !== "throttled") {
-          // #337: readiness probe — ONE minimal generation request before any
-          // consolidation phase. This REPLACES the #231 no-preflight decision
-          // (its premise "a failed phase costs latency, not data" was falsified
-          // by the 2026-08-23/24 incident: the gateway answered /v1/models —
-          // liveness — while generation was dead, and the nightly retried into
-          // it for ~5 h, making the wedge monotonically worse). A failed probe
-          // skips consolidation entirely with the diagnosis "LLM endpoint not
-          // generating" (not-generating, not slow) and status endpoint_down —
-          // a transient outcome: consolidation has resumable cursors, the
-          // nightly re-runs 2-4×/day, and capture is unaffected (the daemon's
-          // /distill path has its own probe). Zero LLM phases run when the
-          // probe fails — one fast failure is the whole cost.
-          const probeOk = await llm.probe();
-          if (!probeOk) {
-            console.error(
-              "[hicortex] LLM endpoint not generating — consolidation skipped " +
-              "(endpoint_down, will retry next run). See the ops runbook's " +
-              "known failure signatures; llmProbeTimeoutMs tunes the probe's patience."
-            );
-            consolidationStatus = "endpoint_down";
-          } else {
+          // #405: the pre-consolidation readiness probe gate is DELETED. The
+          // breaker's first-fast-failure semantics took over its job: a
+          // wedged endpoint costs at most 3 ladder-exhausted logical calls
+          // (~31 min at the 900 s ceiling, once per dead night, bounded by
+          // the run deadline) before the post-run breakerOpen override below
+          // reports endpoint_down. The probe SURVIVES in the daemon's
+          // /distill gate (mcp-server.ts resolveDistillProbeGate) — a
+          // different process with a different job.
+          {
             const cfgDomains = parseConfigDomains(savedConfig);
 
             console.log(`[hicortex] Running consolidation...`);
@@ -784,11 +805,13 @@ export async function runNightly(options: {
               contentDomainsReady: true,
               weakPrimaryFloor: resolveWeakPrimaryFloor(savedConfig),
             }, {
+              // #405: no supersessionMaxCalls — the ONE run budget is the
+              // only call cap.
               minSimilarity: savedConfig?.supersessionMinSimilarity as number | undefined,
-              maxCalls: savedConfig?.supersessionMaxCalls as number | undefined,
             },
-              // #241: config-driven total LLM-call ceiling (default 5000, was 200).
-              readPositiveConfig(savedConfig ?? {}, "consolidateMaxLlmCalls", CONSOLIDATE_MAX_LLM_CALLS),
+              // #405: the ONE per-run LLM-call ceiling (default 5000;
+              // consolidateMaxLlmCalls honored as a deprecated alias).
+              resolveNightlyLlmCallBudget(savedConfig),
               // #245: soft cap on the corpus (default 10000; 0 disables eviction).
               memorySoftCapResolved,
               {
@@ -797,20 +820,16 @@ export async function runNightly(options: {
                 // to its defaults (0.75 / 0.80) on invalid/absent values.
                 minSimilarity: savedConfig?.correctionMinSimilarity as number | undefined,
                 rewriteMinConfidence: savedConfig?.correctionRewriteMinConfidence as number | undefined,
-                // #392 unified-resolution knobs: the deterministic-merge
-                // ceiling (legacy dedupMergeThreshold honored when the new
-                // key is absent) and the pacing cap. Same validation posture
-                // — the stage defaults to 0.92 / 250.
+                // #392: the deterministic-merge ceiling (legacy
+                // dedupMergeThreshold honored when the new key is absent).
+                // #405: maxMerges/reconsolidationMaxCalls are gone — the run
+                // budget + deadline are the only bounds.
                 autoMergeThreshold: (savedConfig?.dedupAutoMergeThreshold ??
                   savedConfig?.dedupMergeThreshold) as number | undefined,
-                maxMerges: savedConfig?.dedupNightlyMaxMerges as number | undefined,
-                // #401 runtime bounds: the wall-clock deadline (default 120
-                // min, 0 disables) and the per-run classify-call ceiling
-                // (default 600, 0 disables). Same posture — the stage
-                // validates and falls back on invalid/absent values.
-                maxMinutes: savedConfig?.reconsolidationMaxMinutes as number | undefined,
-                maxCalls: savedConfig?.reconsolidationMaxCalls as number | undefined,
               },
+              // #405: the ONE run-wide deadline — capture and every
+              // consolidation stage check this same handle.
+              deadline,
             );
             console.log(
               `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
@@ -872,27 +891,18 @@ export async function runNightly(options: {
               updateState((s) => {
                 const now = new Date();
                 const cur = s.llmTokensThisPeriod;
-                let periodStart = cur?.periodStart ?? now.toISOString();
-                let prompt = cur?.prompt ?? 0;
-                let completion = cur?.completion ?? 0;
-                let total = cur?.total ?? 0;
-                // Monthly reset: if periodStart is in a previous calendar month,
-                // zero the accrual before adding this run's contribution.
-                const startD = new Date(periodStart);
-                if (startD.getUTCFullYear() !== now.getUTCFullYear() ||
-                    startD.getUTCMonth() !== now.getUTCMonth()) {
-                  periodStart = now.toISOString();
-                  prompt = 0;
-                  completion = 0;
-                  total = 0;
-                }
-                if (tokensTotal) {
-                  prompt += tokensTotal.prompt;
-                  completion += tokensTotal.completion;
-                  total += tokensTotal.total;
-                }
+                // Monthly reset — the ONE staleness helper (#405): zero the
+                // accrual before adding this run's contribution when
+                // periodStart sits in a previous UTC calendar month. Shared
+                // with shouldThrottleTokens, this file's throttle-branch
+                // reset, and token-budget.ts recordDistillUsage.
+                const stale = isStaleTokenPeriod(cur?.periodStart, now);
+                const prompt = (stale ? 0 : cur?.prompt ?? 0) + (tokensTotal?.prompt ?? 0);
+                const completion = (stale ? 0 : cur?.completion ?? 0) + (tokensTotal?.completion ?? 0);
+                const total = (stale ? 0 : cur?.total ?? 0) + (tokensTotal?.total ?? 0);
                 s.llmTokensThisPeriod = {
-                  prompt, completion, total, periodStart,
+                  prompt, completion, total,
+                  periodStart: stale ? now.toISOString() : cur!.periodStart,
                 };
                 s.llmTokensLastRun = tokensTotal?.total ?? 0;
               }, stateDir);
@@ -1185,13 +1195,12 @@ async function runClientNightly(
   // the whole run — the pre-flight only needs the link back, which can take
   // ~1 min after wake.
   //
-  // Config-overridable (#163): a wired/well-connected client vs one whose link
-  // is slow to re-establish after wake want different values. Defaults: 20s
-  // per-attempt timeout, 3 attempts, 60s gap. The 20s per-attempt (bumped from
-  // 15s in 0.17) absorbs a slow link coming back after the client wakes — a
-  // remote server reached over a mesh/VPN link can take several seconds to
-  // answer on the first request. For a genuinely DOWN link (`fetch failed`) no
-  // timeout length helps — the capture watchdog's frequent retry handles that (#239).
+  // #163/#405: constants (the preflightTimeoutMs/preflightAttempts/
+  // preflightRetryGapMs config keys are removed — no incident in the #403
+  // inventory ever required tuning them). 20s per attempt absorbs a slow link
+  // re-establishing after the client wakes (bumped from 15s in 0.17); for a
+  // genuinely DOWN link no timeout length helps — the capture watchdog's
+  // frequent retry handles that (#239).
   //
   // WALL-CLOCK NOTE: setTimeout and AbortSignal.timeout do NOT advance while
   // macOS is asleep, so the ~3m worst case (3×20s + 2×60s) is wall-clock-
@@ -1199,9 +1208,9 @@ async function runClientNightly(
   // elapsed time can exceed it. Not a defect: the capture lock isn't held
   // during the retry and the cursor design is dup-over-loss, so a late success
   // is harmless. Just don't treat 3m as a hard wall-clock bound.
-  const PREFLIGHT_TIMEOUT_MS = readPositiveConfig(config, "preflightTimeoutMs", 20_000);
-  const PREFLIGHT_ATTEMPTS = Math.max(1, Math.floor(readPositiveConfig(config, "preflightAttempts", 3)));
-  const PREFLIGHT_RETRY_GAP_MS = readPositiveConfig(config, "preflightRetryGapMs", 60_000);
+  const PREFLIGHT_TIMEOUT_MS = 20_000;
+  const PREFLIGHT_ATTEMPTS = 3;
+  const PREFLIGHT_RETRY_GAP_MS = 60_000;
   let reachable = false;
   for (let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS; attempt++) {
     try {

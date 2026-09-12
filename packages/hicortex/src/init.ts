@@ -40,6 +40,7 @@ import {
   type DesktopServerEntry,
 } from "./claude-desktop.js";
 import { parseHours, readNonNegativeConfig } from "./config-read.js";
+import { resolveNightlyTimeBudgetMinutes } from "./run-deadline.js";
 import { sanitizeAgentId } from "./identity-store.js";
 import type { DomainDef } from "./types.js";
 
@@ -2677,7 +2678,13 @@ function installCaptureWatchdogTimer(): void {
  * Install the CONSOLIDATION timer (full `nightly`). Reuses the existing
  * `hicortex-nightly` unit name (repurposed from the pre-0.17 single full-nightly).
  */
-function installConsolidationTimer(hours: number[]): void {
+export function installConsolidationTimer(hours: number[]): void {
+  // #405: DERIVED from the run deadline — nightlyTimeBudgetMinutes + 60 min
+  // slack. The old fixed 360 was prose-coupled to the old call budget (raise
+  // together!); now the unit backstop tracks the deadline it is backing.
+  // Backstop only (NOT an operating limit) — the slack absorbs backup +
+  // telemetry + a slow shutdown after the deadline stops the stages.
+  const timeoutMin = resolveNightlyTimeBudgetMinutes(readInstallConfig()) + 60;
   writeScheduleUnit({
     unitBase: "hicortex-nightly",
     plistLabel: "com.gamaze.hicortex-nightly",
@@ -2685,12 +2692,46 @@ function installConsolidationTimer(hours: number[]): void {
     timerDesc: "Hicortex Consolidation Timer",
     nightlyArgs: ["nightly"],
     hours,
-    // Backstop only (NOT an operating limit) — set well above the longest
-    // legitimate run so it catches a true hang, never a slow-but-progressing
-    // one. ~5000 LLM calls × ~1–3s/call ≈ 1.4–4.2h → 6h clears it with margin.
-    // Coupled to the consolidateMaxLlmCalls budget (#241): raise together.
-    timeoutMin: 360,
+    // nightlyTimeBudgetMinutes (default 240) + 60 min slack — see above.
+    timeoutMin,
   });
+  // #405 shadow detection: a systemd drop-in can override the derived
+  // TimeoutStartSec silently (a stale pre-#405 drop-in pinning a shorter
+  // timeout would hard-kill legitimate deadline-bounded runs). Detect and
+  // warn — removal is a deploy-time ops step, not an init action.
+  warnSystemdDropInShadow("hicortex-nightly", timeoutMin);
+}
+
+/** Read the install-time config (~/.hicortex/config.json), null-tolerant. */
+function readInstallConfig(): Record<string, unknown> | null {
+  try {
+    return JSON.parse(readFileSync(join(HICORTEX_HOME, "config.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Warn when `~/.config/systemd/user/<unit>.service.d/*.conf` drop-ins exist —
+ * they can shadow the generated TimeoutStartSec (and anything else the unit
+ * sets). Linux only; the macOS launchd path has no drop-in mechanism.
+ */
+function warnSystemdDropInShadow(unitBase: string, derivedTimeoutMin: number): void {
+  if (platform() !== "linux") return;
+  const dropInDir = join(homedir(), ".config", "systemd", "user", `${unitBase}.service.d`);
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dropInDir).filter((f) => f.endsWith(".conf"));
+  } catch {
+    return; // no drop-in dir — the common case
+  }
+  if (entries.length === 0) return;
+  console.warn(
+    `[hicortex] systemd drop-ins present for ${unitBase}.service (${entries.join(", ")}) — ` +
+      `they can SHADOW the generated unit settings (TimeoutStartSec is now derived: ` +
+      `${derivedTimeoutMin}min = nightlyTimeBudgetMinutes + 60 slack). ` +
+      `Remove stale drop-ins so the derived values take effect.`,
+  );
 }
 
 /**

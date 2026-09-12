@@ -3,12 +3,12 @@
   "name": "io.github.gamaze-labs/hicortex",
   "title": "Hicortex",
   "description": "Shared fleet memory for AI agents \u2014 what one agent learns, the whole fleet knows.",
-  "version": "0.20.5",
+  "version": "0.20.7",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "@gamaze/hicortex",
-      "version": "0.20.5",
+      "version": "0.20.7",
       "transport": {
         "type": "stdio",
         "command": "npx",

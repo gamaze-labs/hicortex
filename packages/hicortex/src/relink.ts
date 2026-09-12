@@ -47,7 +47,6 @@ import type { Memory } from "./types.js";
 import { initDb, resolveDbPath } from "./db.js";
 import * as storage from "./storage.js";
 import {
-  BudgetTracker,
   discoverLinkCandidates,
   classifyLinkCandidates,
   type LinkCandidate,
@@ -162,7 +161,6 @@ export async function runRelink(options: RelinkOptions = {}): Promise<RelinkRepo
   }
 
   // Classification is heuristic-only — no LLM client, no budget cap.
-  const budget = new BudgetTracker(Number.MAX_SAFE_INTEGER);
 
   const dbPath = resolveDbPath(options.dbPath);
   const db = initDb(dbPath);
@@ -257,9 +255,9 @@ export async function runRelink(options: RelinkOptions = {}): Promise<RelinkRepo
       report.skippedDuplicate += batchSkippedDuplicate;
 
       // Phase B: classification — shared heuristic-only path (LLM retired).
-      // classifyLinkCandidates ignores the null LLM/budget and returns each
-      // candidate's heuristic type (extends/relates_to).
-      const classified = await classifyLinkCandidates(candidates, null, budget);
+      // classifyLinkCandidates returns each candidate's heuristic type
+      // (extends/relates_to); #405 dropped its dead llm/budget params.
+      const classified = await classifyLinkCandidates(candidates);
       const types = classified.types;
       report.llmClassified += classified.llmClassified; // always 0
       report.heuristicFallback += classified.heuristicFallback;

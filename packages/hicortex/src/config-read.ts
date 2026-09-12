@@ -186,6 +186,27 @@ const IGNORED_CONFIG_KEYS = [
 ] as const;
 
 /**
+ * Config keys REMOVED by the #405 budget simplification, each mapped to its
+ * replacement (or "removed" when there is none). The old single 0.16.8-style
+ * message does not fit — every key here needs to name where its job went.
+ * Warned at the config boundary alongside the 0.16.8 keys above.
+ */
+const REMOVED_CONFIG_KEYS: Record<string, string> = {
+  reconsolidationMaxMinutes: "removed — the ONE run deadline (nightlyTimeBudgetMinutes) bounds the stage",
+  reconsolidationMaxCalls: "removed — the ONE call budget (nightlyLlmCallBudget) caps all stages",
+  supersessionMaxCalls: "removed — the ONE call budget (nightlyLlmCallBudget) caps all stages",
+  dedupNightlyMaxMerges: "removed — the run deadline (nightlyTimeBudgetMinutes) bounds nightly merges",
+  classifyMaxTokens: "removed — maxTokens is the single output ceiling for every call",
+  llmBreakerThreshold: "removed — the breaker threshold is a constant (3)",
+  llmBreakerCooldownMs: "removed — the breaker cooldown is a constant (10 min)",
+  llmSingleFlightWaitMs: "removed — the wait derives from llmTimeoutMs",
+  preflightTimeoutMs: "removed — a constant (20 s per attempt)",
+  preflightAttempts: "removed — a constant (3 attempts)",
+  preflightRetryGapMs: "removed — a constant (60 s gap)",
+  moduleIndexTokenBudget: "removed — was documentation-only",
+};
+
+/**
  * Warn if the saved config carries keys that 0.16.8+ ignores. Call at every
  * config read (daemon boot + nightly). The warning clears once the keys are
  * removed and (for the model keys) the model is consolidated into
@@ -197,13 +218,25 @@ export function warnIgnoredConfigKeys(
   if (!savedConfig) return;
   const present = IGNORED_CONFIG_KEYS.filter((k) => savedConfig[k] !== undefined);
   const hasModelsBlock = savedConfig.models !== undefined;
-  if (present.length === 0 && !hasModelsBlock) return;
-  const detail = [...present, ...(hasModelsBlock ? ["models"] : [])].join(", ");
-  console.warn(
-    `[hicortex] config has keys IGNORED since 0.16.8 (${detail}). They have no effect now. ` +
-    `Per-stage model keys / the \`models\` block: one model serves all phases — set ` +
-    `llmModel/llmBaseUrl/llmProvider (+ llmApiKey) to your intended model. ` +
-    `distillFallback: removed (strict mode is default — a failed distill retries next run). ` +
-    `Remove these keys to clear this warning. See the 0.16.8 changelog.`,
-  );
+  if (present.length > 0 || hasModelsBlock) {
+    const detail = [...present, ...(hasModelsBlock ? ["models"] : [])].join(", ");
+    console.warn(
+      `[hicortex] config has keys IGNORED since 0.16.8 (${detail}). They have no effect now. ` +
+      `Per-stage model keys / the \`models\` block: one model serves all phases — set ` +
+      `llmModel/llmBaseUrl/llmProvider (+ llmApiKey) to your intended model. ` +
+      `distillFallback: removed (strict mode is default — a failed distill retries next run). ` +
+      `Remove these keys to clear this warning. See the 0.16.8 changelog.`,
+    );
+  }
+  // #405: keys removed by the budget simplification — one line naming each
+  // present key and its replacement (or "removed").
+  const removed = Object.entries(REMOVED_CONFIG_KEYS)
+    .filter(([k]) => savedConfig[k] !== undefined);
+  if (removed.length > 0) {
+    const detail = removed.map(([k, v]) => `${k} (${v})`).join(", ");
+    console.warn(
+      `[hicortex] config has keys REMOVED by the budget simplification (#405): ${detail}. ` +
+      `They have no effect. Remove them to clear this warning.`,
+    );
+  }
 }
