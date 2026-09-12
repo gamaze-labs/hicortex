@@ -484,8 +484,12 @@ class HicortexProvider(MemoryProvider):
             {
                 "name": "hicortex_search",
                 "description": (
-                    "Search long-term memory using semantic similarity. Returns the most "
-                    "relevant memories from past sessions."
+                    "Search shared long-term memory (all agents, all sessions). "
+                    "CALL THIS BEFORE assuming, guessing, or asking the user about "
+                    "anything that may have come up before: prior decisions, "
+                    "preferences, project facts, people, hardware, past incidents. "
+                    "If you are about to write 'I don't have information about…', "
+                    "search first."
                 ),
                 "parameters": {
                     "type": "object",
@@ -504,13 +508,13 @@ class HicortexProvider(MemoryProvider):
                 "name": "hicortex_get",
                 "description": (
                     "Fetch ONE memory's full content by id — use this to lazy-load "
-                    "entries from the recall index or from search results whose "
-                    "snippet was not enough. Fetching a memory marks it as used "
-                    "(strengthens it), so fetch entries that could change your "
-                    "action — not every shown one. When the memory shapes your "
-                    "answer, cite it as given in the response — mark a fetched "
-                    "memory FETCHED and a one-line entry cited unread SNIPPET; "
-                    "don't pass SNIPPET off as established."
+                    "entries from the '## Memory recall (auto)' index or from search "
+                    "results whose snippet was not enough. Fetching a memory marks "
+                    "it as used (strengthens it), so fetch entries that could "
+                    "change your action — not every shown one. When the memory "
+                    "shapes your answer, cite it to the user (id + date + origin "
+                    "agent) — mark a fetched memory `FETCHED` and a one-line entry "
+                    "cited unread `SNIPPET`; don't pass SNIPPET off as established."
                 ),
                 "parameters": {
                     "type": "object",
@@ -526,9 +530,9 @@ class HicortexProvider(MemoryProvider):
             {
                 "name": "hicortex_recent",
                 "description": (
-                    "Get recent memories, optionally filtered by project. Queryless recall "
-                    "of the latest memories by project, ranked by importance. Useful to "
-                    "catch up on what happened recently."
+                    "Get recent memories, optionally filtered by project. CALL THIS "
+                    "AT THE START of substantive work on a project to catch up on "
+                    "its latest state — cheaper than asking the user what happened."
                 ),
                 "parameters": {
                     "type": "object",
@@ -542,7 +546,9 @@ class HicortexProvider(MemoryProvider):
                 "name": "hicortex_ingest",
                 "description": (
                     "Store a new memory in long-term storage. "
-                    "Use for Knowledge, Decisions, or Learnings."
+                    "Use for Knowledge, Decisions, or Learnings. Capture is "
+                    "automatic (nightly) — use this ONLY for explicitly requested "
+                    "learnings, never routine content."
                 ),
                 "parameters": {
                     "type": "object",
@@ -561,8 +567,10 @@ class HicortexProvider(MemoryProvider):
             {
                 "name": "hicortex_lessons",
                 "description": (
-                    "Get actionable Learnings distilled from past sessions. "
-                    "Auto-generated insights about mistakes to avoid."
+                    "Get actionable Learnings — auto-generated insights about "
+                    "mistakes to avoid. CALL THIS before retrying an approach that "
+                    "failed before, or when picking up work where past problems may "
+                    "have been recorded."
                 ),
                 "parameters": {
                     "type": "object",
@@ -575,7 +583,9 @@ class HicortexProvider(MemoryProvider):
                 "name": "hicortex_index",
                 "description": (
                     "Get the knowledge domain index — shows what topics and projects "
-                    "are stored in memory, grouped by domain."
+                    "are stored in memory, grouped by domain. Call before a broad "
+                    "search to see which knowledge domains exist, or when unsure "
+                    "what the memory covers."
                 ),
                 "parameters": {
                     "type": "object",
@@ -586,7 +596,9 @@ class HicortexProvider(MemoryProvider):
                 "name": "hicortex_graph",
                 "description": (
                     "Query the memory knowledge graph — find connected memories, "
-                    "hub nodes, or paths between memories."
+                    "hub nodes, or paths between memories. Use it to explore "
+                    "memories connected to one you just fetched, or to find hub "
+                    "memories in a domain."
                 ),
                 "parameters": {
                     "type": "object",

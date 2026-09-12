@@ -1,0 +1,44 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.gamaze-labs/hicortex",
+  "title": "Hicortex",
+  "description": "Shared fleet memory for AI agents \u2014 what one agent learns, the whole fleet knows.",
+  "version": "0.20.5",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@gamaze/hicortex",
+      "version": "0.20.5",
+      "transport": {
+        "type": "stdio",
+        "command": "npx",
+        "args": [
+          "-y",
+          "@gamaze/hicortex",
+          "mcp"
+        ]
+      },
+      "environmentVariables": [
+        {
+          "name": "HICORTEX_AUTH_TOKEN",
+          "description": "Bearer token for a remote Hicortex server (server prints it via `hicortex status`). Optional \u2014 a local server needs no token.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "HICORTEX_SERVER_URL",
+          "description": "URL of a remote Hicortex server (e.g. https://your-server:8787). Optional \u2014 omit for a local server on this machine.",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ],
+  "repository": {
+    "url": "https://github.com/gamaze-labs/hicortex",
+    "source": "github"
+  },
+  "websiteUrl": "https://hicortex.gamaze.com"
+}

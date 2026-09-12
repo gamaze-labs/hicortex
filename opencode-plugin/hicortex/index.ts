@@ -629,7 +629,7 @@ function registerTools(): Record<string, unknown> {
   return {
     hicortex_search: {
       description:
-        "Search long-term memory using semantic similarity. Returns the most relevant memories from past sessions.",
+        "Search shared long-term memory (all agents, all sessions). CALL THIS BEFORE assuming, guessing, or asking the user about anything that may have come up before: prior decisions, preferences, project facts, people, hardware, past incidents. If you are about to write 'I don't have information about…', search first.",
       args: {
         query: { type: "string", description: "Search query text (required)" },
         limit: { type: "number", description: "Max results (default 5)" },
@@ -653,7 +653,7 @@ function registerTools(): Record<string, unknown> {
 
     hicortex_get: {
       description:
-        "Fetch ONE memory's full content by id — use this to lazy-load entries from the '## Memory recall (auto)' index or from search results whose snippet was not enough. Fetching a memory marks it as used (strengthens it), so fetch entries that could change your action — not every shown one. When the memory shapes your answer, cite it as given in the response — mark a fetched memory `FETCHED` and a one-line entry cited unread `SNIPPET`; don't pass SNIPPET off as established.",
+        "Fetch ONE memory's full content by id — use this to lazy-load entries from the '## Memory recall (auto)' index or from search results whose snippet was not enough. Fetching a memory marks it as used (strengthens it), so fetch entries that could change your action — not every shown one. When the memory shapes your answer, cite it to the user (id + date + origin agent) — mark a fetched memory `FETCHED` and a one-line entry cited unread `SNIPPET`; don't pass SNIPPET off as established.",
       args: {
         id: { type: "string", description: "Memory ID (required; as shown in the recall index or search results)" },
       },
@@ -681,7 +681,7 @@ function registerTools(): Record<string, unknown> {
 
     hicortex_recent: {
       description:
-        "Get recent memories, optionally filtered by project. Queryless recall of the latest memories by project, ranked by importance. Useful to catch up on what happened recently.",
+        "Get recent memories, optionally filtered by project. CALL THIS AT THE START of substantive work on a project to catch up on its latest state — cheaper than asking the user what happened.",
       args: {
         project: { type: "string", description: "Filter by project name" },
         limit: { type: "number", description: "Max results (default 10)" },
@@ -705,7 +705,7 @@ function registerTools(): Record<string, unknown> {
 
     hicortex_ingest: {
       description:
-        "Store a new memory in long-term storage. Use for Knowledge, Decisions, or Learnings.",
+        "Store a new memory in long-term storage. Use for Knowledge, Decisions, or Learnings. Capture is automatic (nightly) — use this ONLY for explicitly requested learnings, never routine content.",
       args: {
         content: { type: "string", description: "Memory content to store (required)" },
         project: { type: "string", description: "Project this memory belongs to" },
@@ -739,7 +739,7 @@ function registerTools(): Record<string, unknown> {
 
     hicortex_lessons: {
       description:
-        "Get actionable Learnings distilled from past sessions. Auto-generated insights about mistakes to avoid.",
+        "Get actionable Learnings — auto-generated insights about mistakes to avoid. CALL THIS before retrying an approach that failed before, or when picking up work where past problems may have been recorded.",
       args: {
         project: { type: "string", description: "Filter by project name (optional)" },
       },
@@ -763,7 +763,7 @@ function registerTools(): Record<string, unknown> {
 
     hicortex_index: {
       description:
-        "Get the knowledge domain index — shows what topics and projects are stored in memory, grouped by domain.",
+        "Get the knowledge domain index — shows what topics and projects are stored in memory, grouped by domain. Call before a broad search to see which knowledge domains exist, or when unsure what the memory covers.",
       args: {},
       async execute(_args: any): Promise<string> {
         try {
@@ -780,7 +780,7 @@ function registerTools(): Record<string, unknown> {
 
     hicortex_graph: {
       description:
-        "Query the memory knowledge graph — find connected memories, hub nodes, or paths between memories.",
+        "Query the memory knowledge graph — find connected memories, hub nodes, or paths between memories. Use it to explore memories connected to one you just fetched, or to find hub memories in a domain.",
       args: {
         operation: { type: "string", description: "Graph operation to perform: neighbors, hubs, or path (required)" },
         id: { type: "string", description: "Memory ID (required for neighbors and path operations)" },

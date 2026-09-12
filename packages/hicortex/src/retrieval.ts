@@ -367,6 +367,39 @@ export function findSupersededIds(
 }
 
 /**
+ * The full ranking-demotion set among `candidateIds` (#384): the UNION of
+ * (a) sources of a `superseded_by` link (legacy + stageSupersession — link
+ * driven, works on pre-v14 rows with NULL status) and (b) rows whose
+ * `memories.status` is 'superseded' or 'retracted' (reconsolidation marks +
+ * explicit ingest marks). `corrected` is deliberately NOT demoting — a
+ * rewritten memory carries the CORRECTION, and demoting it would bury the
+ * fix (the exact failure reconsolidation exists to repair). `absorbed` needs
+ * no entry here: absorbed rows have no vector/FTS row and are filtered at
+ * candidacy. One batched query, both call sites (retrieve + searchRecent).
+ * Byte-identical behavior for memories with no correction relationship
+ * (NULL status, no link) — they never match either arm.
+ */
+export function findDemotedIds(
+  db: Database.Database,
+  candidateIds: string[]
+): Set<string> {
+  if (candidateIds.length === 0) return new Set();
+  const placeholders = candidateIds.map(() => "?").join(",");
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT id FROM (
+         SELECT source_id AS id FROM memory_links
+          WHERE relationship = 'superseded_by' AND source_id IN (${placeholders})
+         UNION
+         SELECT id FROM memories
+          WHERE status IN ('superseded', 'retracted') AND id IN (${placeholders})
+       )`
+    )
+    .all(...candidateIds, ...candidateIds) as Array<{ id: string }>;
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
  * Placeholder L2 distance for candidates that have no measured vector
  * distance (FTS-only hits and graph-discovered neighbors). Chosen so that
  * l2ToCosine(1.0) = 0.5 — a neutral mid-scale similarity. Before the #145
@@ -857,6 +890,10 @@ export async function retrieve(
   for (const gid of graphIds) {
     const mem = storage.getMemory(db, gid);
     if (!mem) continue;
+    // #384: absorbed memories never enter via the graph either — they keep
+    // their link rows (evidence + rollback reference), so graph traversal can
+    // reach them, but they are invisible to recall by contract.
+    if (mem.status === "absorbed") continue;
     // #203: project check removed — project is a soft affinity in computeScore,
     // not a filter. 0.16.x: privacy check removed — the column is vestigial,
     // never filtered. sourceAgent stays a hard filter.
@@ -885,8 +922,10 @@ export async function retrieve(
   );
 
   // One query for the whole candidate set (#191 Phase B): superseded memories
-  // are demoted in computeScore rather than strength-penalized.
-  const supersededIds = findSupersededIds(db, [...candidateMap.keys()]);
+  // are demoted in computeScore rather than strength-penalized. #384: the set
+  // is the full demotion set — link-driven supersessions UNION status-marked
+  // superseded/retracted rows (see findDemotedIds).
+  const supersededIds = findDemotedIds(db, [...candidateMap.keys()]);
 
   // #203: ONE batched load of every candidate's graded domain tags — fed to
   // computeScore for domain affinity. Only needed when the scope carries
@@ -1013,7 +1052,9 @@ export function searchRecent(
     connCount: number;
   }> = [];
 
-  const supersededRecent = findSupersededIds(db, candidates.map((c) => c.id));
+  // #384: same full demotion set as retrieve() — link-driven supersessions
+  // UNION status-marked superseded/retracted rows (findDemotedIds).
+  const supersededRecent = findDemotedIds(db, candidates.map((c) => c.id));
 
   for (const mem of candidates) {
     const connCount = connectionCounts.get(mem.id) ?? 0;

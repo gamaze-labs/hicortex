@@ -791,6 +791,26 @@ export async function runNightly(options: {
               readPositiveConfig(savedConfig ?? {}, "consolidateMaxLlmCalls", CONSOLIDATE_MAX_LLM_CALLS),
               // #245: soft cap on the corpus (default 10000; 0 disables eviction).
               memorySoftCapResolved,
+              {
+                // #384 reconsolidation knobs — threaded exactly like the
+                // supersession pair above; the stage validates and falls back
+                // to its defaults (0.75 / 0.80) on invalid/absent values.
+                minSimilarity: savedConfig?.correctionMinSimilarity as number | undefined,
+                rewriteMinConfidence: savedConfig?.correctionRewriteMinConfidence as number | undefined,
+                // #392 unified-resolution knobs: the deterministic-merge
+                // ceiling (legacy dedupMergeThreshold honored when the new
+                // key is absent) and the pacing cap. Same validation posture
+                // — the stage defaults to 0.92 / 250.
+                autoMergeThreshold: (savedConfig?.dedupAutoMergeThreshold ??
+                  savedConfig?.dedupMergeThreshold) as number | undefined,
+                maxMerges: savedConfig?.dedupNightlyMaxMerges as number | undefined,
+                // #401 runtime bounds: the wall-clock deadline (default 120
+                // min, 0 disables) and the per-run classify-call ceiling
+                // (default 600, 0 disables). Same posture — the stage
+                // validates and falls back on invalid/absent values.
+                maxMinutes: savedConfig?.reconsolidationMaxMinutes as number | undefined,
+                maxCalls: savedConfig?.reconsolidationMaxCalls as number | undefined,
+              },
             );
             console.log(
               `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +

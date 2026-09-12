@@ -540,6 +540,42 @@ const MIGRATIONS: Migration[] = [
       db.exec("UPDATE memories SET memory_type = 'learnings'  WHERE memory_type = 'lesson'");
     },
   },
+  {
+    version: 14,
+    name: "reconsolidation_status_history",
+    up: (db) => {
+      // #384 reconsolidation. `memories.status` is the code-defined state
+      // vocabulary (NULL/active default; 'superseded'/'retracted' demote in
+      // ranking; 'corrected' = rewritten, never demotes; 'absorbed' =
+      // invisible to recall — no vector, no FTS row). NULL default with NO
+      // backfill: legacy supersessions stay link-driven (findSupersededIds
+      // already demotes them); a status is only ever written by the
+      // reconsolidation stage, an explicit ingest mark, or a rollback.
+      // `memory_history` records CONTENT REWRITES ONLY (before/after content,
+      // prior status, trigger dispositions) — one structure serving audit AND
+      // `hicortex history --rollback`. Marks need no history row: they are
+      // auditable via links + status. Idempotent: hasColumn + IF NOT EXISTS.
+      if (!hasColumn(db, "memories", "status")) {
+        db.exec("ALTER TABLE memories ADD COLUMN status TEXT");
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          memory_id TEXT NOT NULL,
+          old_content TEXT NOT NULL,
+          new_content TEXT NOT NULL,
+          prev_status TEXT,
+          new_status TEXT,
+          triggers_json TEXT,
+          evidence_id TEXT,
+          confidence REAL,
+          cause TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_history_memory ON memory_history(memory_id)");
+    },
+  },
 ];
 
 /**

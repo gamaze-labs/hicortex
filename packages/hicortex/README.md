@@ -156,6 +156,21 @@ The run is resumable — interrupt it any time and it continues where it stopped
 
 Explicit learnings: call `hicortex_ingest` directly (capture is otherwise automatic, nightly).
 
+### Connect an MCP client (stdio)
+
+MCP clients that launch stdio servers (Claude Desktop, Cursor, the MCP Registry's install flow) should run:
+
+```bash
+npx -y @gamaze/hicortex mcp
+```
+
+The command speaks MCP over stdin/stdout and bridges to the Hicortex daemon — it does not open the database itself. Two optional environment variables control where it connects:
+
+- `HICORTEX_SERVER_URL` — URL of a remote Hicortex server (e.g. `https://your-server:8787`). Omit to use the local machine.
+- `HICORTEX_AUTH_TOKEN` — bearer token for a remote server (the server prints it via `hicortex status`). A local server needs no token.
+
+With no server running, a local one is started automatically (detached; it keeps running after the MCP client exits — the same persistent daemon `init` installs). Registry/stdio configs (Claude Desktop, Cursor, etc.) point at the command above.
+
 ## Identity Layer
 
 Beyond auto-distilled memories and lessons, Hicortex holds a **hand-edited identity layer** — standing "who you are + how to work" Markdown injected into every session at start. Unlike memories, it is **never distilled, scored, or decayed**: what you write stays verbatim until you change it.
@@ -183,6 +198,7 @@ One server serves a fleet of distinct-persona agents. Each agent can have its **
 
 ```bash
 npx @gamaze/hicortex server                    # Start MCP server (port 8787)
+npx @gamaze/hicortex mcp                       # Speak MCP over stdio (bridge to the local daemon or HICORTEX_SERVER_URL)
 npx @gamaze/hicortex init                      # Set up server mode
 npx @gamaze/hicortex init --server <url>       # Set up client mode
 npx @gamaze/hicortex nightly                   # Run distill + consolidate (full nightly)
@@ -237,6 +253,7 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `numCtx` | Context window for ollama (default 8192, one value for all phases). Scoring uses ~850 tokens, so 2048 is ample; distill/reflect/classify need more for `detectChunkSize`'s chunk sizing. |
 | `enableThinking` | Toggle the model's internal reasoning ("thinking") stream for OpenAI-compatible endpoints (default false). Only meaningful for local chat-template-aware servers (ollama, mlx-lm); leave unset for cloud OpenAI/OpenRouter/Groq endpoints (they 400 on the unknown `chat_template_kwargs` field). |
 | `maxTokens` | Max output tokens for all phases (default 8192). A ceiling, not a target — the model stops early when done. |
+| `classifyMaxTokens` | Max output tokens for the classify tier — the short JSON-verdict calls (correction/supersession verdicts, rewrite contracts, type and domain tag classification). Default 1024. A ceiling, not a target: raise it when a reasoning-style model spends the budget on internal reasoning and returns empty verdicts; `maxTokens` keeps governing the heavy phases (distill, reflect). |
 | `ollamaFlushEvery` | Flush ollama's accumulated memory every N scoring calls. **Off by default (0)** — opt-in only for an **ollama** install whose runner RSS growth (~171 MB/call) swap-thrashes long consolidations on a RAM-constrained box; N=15 caps a cycle at ~2.5 GB. Gated on the provider being ollama (local **or** remote) — no effect for non-ollama providers. Only you can judge whether your ollama endpoint actually suffers the growth (a managed/cloud ollama host may not), so it stays off until you set it. |
 | `ollamaFlushWaitMs` | Milliseconds to wait after an ollama flush for the runner to exit + release memory (default 180000 = 3 min). |
 | `llmTimeoutMs` | The ONE timeout ceiling on every LLM call in every phase (default 900000 = 15 min). The LLM request paths disable the HTTP client's hidden 5-minute response-header timer, so this knob is the only bound — one place to tune when the endpoint is slow, no per-phase special cases. |
@@ -287,7 +304,9 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `recallMinPromptChars` | Prompts shorter than this skip the recall index (default: 20) |
 | `recallTitleChars` | Chars of each memory's first line shown in an index entry (default: 100, range 40–400). Reverted from 150 on 2026-08-03: a full-corpus relevance eval found 100 and 150 statistically identical while 100 saves ~13% of the block's tokens |
 | `sessionIntentWeight` | Blend weight of the session-intent rolling centroid in the recall search vector: `query = (1-w)·prompt + w·centroid` (default: 0.33; set 0 to disable — pure-prompt recall, the kill-switch). The first turn of a session searches with pure prompt and seeds the centroid; subsequent turns blend so recall follows the session's intent instead of being query-literal. The EMA rate (0.4) is a shipped constant, not configurable |
-| `dedupMergeThreshold` | Minimum cosine similarity for `hicortex dedup` to cluster memories as near-duplicates (default: 0.92) |
+| `dedupAutoMergeThreshold` | The deterministic merge ceiling of the unified resolution pass: memory pairs at/above this cosine merge automatically (zero LLM) via the dedup core's clustering; pairs between `correctionMinSimilarity` and this value get the one merge/corrects/supersedes/none verdict. Also the default threshold for `hicortex dedup` (default: 0.92) |
+| `dedupMergeThreshold` | Legacy alias for `dedupAutoMergeThreshold`, still honored when the newer key is absent |
+| `dedupNightlyMaxMerges` | Pacing cap on merge operations per nightly run — deterministic-zone clusters plus verdict-confirmed pair merges count against one cap, so a large duplicate backlog drains over a few nights (default: 250; `0` disables the merge machinery) |
 | `supersessionMinSimilarity` | Minimum cosine similarity for a nightly supersession candidate pair (default: 0.80) |
 | `supersessionMaxCalls` | Max classify-tier LLM calls the nightly's supersession stage spends per run (default: 30) |
 | `supersessionPenalty` | Multiplier applied to a superseded memory's `base_strength` (default: 0.5) |

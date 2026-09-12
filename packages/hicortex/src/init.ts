@@ -7,13 +7,16 @@
  *   3. OC plugin installed (~/.openclaw/openclaw.json)
  *   4. CC MCP already registered (~/.claude/settings.json)
  *   5. Hermes present (~/.hermes) / Pi present (~/.pi/agent) /
- *      opencode present (~/.config/opencode or ~/.local/share/opencode)
+ *      opencode present (~/.config/opencode or ~/.local/share/opencode) /
+ *      Claude Desktop present (macOS ~/Library/Application Support/Claude,
+ *      Windows %APPDATA%\Claude)
  *   6. Existing DB (~/.hicortex/ or ~/.openclaw/data/)
  *
  * Actions:
  *   - Install persistent daemon (launchd/systemd)
  *   - Register MCP server in CC settings
  *   - Install CC SessionStart hook for query-time lessons
+ *   - Offer the Claude Desktop stdio MCP entry (opt-in, #381)
  *   - Strip old static CLAUDE.md learnings block if present
  *   - Remove legacy pre-0.10 CC commands (/learn, /hicortex-activate) if present
  */
@@ -28,6 +31,14 @@ import { execSync } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomBytes, randomUUID } from "node:crypto";
 import { removeLessonsBlock } from "./claude-md.js";
+import {
+  desktopConfigDir,
+  resolveDesktopNpxPath,
+  buildDesktopServerEntry,
+  isLocalServerUrl,
+  writeDesktopServerConfig,
+  type DesktopServerEntry,
+} from "./claude-desktop.js";
 import { parseHours, readNonNegativeConfig } from "./config-read.js";
 import { sanitizeAgentId } from "./identity-store.js";
 import type { DomainDef } from "./types.js";
@@ -76,6 +87,8 @@ interface DetectionResult {
   hermesFound: boolean;
   piFound: boolean;
   opencodeFound: boolean;
+  desktopFound: boolean;
+  desktopDir?: string;
   existingDb: boolean;
   dbPath?: string;
   memoryCount?: number;
@@ -90,6 +103,7 @@ async function detect(): Promise<DetectionResult> {
     hermesFound: false,
     piFound: false,
     opencodeFound: false,
+    desktopFound: false,
     existingDb: false,
   };
 
@@ -137,6 +151,16 @@ async function detect(): Promise<DetectionResult> {
   // Check opencode (~/.config/opencode or ~/.local/share/opencode — its
   // global plugins dir / session store; it auto-loads ~/.config/opencode/plugins/)
   result.opencodeFound = existsSync(OPENCODE_CONFIG_DIR) || existsSync(OPENCODE_DATA_DIR);
+
+  // Check Claude Desktop (#381 — macOS ~/Library/Application Support/Claude,
+  // Windows %APPDATA%\Claude; Linux has no Desktop build → null → skip
+  // silently). Detection is the DIRECTORY: the config file may not exist
+  // yet, and creating it fresh is exactly what the Desktop setup step does.
+  const desktopDir = desktopConfigDir();
+  if (desktopDir && existsSync(desktopDir)) {
+    result.desktopFound = true;
+    result.desktopDir = desktopDir;
+  }
 
   // Check OC plugin
   try {
@@ -406,6 +430,97 @@ function setupOpencode(): void {
   console.log(`  ✓ Copied opencode plugin to ${target}`);
 
   console.log("  → Restart opencode sessions to load the plugin (recall, identity, lessons, 9 tools)");
+}
+
+// ---------------------------------------------------------------------------
+// Claude Desktop setup
+// ---------------------------------------------------------------------------
+
+/**
+ * Offer to add the Hicortex stdio MCP entry to Claude Desktop's
+ * claude_desktop_config.json (#381) — Desktop's only stdio MCP route, and a
+ * file owned by ANOTHER app, which is why this step is OPT-IN (default No,
+ * its own prompt after the batch actions) while the other harness setups
+ * just run. The write itself is merge-safe + atomic + backed up (see
+ * claude-desktop.ts); a malformed existing config is refused UNTOUCHED with
+ * the hand-fix snippet printed. The entry is the `hicortex mcp` bridge with
+ * an ABSOLUTE npx path (GUI apps don't inherit the shell PATH — a bare
+ * "npx" is the #1 Desktop failure mode); remote targets carry the server
+ * URL + token in env, loopback needs none (the bridge autostarts the daemon
+ * and loopback bypasses auth). Never throws — every failure path is a
+ * printed warning and init continues. No-ops when Desktop is not installed.
+ */
+async function setupClaudeDesktop(serverUrl: string, authToken: string): Promise<void> {
+  const dir = desktopConfigDir();
+  if (!dir || !existsSync(dir)) return; // no Claude Desktop on this machine
+
+  // Same non-interactive guard as persistLlmConfig: a piped/scripted init
+  // must not auto-apply an opt-in choice — a readline EOF would read as "".
+  if (!process.stdin.isTTY) {
+    console.log(
+      "  ⚠ Non-interactive stdin — Claude Desktop setup skipped; re-run `hicortex init` interactively to add it."
+    );
+    return;
+  }
+
+  const answer = (await ask("Add the Hicortex MCP server to Claude Desktop? [y/N] ")).toLowerCase();
+  if (answer !== "y" && answer !== "yes") {
+    console.log("  → Claude Desktop left unchanged");
+    return;
+  }
+
+  const configPath = join(dir, "claude_desktop_config.json");
+
+  // Absolute npx, rejecting npm's ephemeral /_npx/ cache (#176). Null → we
+  // cannot write a WORKING entry, so we print it and write nothing.
+  const npxPath = resolveDesktopNpxPath();
+  if (!npxPath) {
+    console.log("  ⚠ Could not locate a durable npx on this machine — nothing written.");
+    printDesktopManualEntry(configPath, "<path-to-npx>", serverUrl, authToken);
+    return;
+  }
+
+  // Remote targets carry the connection in env; loopback needs none.
+  const env: Record<string, string> | undefined = isLocalServerUrl(serverUrl)
+    ? undefined
+    : { HICORTEX_SERVER_URL: serverUrl, ...(authToken ? { HICORTEX_AUTH_TOKEN: authToken } : {}) };
+
+  // getPackageSpec() reads the config.json this run has already written (or
+  // an earlier run's), so the Desktop entry honours updateChannel exactly
+  // like the daemon/timer ExecStart does.
+  const entry = buildDesktopServerEntry(npxPath, getPackageSpec(), env);
+  const result = writeDesktopServerConfig(configPath, entry);
+  if (result.status === "written") {
+    console.log(`  ✓ Added the Hicortex MCP server to Claude Desktop (${configPath})`);
+    if (result.backupPath) {
+      console.log(`    Backup of the previous config: ${result.backupPath}`);
+    }
+    console.log("  → Fully quit and restart Claude Desktop to load it (Cmd+Q on macOS).");
+  } else if (result.status === "refused") {
+    console.log(`  ✗ ${result.reason}`);
+    printDesktopManualEntry(configPath, npxPath, serverUrl, authToken);
+  } else {
+    console.log(`  ⚠ Claude Desktop config write failed: ${result.reason} — nothing was changed.`);
+  }
+}
+
+/**
+ * The hand-fix snippet for the two paths where init writes nothing (no
+ * durable npx found / existing config refused): the ready-to-paste entry and
+ * the file it goes in, so the user can finish by hand in one paste.
+ */
+function printDesktopManualEntry(
+  configPath: string,
+  command: string,
+  serverUrl: string,
+  authToken: string,
+): void {
+  const env: Record<string, string> | undefined = isLocalServerUrl(serverUrl)
+    ? undefined
+    : { HICORTEX_SERVER_URL: serverUrl, ...(authToken ? { HICORTEX_AUTH_TOKEN: authToken } : {}) };
+  const entry: DesktopServerEntry = buildDesktopServerEntry(command, getPackageSpec(), env);
+  console.log(`    Add it by hand in ${configPath}, under "mcpServers":`);
+  console.log(`    "hicortex": ${JSON.stringify(entry)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,6 +1876,7 @@ export async function runInit(
   if (d.hermesFound) console.log(`  • Hermes found at ${HERMES_HOME}`);
   if (d.piFound) console.log(`  • Pi found at ${PI_AGENT_DIR}`);
   if (d.opencodeFound) console.log(`  • opencode found at ${OPENCODE_CONFIG_DIR}`);
+  if (d.desktopFound) console.log(`  • Claude Desktop found at ${d.desktopDir}`);
   if (d.ccMcpRegistered) console.log("  • CC MCP already registered");
   if (d.existingDb) console.log(`  • Database at ${d.dbPath}`);
   if (!d.localServer && !d.remoteServer && !d.ocPlugin && !d.existingDb) {
@@ -1930,6 +2046,11 @@ export async function runInit(
   if (d.opencodeFound) {
     setupOpencode();
   }
+
+  // Offer the Claude Desktop MCP entry (opt-in — Desktop's config file
+  // belongs to another app, so it gets its own prompt after the batch
+  // actions above). No-ops when Desktop is not installed.
+  await setupClaudeDesktop(serverUrl, authToken);
 
   // Install CC SessionStart hook for query-time lesson injection.
   // Lessons are now fetched live at session start — no static CLAUDE.md block needed.
@@ -2135,6 +2256,11 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
     console.log("\nopencode detected — installing plugin...");
     setupOpencode();
   }
+
+  // Step 8d: Offer the Claude Desktop MCP entry (opt-in; no-ops when Desktop
+  // is not installed). The client config was written in Step 3, so the
+  // entry's package spec already honours updateChannel.
+  await setupClaudeDesktop(serverUrl, authToken);
 
   console.log("\n✓ Hicortex client setup complete!\n");
   // Telemetry disclosure at install time (informed consent, best practice):

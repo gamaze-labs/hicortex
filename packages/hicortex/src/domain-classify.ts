@@ -302,8 +302,10 @@ export async function classifyMemoryTags(
   for (let attempt = 0; attempt < 2; attempt++) {
     let raw: string;
     try {
-      // ~64 tokens covers a short JSON object with a handful of tags.
-      const r = await llm.completeClassify(prompt, 64);
+      // No per-call cap (#391): the classify-tier ceiling (classifyMaxTokens,
+      // default 1024) resolves inside completeClassify — a hardcoded 64
+      // starved reasoning models whose thinking ate the whole output budget.
+      const r = await llm.completeClassify(prompt);
       raw = r.text;
       threw = false;
       // Surface the usage ONLY when this attempt's reply parses (below). Hold

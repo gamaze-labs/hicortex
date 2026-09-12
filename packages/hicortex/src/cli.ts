@@ -4,6 +4,7 @@
  *
  * Commands:
  *   server     Start the MCP HTTP/SSE server (persistent daemon)
+ *   mcp        Speak MCP over stdio (bridge to the local daemon or HICORTEX_SERVER_URL)
  *   init       Detect existing setup and configure for CC/OC
  *   nightly    Run capture + consolidate (manual trigger)
  *              nightly --capture-only     Capture only, skip consolidation
@@ -11,8 +12,12 @@
  *              nightly --evict-only       Memory-cap eviction only — pure DB, no LLM (#317)
  *              nightly --status           Show nightly pipeline health check
  *   relink     Resumable link-discovery pass over the entire corpus (issue #143)
- *   dedup      Cluster + merge near-duplicate memories (issue #100)
- *              dedup --apply           Execute the merge (default: dry run)
+ *   dedup      Cluster + merge near-duplicate memories (issues #100, #392)
+ *              dedup --apply           Execute the merge (default: dry run);
+ *                                      losers are absorbed (kept as evidence,
+ *                                      hidden from recall), not deleted
+ *   history    Show a memory's rewrite history, or roll one back (issue #384)
+ *              history --rollback <row>  Undo one rewrite + un-absorb triggers
  *   status     Show config, DB stats, adapter status
  *   uninstall  Clean removal of CC integration
  */
@@ -33,6 +38,27 @@ switch (command) {
         console.error("[hicortex] Server failed to start:", err);
         process.exit(1);
       });
+    });
+    break;
+  }
+
+  case "mcp": {
+    // Stdio MCP bridge (#375): speak MCP on stdin/stdout, backed by the
+    // daemon's SSE endpoint (or a remote server via HICORTEX_SERVER_URL).
+    // Registry clients (Claude Desktop, Cursor, the MCP Registry's install
+    // flow) launch stdio commands — this is the command the registry's
+    // server.json declares (`npx -y @gamaze/hicortex mcp`). Starts a local
+    // daemon when the target is loopback and none is running; never spawns
+    // for remote targets. stdout carries ONLY the MCP protocol — all
+    // diagnostics go to stderr (the bridge owns that discipline internally).
+    import("./mcp-stdio.js").then(({ runMcpStdio }) => {
+      runMcpStdio().catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] mcp bridge failed: ${err}`);
+        process.exit(1);
+      });
+    }).catch((err) => {
+      console.error("[hicortex] Failed to load the mcp bridge:", err);
+      process.exit(1);
     });
     break;
   }
@@ -253,6 +279,51 @@ switch (command) {
     break;
   }
 
+  case "history": {
+    // Rewrite history: audit + one-command rollback (#384). Listing is
+    // read-only; --rollback mutates (restores prior content/status and
+    // un-absorbs triggers). Mirrors `dedup`: flags parsed here, the runner
+    // (config load + DB open + print/rollback + close) lives in
+    // reconsolidation.ts so this switch stays thin.
+    const args = process.argv.slice(3);
+    let rollbackId: number | undefined;
+    try {
+      const raw = readValueFlag(args, "--rollback");
+      if (raw !== undefined) {
+        rollbackId = parseInt(raw, 10);
+        if (isNaN(rollbackId)) {
+          console.error("[hicortex] history: --rollback requires a numeric history row id");
+          process.exit(1);
+        }
+      }
+    } catch {
+      console.error("[hicortex] history: --rollback requires a history row id (see `hicortex history <memory-id>`)");
+      process.exit(1);
+    }
+    let dbPath: string | undefined;
+    try {
+      dbPath = readValueFlag(args, "--db");
+    } catch {
+      console.error("[hicortex] history: --db requires a path value");
+      process.exit(1);
+    }
+    const positional = args.filter((a) => !a.startsWith("-") && a !== dbPath);
+    const memoryId = positional[0];
+    const historyOptions = { dbPath, memoryId, rollbackId };
+    import("./reconsolidation.js").then(({ runHistoryCommand }) => {
+      runHistoryCommand(historyOptions)
+        .then((code) => process.exit(code))
+        .catch((err) => {
+          console.error(err instanceof Error ? err.message : `[hicortex] history failed: ${err}`);
+          process.exit(1);
+        });
+    }).catch((err) => {
+      console.error("[hicortex] history failed:", err);
+      process.exit(1);
+    });
+    break;
+  }
+
   case "identity": {
     // Standing identity layer edit surface (spec §6; renamed from context in
     // 0.18 #264): show|edit against the configured server. Secondary to the
@@ -336,6 +407,7 @@ Usage: hicortex <command> [options]
 
 Commands:
   server          Start the MCP HTTP/SSE server (server mode)
+  mcp             Speak MCP over stdio (bridge to the local daemon or HICORTEX_SERVER_URL)
   init            Set up Hicortex (server mode, local DB + daemon)
                   Scaffolds 5 editable default memory domains (Work, Personal,
                   People, Health, Finance) in ~/.hicortex/config.json
@@ -348,6 +420,9 @@ Commands:
   nightly         Run nightly denoise + capture + consolidate
   relink          Resumable link-discovery pass over the ENTIRE corpus (server mode)
   dedup           Cluster + merge near-duplicate memories (server mode; dry run by default)
+  history         Show a memory's rewrite history, or roll one back (server mode)
+                  history <id>                List rewrite events (read-only)
+                  history --rollback <row>    Undo one rewrite + un-absorb its triggers
   backup          Snapshot the DB + identity + state to a tar.gz (online, WAL-safe)
   classify-domains  Backfill content-based domain tags over the corpus (server mode, needs config.domains)
   classify-types    Backfill episode→fact/decision type tags over the corpus (server mode)
@@ -373,8 +448,14 @@ Options:
   relink --batch <n>        Memories per batch (default: 200)
   relink --reset            Restart from the beginning (ignore saved cursor)
   dedup --apply             Execute the merge (default: dry run, report only)
-  dedup --threshold <t>     Override config dedupMergeThreshold for one run
+                            Losers are absorbed — hidden from recall, kept as
+                            evidence (fetchable by id; dedup_log audit) — not deleted
+  dedup --threshold <t>     Override the threshold for one run (default: config
+                            dedupAutoMergeThreshold, legacy dedupMergeThreshold
+                            still honored; else 0.92)
   dedup --db <path>         DB path override (defaults to the configured DB)
+  history --rollback <row>  Roll back history row <row>: restores prior content/status, un-absorbs triggers
+  history --db <path>       DB path override (defaults to the configured DB)
   backup --out <dir>        Write the artifact into <dir> as hicortex-<ISO>.tar.gz (default: <home>/backups)
   backup --stdout           Stream the tar.gz to stdout (offsite pipe: hicortex backup --stdout | rclone rcat …)
   classify-domains --all    Reclassify every memory (default: only NULL/stale-domain rows)

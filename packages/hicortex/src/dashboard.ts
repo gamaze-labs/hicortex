@@ -887,3 +887,36 @@ export function accountHandler(
     }
   };
 }
+
+/**
+ * Express adapter for GET /account/token — the install's connection token for
+ * the console account menu (#365). SECURITY: echo-only — the caller must
+ * ALREADY present the token (bearer, or the localhost bypass) to receive it,
+ * so this endpoint grants no privilege. It exists so the menu shows the
+ * AUTHORITATIVE server-side token instead of trusting localStorage, which can
+ * be stale after token rotation and is absent entirely for browser sessions
+ * the hosted router authenticates via its session→bearer injection.
+ *
+ * `getToken` receives the boot-resolved PRIMARY token (config authToken ??
+ * HICORTEX_AUTH_TOKEN env) — the value the auth middleware itself accepts as
+ * current, so the menu survives rotation and never echoes the rotation-grace
+ * token. When no token is configured the handler answers 503 (mirrors how the
+ * /auth/* endpoints answer "not configured"); other failures surface as a 500
+ * {error} exactly like accountHandler.
+ */
+export function accountTokenHandler(
+  getToken: () => string | undefined,
+): express.RequestHandler {
+  return (_req, res) => {
+    try {
+      const token = getToken();
+      if (!token) {
+        res.status(503).json({ error: "no auth token configured on this install" });
+        return;
+      }
+      res.status(200).json({ token });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}

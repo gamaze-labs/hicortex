@@ -5,7 +5,7 @@
  */
 
 import type Database from "better-sqlite3";
-import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain } from "./types.js";
+import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain, ResolutionBandStat } from "./types.js";
 import type { LlmClient } from "./llm.js";
 import type { EmbedFn } from "./retrieval.js";
 import { effectiveStrength, l2ToCosine } from "./retrieval.js";
@@ -33,6 +33,12 @@ import {
   applyWeakPrimary,
   resolveNoFit,
 } from "./nofit.js";
+import { stageReconsolidation, type ReconsolidationOptions } from "./reconsolidation.js";
+import {
+  runDeterministicMergeZone,
+  DEFAULT_DEDUP_MERGE_THRESHOLD,
+  DEFAULT_DEDUP_NIGHTLY_MAX_MERGES,
+} from "./dedup.js";
 
 // Default config constants (matching Python config.py)
 /**
@@ -1285,7 +1291,7 @@ async function classifySupersession(
   newContent: string,
 ): Promise<{ verdict: boolean | null; usage: import("./llm.js").LlmUsage | undefined }> {
   try {
-    const r = await llm.completeClassify(buildSupersessionPrompt(oldContent, newContent), 32);
+    const r = await llm.completeClassify(buildSupersessionPrompt(oldContent, newContent));
     return { verdict: parseSupersessionReply(r.text), usage: r.usage };
   } catch {
     return { verdict: null, usage: undefined };
@@ -1693,6 +1699,85 @@ export interface DomainStageOptions {
   weakPrimaryFloor?: number;
 }
 
+/**
+ * Minimal resolution-stage report for a SKIPPED (quiet-night) consolidation
+ * run (#392): every stage field zero except `merges` — the deterministic
+ * zone's own report — and its derived deterministic band snapshot. Keeps the
+ * one-report surface intact (the zone is the only resolution work a quiet
+ * night does) while telemetry's "skipped = zero LLM work" stays true. Knob
+ * validation mirrors the stage's own (invalid → defaults).
+ */
+async function skippedRunResolutionReport(
+  db: Database.Database,
+  dryRun: boolean,
+  stateDir: string | undefined,
+  options: ReconsolidationOptions = {},
+): Promise<NonNullable<ConsolidationReport["stages"]["reconsolidation"]>> {
+  const validNumber = (v: unknown, fallback: number, ok: (n: number) => boolean): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && ok(n) ? n : fallback;
+  };
+  const autoMergeThreshold = validNumber(
+    options.autoMergeThreshold,
+    DEFAULT_DEDUP_MERGE_THRESHOLD,
+    (n) => n > 0 && n <= 1,
+  );
+  const maxMerges = validNumber(
+    options.maxMerges,
+    DEFAULT_DEDUP_NIGHTLY_MAX_MERGES,
+    (n) => n >= 0,
+  );
+
+  const merges = await runDeterministicMergeZone(db, {
+    stateDir,
+    threshold: autoMergeThreshold,
+    maxMerges,
+    dryRun,
+    acquireLock: options.acquireLock,
+  });
+
+  const bandStats: Record<string, ResolutionBandStat> = {};
+  if (merges.max_merges > 0) {
+    bandStats[`>=${autoMergeThreshold}`] = {
+      pairs: merges.losers_merged,
+      merge: merges.losers_merged,
+      corrects: 0,
+      supersedes: 0,
+      none: 0,
+      merge_below_gate: 0,
+      conf_sum: merges.losers_merged,
+      ...(merges.skipped_metadata_mismatch > 0
+        ? { metadata_skipped: merges.skipped_metadata_mismatch }
+        : {}),
+    };
+  }
+
+  return {
+    scanned: 0,
+    pairs_evaluated: 0,
+    pairs_discovered: 0, // #394: the scan doesn't run on a quiet night — nothing discovered
+    pairs_discovered_unlinked: 0,
+    rewritten: 0,
+    absorbed: 0,
+    kept_linked: 0,
+    marked_superseded: 0,
+    marked_retracted: 0,
+    below_gate: 0,
+    contract_failed: 0,
+    skipped_infra: 0,
+    skipped_idempotent: 0,
+    explicit_verified: 0,
+    explicit_divergent: 0,
+    cursor: loadState(stateDir).reconsolidationCursor ?? 0,
+    merges,
+    merge_pairs_applied: 0,
+    merge_below_gate: 0,
+    skipped_above_ceiling: 0,
+    skipped_metadata_mismatch: 0,
+    band_stats: bandStats,
+  };
+}
+
 export async function runConsolidation(
   db: Database.Database,
   llm: LlmClient,
@@ -1710,6 +1795,12 @@ export async function runConsolidation(
    *  config and passes it; unset → `DEFAULT_MEMORY_SOFT_CAP` (10000). `0`
    *  disables eviction (indefinite growth). */
   memorySoftCap?: number,
+  /** Reconsolidation-stage knobs (#384), threaded from config by nightly.ts
+   *  (correctionMinSimilarity / correctionRewriteMinConfidence) exactly like
+   *  supersessionOptions above; unset fields → the stage's defaults.
+   *  Appended AFTER the pre-#384 params so every existing positional caller
+   *  (tests, hosted nightly) keeps its argument meaning. */
+  reconsolidationOptions?: ReconsolidationOptions,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -1764,6 +1855,13 @@ export async function runConsolidation(
   );
 
   if (skip) {
+    // #392: the deterministic merge zone is LLM-free, so a quiet night (zero
+    // new memories → this skip) still drains a pre-existing duplicate
+    // backlog — the memory_cap precedent. Results ride the ONE resolution
+    // stage report (telemetry's "skipped = zero LLM work" stays true), and
+    // the zone never runs twice: the main path runs it INSIDE the stage, this
+    // skip path returns before that.
+    report.stages.reconsolidation = await skippedRunResolutionReport(db, dryRun, stateDir, reconsolidationOptions);
     report.status = "skipped";
     report.completed_at = new Date().toISOString();
     return report;
@@ -1840,6 +1938,14 @@ export async function runConsolidation(
     // Stage 3.7: Supersession Detection (#191 Phase B)
     report.stages.supersession = await stageSupersession(
       db, llm, budget, embedFn, dryRun, stateDir, supersessionOptions,
+    );
+
+    // Stage 3.8: Reconsolidation (#384) — resolve corrections: rewrite
+    // fact-shaped targets in place (absorbing transition-only triggers),
+    // mark everything else. Rides the same shared budget under its own stage
+    // label + cursor (supersession-stage pattern).
+    report.stages.reconsolidation = await stageReconsolidation(
+      db, llm, budget, embedFn, dryRun, stateDir, reconsolidationOptions,
     );
 
     // Stage 4: Decay & Prune
