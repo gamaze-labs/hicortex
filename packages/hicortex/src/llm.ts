@@ -40,10 +40,6 @@ export interface LlmConfig {
   provider: string;
   /** Max output tokens for all phases (one model). Default 8192. */
   maxTokens?: number;
-  /** Max output tokens for the CLASSIFY tier only — the short JSON-verdict
-   *  calls (correction/supersession verdicts, rewrite contracts, type + tag
-   *  classification). Default 1024. See HicortexConfig.classifyMaxTokens (#391). */
-  classifyMaxTokens?: number;
   /** Toggle thinking on the openai-compat path for all phases. Absent = no kwarg sent.
    *  LOCAL-endpoint only (ollama / mlx-lm gateway); see HicortexConfig.enableThinking. */
   enableThinking?: boolean;
@@ -54,15 +50,9 @@ export interface LlmConfig {
   /** Ms to wait after an ollama flush for the runner to release. */
   ollamaFlushWaitMs?: number;
   /** ONE per-call timeout ceiling for every phase (#337). Default 900000 — the
-   *  AbortSignal.timeout value passed by all four phase wrappers (the old
+   *  AbortSignal.timeout value passed by the single complete() surface (the old
    *  600000 scoring special-case is gone). See HicortexConfig.llmTimeoutMs. */
   timeoutMs?: number;
-  /** Consecutive ladder-exhausted total failures before the circuit breaker
-   *  opens (#337). Default 3; 0 disables. See HicortexConfig.llmBreakerThreshold. */
-  breakerThreshold?: number;
-  /** How long an OPEN breaker stays open before the next call becomes a trial
-   *  (#337). Default 600000. See HicortexConfig.llmBreakerCooldownMs. */
-  breakerCooldownMs?: number;
   /** Timeout for the readiness probe's single generation attempt (#337).
    *  Default 60000. See HicortexConfig.llmProbeTimeoutMs. */
   probeTimeoutMs?: number;
@@ -74,10 +64,6 @@ export interface LlmConfig {
    *  single-user model servers (two concurrent large-context calls stall/OOM
    *  the server and the machine under it). See HicortexConfig.llmSingleFlight. */
   singleFlight?: boolean;
-  /** How long a queued call waits for the in-flight call before failing as
-   *  endpoint-down (#355). Default 900000 — the same ceiling as llmTimeoutMs.
-   *  See HicortexConfig.llmSingleFlightWaitMs. */
-  singleFlightWaitMs?: number;
 }
 
 /**
@@ -134,19 +120,20 @@ export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
 
 /**
  * Validate + copy the tuning keys (#220: maxTokens + enableThinking + numCtx +
- * ollama flush; #391: classifyMaxTokens) from the saved disk config onto a
- * runtime LlmConfig. Called by BOTH LlmConfig construction sites — the daemon
- * in mcp-server.ts (runs distill) AND resolveSavedLlmConfig below (the nightly
- * runs reflect + classify) — so every process honors the keys, and a future
- * site calling this inherits them by construction.
+ * ollama flush) from the saved disk config onto a runtime LlmConfig. Called by
+ * BOTH LlmConfig construction sites — the daemon in mcp-server.ts (runs
+ * distill) AND resolveSavedLlmConfig below (the nightly runs reflect +
+ * classify) — so every process honors the keys, and a future site calling this
+ * inherits them by construction.
  *
  * All keys are optional; absent = call-site defaults (maxTokens 8192,
- * classifyMaxTokens 1024, numCtx 8192, thinking kwarg omitted, flush off).
- * Wrong-typed values warn and are dropped (readPositiveConfig /
- * readStrictBoolean / readNonNegativeConfig) — notably a JSON slip
- * `"enableThinking": "false"` (string) is rejected rather than coerced to
- * truthy thinking-on, which would silently invert the fix this key exists to
- * apply.
+ * numCtx 8192, thinking kwarg omitted, flush off). Wrong-typed values warn
+ * and are dropped (readPositiveConfig / readStrictBoolean /
+ * readNonNegativeConfig) — notably a JSON slip `"enableThinking": "false"`
+ * (string) is rejected rather than coerced to truthy thinking-on, which would
+ * silently invert the fix this key exists to apply. #405: classifyMaxTokens
+ * is deleted — maxTokens is the single output ceiling for every call (the
+ * key is warned as ignored at the config-read boundary).
  */
 export function applyTierTuningOverlay(
   llmConfig: LlmConfig,
@@ -155,9 +142,6 @@ export function applyTierTuningOverlay(
   if (!savedConfig) return;
   if (savedConfig.maxTokens !== undefined) {
     llmConfig.maxTokens = readPositiveConfig(savedConfig, "maxTokens", 8192);
-  }
-  if (savedConfig.classifyMaxTokens !== undefined) {
-    llmConfig.classifyMaxTokens = readPositiveConfig(savedConfig, "classifyMaxTokens", 1024);
   }
   const thinking = readStrictBoolean(savedConfig, "enableThinking");
   if (thinking !== undefined) {
@@ -173,18 +157,12 @@ export function applyTierTuningOverlay(
     llmConfig.ollamaFlushWaitMs = readPositiveConfig(savedConfig, "ollamaFlushWaitMs", 180000);
   }
   // #337 resilience knobs. Same boundary discipline as the keys above: absent =
-  // call-site defaults (timeout 900 s, threshold 3, cooldown 10 min, probe
-  // timeout 60 s, probe TTL 5 min), wrong-typed values warn and fall back.
-  // breakerThreshold uses readNonNegativeConfig because 0 is a VALID value
-  // ("disable the breaker") — the same reason ollamaFlushEvery uses it.
+  // call-site defaults (timeout 900 s, probe timeout 60 s, probe TTL 5 min),
+  // wrong-typed values warn and fall back. #405: the breaker threshold/
+  // cooldown and the single-flight wait are CONSTANTS now (no incident ever
+  // required tuning them) — the keys are warned as ignored by config-read.ts.
   if (savedConfig.llmTimeoutMs !== undefined) {
     llmConfig.timeoutMs = readPositiveConfig(savedConfig, "llmTimeoutMs", 900000);
-  }
-  if (savedConfig.llmBreakerThreshold !== undefined) {
-    llmConfig.breakerThreshold = readNonNegativeConfig(savedConfig, "llmBreakerThreshold", 3);
-  }
-  if (savedConfig.llmBreakerCooldownMs !== undefined) {
-    llmConfig.breakerCooldownMs = readPositiveConfig(savedConfig, "llmBreakerCooldownMs", 600000);
   }
   if (savedConfig.llmProbeTimeoutMs !== undefined) {
     llmConfig.probeTimeoutMs = readPositiveConfig(savedConfig, "llmProbeTimeoutMs", 60000);
@@ -193,18 +171,11 @@ export function applyTierTuningOverlay(
     llmConfig.probeTtlMs = readPositiveConfig(savedConfig, "llmProbeTtlMs", 300000);
   }
   // #355 single-flight. Default ON (a correctness property, not a tuning
-  // option); the wait budget defaults to the timeout ceiling so a queued call
-  // never gives up before the in-flight call's own ceiling expires.
+  // option); the kill switch survives as config. #405: the wait budget is
+  // DERIVED (max(900 s, llmTimeoutMs)) — no longer a knob.
   const singleFlight = readStrictBoolean(savedConfig, "llmSingleFlight");
   if (singleFlight !== undefined) {
     llmConfig.singleFlight = singleFlight;
-  }
-  if (savedConfig.llmSingleFlightWaitMs !== undefined) {
-    llmConfig.singleFlightWaitMs = readPositiveConfig(
-      savedConfig,
-      "llmSingleFlightWaitMs",
-      900000,
-    );
   }
 }
 
@@ -424,13 +395,22 @@ const rateLimitedUntilByEndpoint = new Map<string, number>();
 // retry ladder matches — fetch-failed/ECONNREFUSED/timeout/"Headers Timeout");
 // HTTP errors WITH a response, parse errors, and RateLimitError throw before
 // the ladder can be exhausted and never accrue. Any success resets. At
-// `llmBreakerThreshold` consecutive failures the breaker opens: calls then
+// BREAKER_THRESHOLD consecutive failures the breaker opens: calls then
 // throw LlmCircuitOpenError with NO network I/O until the cooldown elapses,
 // after which exactly one call is a trial (a failure re-opens, a success
 // resets). This is what bounds a wedged endpoint to K ladder-exhausted calls
 // instead of the ~200-call nightly retrying into it for hours (incident
 // 2026-08-23/24). `openedAt` stays set (breakerOpen stays true) until a
 // SUCCESS resets it — tripped-but-past-cooldown is still "not proven healthy".
+//
+// #405: threshold + cooldown are CONSTANTS — the config knobs
+// (llmBreakerThreshold / llmBreakerCooldownMs) were deleted after the #403
+// inventory found no incident that ever required tuning them. Worst-case
+// dead-endpoint discovery: 3 logical calls × (1 timeout + 1 retry) ≈ 31 min,
+// once per dead night, bounded by the run deadline (the nightly probe gate
+// that used to catch this in 60 s is also gone — spec-accepted).
+const BREAKER_THRESHOLD = 3;
+const BREAKER_COOLDOWN_MS = 600_000;
 interface BreakerState {
   failures: number;
   openedAt: number | null;
@@ -503,11 +483,9 @@ export class LlmClient {
 
   /** Record one ladder-exhausted TOTAL failure; open the breaker at threshold. */
   private recordBreakerFailure(): void {
-    const threshold = this.config.breakerThreshold ?? 3;
-    if (threshold <= 0) return; // 0 disables — never open, never fast-fail
     const st = breakerByEndpoint.get(this.endpointKey) ?? { failures: 0, openedAt: null };
     st.failures += 1;
-    if (st.failures >= threshold) {
+    if (st.failures >= BREAKER_THRESHOLD) {
       // (Re)open. Re-opening (a failed trial past cooldown) restarts the
       // cooldown window from NOW — the endpoint just proved itself still dead.
       st.openedAt = Date.now();
@@ -515,8 +493,8 @@ export class LlmClient {
       // key=value style as event=budget_exhausted (consolidate.ts).
       console.warn(
         `[hicortex] event=circuit_open endpoint=${this.endpointKey} ` +
-          `failures=${st.failures} threshold=${threshold} ` +
-          `cooldown_ms=${this.config.breakerCooldownMs ?? 600_000}`
+          `failures=${st.failures} threshold=${BREAKER_THRESHOLD} ` +
+          `cooldown_ms=${BREAKER_COOLDOWN_MS}`
       );
     }
     breakerByEndpoint.set(this.endpointKey, st);
@@ -546,19 +524,20 @@ export class LlmClient {
   }
 
   /**
-   * Fast-tier completion (importance scoring, simple tasks). One model serves
-   * all phases (#231); numCtx + enableThinking are read from config directly
-   * inside completeOnce's per-provider dispatch, not threaded here. The periodic
-   * ollama flush stays (provider-gated) — it is a scoring-call-count cadence and
-   * scoring is the highest-frequency call, so this is where the flush belongs.
+   * The ONE completion surface (#405). Every phase — distill, reflect,
+   * classify, scoring — calls this; maxTokens (default 8192) and timeoutMs
+   * (default 900 s) resolve from config INSIDE, so no call site can starve a
+   * phase with a per-site ceiling (#391's failure direction: hardcoded
+   * 16/64/256-token caps starved reasoning models whose internal thinking
+   * ate the whole output budget, leaving verdicts empty). numCtx +
+   * enableThinking are likewise read inside completeOnce's per-provider
+   * dispatch. The periodic ollama flush survives here (provider-gated) — it
+   * now counts ALL calls, not just the scoring tier.
    */
-  async completeFast(prompt: string, maxTokens?: number): Promise<LlmResult> {
-    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
-    // #337: ONE ceiling for every phase (llmTimeoutMs, default 900 s). The old
-    // 600 s scoring special-case assumed fast-tier calls are short — but the
-    // ceiling only ever mattered when the endpoint was wedged, and a wedged
-    // endpoint wedges scoring too. One knob, one place.
-    const result = await this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
+  async complete(prompt: string): Promise<LlmResult> {
+    const tokens = this.config.maxTokens ?? 8192;
+    // #337: ONE ceiling for every phase (llmTimeoutMs, default 900 s).
+    const result = await this.completeWithRetry(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
     const flushEvery = this.config.ollamaFlushEvery ?? 0;
     if (this.config.provider === "ollama" && flushEvery > 0) {
       this.ollamaCallCount++;
@@ -571,48 +550,15 @@ export class LlmClient {
   }
 
   /**
-   * Reflect-tier completion (nightly reflection). One model serves all phases
-   * (#231) — this is a thin wrapper kept for call-site readability.
-   */
-  async completeReflect(prompt: string, maxTokens?: number): Promise<LlmResult> {
-    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
-    return this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
-  }
-
-  /**
-   * Distillation-tier completion (session knowledge extraction). One model
-   * serves all phases (#231) — thin wrapper kept for call-site readability.
-   */
-  async completeDistill(prompt: string, maxTokens?: number): Promise<LlmResult> {
-    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
-    return this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
-  }
-
-  /**
-   * Classification-tier completion (verdicts + tag/type classification). One
-   * model serves all phases (#231) — thin wrapper kept for call-site
-   * readability, but the tier keeps its OWN output ceiling (#391).
-   */
-  async completeClassify(prompt: string, maxTokens?: number): Promise<LlmResult> {
-    // #391: classify-tier ceiling — the call sites' old hardcoded caps
-    // (64/32/20, tuned for a local non-reasoning model) starved reasoning
-    // models whose internal thinking consumed the whole budget, leaving
-    // verdicts empty. Deliberately NOT this.config.maxTokens: that knob
-    // governs the heavy phases; this tier has its own (a ceiling, not a
-    // target — generation still stops at the model's natural end).
-    const tokens = maxTokens ?? this.config.classifyMaxTokens ?? 1024;
-    return this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
-  }
-
-  /**
    * Readiness probe (#337): ONE minimal generation request (max output 1
    * token) through the normal provider dispatch. Asks the question liveness
    * checks CANNOT: "can this endpoint GENERATE right now?" — the incident
    * gateway kept answering /v1/models for hours while every completion hung.
    * Single attempt: no retry ladder (a dead endpoint must cost one fast
-   * failure, not a 3.5-min ladder), and it never accrues to the circuit
+   * failure, not a ladder), and it never accrues to the circuit
    * breaker (probing is diagnosis, not traffic). Catch-all → false; the
    * callers translate that into "endpoint_down" / a 503, never an exception.
+   * #405: owned by the DAEMON's /distill gate — the nightly no longer probes.
    */
   async probe(timeoutMs?: number): Promise<boolean> {
     try {
@@ -630,7 +576,7 @@ export class LlmClient {
     }
   }
 
-  private async complete(
+  private async completeWithRetry(
     model: string,
     prompt: string,
     maxTokens: number,
@@ -642,15 +588,18 @@ export class LlmClient {
     const breakerSt = breakerByEndpoint.get(this.endpointKey);
     if (breakerSt !== undefined && breakerSt.openedAt !== null) {
       const elapsed = Date.now() - breakerSt.openedAt;
-      const cooldownMs = this.config.breakerCooldownMs ?? 600_000;
-      if (elapsed < cooldownMs) {
-        throw new LlmCircuitOpenError(this.endpointKey, cooldownMs - elapsed);
+      if (elapsed < BREAKER_COOLDOWN_MS) {
+        throw new LlmCircuitOpenError(this.endpointKey, BREAKER_COOLDOWN_MS - elapsed);
       }
     }
     if (this.isRateLimited) {
       throw new RateLimitError(this.rateLimitedUntil - Date.now());
     }
-    const retryDelays = [30_000, 60_000, 120_000]; // 30s, 60s, 120s
+    // #405: retry ladder collapsed to ONE 60 s retry (was 30/60/120×3 — the
+    // 63.5-min/call worst case from the #403 inventory). Worst-case logical
+    // call: 2 × timeoutMs + 60 s ≈ 31 min at the 900 s ceiling. A second
+    // consecutive total failure is breaker evidence, not a reason to wait.
+    const retryDelays = [60_000];
     let lastErr: Error | undefined;
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
       try {
@@ -715,13 +664,14 @@ export class LlmClient {
   }
 
   /** The single-flight wait budget for a call with ceiling `timeoutMs`.
-   *  An explicit `llmSingleFlightWaitMs` wins; otherwise the default is
-   *  max(900 s, llmTimeoutMs) so a waiter never gives up before a legitimate
-   *  in-flight call's own (possibly raised) ceiling expires (2nd-review
-   *  finding 2 — a hardcoded 900 s made a raised-timeout install treat a
-   *  healthy-busy endpoint as down). */
+   *  #405: always DERIVED — max(900 s, llmTimeoutMs) — so a waiter never
+   *  gives up before a legitimate in-flight call's own (possibly raised)
+   *  ceiling expires (2nd-review finding 2 — a hardcoded 900 s made a
+   *  raised-timeout install treat a healthy-busy endpoint as down). The
+   *  llmSingleFlightWaitMs knob is deleted (its only documented use was to
+   *  restore this exact derivation). */
   private flightWaitMs(timeoutMs: number): number {
-    return this.config.singleFlightWaitMs ?? Math.max(900_000, timeoutMs);
+    return Math.max(900_000, timeoutMs);
   }
 
   /** Resolve the flight guard for this call, or undefined when disabled.

@@ -96,17 +96,17 @@ export interface TelemetryPayload {
    * `runConsolidation`'s status: "completed" | "skipped" | "failed", plus
    * "no_llm" when consolidation was skipped because no LLM was configured,
    * "throttled" (#246) when the run was skipped because the
-   * `llmTokensPerMonth` fair-use cap was projected to be exceeded, and
-   * "endpoint_down" (#337) when the pre-consolidation readiness probe failed
-   * or the LLM circuit breaker was open after the run — a TRANSIENT state
-   * (retried next run), never reported as "completed" even though the stages
-   * fail soft.
+   * `llmTokensPerMonth` fair-use cap was projected to be exceeded,
+   * "endpoint_down" (#337) when the LLM circuit breaker was open after the
+   * run, and "deferred" (#405) when the run-wide wall-clock deadline fired —
+   * the latter two are TRANSIENT states (retried next run), never reported
+   * as "completed" even though the stages fail soft.
    * "skipped" = the built-in nothing-to-do short-circuit (no new + no unscored
    * memories → zero LLM calls), NOT a failure. Lets the fleet aggregate tell a
    * real consolidation run from a no-op without repurposing `ok` (which is the
    * capture-health signal). 0.17+.
    */
-  consolidation?: "completed" | "skipped" | "failed" | "no_llm" | "throttled" | "endpoint_down";
+  consolidation?: "completed" | "skipped" | "failed" | "no_llm" | "throttled" | "endpoint_down" | "deferred";
   /**
    * Total LLM tokens consumed by THIS nightly's consolidation (#246) — the
    * BudgetTracker total. Server-mode only (capture-only + client runs make no
@@ -116,7 +116,8 @@ export interface TelemetryPayload {
    */
   tokens_this_run?: number;
   /**
-   * True when the per-tenant consolidation budget (`consolidateMaxLlmCalls`)
+   * True when the per-tenant consolidation budget (`nightlyLlmCallBudget`,
+   * #405 — formerly consolidateMaxLlmCalls)
    * was exhausted this run (#255) — LLM-bound stages deferred remaining work.
    * A quality-degradation signal concentrated on heavy users; absent on a
    * pre-#255 ping, a capture-only/no-LLM/throttled/skipped run, or when the

@@ -72,9 +72,8 @@ export interface HicortexState {
    * B) — highest memories.rowid whose decision/correction candidates have
    * been evaluated (or infra-skipped) this run. Absent/0 = never run. Unlike
    * relinkCursor/domainCursor (separate resumable CLI commands), this cursor
-   * advances a SMALL amount per night (config `supersessionMaxCalls`, default
-   * 30) as part of the regular nightly — the corpus is back-processed
-   * gradually over many nights.
+   * advances within the shared nightly LLM call budget as part of the regular
+   * nightly — the corpus is back-processed gradually over many nights.
    */
   supersessionCursor?: number;
   /**

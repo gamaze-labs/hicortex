@@ -67,9 +67,10 @@ export interface DashboardMetrics {
      */
     tokens_by_stage?: Record<string, { prompt: number; completion: number; total: number }>;
     /**
-     * Always-on consolidation-budget usage metric (#255 CR). `calls_used` is
+     * Always-on consolidation-budget usage metric (#255 CR; ceiling renamed
+     * nightlyLlmCallBudget in #405). `calls_used` is
      * how many LLM calls the run actually spent; `max_calls` is the configured
-     * `consolidateMaxLlmCalls` ceiling. Forwarded whenever consolidation ran
+     * `nightlyLlmCallBudget` ceiling (#405). Forwarded whenever consolidation ran
      * (the digest renders a continuous used/max bar, like the token-usage
      * metric, so you can see the budget climbing before exhaustion). Undefined
      * on backfill rows and on runs where consolidation didn't execute
@@ -78,7 +79,7 @@ export interface DashboardMetrics {
     budget_calls_used?: number;
     budget_max_calls?: number;
     /**
-     * True when this run's consolidation budget (`consolidateMaxLlmCalls`)
+     * True when this run's consolidation budget (`nightlyLlmCallBudget`)
      * was exhausted — LLM-bound stages deferred remaining work (#255).
      * Forwarded ONLY on exhaustion (the alert state on top of the always-on
      * usage bar). Undefined on healthy runs (where budget_calls_used is still

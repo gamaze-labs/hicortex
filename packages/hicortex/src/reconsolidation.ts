@@ -52,8 +52,8 @@ import {
   mergeMemoryIds,
   takePreDedupBackup,
   DEFAULT_DEDUP_MERGE_THRESHOLD,
-  DEFAULT_DEDUP_NIGHTLY_MAX_MERGES,
 } from "./dedup.js";
+import type { RunDeadline } from "./run-deadline.js";
 
 // ---------------------------------------------------------------------------
 // Constants + status vocabulary
@@ -77,26 +77,6 @@ export const DEFAULT_CORRECTION_MIN_SIMILARITY = 0.75;
  * weak rewrite is corruption.
  */
 export const DEFAULT_CORRECTION_REWRITE_MIN_CONFIDENCE = 0.8;
-
-/**
- * Default wall-clock bound for the stage, in minutes (#401). Checked at the
- * top of the candidate scan loop (and before each rewrite contract call); on
- * expiry the scan breaks cleanly at the last fully-considered candidate and
- * the next run resumes from the persisted cursor. 120 sits safely under any
- * sane process-level nightly timeout. 0 disables the bound. Invalid →
- * default.
- */
-export const DEFAULT_RECONSOLIDATION_MAX_MINUTES = 120;
-
-/**
- * Default per-run classify-call ceiling for the stage (#401) — the
- * supersessionMaxCalls pattern with a NON-ZERO default ON PURPOSE: that
- * knob's 0=unlimited default is what let the first full-corpus pass grow
- * unbounded. Counts EVERY classify-tier call the stage makes (mark
- * verifications, pair verdicts, rewrite contracts). 0 disables the cap.
- * Invalid → default.
- */
-export const DEFAULT_RECONSOLIDATION_MAX_CALLS = 600;
 
 /** Neighbor pool size before older/similarity filtering narrows to top 5 (supersession mirror). */
 const CORRECTION_NEIGHBOR_POOL = 15;
@@ -123,7 +103,7 @@ export const DEMOTED_STATUSES: readonly [MemoryStatus, MemoryStatus] = ["superse
 /** structural subset of consolidate.BudgetTracker (avoids an import cycle). */
 export interface StageBudget {
   readonly exhausted: boolean;
-  use(stage: string, count?: number): boolean;
+  use(stage: string): boolean;
   recordUsage(stage: string, usage: LlmUsage | undefined): void;
 }
 
@@ -141,29 +121,15 @@ export interface ReconsolidationOptions {
    */
   autoMergeThreshold?: number;
   /**
-   * dedupNightlyMaxMerges (config; default 250; 0 disables the merge
-   * machinery). Counts merge OPERATIONS per run — zone clusters + judged
-   * pair merges against ONE cap. Invalid → default.
+   * The run-wide pipeline deadline (#405 — successor of the stage-local
+   * reconsolidationMaxMinutes clock, #401): created at nightly start, shared
+   * with capture and every other stage, threaded here by runConsolidation.
+   * Checked at the top of the candidate scan loop and before each rewrite
+   * contract call; on expiry the scan breaks cleanly — the cursor already
+   * points at the last fully-considered candidate, so the run ends
+   * consistent and the next nightly resumes from it.
    */
-  maxMerges?: number;
-  /**
-   * reconsolidationMaxMinutes (config; default 120; 0 disables) — wall-clock
-   * deadline for the stage (#401), measured from stage start. Checked at the
-   * top of the candidate scan loop and before each rewrite contract call; on
-   * expiry the scan breaks cleanly — the cursor already points at the last
-   * fully-considered candidate, so the run ends consistent and the next
-   * nightly resumes from it. Invalid → default.
-   */
-  maxMinutes?: number;
-  /**
-   * reconsolidationMaxCalls (config; default 600; 0 disables) — per-run
-   * ceiling on classify-tier calls for the stage (#401), the
-   * supersessionMaxCalls pattern with a NON-ZERO default (the 0=unlimited
-   * default there is what removed the last per-stage bound). Exhaustion
-   * mid-neighbor-loop or mid-rewrite-phase stops/defers cleanly at the
-   * current candidate boundary. Invalid → default.
-   */
-  maxCalls?: number;
+  deadline?: RunDeadline;
   /**
    * Capture-lock acquirer override (tests) — the deterministic zone and the
    * judged-merge phase each hold a short lock window. Defaults to the real
@@ -657,7 +623,7 @@ async function classifyPair(
   newContent: string,
 ): Promise<{ verdict: CorrectionVerdict | null; usage: LlmUsage | undefined }> {
   try {
-    const r = await llm.completeClassify(buildCorrectionVerdictPrompt(oldContent, newContent));
+    const r = await llm.complete(buildCorrectionVerdictPrompt(oldContent, newContent));
     return { verdict: parseCorrectionVerdict(r.text), usage: r.usage };
   } catch {
     return { verdict: null, usage: undefined };
@@ -727,38 +693,27 @@ export async function stageReconsolidation(
     DEFAULT_DEDUP_MERGE_THRESHOLD,
     (n) => n > 0 && n <= 1,
   );
-  const maxMerges = validNumber(
-    options.maxMerges,
-    DEFAULT_DEDUP_NIGHTLY_MAX_MERGES,
-    (n) => n >= 0,
-  );
-  const maxMinutes = validNumber(
-    options.maxMinutes,
-    DEFAULT_RECONSOLIDATION_MAX_MINUTES,
-    (n) => n >= 0,
-  );
-  const maxCalls = validNumber(
-    options.maxCalls,
-    DEFAULT_RECONSOLIDATION_MAX_CALLS,
-    (n) => n >= 0,
-  );
 
-  // ---- #401 runtime bounds. The wall-clock deadline is measured from stage
-  // start (the deterministic zone's runtime counts against it — the binding
-  // constraint must be THIS knob, never the process-level backstop).
-  const deadlineAt = maxMinutes > 0 ? Date.now() + Math.round(maxMinutes * 60_000) : Infinity;
-  const deadlineHit = (): boolean => Date.now() >= deadlineAt;
+  // ---- #405 runtime bound. The stage-local reconsolidationMaxMinutes clock
+  // (#401) is gone — the run-wide pipeline deadline (nightly.ts, config
+  // nightlyTimeBudgetMinutes) is the only wall-clock. The deterministic
+  // zone's runtime counts against it via the zone's own stop-check below.
+  // hit() logs event=deadline_deferred once per stage name.
+  const deadline = options.deadline;
+  const deadlineHit = (stageLabel = RECONSOLIDATION_STAGE_LABEL): boolean =>
+    deadline?.hit(stageLabel) ?? false;
 
   // ---- #392 phase 0: the deterministic merge zone (pairs >= the ceiling),
   // LLM-free and budget-free — an LLM-less night still drains duplicates. Its
-  // own short lock window, pre-merge backup, and pacing cap; fail-soft, never
-  // a throw. Runs FIRST so the scan below never sees the pairs it owns.
+  // own short lock window, pre-merge backup, and #405 deadline stop-check;
+  // fail-soft, never a throw. Runs FIRST so the scan below never sees the
+  // pairs it owns.
   const merges = await runDeterministicMergeZone(db, {
     stateDir: stateDir ?? hicortexHome(),
     threshold: autoMergeThreshold,
-    maxMerges,
     dryRun,
     acquireLock: options.acquireLock,
+    deadline,
   });
 
   // Per-run verdict statistics by cosine band (#392) — report snapshot here,
@@ -831,16 +786,14 @@ export async function stageReconsolidation(
   };
 
   // ---- #401: mid-scan cursor persistence. Called at EVERY scan-loop exit
-  // path (deadline, call/budget cap, mark-verify budget stop, discovery
+  // path (deadline, budget cap, mark-verify budget stop, discovery
   // failure) AND after every fully-considered candidate, so a killed run
   // loses at most the candidate in flight. The end-of-stage updateState
   // below stays the authoritative final write (it also applies the
   // pendingMinRowid hold — that variable is only ever set AFTER the scan
   // loop, so it is null at every call site here). updateState is
   // load→mutate→temp-rename atomic.
-  let callsUsed = 0;
   let deadlineStopped = false;
-  let callCapStopped = false;
   // #402 follow-up (reviewer note 1): the hard-kill orphan floor. Queued
   // merges and open rewrite groups are applied only in the POST-scan
   // phases — until then their verdicts exist only in memory, and a
@@ -897,14 +850,6 @@ export async function stageReconsolidation(
       persistCursor();
       break;
     }
-    // #401: the per-stage call cap stops the scan at the candidate boundary
-    // (the in-loop check below is the mid-candidate backstop — supersession
-    // mirrors both).
-    if (!dryRun && maxCalls > 0 && callsUsed >= maxCalls) {
-      callCapStopped = true;
-      persistCursor();
-      break;
-    }
     scanned++;
 
     // ---- AC7: verify incoming explicit marks (corrected_by/superseded_by
@@ -937,7 +882,6 @@ export async function stageReconsolidation(
         }
         const { verdict, usage } = await classifyPair(llm, target.content, candidate.content);
         budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, usage);
-        callsUsed++; // #401
         pairsEvaluated++;
         if (!verdict) {
           skippedInfra++; // mark retained; the neighborhood is revisited via newer candidacies
@@ -993,16 +937,13 @@ export async function stageReconsolidation(
       }
       if (dryRun) continue; // preview only — no LLM call, no write
 
-      // #401: the per-stage call cap rides the same boundary as the budget —
-      // supersession-stage pattern (consolidate.ts stageSupersession).
-      if ((maxCalls > 0 && callsUsed >= maxCalls) || !budget.use(RECONSOLIDATION_STAGE_LABEL)) {
-        callCapStopped = maxCalls > 0 && callsUsed >= maxCalls;
+      // #405: the ONE run budget's refusal is the only call cap.
+      if (!budget.use(RECONSOLIDATION_STAGE_LABEL)) {
         persistCursor(); // cursor still points at the last fully-considered candidate
         break;
       }
       const { verdict, usage } = await classifyPair(llm, neighbor.content, candidate.content);
       budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, usage);
-      callsUsed++; // #401
       pairsEvaluated++;
       if (!verdict) {
         skippedInfra++;
@@ -1075,12 +1016,7 @@ export async function stageReconsolidation(
 
   if (deadlineStopped) {
     console.log(
-      `[hicortex] Reconsolidation: wall-clock deadline reached (reconsolidationMaxMinutes) — ` +
-        `scan stopped at cursor ${cursor}; the next run resumes from there`,
-    );
-  } else if (callCapStopped) {
-    console.log(
-      `[hicortex] Reconsolidation: per-run call cap reached (reconsolidationMaxCalls) — ` +
+      `[hicortex] Reconsolidation: run deadline reached (nightlyTimeBudgetMinutes) — ` +
         `scan stopped at cursor ${cursor}; the next run resumes from there`,
     );
   }
@@ -1088,14 +1024,14 @@ export async function stageReconsolidation(
   // ---- #392 judged-merge phase: apply the queued pair merges through the
   // dedup core (mergeMemoryIds — same canonical pick, link re-points,
   // dedup_log, absorb). One short lock/backup window for the whole batch, one
-  // transaction per pair. Zone merge operations count against the SAME
-  // dedupNightlyMaxMerges cap. A pair that cannot apply (cap exhausted, busy
-  // lock, failed backup) keeps BOTH memories live and holds the cursor below
-  // its candidate — a confirmed merge is never silently dropped by the cursor
-  // passing it (dup-over-loss). A metadata-rail refusal is different: the
-  // verdict WAS rendered, both memories stay live, the cursor advances.
-  const zoneOpsUsed = merges.merged_clusters + merges.failed;
-  let mergeOpsRemaining = maxMerges > 0 ? Math.max(0, maxMerges - zoneOpsUsed) : 0;
+  // transaction per pair. #405: the dedupNightlyMaxMerges cap is gone — the
+  // run deadline bounds the merge loop (a stop-check between local
+  // transactions; the deferred pairs hold the cursor below their candidates).
+  // A pair that cannot apply (deadline, busy lock, failed backup) keeps BOTH
+  // memories live and holds the cursor below its candidate — a confirmed
+  // merge is never silently dropped by the cursor passing it (dup-over-loss).
+  // A metadata-rail refusal is different: the verdict WAS rendered, both
+  // memories stay live, the cursor advances.
   let mergePairsDeferred = 0;
   if (!dryRun && queuedMerges.length > 0) {
     const holdQueued = (from: number): void => {
@@ -1107,22 +1043,7 @@ export async function stageReconsolidation(
       }
     };
 
-    if (maxMerges === 0) {
-      // Machinery disabled by config: keep both (counted in band_stats as
-      // merge verdicts) and ADVANCE — holding the cursor would re-judge the
-      // same pairs into the same disabled state forever.
-      console.log(
-        `[hicortex] Reconsolidation: ${queuedMerges.length} confirmed merge(s) kept — ` +
-          `dedupNightlyMaxMerges is 0 (merge machinery disabled)`,
-      );
-    } else if (mergeOpsRemaining <= 0) {
-      mergePairsDeferred = queuedMerges.length;
-      holdQueued(0); // zone consumed the whole cap — retry next run
-      console.log(
-        `[hicortex] Reconsolidation: ${mergePairsDeferred} confirmed merge(s) deferred — ` +
-          `dedupNightlyMaxMerges exhausted by the deterministic zone`,
-      );
-    } else {
+    {
       const acquire = options.acquireLock ?? acquireCaptureLock;
       const release = await acquire(stateDir ?? hicortexHome(), 0);
       if (!release) {
@@ -1146,18 +1067,21 @@ export async function stageReconsolidation(
           if (backupOk) {
             for (let i = 0; i < queuedMerges.length; i++) {
               const pair = queuedMerges[i];
-              if (mergeOpsRemaining <= 0) {
+              // #405: the deadline stop-check between local merge
+              // transactions — a safe boundary; deferred pairs hold the
+              // cursor below their candidates and retry next run.
+              if (deadlineHit()) {
+                deadlineStopped = true;
                 mergePairsDeferred = queuedMerges.length - i;
-                holdQueued(i); // cap exhausted mid-batch — the rest retry next run
+                holdQueued(i);
                 console.log(
-                  `[hicortex] Reconsolidation: ${mergePairsDeferred} confirmed merge(s) deferred — dedupNightlyMaxMerges exhausted`,
+                  `[hicortex] Reconsolidation: ${mergePairsDeferred} confirmed merge(s) deferred — run deadline reached`,
                 );
                 break;
               }
               const result = mergeMemoryIds(db, [pair.oldId, pair.newId]);
               if (result.ok) {
                 mergePairsApplied++;
-                mergeOpsRemaining--;
                 console.log(
                   `[hicortex] Reconsolidation: merged ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
                     `into canonical ${result.canonicalId.slice(0, 8)} (${result.linksRepointed} link(s) re-pointed)`,
@@ -1213,11 +1137,6 @@ export async function stageReconsolidation(
         deferFrom(group.targetId);
         break;
       }
-      if (maxCalls > 0 && callsUsed >= maxCalls) {
-        callCapStopped = true;
-        deferFrom(group.targetId);
-        break;
-      }
       if (!budget.use(RECONSOLIDATION_STAGE_LABEL)) {
         deferFrom(group.targetId);
         break;
@@ -1226,10 +1145,9 @@ export async function stageReconsolidation(
       let contract: RewriteContract | null = null;
       let infraError = false;
       try {
-        const r = await llm.completeClassify(buildRewritePrompt(group.target.content, triggersArg));
+        const r = await llm.complete(buildRewritePrompt(group.target.content, triggersArg));
         contract = parseRewriteReply(r.text, group.triggers.map((t) => t.id), group.target.content);
         budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, r.usage);
-        callsUsed++; // #401: rewrite contracts count toward the stage call cap
       } catch {
         infraError = true;
       }
@@ -1324,7 +1242,10 @@ export async function stageReconsolidation(
   // losers are merge verdicts at confidence 1.0; the zone persists the
   // cumulative copy itself) plus this run's judged bands.
   const bandStats: Record<string, ResolutionBandStat> = {};
-  if (merges.max_merges > 0) {
+  {
+    // #405: recorded whenever the zone ran (the old max_merges>0 gate was a
+    // 0=disabled switch — the switch is gone; a clean corpus records zeros,
+    // same as the old default-config behavior).
     const det = emptyBandStat();
     det.pairs = merges.losers_merged;
     det.merge = merges.losers_merged;

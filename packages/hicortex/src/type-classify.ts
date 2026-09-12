@@ -198,10 +198,10 @@ export async function classifyMemoryType(
   for (let attempt = 0; attempt < 2; attempt++) {
     let raw: string;
     try {
-      // No per-call cap (#391): the classify-tier ceiling (classifyMaxTokens,
-      // default 1024) resolves inside completeClassify — a hardcoded 20
-      // starved reasoning models whose thinking ate the whole output budget.
-      const r = await llm.completeClassify(prompt);
+      // No per-call cap (#391/#405): maxTokens — the ONE ceiling — resolves
+      // inside complete(); the old hardcoded 20 starved reasoning models
+      // whose thinking ate the whole output budget.
+      const r = await llm.complete(prompt);
       raw = r.text;
     } catch (err) {
       if (attempt === 0) continue; // retry once

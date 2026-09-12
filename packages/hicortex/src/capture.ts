@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { extractConversationText } from "./distiller.js";
 import type { TranscriptBatch } from "./transcript-reader.js";
 import type { CursorStore } from "./capture-cursors.js";
+import type { RunDeadline } from "./run-deadline.js";
 
 /**
  * Max denoised chars per segment. Kept below the server's 80K distill cap
@@ -123,6 +124,15 @@ export interface CaptureOptions {
    * `source_domain` provenance. Null when undeclared.
    */
   sourceDomain?: string | null;
+  /**
+   * The run-wide pipeline deadline (#405), checked BETWEEN segment POSTs —
+   * a boundary the per-session cursor discipline already guarantees is safe
+   * (the cursor only advances past server-confirmed segments, so a deadline
+   * stop holds every unconfirmed segment for the next run; dup-over-loss).
+   * Full and consolidate-only nightlies pass it; capture-only/watchdog runs
+   * keep their 30-min unit backstop instead.
+   */
+  deadline?: RunDeadline;
 }
 
 export interface CaptureResult {
@@ -132,10 +142,12 @@ export interface CaptureResult {
   /**
    * Set when the loop stopped early on a terminal server response: "limit"
    * (token-budget 429, mcp-server.ts's `"token budget exceeded"` gate) or
-   * "auth" (401). A rate-limit 429 never sets this — it is transient (#327).
-   * The caller decides watermark handling.
+   * "auth" (401); "deadline" (#405) when the run-wide pipeline deadline fired
+   * between segments (transient — the watermark holds, everything unconfirmed
+   * retries next run). A rate-limit 429 never sets this — it is transient
+   * (#327). The caller decides watermark handling.
    */
-  stopped?: "limit" | "auth";
+  stopped?: "limit" | "auth" | "deadline";
   /**
    * Run-global rate-429 latch (#327 CR): true when at least one session
    * SURRENDERED to a rate-limit 429 (the transient kind — postWithRateRetry
@@ -333,11 +345,11 @@ export async function captureBatches(
   batches: TranscriptBatch[],
   opts: CaptureOptions,
 ): Promise<CaptureResult> {
-  const { post, cursorStore, dryRun = false, segmentMaxChars = SEGMENT_MAX_CHARS, sourceAgentId, sourceDomain } = opts;
+  const { post, cursorStore, dryRun = false, segmentMaxChars = SEGMENT_MAX_CHARS, sourceAgentId, sourceDomain, deadline } = opts;
   let memoriesIngested = 0;
   let sessionsSent = 0;
   let hadTransientFailure = false;
-  let stopped: "limit" | "auth" | undefined;
+  let stopped: "limit" | "auth" | "deadline" | undefined;
   // Run-global rate-429 latch (#327 CR): once one session has paid the full
   // Retry-After ladder and surrendered, the limiter window is exhausted for
   // THIS run — letting each remaining session re-pay the ladder (worst case
@@ -386,6 +398,16 @@ export async function captureBatches(
 
     for (let s = 0; s < segments.length; s++) {
       const seg = segments[s];
+
+      // #405: stop BETWEEN segments — a safe boundary by construction (the
+      // cursor below only advances past server-confirmed segments). The whole
+      // session loop breaks on `stopped` at the bottom; unconfirmed segments
+      // hold and retry next run.
+      if (!dryRun && deadline?.hit("capture")) {
+        console.warn(`[hicortex]     Run deadline reached — capture stops after the last confirmed segment`);
+        stopped = "deadline";
+        break;
+      }
       // A segment advances the cursor to its segEnd only when it is the LAST
       // segment ending at that boundary. Hard-split pieces (.p0,.p1,…) of one
       // entry share the same segEnd; confirming an earlier piece must NOT move

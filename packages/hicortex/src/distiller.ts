@@ -444,7 +444,7 @@ async function distillChunk(
   // failures, 4xx/5xx, model-not-found, timeouts) propagate up to the caller
   // so the nightly pipeline can treat them as "retry later" instead of
   // "processed successfully with zero extractions".
-  const { text: result, usage } = await llm.completeDistill(prompt);
+  const { text: result, usage } = await llm.complete(prompt);
   // #5: report this chunk's token usage to the caller's budget meter. Optional
   // (absent for callers that don't meter); a missing/undefined usage (claude-cli)
   // is a no-op — consistent with the existing design that such tenants never

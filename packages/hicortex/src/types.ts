@@ -118,8 +118,6 @@ export interface ResolutionBandStat {
 export interface DeterministicMergeZoneReport {
   /** The cosine ceiling in force (config dedupAutoMergeThreshold; default 0.92). */
   threshold: number;
-  /** The pacing cap in force (dedupNightlyMaxMerges; 0 = machinery disabled). */
-  max_merges: number;
   /** Every cluster found at the threshold (mergeable + mismatch-skipped). */
   clusters_found: number;
   /** Clusters that passed the metadata rails (would merge). */
@@ -132,8 +130,13 @@ export interface DeterministicMergeZoneReport {
   links_repointed: number;
   /** Clusters skipped — members disagree on project / source_agent. */
   skipped_metadata_mismatch: number;
-  /** Mergeable clusters NOT attempted because the pacing cap was exhausted. */
+  /**
+   * Mergeable clusters NOT attempted (pacing cap retired, #405): the run
+   * deadline fired before them. Deferred clusters drain on the next run.
+   */
   capped: number;
+  /** #405: clusters in `capped` that stopped specifically on the deadline. */
+  deadline_deferred?: number;
   /** Clusters whose merge transaction failed (rolled back; retried next run). */
   failed: number;
   /** Apply only: the capture lock was busy — zero merges, fail-soft. */
@@ -151,7 +154,14 @@ export interface ConsolidationReport {
   started_at: string;
   completed_at?: string;
   dry_run: boolean;
-  status: "completed" | "skipped" | "failed";
+  /**
+   * "deferred" (#405): the run-wide wall-clock deadline
+   * (nightlyTimeBudgetMinutes) fired — at least one stage stopped at a safe
+   * boundary and its remaining work drains on the next run (cursors hold
+   * below it). Like "endpoint_down" it must NOT advance lastConsolidated,
+   * so the pending-set queries re-find the deferred work.
+   */
+  status: "completed" | "skipped" | "failed" | "deferred";
   elapsed_seconds?: number;
   stages: {
     precheck?: {
@@ -437,14 +447,28 @@ export interface HicortexConfig {
    */
   consolidationHours?: number[];
   /**
-   * Ceiling on total LLM calls across all classify-tier consolidation stages
-   * (content-domain, link discovery, supersession) per nightly run (0.17, #241).
-   * A runaway backstop, not a throughput throttle — on a free local model the
-   * binding constraint is the nightly unit's wall-clock timeout, not call count.
-   * Default `5000` (was a hard-coded 200 that starved link/supersession during a
-   * classification backlog and drained large backlogs at ~cap/night).
+   * The ONE wall-clock budget (minutes) for a nightly run (#405): capture +
+   * every consolidation stage share one cooperative deadline, checked at safe
+   * boundaries (capture segments, stage boundaries, item loops, the merge
+   * zone). A run whose deadline fires reports consolidation status
+   * "deferred" and resumes from its cursors next run — no work is lost or
+   * redone. Default 240; 0 or invalid → default (a deadline ALWAYS exists —
+   * unlike the retired reconsolidationMaxMinutes, 0 is not "off"). The
+   * systemd unit's TimeoutStartSec is derived from this (budget + 60 min
+   * slack) at init.
    */
-  consolidateMaxLlmCalls?: number;
+  nightlyTimeBudgetMinutes?: number;
+  /**
+   * The ONE per-run ceiling on LLM calls across the whole nightly pipeline
+   * (#405; successor of consolidateMaxLlmCalls, #241). Consumed in run
+   * order — run order IS the fair share; a stage that exhausts the budget
+   * defers its remainder to the next run via its cursor. Bounds money/load
+   * independent of latency: a fast metered or capacity-limited endpoint
+   * permits thousands of calls inside the wall-clock budget. Default 5000;
+   * 0 or invalid → default. The legacy `consolidateMaxLlmCalls` key is
+   * honored as a deprecated alias for one release.
+   */
+  nightlyLlmCallBudget?: number;
   /**
    * Release channel pinned into the generated daemon/timer ExecStart for
    * **npx-thin** installs (global-binary installs use the absolute binary path
@@ -463,28 +487,6 @@ export interface HicortexConfig {
    */
   weakPrimaryFloor?: number;
   /**
-   * Per-attempt timeout (ms) for the CLIENT nightly's pre-flight GET /health
-   * check before capturing (#163). Default 15000. Overridable per machine —
-   * a wired Pi vs a sleeping laptop want different values. See runClientNightly
-   * in nightly.ts. No effect in server mode (server capture is localhost).
-   */
-  preflightTimeoutMs?: number;
-  /**
-   * Max attempts for the client nightly's pre-flight /health retry loop (#163).
-   * Default 3. Attempts are spaced preflightRetryGapMs apart; on exhaustion the
-   * run aborts with a non-zero exit code and an ok=false telemetry ping so the
-   * failure is visible to systemd/launchd and the activity aggregate.
-   */
-  preflightAttempts?: number;
-  /**
-   * Gap (ms) between pre-flight /health attempts in the client nightly (#163).
-   * Default 60000. Wall-clock-optimistic on a sleeping laptop — setTimeout does
-   * NOT advance while macOS is asleep, so real elapsed time can exceed the
-   * nominal worst case. Not a defect (capture lock isn't held; cursor design is
-   * dup-over-loss); just don't treat the nominal sum as a hard bound.
-   */
-  preflightRetryGapMs?: number;
-  /**
    * Max output tokens for the ONE LLM model used by all phases — distillation,
    * reflection, classification, and scoring. Default 8192. An explicit value
    * overrides the default. A ceiling, not a target: generation stops at the
@@ -492,18 +494,6 @@ export interface HicortexConfig {
    * when it finishes early. Read in llm.ts; see #220.
    */
   maxTokens?: number;
-  /**
-   * Max output tokens for the classify tier ONLY — the short JSON-verdict
-   * calls: correction/supersession verdicts, rewrite contracts, and type +
-   * domain tag classification. Default 1024. A ceiling, not a target
-   * (generation stops at the model's natural end) — raise it when a
-   * reasoning-style model spends the budget on internal reasoning and returns
-   * empty verdicts (the pre-#391 hardcoded per-call caps starved exactly that
-   * shape; a local non-reasoning model is unaffected by the raise).
-   * `maxTokens` continues to govern the heavy phases (distill/reflect).
-   * Read in llm.ts; see #391.
-   */
-  classifyMaxTokens?: number;
   /**
    * Toggle the model's internal reasoning ("thinking") stream on the openai-compat
    * path — applies to ALL phases (distill / reflect / classify / scoring) since one
@@ -531,17 +521,17 @@ export interface HicortexConfig {
    */
   numCtx?: number;
   /**
-   * Flush ollama's accumulated memory every N scoring calls — workaround for
+   * Flush ollama's accumulated memory every N LLM calls — workaround for
    * ollama's per-request memory growth (the runner's RSS climbs ~171 MB/call and
    * isn't freed between requests), which swap-thrashes RAM-constrained boxes
-   * during long consolidations. Default 0 (off). When >0, every Nth scoring call
-   * (`completeFast`) triggers a `keep_alive:0` unload + an `ollamaFlushWaitMs`
-   * pause for the runner to exit + release, then the next call reloads fresh.
-   * N=15 caps a cycle at ~2.5 GB. Scoped to the fast tier (scoring) only. Note:
-   * N counts **logical** scoring calls, not raw HTTP requests — `complete()`
-   * retries up to 4× on timeout, so under retry pressure the actual accumulation
-   * may be up to 4×N calls' worth. In practice the flush prevents the thrash that
-   * causes retries, keeping the count accurate.
+   * during long consolidations. Default 0 (off). When >0, every Nth call
+   * (`complete()`, #405 — ALL phases count, not just scoring) triggers a
+   * `keep_alive:0` unload + an `ollamaFlushWaitMs` pause for the runner to
+   * exit + release, then the next call reloads fresh. N=15 caps a cycle at
+   * ~2.5 GB. Note: N counts **logical** calls, not raw HTTP requests —
+   * `complete()` retries once on timeout (#405), so under retry pressure the
+   * actual accumulation may be up to 2×N calls' worth. In practice the flush
+   * prevents the thrash that causes retries, keeping the count accurate.
    */
   ollamaFlushEvery?: number;
   /**
@@ -564,21 +554,6 @@ export interface HicortexConfig {
    * claude-cli (subprocess timeout).
    */
   llmTimeoutMs?: number;
-  /**
-   * Consecutive ladder-exhausted TOTAL failures (fetch-failed / ECONNREFUSED /
-   * timeout / "Headers Timeout" class) after which the per-endpoint circuit
-   * breaker opens (#337). Default 3; `0` disables. While open, calls throw
-   * `LlmCircuitOpenError` immediately with NO network I/O. HTTP error statuses
-   * with a response, parse errors, and rate limits never count (they throw
-   * before the retry ladder can be exhausted). Any success resets the counter.
-   */
-  llmBreakerThreshold?: number;
-  /**
-   * How long (ms) an open circuit breaker stays open before the next call
-   * becomes a half-open trial (#337). Default 600000 (10 min). A trial failure
-   * re-opens the breaker; a trial success resets it.
-   */
-  llmBreakerCooldownMs?: number;
   /**
    * Timeout (ms) for the readiness probe's single 1-token generation attempt
    * (#337). Default 60000. The probe asks "can this endpoint GENERATE", which
@@ -736,15 +711,6 @@ export interface HicortexConfig {
    * CLI (same precedence: --threshold > this key > legacy key > 0.92).
    */
   dedupAutoMergeThreshold?: number;
-  /**
-   * Pacing cap on merge OPERATIONS per nightly run (#392): deterministic-zone
-   * clusters plus judged pair merges count against ONE cap, so a
-   * misbehaving-distiller burst is bounded and a large pre-existing backlog
-   * drains over a few nights rather than in one run. Default 250. `0` disables
-   * the merge machinery entirely (the deterministic zone is skipped; a
-   * confirmed merge verdict keeps both memories). Non-negative integer.
-   */
-  dedupNightlyMaxMerges?: number;
 }
 
 /** A config-owned life-sphere domain (see HicortexConfig.domains). */

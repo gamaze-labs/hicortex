@@ -12,8 +12,10 @@
  *    `--threshold` > config `dedupAutoMergeThreshold` > legacy config
  *    `dedupMergeThreshold` > 0.92.
  *  - `runDeterministicMergeZone` (#392) — the nightly's LLM-free merge zone:
- *    pairs at/above the ceiling merge deterministically, ZERO LLM calls, under
- *    its own pacing cap (`dedupNightlyMaxMerges`). Called from the
+ *    pairs at/above the ceiling merge deterministically, ZERO LLM calls,
+ *    bounded by the run-wide pipeline deadline's stop-check (#405 — the
+ *    dedupNightlyMaxMerges pacing cap is gone; merges are local transactions,
+ *    so the deadline bounds their wall-clock). Called from the
  *    reconsolidation stage (and from the quiet-night skip path in
  *    consolidate.ts) so one stage report covers all resolution work.
  *
@@ -76,6 +78,7 @@ import { updateState } from "./state.js";
 import { readNonNegativeConfig } from "./config-read.js";
 import { DEFAULT_BACKUP_RETENTION, pruneBackupArtifacts } from "./backup.js";
 import type { DeterministicMergeZoneReport, ResolutionBandStat } from "./types.js";
+import type { RunDeadline } from "./run-deadline.js";
 
 const HICORTEX_HOME = hicortexHome();
 
@@ -86,14 +89,6 @@ const HICORTEX_HOME = hicortexHome();
  * boundary of the unified resolution pass.
  */
 export const DEFAULT_DEDUP_MERGE_THRESHOLD = 0.92;
-
-/**
- * Default pacing cap on merge OPERATIONS per nightly run (#392): the zone's
- * clusters and the stage's judged pair merges count against ONE cap. Bounds a
- * misbehaving-distiller burst; a large backlog drains over a few nights.
- * `0` disables the merge machinery entirely.
- */
-export const DEFAULT_DEDUP_NIGHTLY_MAX_MERGES = 250;
 
 /** KNN neighbors considered per memory — same as the #191 audit (cluster.ts default). */
 const DEDUP_KNN_K = 10;
@@ -563,18 +558,19 @@ export interface DeterministicMergeZoneOptions {
   stateDir?: string;
   /** Cosine ceiling; validated (0,1] → DEFAULT_DEDUP_MERGE_THRESHOLD. */
   threshold?: number;
-  /**
-   * Pacing cap on merge operations this run; validated >= 0 →
-   * DEFAULT_DEDUP_NIGHTLY_MAX_MERGES. `0` disables the machinery entirely
-   * (discovery skipped, zeroed report).
-   */
-  maxMerges?: number;
   /** Discovery + bounded preview only — zero writes, no lock, no backup. */
   dryRun?: boolean;
   /** Config override (backupRetention) — defaults to reading stateDir/config.json. */
   config?: Record<string, unknown> | null;
   /** Capture-lock acquirer override (tests). Defaults to the real capture.ts lock. */
   acquireLock?: typeof acquireCaptureLock;
+  /**
+   * The run-wide pipeline deadline (#405) — checked BETWEEN cluster merges
+   * (each merge is a local transaction, so the boundary is safe). On expiry
+   * the un-attempted clusters count as deadline_deferred and drain next run
+   * (re-discovery is structural: the pairs stay above the threshold).
+   */
+  deadline?: RunDeadline;
 }
 
 /**
@@ -600,24 +596,13 @@ export async function runDeterministicMergeZone(
     return Number.isFinite(n) && ok(n) ? n : fallback;
   };
   const threshold = validNumber(opts.threshold, DEFAULT_DEDUP_MERGE_THRESHOLD, (n) => n > 0 && n <= 1);
-  const maxMerges = validNumber(opts.maxMerges, DEFAULT_DEDUP_NIGHTLY_MAX_MERGES, (n) => n >= 0);
   const stateDir = opts.stateDir ?? HICORTEX_HOME;
   const dryRun = opts.dryRun ?? false;
-
-  // 0 = the merge machinery is disabled — skip discovery entirely.
-  if (maxMerges === 0) {
-    return {
-      threshold, max_merges: 0, clusters_found: 0, mergeable_clusters: 0,
-      merged_clusters: 0, losers_merged: 0, links_repointed: 0,
-      skipped_metadata_mismatch: 0, capped: 0, failed: 0,
-    };
-  }
 
   try {
     const plan = planDedup(db, threshold);
     const report: DeterministicMergeZoneReport = {
       threshold,
-      max_merges: maxMerges,
       clusters_found: plan.clusterCount,
       mergeable_clusters: plan.mergePlans.length,
       merged_clusters: 0,
@@ -701,14 +686,26 @@ export async function runDeterministicMergeZone(
       }
       report.backup_path = backupPath;
 
-      // Discovery order, capped at maxMerges merge OPERATIONS. Capped
-      // clusters wait for the cap (they are the zone's backlog — the verdict
-      // scan never touches them), so a large pre-existing corpus drains over
-      // a few nights.
-      const toAttempt = plan.mergePlans.slice(0, maxMerges);
-      report.capped = plan.mergePlans.length - toAttempt.length;
+      // Discovery order. #405: no pacing slice — the deadline stop-check
+      // below is the only bound (the deferred clusters count as
+      // deadline_deferred/capped and drain next run; re-discovery is
+      // content-based, so they re-appear).
+      const toAttempt = plan.mergePlans;
 
-      for (const p of toAttempt) {
+      for (let pi = 0; pi < toAttempt.length; pi++) {
+        const p = toAttempt[pi];
+        // #405: stop-check between cluster merges — each merge is a local
+        // transaction, so this is a safe boundary. The un-attempted clusters
+        // drain next run (discovery is content-based, so they re-appear).
+        if (opts.deadline?.hit("dedup_merge_zone")) {
+          report.deadline_deferred = toAttempt.length - pi;
+          report.capped += toAttempt.length - pi;
+          console.warn(
+            `[hicortex] deterministic-merge zone: run deadline reached — ` +
+              `${report.deadline_deferred} cluster merge(s) deferred to the next run`,
+          );
+          break;
+        }
         try {
           const tx = db.transaction(() => mergeCluster(db, p.canonical, p.losers));
           const appliedPlan = tx();
@@ -729,7 +726,7 @@ export async function runDeterministicMergeZone(
         `[hicortex] deterministic-merge zone (>= ${threshold}): ${report.merged_clusters}/${plan.mergePlans.length} ` +
           `cluster(s) merged, ${report.losers_merged} loser(s) absorbed, ` +
           `${report.skipped_metadata_mismatch} skipped (metadata mismatch)` +
-          (report.capped > 0 ? `, ${report.capped} capped (dedupNightlyMaxMerges)` : "") +
+          (report.capped > 0 ? `, ${report.capped} deferred (run deadline)` : "") +
           (report.failed > 0 ? `, ${report.failed} FAILED` : ""),
       );
 
@@ -746,7 +743,7 @@ export async function runDeterministicMergeZone(
         `(no merges attempted; retried next run).`,
     );
     return {
-      threshold, max_merges: maxMerges, clusters_found: 0, mergeable_clusters: 0,
+      threshold, clusters_found: 0, mergeable_clusters: 0,
       merged_clusters: 0, losers_merged: 0, links_repointed: 0,
       skipped_metadata_mismatch: 0, capped: 0, failed: 0,
     };

@@ -34,7 +34,7 @@
  * projects whose content alone reads as ambiguous.
  *
  * The classifier makes ONE constrained LLM call per memory (via the one model
- * #231 — completeClassify, a thin wrapper over the shared complete()),
+ * #231/#405 — the one complete() surface,
  * validates every returned name against the configured vocabulary
  * (case-insensitive), and retries once on an invalid/unparseable reply.
  *
@@ -260,8 +260,8 @@ export function parseTagReply(reply: string, domains: DomainDef[]): TagResult | 
 /**
  * Multi-tag classify one memory's content against the configured vocabulary.
  *
- * Uses the one model (`completeClassify` — a thin wrapper over the shared
- * complete(), #231). Per-memory classification failures return null (issue
+ * Uses the one model (the single complete() surface, #231/#405).
+ * Per-memory classification failures return null (issue
  * #150): the caller leaves the memory unclassified and the cursor advances,
  * so a re-run retries it.
  *
@@ -302,10 +302,11 @@ export async function classifyMemoryTags(
   for (let attempt = 0; attempt < 2; attempt++) {
     let raw: string;
     try {
-      // No per-call cap (#391): the classify-tier ceiling (classifyMaxTokens,
-      // default 1024) resolves inside completeClassify — a hardcoded 64
-      // starved reasoning models whose thinking ate the whole output budget.
-      const r = await llm.completeClassify(prompt);
+      // No per-call cap (#391/#405): maxTokens — the ONE ceiling — resolves
+      // inside complete(); the old hardcoded 64 (and later the separate
+      // classifyMaxTokens tier ceiling) starved reasoning models whose
+      // thinking ate the whole output budget.
+      const r = await llm.complete(prompt);
       raw = r.text;
       threw = false;
       // Surface the usage ONLY when this attempt's reply parses (below). Hold

@@ -10,7 +10,7 @@ import type { LlmClient } from "./llm.js";
 import type { EmbedFn } from "./retrieval.js";
 import { effectiveStrength, l2ToCosine } from "./retrieval.js";
 import * as storage from "./storage.js";
-import { readNonNegativeConfig } from "./config-read.js";
+import { readNonNegativeConfig, readPositiveConfig } from "./config-read.js";
 import { importanceScoring, reflection, domainCuration } from "./prompts.js";
 import { createHash } from "node:crypto";
 import { isPro } from "./features.js";
@@ -37,22 +37,48 @@ import { stageReconsolidation, type ReconsolidationOptions } from "./reconsolida
 import {
   runDeterministicMergeZone,
   DEFAULT_DEDUP_MERGE_THRESHOLD,
-  DEFAULT_DEDUP_NIGHTLY_MAX_MERGES,
 } from "./dedup.js";
+import type { RunDeadline } from "./run-deadline.js";
 
 // Default config constants (matching Python config.py)
 /**
- * Default ceiling on total LLM calls across all classify-tier consolidation
- * stages (content-domain, link discovery, supersession) per run. This is a
- * runaway BACKSTOP, not a throughput throttle — on a free local model there is
- * no per-call cost to defend against; the binding constraint is the nightly
- * unit's wall-clock timeout (TimeoutStartSec), not call count. 5000 clears a
- * one-time classification backlog (a ~2000-memory batch drains in ~1-2 runs
- * instead of ~11 nights at the old 200) with margin for link/supersession, and
- * ~5000 calls x ~1-3s/call ≈ 1.4-4.2h fits the 6h consolidation backstop.
- * Config-overridable as `consolidateMaxLlmCalls` (#241).
+ * Default ceiling on LLM calls across the WHOLE nightly pipeline (#405; the
+ * #241 consolidateMaxLlmCalls mechanism, renamed and widened). A runaway
+ * BACKSTOP that bounds money/load INDEPENDENT OF LATENCY — a fast metered or
+ * capacity-limited endpoint permits thousands of calls inside the wall-clock
+ * budget, so time alone cannot protect it (owner ruling 2026-09-12). Consumed
+ * in run order: a stage that exhausts it defers its remainder via its cursor.
+ * 5000 clears a one-time classification backlog (a ~2000-memory batch drains
+ * in ~1-2 runs) with margin. Config: `nightlyLlmCallBudget` (#405); the old
+ * `consolidateMaxLlmCalls` key is a deprecated alias honored one release.
  */
-export const CONSOLIDATE_MAX_LLM_CALLS = 5000;
+export const DEFAULT_NIGHTLY_LLM_CALL_BUDGET = 5000;
+
+/**
+ * Resolve the per-run LLM call budget from config (#405):
+ *  - `nightlyLlmCallBudget` present (positive finite) → it wins;
+ *  - else `consolidateMaxLlmCalls` present → used as a DEPRECATED ALIAS with
+ *    a warn naming the replacement (honored one release);
+ *  - absent/invalid → the 5000 default.
+ */
+export function resolveNightlyLlmCallBudget(
+  config: Record<string, unknown> | null | undefined,
+): number {
+  const c = config ?? {};
+  if (c.nightlyLlmCallBudget !== undefined) {
+    return readPositiveConfig(c, "nightlyLlmCallBudget", DEFAULT_NIGHTLY_LLM_CALL_BUDGET);
+  }
+  if (c.consolidateMaxLlmCalls !== undefined) {
+    const legacy = readPositiveConfig(c, "consolidateMaxLlmCalls", DEFAULT_NIGHTLY_LLM_CALL_BUDGET);
+    console.warn(
+      `[hicortex] config key "consolidateMaxLlmCalls" is deprecated — renamed ` +
+        `"nightlyLlmCallBudget" (same meaning, now the ONE per-run LLM call ceiling). ` +
+        `The old key is honored for one release; rename it to clear this warning.`,
+    );
+    return legacy;
+  }
+  return DEFAULT_NIGHTLY_LLM_CALL_BUDGET;
+}
 const CONSOLIDATE_PRUNE_MIN_AGE_DAYS = 90;
 /**
  * Minimum COSINE similarity for a link candidate.
@@ -109,14 +135,12 @@ export class BudgetTracker {
   callsByStage: Record<string, number> = {};
   /**
    * Per-stage count of LLM-call REQUESTS refused because the budget was
-   * exhausted (#255). Keys are the same stage labels passed to `use()`. The
-   * value is the SUM of the `count` args passed to each refused `use()` call
-   * in that stage (in production every `use()` call passes count=1, so each
-   * refused call adds 1 — but the API accepts a batch count, so a single
-   * refused batch request accrues its full count). Stages break on the first
-   * refusal, so a stage's value is the count of the one request that crossed
-   * the boundary. For item-level skip counts (how many memories or pairs were
-   * left unprocessed), see the per-stage reports — e.g.
+   * exhausted (#255). Keys are the same stage labels passed to `use()`; each
+   * refused call adds 1 (the dead batch `count` param is gone — #405 —
+   * production always passed 1 anyway). Stages break on the first refusal,
+   * so a stage's value is the count of requests that crossed the boundary.
+   * For item-level skip counts (how many memories or pairs were left
+   * unprocessed), see the per-stage reports — e.g.
    * `stages.importance.skipped_budget` — which count MEMORIES, not call
    * requests. Surfaced in summary() and ConsolidationReport as
    * `deferred_by_stage`.
@@ -148,14 +172,14 @@ export class BudgetTracker {
     return Math.max(0, this.maxCalls - this.callsUsed);
   }
 
-  use(stage: string, count = 1): boolean {
-    if (this.callsUsed + count > this.maxCalls) {
+  use(stage: string): boolean {
+    if (this.callsUsed >= this.maxCalls) {
       // #255: emit as a STRUCTURED event (not a bare prose warn) so a monitor
       // can grep/parse `event=budget_exhausted` from journald. The line stays
       // human-readable (key=value tokens after the [hicortex] prefix). Deferred
       // counts are accrued BEFORE the log so the line reflects the up-to-date
       // per-stage toll — the refused count is added to this stage's slot.
-      this.deferredByStage[stage] = (this.deferredByStage[stage] ?? 0) + count;
+      this.deferredByStage[stage] = (this.deferredByStage[stage] ?? 0) + 1;
       console.warn(
         `[hicortex] event=budget_exhausted stage=${stage} ` +
           `calls_used=${this.callsUsed} max_calls=${this.maxCalls} ` +
@@ -163,8 +187,8 @@ export class BudgetTracker {
       );
       return false;
     }
-    this.callsUsed += count;
-    this.callsByStage[stage] = (this.callsByStage[stage] ?? 0) + count;
+    this.callsUsed += 1;
+    this.callsByStage[stage] = (this.callsByStage[stage] ?? 0) + 1;
     return true;
   }
 
@@ -210,6 +234,23 @@ export class BudgetTracker {
 // ---------------------------------------------------------------------------
 
 /**
+ * True when a token-period start stamp is ABSENT or sits in a previous UTC
+ * calendar month than `now` — the monthly-reset staleness check. #405: ONE
+ * shared helper — the check was triplicated (the nightly's throttle branch,
+ * the nightly's accrual write, token-budget.ts recordDistillUsage) and each
+ * copy re-derived the year+month comparison by hand.
+ */
+export function isStaleTokenPeriod(
+  periodStart: string | undefined,
+  now: Date = new Date(),
+): boolean {
+  if (!periodStart) return true;
+  const start = new Date(periodStart);
+  return start.getUTCFullYear() !== now.getUTCFullYear() ||
+    start.getUTCMonth() !== now.getUTCMonth();
+}
+
+/**
  * Decide whether consolidation should be throttled this run based on the
  * `llmTokensPerMonth` fair-use cap. Pure (no I/O) so it can be unit-tested
  * independently of the nightly wiring.
@@ -221,8 +262,8 @@ export class BudgetTracker {
  *
  * `cap = 0` (the self-hosted default) → never throttle (unlimited).
  * `periodStart` in a previous calendar month → period resets to 0 first
- * (mirrors the reset logic in nightly.ts; both sides agree because both read
- * the same state + clock).
+ * (isStaleTokenPeriod — the same helper every monthly-reset site uses, so
+ * the sides agree because they read the same state + clock).
  */
 export function shouldThrottleTokens(
   cap: number,
@@ -231,16 +272,8 @@ export function shouldThrottleTokens(
   now: Date = new Date(),
 ): { throttle: boolean; used?: number; cap?: number } {
   if (cap <= 0) return { throttle: false };
-  let periodTotal = period?.total ?? 0;
-  const periodStart = period?.periodStart;
-  if (periodStart) {
-    const start = new Date(periodStart);
-    if (start.getUTCFullYear() !== now.getUTCFullYear() ||
-        start.getUTCMonth() !== now.getUTCMonth()) {
-      // Stale period → reset accrual to 0 before the check.
-      periodTotal = 0;
-    }
-  }
+  // Stale period → reset accrual to 0 before the check.
+  const periodTotal = isStaleTokenPeriod(period?.periodStart, now) ? 0 : (period?.total ?? 0);
   if (periodTotal + lastRunTokens > cap) {
     return { throttle: true, used: periodTotal, cap };
   }
@@ -339,7 +372,8 @@ async function stageImportance(
   memories: Memory[],
   llm: LlmClient,
   budget: BudgetTracker,
-  dryRun: boolean
+  dryRun: boolean,
+  deadline?: RunDeadline
 ): Promise<{ scored: number; failed: number; skipped_budget: number }> {
   const batchSize = 10;
   let scored = 0;
@@ -351,6 +385,10 @@ async function stageImportance(
       skippedBudget += memories.length - i;
       break;
     }
+    // #405: the run deadline bounds the batch loop too — a large unscored
+    // backlog must not blow the whole run's wall-clock inside one stage.
+    // Same stage label as the boundary check, so the defer log fires once.
+    if (deadline?.hit("importance")) break;
 
     const batch = memories.slice(i, i + batchSize);
     const lines = batch.map(
@@ -367,7 +405,7 @@ async function stageImportance(
     }
 
     try {
-      const r = await llm.completeFast(prompt, 256);
+      const r = await llm.complete(prompt);
       budget.recordUsage("importance", r.usage);
       let scores = parseJsonLenient<number[] | null>(r.text, null);
 
@@ -449,7 +487,7 @@ async function stageReflection(
   }
 
   try {
-    const r = await llm.completeReflect(prompt, 2048);
+    const r = await llm.complete(prompt);
     budget.recordUsage("reflection", r.usage);
     const lessons = parseJsonLenient<unknown[]>(r.text, []);
 
@@ -507,11 +545,10 @@ async function stageReflection(
           const existingText = similarLessons[0].content.slice(0, 300);
           const newText = content.slice(0, 300);
           try {
-            const verdictR = await llm.completeFast(
+            const verdictR = await llm.complete(
               `Two lessons from an AI memory system. Do they CONTRADICT each other (opposite advice on the same topic)?\n\n` +
               `EXISTING: ${existingText}\n\nNEW: ${newText}\n\n` +
               `Answer ONLY "yes" or "no". If the new lesson updates/refines the existing one (not contradicts), answer "no".`,
-              16,
             );
             // Stage label "contradiction_check" matches the budget.use() call
             // above (separate counter from the reflection call proper). Token
@@ -619,6 +656,7 @@ async function stageContentDomains(
   dryRun: boolean,
   stateDir?: string,
   weakPrimaryFloor: number = DEFAULT_WEAK_PRIMARY_FLOOR,
+  deadline?: RunDeadline,
 ): Promise<{
   curated: boolean;
   domains: number;
@@ -665,6 +703,10 @@ async function stageContentDomains(
     const { prototypes: startPrototypes } = await computeDomainPrototypes(db, domains, getEmbedFn);
 
     for (const row of rows) {
+      // #405: the run deadline bounds the classification row loop (a large
+      // backlog must defer, not blow the wall-clock). Same stage label as the
+      // boundary check, so the defer log fires once.
+      if (deadline?.hit("domain_curation")) break;
       if (budget.exhausted || !budget.use("content_domain")) {
         console.warn(`[hicortex] content-domain: budget exhausted after ${classified} classified`);
         break;
@@ -841,7 +883,7 @@ async function stageDomainCuration(
       .join("\n");
 
     try {
-      const r = await llm.completeFast(domainCuration(projectLines), 1024);
+      const r = await llm.complete(domainCuration(projectLines));
       budget.recordUsage("domain_curation", r.usage);
       const parsed = parseJsonLenient<unknown[]>(r.text, []);
       if (!Array.isArray(parsed) || parsed.length === 0) {
@@ -1013,22 +1055,17 @@ export function discoverLinkCandidates(
  * 672-link audit (see the Stage 3 header) found the LLM-classified UPPERCASE
  * types near-useless (CONTRADICTS 4% acceptable). Every candidate now takes its
  * pre-computed `heuristicType` (only `extends` or `relates_to` — see
- * classifyRelationship). No LLM call is made.
- *
- * Signature stability: `llm` and `budget` are RETAINED but intentionally
- * ignored so the callers (nightly `stageLinks`, `hicortex relink`) and the
- * tests that import this need no change to their call sites. The return shape
- * is unchanged; `llmClassified` is always 0 now and `heuristicFallback` counts
- * every candidate. Do NOT re-add an LLM path here without a classifier that
- * passes the audit harness at >= 70% acceptable.
+ * classifyRelationship). No LLM call is made. #405: the ignored `llm`/`budget`
+ * params are deleted — the signature now tells the truth.
+ * The return shape is unchanged; `llmClassified` is always 0 and
+ * `heuristicFallback` counts every candidate. Do NOT re-add an LLM path here
+ * without a classifier that passes the audit harness at >= 70% acceptable.
  *
  * Shared between the nightly `stageLinks` and `hicortex relink`.
  * Returns one relationship type per candidate (same order as input).
  */
 export async function classifyLinkCandidates(
   candidates: LinkCandidate[],
-  _llm: LlmClient | null,
-  _budget: BudgetTracker,
 ): Promise<{ types: string[]; llmClassified: number; heuristicFallback: number }> {
   const types = candidates.map((c) => c.heuristicType);
   return { types, llmClassified: 0, heuristicFallback: candidates.length };
@@ -1061,9 +1098,10 @@ async function stageLinks(
     return { auto_linked: 0, llm_classified: 0, heuristic_fallback: 0, failed };
   }
 
-  // Phase B: LLM batch classification (heuristic fallback inside)
+  // Phase B: heuristic-only classification (LLM retired; #405 dropped the
+  // dead llm/budget params)
   const { types: classifiedTypes, llmClassified, heuristicFallback } =
-    await classifyLinkCandidates(candidates, llm, budget);
+    await classifyLinkCandidates(candidates);
 
   // Phase C: Store all classified links
   for (let i = 0; i < candidates.length; i++) {
@@ -1166,27 +1204,17 @@ function stageHubBoost(
 // this is a judgment call about content, not a duplicate).
 //
 // Scope: memories with `rowid > supersessionCursor` (state.json; starts 0 —
-// the corpus is back-processed gradually, config `supersessionMaxCalls` LLM
-// calls per night) whose shape suggests a decision/correction. For each,
-// KNN top-5 OLDER same-shape neighbors at/above `supersessionMinSimilarity`;
-// one constrained classify-tier LLM call per pair decides `superseded: true|
-// false`. A parse/infra error skips just that PAIR (retried naturally next
-// night since the cursor still advances past the memory — see the cursor
-// note below); it never mis-links.
+// the corpus is back-processed gradually) whose shape suggests a
+// decision/correction. For each, KNN top-5 OLDER same-shape neighbors
+// at/above `supersessionMinSimilarity`; one constrained classify-tier LLM
+// call per pair decides `superseded: true| false`. A parse/infra error skips
+// just that PAIR (retried naturally next night since the cursor still
+// advances past the memory — see the cursor note below); it never mis-links.
+// #405: no per-stage call cap — the ONE run budget (nightlyLlmCallBudget)
+// and the run deadline are the only bounds, like every other stage.
 
 /** Default minimum COSINE similarity for a supersession candidate pair. */
 export const DEFAULT_SUPERSESSION_MIN_SIMILARITY = 0.8;
-/**
- * Default max classify-tier LLM calls (pairs evaluated) spent per nightly run.
- * 0 = no separate cap — supersession shares the consolidation budget
- * (CONSOLIDATE_MAX_LLM_CALLS, default 5000) like every other stage. The old
- * default of 30 was set when the corpus had 14 decisions; with the distiller
- * now classifying types correctly (#216), decisions are common and the cap
- * was throttling supersession to a crawl. On a local free model there is no
- * per-call cost to defend against — the binding constraint is the wall-clock
- * timeout (TimeoutStartSec), not call count.
- */
-export const DEFAULT_SUPERSESSION_MAX_CALLS = 0;
 /** Default multiplier applied to a superseded memory's base_strength. */
 /** Floor under which a superseded memory's base_strength never drops. */
 /** Neighbor pool size before shape/older/similarity filtering narrows to top 5. */
@@ -1195,7 +1223,10 @@ const SUPERSESSION_NEIGHBOR_POOL = 15;
 const SUPERSESSION_NEIGHBOR_TOP_K = 5;
 export interface SupersessionOptions {
   minSimilarity?: number;
-  maxCalls?: number;
+  /** The run-wide pipeline deadline (#405) — checked at each candidate
+   *  boundary; on expiry the scan stops and the cursor holds at the last
+   *  fully-considered candidate (resumed next run). */
+  deadline?: RunDeadline;
 }
 
 export interface SupersessionStageResult {
@@ -1291,7 +1322,7 @@ async function classifySupersession(
   newContent: string,
 ): Promise<{ verdict: boolean | null; usage: import("./llm.js").LlmUsage | undefined }> {
   try {
-    const r = await llm.completeClassify(buildSupersessionPrompt(oldContent, newContent));
+    const r = await llm.complete(buildSupersessionPrompt(oldContent, newContent));
     return { verdict: parseSupersessionReply(r.text), usage: r.usage };
   } catch {
     return { verdict: null, usage: undefined };
@@ -1340,6 +1371,13 @@ async function findOlderNeighbors(
  * candidacy. It only stops SHORT of a candidate when the budget is already
  * exhausted before that candidate starts, so the cursor never skips a
  * candidate that was never looked at.
+ *
+ * #405: the cursor persists after EVERY fully-considered candidate (the
+ * post-#404 reconsolidation pattern), not at stage end — a run killed or
+ * deadline-deferred mid-stage loses at most the candidate in flight. No
+ * orphan clamp is needed (unlike reconsolidation): supersession applies each
+ * verdict's link immediately, so `cursor = candidate.__rowid` always sits
+ * after all of that candidate's writes.
  */
 export async function stageSupersession(
   db: Database.Database,
@@ -1357,7 +1395,6 @@ export async function stageSupersession(
     return Number.isFinite(n) && ok(n) ? n : fallback;
   };
   const minSimilarity = validNumber(options.minSimilarity, DEFAULT_SUPERSESSION_MIN_SIMILARITY, (n) => n > 0 && n <= 1);
-  const maxCalls = validNumber(options.maxCalls, DEFAULT_SUPERSESSION_MAX_CALLS, (n) => n >= 0);
 
   const startCursor = loadState(stateDir).supersessionCursor ?? 0;
   const rows = db
@@ -1380,11 +1417,25 @@ export async function stageSupersession(
   let superseded = 0;
   let skippedInfra = 0;
   let skippedIdempotent = 0;
-  let callsUsed = 0;
   let cursor = startCursor;
+  // #405: per-candidate checkpoint — persists the cursor after every fully
+  // considered candidate (updateState is an atomic temp-rename of a small
+  // file; the loop cadence is seconds per candidate, so the cost is
+  // negligible). The end-of-stage write below stays the authoritative final
+  // write.
+  const persistCursor = (): void => {
+    if (dryRun) return;
+    updateState((s) => {
+      s.supersessionCursor = cursor;
+    }, stateDir);
+  };
 
   for (const candidate of rows) {
-    if (!dryRun && ((maxCalls > 0 && callsUsed >= maxCalls) || budget.exhausted)) break;
+    // #405: the ONE run budget is the only call cap; the deadline stops the
+    // scan at the candidate boundary — the cursor holds at the last
+    // fully-considered candidate (persisted below).
+    if (!dryRun && budget.exhausted) break;
+    if (!dryRun && options.deadline?.hit("supersession")) break;
     scanned++;
 
     let neighbors: Array<Memory & { distance: number }>;
@@ -1395,6 +1446,7 @@ export async function stageSupersession(
         `[hicortex] supersession: discovery failed for ${candidate.id.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
       );
       cursor = candidate.__rowid;
+      persistCursor(); // #405: every exit path persists
       continue;
     }
 
@@ -1405,8 +1457,7 @@ export async function stageSupersession(
       }
       if (dryRun) continue; // preview only — no LLM call, no write
 
-      if ((maxCalls > 0 && callsUsed >= maxCalls) || !budget.use("supersession")) break;
-      callsUsed++;
+      if (!budget.use("supersession")) break; // #405: the ONE run budget
 
       const { verdict, usage } = await classifySupersession(llm, neighbor.content, candidate.content);
       // Meter every round-tripped attempt (#246) — even a null verdict spent
@@ -1434,6 +1485,10 @@ export async function stageSupersession(
     }
 
     cursor = candidate.__rowid;
+    // #405: checkpoint after every fully-considered candidate (post-#404
+    // reconsolidation pattern) — a killed or deadline-deferred run loses at
+    // most the candidate in flight.
+    persistCursor();
   }
 
   if (!dryRun) {
@@ -1682,7 +1737,7 @@ export function stageMemoryCapEviction(
  * When `domains` is a non-empty list, the pipeline uses content-based
  * classification (config-owned) INSTEAD of project grouping. The single
  * model serves all phases; if it's unavailable, `complete()` retries
- * internally (30s/60s/120s) and the phase fails soft on persistence —
+ * internally (one 60 s retry, #405) and the phase fails soft on persistence —
  * the nightly retries on the next run. No pre-flight health checks; the
  * phase either answers or is skipped until the next scheduled run. When
  * `domains` is absent/empty, the legacy project-grouping curation runs
@@ -1722,22 +1777,19 @@ async function skippedRunResolutionReport(
     DEFAULT_DEDUP_MERGE_THRESHOLD,
     (n) => n > 0 && n <= 1,
   );
-  const maxMerges = validNumber(
-    options.maxMerges,
-    DEFAULT_DEDUP_NIGHTLY_MAX_MERGES,
-    (n) => n >= 0,
-  );
 
   const merges = await runDeterministicMergeZone(db, {
     stateDir,
     threshold: autoMergeThreshold,
-    maxMerges,
     dryRun,
     acquireLock: options.acquireLock,
+    deadline: options.deadline,
   });
 
   const bandStats: Record<string, ResolutionBandStat> = {};
-  if (merges.max_merges > 0) {
+  {
+    // #405: recorded whenever the zone ran (the old max_merges>0 gate was a
+    // 0=disabled switch — the switch is gone).
     bandStats[`>=${autoMergeThreshold}`] = {
       pairs: merges.losers_merged,
       merge: merges.losers_merged,
@@ -1787,9 +1839,10 @@ export async function runConsolidation(
   stateDir?: string,
   domainOptions?: DomainStageOptions,
   supersessionOptions?: SupersessionOptions,
-  /** Total LLM-call ceiling across classify-tier stages (#241). The caller
-   *  reads `consolidateMaxLlmCalls` from config and passes it; unset → the
-   *  exported `CONSOLIDATE_MAX_LLM_CALLS` default (5000). */
+  /** The ONE per-run LLM-call ceiling (#405/#241). The caller resolves
+   *  `nightlyLlmCallBudget` from config (consolidateMaxLlmCalls is a
+   *  deprecated alias — resolveNightlyLlmCallBudget) and passes it; unset →
+   *  the exported DEFAULT_NIGHTLY_LLM_CALL_BUDGET (5000). */
   budgetMaxCalls?: number,
   /** Soft cap on the corpus (#245). Nightly.ts reads `memorySoftCap` from
    *  config and passes it; unset → `DEFAULT_MEMORY_SOFT_CAP` (10000). `0`
@@ -1801,6 +1854,15 @@ export async function runConsolidation(
    *  Appended AFTER the pre-#384 params so every existing positional caller
    *  (tests, hosted nightly) keeps its argument meaning. */
   reconsolidationOptions?: ReconsolidationOptions,
+  /**
+   * The run-wide pipeline deadline (#405), created at nightly start and
+   * shared by capture + every consolidation stage. Absent = no deadline
+   * (tests, evict-only paths, pre-#405 callers). When it fires, every
+   * not-yet-run stage defers (logs event=deadline_deferred stage=<name>) and
+   * the report status becomes "deferred" — which keeps lastConsolidated
+   * un-advanced so the next run re-finds the pending work.
+   */
+  deadline?: RunDeadline,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -1861,29 +1923,41 @@ export async function runConsolidation(
     // stage report (telemetry's "skipped = zero LLM work" stays true), and
     // the zone never runs twice: the main path runs it INSIDE the stage, this
     // skip path returns before that.
-    report.stages.reconsolidation = await skippedRunResolutionReport(db, dryRun, stateDir, reconsolidationOptions);
+    report.stages.reconsolidation = await skippedRunResolutionReport(db, dryRun, stateDir, { ...reconsolidationOptions, deadline });
     report.status = "skipped";
     report.completed_at = new Date().toISOString();
     return report;
   }
 
-  // Config-overridable total LLM-call ceiling (#241). Default 5000 (was 200) —
-  // see CONSOLIDATE_MAX_LLM_CALLS. The caller reads `consolidateMaxLlmCalls`
-  // from config and passes it here.
-  const budget = new BudgetTracker(budgetMaxCalls ?? CONSOLIDATE_MAX_LLM_CALLS);
+  // #405: the ONE per-run LLM-call ceiling (default 5000). The caller
+  // resolves `nightlyLlmCallBudget` from config (consolidateMaxLlmCalls is a
+  // deprecated alias — see resolveNightlyLlmCallBudget) and passes it here.
+  const budget = new BudgetTracker(budgetMaxCalls ?? DEFAULT_NIGHTLY_LLM_CALL_BUDGET);
+  console.log(`[hicortex] Consolidation LLM call budget: ${budget.maxCalls} calls`);
 
   try {
+    // #405 stage gating: each boundary checks the run deadline; a hit defers
+    // that stage (absent from the report — it did not run) and logs
+    // event=deadline_deferred stage=<name> once. Later boundaries check
+    // independently, so a mid-run deadline reports every remaining stage as
+    // deferred. Deferred stages drain next run (cursors hold below them).
+
     // Stage 2: Importance Scoring
-    report.stages.importance = await stageImportance(
-      db,
-      scoreMemories,
-      llm,
-      budget,
-      dryRun
-    );
+    if (!deadline?.hit("importance")) {
+      report.stages.importance = await stageImportance(
+        db,
+        scoreMemories,
+        llm,
+        budget,
+        dryRun,
+        deadline,
+      );
+    }
 
     // Stage 2.5: Reflection
-    if (skipReflection) {
+    if (deadline?.hit("reflection")) {
+      // deferred — stage absent from the report
+    } else if (skipReflection) {
       report.stages.reflection = {
         lessons_generated: 0,
         skipped: true,
@@ -1905,56 +1979,80 @@ export async function runConsolidation(
     // domain list is configured. The single model serves all phases; if it's
     // down, the phase skips and retries on the next nightly run (no fallback).
     const cfgDomains = domainOptions?.domains;
-    if (cfgDomains && cfgDomains.length > 0) {
-      if (domainOptions?.contentDomainsReady === false) {
-        report.stages.domain_curation = {
-          curated: false,
-          domains: cfgDomains.length,
-          reason: "reflect_endpoint_offline",
-        };
+    if (!deadline?.hit("domain_curation")) {
+      if (cfgDomains && cfgDomains.length > 0) {
+        if (domainOptions?.contentDomainsReady === false) {
+          report.stages.domain_curation = {
+            curated: false,
+            domains: cfgDomains.length,
+            reason: "reflect_endpoint_offline",
+          };
+        } else {
+          report.stages.domain_curation = await stageContentDomains(
+            db, cfgDomains, llm, budget, embedFn, dryRun, stateDir,
+            domainOptions?.weakPrimaryFloor ?? DEFAULT_WEAK_PRIMARY_FLOOR,
+            deadline,
+          );
+        }
       } else {
-        report.stages.domain_curation = await stageContentDomains(
-          db, cfgDomains, llm, budget, embedFn, dryRun, stateDir,
-          domainOptions?.weakPrimaryFloor ?? DEFAULT_WEAK_PRIMARY_FLOOR,
-        );
+        report.stages.domain_curation = await stageDomainCuration(db, llm, budget, dryRun, stateDir);
       }
-    } else {
-      report.stages.domain_curation = await stageDomainCuration(db, llm, budget, dryRun, stateDir);
     }
 
-    // Stage 3: Link Discovery (with LLM-assisted edge classification)
-    report.stages.links = await stageLinks(
-      db,
-      precheck.newMemories,
-      embedFn,
-      dryRun,
-      llm,
-      budget,
-    );
+    // Stage 3: Link Discovery (heuristic edge classification — local work,
+    // but bounded by the same deadline as every other stage).
+    if (!deadline?.hit("links")) {
+      report.stages.links = await stageLinks(
+        db,
+        precheck.newMemories,
+        embedFn,
+        dryRun,
+        llm,
+        budget,
+      );
+    }
 
     // Stage 3.5: Hub Detection — boost highly-connected memories
-    report.stages.hub_boost = stageHubBoost(db, dryRun);
+    if (!deadline?.hit("hub_boost")) {
+      report.stages.hub_boost = stageHubBoost(db, dryRun);
+    }
 
     // Stage 3.7: Supersession Detection (#191 Phase B)
-    report.stages.supersession = await stageSupersession(
-      db, llm, budget, embedFn, dryRun, stateDir, supersessionOptions,
-    );
+    if (!deadline?.hit("supersession")) {
+      report.stages.supersession = await stageSupersession(
+        db, llm, budget, embedFn, dryRun, stateDir,
+        { ...supersessionOptions, deadline },
+      );
+    }
 
     // Stage 3.8: Reconsolidation (#384) — resolve corrections: rewrite
     // fact-shaped targets in place (absorbing transition-only triggers),
     // mark everything else. Rides the same shared budget under its own stage
     // label + cursor (supersession-stage pattern).
-    report.stages.reconsolidation = await stageReconsolidation(
-      db, llm, budget, embedFn, dryRun, stateDir, reconsolidationOptions,
-    );
+    if (!deadline?.hit("reconsolidation")) {
+      report.stages.reconsolidation = await stageReconsolidation(
+        db, llm, budget, embedFn, dryRun, stateDir,
+        { ...reconsolidationOptions, deadline },
+      );
+    }
 
     // Stage 4: Decay & Prune
-    report.stages.decay_prune = stageDecayPrune(db, dryRun);
+    if (!deadline?.hit("decay_prune")) {
+      report.stages.decay_prune = stageDecayPrune(db, dryRun);
+    }
 
     // (Memory cap eviction moved before the precheck skip — see above.)
   } catch (err) {
     report.status = "failed";
     console.error("[hicortex] Consolidation pipeline error:", err);
+  }
+
+  // #405: any deferred stage ⇒ the run is "deferred", not "completed" — the
+  // lastConsolidated gate below then holds the watermark so the next run's
+  // pending-set queries re-find the deferred work (mirrors endpoint_down).
+  // A thrown error still wins ("failed" is the more specific outcome).
+  if (report.status === "completed" && deadline && deadline.deferredStages().length > 0) {
+    report.status = "deferred";
   }
 
   // Update last-consolidated timestamp. #357: the stages fail SOFT, so a run
@@ -1981,77 +2079,4 @@ export async function runConsolidation(
     Math.round((Date.now() - start.getTime()) / 100) / 10;
 
   return report;
-}
-
-// ---------------------------------------------------------------------------
-// Scheduling
-// ---------------------------------------------------------------------------
-
-/**
- * Calculate milliseconds until the next occurrence of a given hour (local time).
- */
-export function msUntilHour(hour: number): number {
-  const now = new Date();
-  const target = new Date(now);
-  target.setHours(hour, 30, 0, 0); // :30 past the hour
-
-  if (target.getTime() <= now.getTime()) {
-    // Already passed today, schedule for tomorrow
-    target.setDate(target.getDate() + 1);
-  }
-
-  return target.getTime() - now.getTime();
-}
-
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-
-/**
- * Schedule the consolidation pipeline to run nightly.
- * Returns a cleanup function to cancel the timer.
- *
- * NOTE: currently unused (nightly.ts drives consolidation directly). Any future
- * caller MUST read config.domains and thread `domainOptions` into runConsolidation
- * when content domains are configured — otherwise it silently falls back to the
- * legacy project-grouping path even when a domain list is set.
- */
-export function scheduleConsolidation(
-  db: Database.Database,
-  llm: LlmClient,
-  embedFn: EmbedFn,
-  hour = 2
-): () => void {
-  let timeout: ReturnType<typeof setTimeout> | null = null;
-  let interval: ReturnType<typeof setInterval> | null = null;
-
-  const runAndScheduleInterval = () => {
-    runConsolidation(db, llm, embedFn)
-      .then((report) => {
-        console.log(
-          `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s`
-        );
-      })
-      .catch((err) => {
-        console.error("[hicortex] Consolidation failed:", err);
-      });
-
-    // Schedule recurring daily runs
-    if (!interval) {
-      interval = setInterval(() => {
-        runConsolidation(db, llm, embedFn).catch((err) => {
-          console.error("[hicortex] Consolidation failed:", err);
-        });
-      }, ONE_DAY_MS);
-    }
-  };
-
-  const delay = msUntilHour(hour);
-  console.log(
-    `[hicortex] Consolidation scheduled in ${Math.round(delay / 60_000)} minutes`
-  );
-  timeout = setTimeout(runAndScheduleInterval, delay);
-
-  return () => {
-    if (timeout) clearTimeout(timeout);
-    if (interval) clearInterval(interval);
-  };
 }
