@@ -3,7 +3,7 @@
   "name": "io.github.gamaze-labs/hicortex",
   "title": "Hicortex",
   "description": "Shared fleet memory for AI agents: nightly self-correction, recall every prompt (supported agents).",
-  "version": "0.20.7",
+  "version": "0.20.8",
   "packages": [
     {
       "registryType": "npm",
