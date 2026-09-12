@@ -191,6 +191,68 @@
     display: inline-block; padding: 1px 8px; border-radius: 10px;
     background: rgba(128,128,128,0.18); font-size: 11px; color: var(--text-dim);
   }
+
+  /* ---- account menu (#365) ---- */
+  /* Dropdown under the nav account element: token reveal/copy, connect
+     snippets, plan & billing, sign-out. The wrapper (#nav-account) becomes
+     the positioning context; the panel is absolute + right-aligned under it,
+     above page content (the panel gets z-60). */
+  .hc-nav-account { position: relative; }
+  .acct-trigger {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: transparent; color: var(--text); border: none; border-radius: 6px;
+    padding: 4px 8px; font: inherit; cursor: pointer;
+  }
+  .acct-trigger:hover { background: rgba(128,128,128,0.15); }
+  .acct-caret { color: var(--text-dim); font-size: 10px; }
+  .acct-menu {
+    display: none; position: absolute; top: calc(100% + 8px); right: 0;
+    min-width: 320px; max-width: min(420px, calc(100vw - 40px));
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px;
+    padding: 12px; z-index: 60;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    color: var(--text); font-size: 13px; text-align: left;
+  }
+  .acct-menu.open { display: block; }
+  .acct-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--text-dim); margin: 8px 0 4px;
+  }
+  .acct-menu .acct-label:first-child { margin-top: 0; }
+  .acct-token-row { display: flex; align-items: center; gap: 6px; }
+  .acct-token {
+    flex: 1; min-width: 0;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg); border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 4px 8px; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .acct-btn {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .acct-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .acct-btn:disabled { opacity: 0.5; cursor: default; }
+  .acct-menu details { border-top: 1px solid var(--panel-border); margin-top: 10px; padding-top: 8px; }
+  .acct-menu summary { cursor: pointer; color: var(--text-dim); font-size: 13px; }
+  .acct-menu summary:hover { color: var(--accent); }
+  .acct-snippet { margin-bottom: 8px; }
+  .acct-snippet pre {
+    background: var(--bg); border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 8px; margin: 4px 0;
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 200px; overflow-y: auto;
+  }
+  .acct-link {
+    display: block; width: 100%; text-align: left;
+    background: transparent; border: none; border-radius: 4px;
+    color: var(--text); font: inherit; font-size: 13px;
+    padding: 6px 8px; cursor: pointer;
+  }
+  .acct-link:hover { background: rgba(128,128,128,0.15); }
+  .acct-link.acct-danger:hover { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -325,28 +387,43 @@
   }
 
   // =========================================================================
-  // Account identity in the nav — GET /account (the lightweight endpoint the
-  // dashboard payload also carries). Fail-soft: 401/fetch error leaves the
-  // span empty (the main load() owns the 401 token prompt); an all-null
-  // account (self-hosted default) renders nothing. Built with textContent
-  // only — this page never uses innerHTML for server-derived values.
+  // Account identity in the nav + the ACCOUNT MENU (#365) — GET /account (the
+  // lightweight endpoint the dashboard payload also carries). Fail-soft:
+  // 401/fetch error leaves the span empty (the main load() owns the 401 token
+  // prompt); an all-null account (self-hosted default) renders nothing — no
+  // menu either. Built with createElement/textContent only — this page never
+  // uses innerHTML for server-derived values.
   // =========================================================================
   function renderAccount(a) {
     var host = document.getElementById("nav-account");
     if (!host) return;
     host.textContent = "";
     if (!a || (a.name === null && a.org === null && a.plan === null)) return;
+    var trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.id = "acct-trigger";
+    trigger.className = "acct-trigger";
+    trigger.setAttribute("aria-haspopup", "menu");
+    trigger.setAttribute("aria-expanded", "false");
     var who = [a.name, a.org].filter(function (s) { return typeof s === "string" && s !== ""; });
     who.forEach(function (s, i) {
-      if (i > 0) host.appendChild(document.createTextNode(" · "));
-      host.appendChild(document.createTextNode(s));
+      if (i > 0) trigger.appendChild(document.createTextNode(" · "));
+      trigger.appendChild(document.createTextNode(s));
     });
     if (typeof a.plan === "string" && a.plan !== "") {
       var pill = document.createElement("span");
       pill.className = "plan";
       pill.textContent = a.plan;
-      host.appendChild(pill);
+      trigger.appendChild(pill);
     }
+    var caret = document.createElement("span");
+    caret.className = "acct-caret";
+    caret.setAttribute("aria-hidden", "true");
+    caret.textContent = "▾";
+    trigger.appendChild(caret);
+    host.appendChild(trigger);
+    host.appendChild(buildAcctMenu());
+    wireAcctMenu();
   }
   function loadAccount() {
     fetch("/account", { headers: authHeaders() })
@@ -354,6 +431,270 @@
       .then(function (data) { if (data) renderAccount(data.account); })
       .catch(function () { /* leave the span empty — nav is never worth an error */ });
   }
+
+  // =========================================================================
+  // Account menu (#365) — dropdown under the nav account element: token
+  // reveal/copy, connect snippets, plan & billing, sign-out. The token shown
+  // is AUTHORITATIVE server truth: a lazy GET /account/token on the FIRST
+  // open (echo-only endpoint — the fetch already proves the caller holds the
+  // token). localStorage is NEVER trusted for the display: it can be stale
+  // after token rotation and is absent entirely for browser sessions the
+  // hosted router authenticates via its session→bearer injection. On fetch
+  // failure the row fails explicitly ("token unavailable", actions disabled).
+  // Built with createElement/textContent only (page convention).
+  // =========================================================================
+  var acctToken = null;             // token from /account/token (server truth)
+  var acctTokenState = "unfetched"; // "unfetched" | "ok" | "unavailable"
+  var acctTokenFetched = false;     // one lazy fetch attempt per page load
+  var acctRevealed = false;         // unmasked while the menu is open
+
+  function maskToken(t) {
+    // hctx-••••••23f9 — first 5 chars + 6 bullets + last 4. Real tokens are
+    // hctx-<32hex>; the guard keeps a degenerate short token from leaking.
+    if (typeof t !== "string" || t.length < 10) return "••••••••••";
+    return t.slice(0, 5) + "••••••" + t.slice(-4);
+  }
+
+  function el(tag, id, cls, text) {
+    var n = document.createElement(tag);
+    if (id) n.id = id;
+    if (cls) n.className = cls;
+    if (text !== undefined) n.textContent = text;
+    return n;
+  }
+
+  // Static menu skeleton — token-dependent values fill in renderAcctToken().
+  function buildAcctMenu() {
+    var menu = el("div", "acct-menu", "acct-menu");
+    menu.appendChild(el("div", null, "acct-label", "Connection token"));
+    var row = el("div", null, "acct-token-row");
+    row.appendChild(el("code", "acct-token-val", "acct-token", "…"));
+    row.appendChild(el("button", "acct-reveal", "acct-btn", "Reveal"));
+    row.appendChild(el("button", "acct-copy-token", "acct-btn", "Copy"));
+    menu.appendChild(row);
+    var details = el("details", "acct-connect");
+    details.appendChild(el("summary", null, null, "Connect an agent"));
+    details.appendChild(el("div", null, "acct-label", "CLI"));
+    var snip1 = el("div", null, "acct-snippet");
+    snip1.appendChild(el("pre", "acct-cli"));
+    snip1.appendChild(el("button", "acct-copy-cli", "acct-btn", "Copy"));
+    details.appendChild(snip1);
+    details.appendChild(el("div", null, "acct-label", "MCP — ~/.claude.json"));
+    var snip2 = el("div", null, "acct-snippet");
+    snip2.appendChild(el("pre", "acct-mcp"));
+    snip2.appendChild(el("button", "acct-copy-mcp", "acct-btn", "Copy"));
+    details.appendChild(snip2);
+    menu.appendChild(details);
+    menu.appendChild(el("button", "acct-plan", "acct-link", "Plan & billing"));
+    menu.appendChild(el("button", "acct-signout", "acct-link acct-danger", "Sign out"));
+    // All menu buttons are type=button (never submit).
+    var btns = menu.querySelectorAll("button");
+    for (var i = 0; i < btns.length; i++) btns[i].type = "button";
+    return menu;
+  }
+
+  // The connect line: server URL + token on ONE line, space-separated.
+  function acctConnectLine() {
+    return location.origin + " " + acctToken;
+  }
+
+  // CLI snippet — init has NO --token flag; it prompts interactively. The
+  // comment mirrors init.ts's own printed hint ("When prompted for the token,
+  // paste: …").
+  function acctCliText() {
+    return "# When prompted for the token, paste: " + acctToken +
+      "\nnpx @gamaze/hicortex init --server " + location.origin;
+  }
+
+  // MCP snippet — mirrors EXACTLY what runClientInit writes into
+  // ~/.claude.json (init.ts): SSE transport at <origin>/sse with a bearer
+  // Authorization header.
+  function acctMcpText() {
+    return JSON.stringify({
+      mcpServers: {
+        hicortex: {
+          type: "sse",
+          url: location.origin + "/sse",
+          headers: { Authorization: "Bearer " + acctToken }
+        }
+      }
+    }, null, 2);
+  }
+
+  function renderAcctToken() {
+    var val = document.getElementById("acct-token-val");
+    if (!val) return; // menu not rendered (self-hosted all-null account)
+    var revealBtn = document.getElementById("acct-reveal");
+    var copyToken = document.getElementById("acct-copy-token");
+    var copyCli = document.getElementById("acct-copy-cli");
+    var copyMcp = document.getElementById("acct-copy-mcp");
+    var cli = document.getElementById("acct-cli");
+    var mcp = document.getElementById("acct-mcp");
+    if (acctTokenState !== "ok") {
+      val.textContent = acctTokenState === "unfetched" ? "…" : "token unavailable";
+      revealBtn.disabled = true;
+      copyToken.disabled = true;
+      copyCli.disabled = true;
+      copyMcp.disabled = true;
+      cli.textContent = acctTokenState === "unfetched" ? "" : "token unavailable";
+      mcp.textContent = acctTokenState === "unfetched" ? "" : "token unavailable";
+      return;
+    }
+    revealBtn.disabled = false;
+    copyToken.disabled = false;
+    copyCli.disabled = false;
+    copyMcp.disabled = false;
+    val.textContent = acctRevealed ? acctToken : maskToken(acctToken);
+    revealBtn.textContent = acctRevealed ? "Hide" : "Reveal";
+    cli.textContent = acctCliText();
+    mcp.textContent = acctMcpText();
+  }
+
+  function fetchAcctToken() {
+    if (acctTokenFetched) return;
+    acctTokenFetched = true;
+    fetch("/account/token", { headers: authHeaders() })
+      .then(function (resp) {
+        if (!resp.ok) throw new Error("HTTP " + resp.status);
+        return resp.json();
+      })
+      .then(function (data) {
+        if (typeof data.token !== "string" || !data.token) throw new Error("bad payload");
+        acctToken = data.token;
+        acctTokenState = "ok";
+        renderAcctToken();
+      })
+      .catch(function () {
+        acctTokenState = "unavailable"; // fail explicitly — no localStorage fallback
+        renderAcctToken();
+      });
+  }
+
+  function closeAcctMenu() {
+    var menu = document.getElementById("acct-menu");
+    if (!menu) return;
+    menu.classList.remove("open");
+    var trigger = document.getElementById("acct-trigger");
+    if (trigger) trigger.setAttribute("aria-expanded", "false");
+    // Masked again + connect section collapsed on EVERY close (locked design).
+    acctRevealed = false;
+    var details = document.getElementById("acct-connect");
+    if (details) details.removeAttribute("open");
+    renderAcctToken();
+  }
+
+  function openAcctMenu() {
+    var menu = document.getElementById("acct-menu");
+    if (!menu) return;
+    menu.classList.add("open");
+    document.getElementById("acct-trigger").setAttribute("aria-expanded", "true");
+    fetchAcctToken(); // lazy — one attempt, on first open only
+  }
+
+  // Clipboard helper: async API when available, temporary <textarea> +
+  // execCommand fallback (http remote origins lack the async clipboard API).
+  // Brief "Copied" feedback (label swap for ~1.5 s); total failure alerts.
+  function copyToClipboard(text, btn) {
+    var flash = function () {
+      var orig = btn.dataset.origLabel || (btn.dataset.origLabel = btn.textContent);
+      btn.textContent = "Copied";
+      clearTimeout(btn._copiedTimer);
+      btn._copiedTimer = setTimeout(function () { btn.textContent = orig; }, 1500);
+    };
+    var legacy = function () {
+      try {
+        var ta = document.createElement("textarea");
+        ta.value = text;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = document.execCommand("copy");
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e) { return false; }
+    };
+    var fallback = function () {
+      if (legacy()) { flash(); return; }
+      alert("Copy failed — select the text and copy it manually.");
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(flash, fallback);
+    } else {
+      fallback();
+    }
+  }
+
+  // Sign-out is CLIENT-SIDE ONLY (#365): there is no server session to
+  // invalidate in the Hicortex server itself — auth is per-request bearer, so
+  // dropping the locally stored tokens IS the sign-out. (The hosted router
+  // separately keeps a Google session cookie and offers /auth/logout — out of
+  // scope here; this only ends the browser's console session.)
+  function signOut() {
+    try {
+      localStorage.removeItem("hicortexToken");
+      localStorage.removeItem("hicortex-dashboard-token");
+    } catch (e) { /* private mode — reload anyway */ }
+    location.reload(); // back to the unauthenticated 401-prompt state
+  }
+
+  function wireAcctMenu() {
+    var trigger = document.getElementById("acct-trigger");
+    if (!trigger) return;
+    trigger.addEventListener("click", function () {
+      var menu = document.getElementById("acct-menu");
+      if (menu && menu.classList.contains("open")) closeAcctMenu();
+      else openAcctMenu();
+    });
+    document.getElementById("acct-reveal").addEventListener("click", function () {
+      acctRevealed = !acctRevealed;
+      renderAcctToken();
+    });
+    var copyToken = document.getElementById("acct-copy-token");
+    copyToken.addEventListener("click", function () {
+      if (acctTokenState === "ok") copyToClipboard(acctConnectLine(), copyToken);
+    });
+    var copyCli = document.getElementById("acct-copy-cli");
+    copyCli.addEventListener("click", function () {
+      if (acctTokenState === "ok") {
+        copyToClipboard("npx @gamaze/hicortex init --server " + location.origin, copyCli);
+      }
+    });
+    var copyMcp = document.getElementById("acct-copy-mcp");
+    copyMcp.addEventListener("click", function () {
+      if (acctTokenState === "ok") copyToClipboard(acctMcpText(), copyMcp);
+    });
+    // Plan & billing lives on the dashboard page — navigate there (append
+    // ?token= when one is known, mirroring the shared-nav link handler) and
+    // land on the digest panel's budget/usage anchor (#371 lands there).
+    document.getElementById("acct-plan").addEventListener("click", function () {
+      var t = null;
+      try {
+        t = token
+          || localStorage.getItem("hicortexToken")
+          || localStorage.getItem("hicortex-dashboard-token");
+      } catch (e) { /* private mode — navigate without a token */ }
+      var u = new URL("/dashboard", location.origin);
+      if (t) u.searchParams.set("token", t);
+      u.hash = "plan-billing";
+      location.href = u.toString();
+    });
+    document.getElementById("acct-signout").addEventListener("click", signOut);
+    renderAcctToken();
+  }
+
+  // Click-outside + Escape close the menu (wired once; the handlers no-op
+  // when the menu isn't rendered).
+  document.addEventListener("click", function (e) {
+    var menu = document.getElementById("acct-menu");
+    if (!menu || !menu.classList.contains("open")) return;
+    var wrap = document.getElementById("nav-account");
+    if (wrap && wrap.contains(e.target)) return;
+    closeAcctMenu();
+  });
+  window.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") closeAcctMenu();
+  });
 
   // =========================================================================
   // DOM refs

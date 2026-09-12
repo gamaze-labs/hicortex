@@ -28,7 +28,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { LicenseInfo, ModuleIndex } from "./types.js";
+import type { LicenseInfo, ModuleIndex, ResolutionBandStat } from "./types.js";
 
 const HICORTEX_HOME = hicortexHome();
 const STATE_FILE = "state.json";
@@ -78,6 +78,17 @@ export interface HicortexState {
    */
   supersessionCursor?: number;
   /**
+   * Resume cursor for the nightly's reconsolidation stage (#384) — highest
+   * memories.rowid whose candidates have been evaluated (or infra-skipped)
+   * this run. Absent/0 = never run. Same advance-past-considered-candidates
+   * discipline as supersessionCursor, with one addition: when a rewrite group
+   * could not be applied (budget exhausted / rewrite-call infra error), the
+   * cursor holds BELOW the earliest candidate contributing to an un-applied
+   * group so those pairs are re-detected next run — a confirmed correction is
+   * never silently dropped by the cursor passing it.
+   */
+  reconsolidationCursor?: number;
+  /**
    * Resume cursor for `hicortex classify-types` (#216) — highest memories.rowid
    * whose batch has been fully committed. Absent/0 = never run (or reset).
    * Same discipline as domainCursor: advances per committed batch so an
@@ -106,6 +117,17 @@ export interface HicortexState {
    * which means the first run is never throttled (correct: no baseline yet).
    */
   llmTokensLastRun?: number;
+  /**
+   * Cumulative per-band verdict statistics for the unified resolution pass
+   * (#392), keyed by cosine band label ("0.75-0.8", …, ">=0.92" — labels
+   * derive from the live floor/ceiling at write time). Accumulated across
+   * runs, never reset: labeled calibration evidence for moving the
+   * floor/ceiling boundaries later. The deterministic zone persists its own
+   * band; the reconsolidation stage persists the judged bands. Never written
+   * on dry runs. The per-run snapshot lives in the stage report
+   * (`stages.reconsolidation.band_stats`).
+   */
+  resolutionBandStats?: Record<string, ResolutionBandStat>;
 }
 
 /**

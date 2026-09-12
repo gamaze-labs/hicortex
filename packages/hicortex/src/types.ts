@@ -33,6 +33,16 @@ export interface Memory {
   privacy: ("PUBLIC" | "WORK" | "PERSONAL" | "SENSITIVE") | null;
   memory_type: "experience" | "learnings" | "knowledge" | "decisions";
   updated_at: string | null;
+  /**
+   * Reconsolidation state (#384, migration v14). Code-defined vocabulary,
+   * never config: NULL/absent = active (the default, and every pre-v14 row);
+   * 'superseded'/'retracted' = marked stale or wrong (demoted in ranking);
+   * 'corrected' = rewritten in place (does NOT demote — demoting it would
+   * bury the correction); 'absorbed' = invisible to recall (trigger memory
+   * folded into a corrected target — no vector/FTS row, plain row + link
+   * kept as evidence and rollback reference).
+   */
+  status?: string | null;
 }
 
 /** A link between two memories. */
@@ -74,6 +84,66 @@ export interface MemorySearchResult {
   /** Which retrieval channel produced the candidate (vector KNN, BM25 FTS,
    *  both, or graph traversal). Used by the /recall-index relevance gate. */
   source?: "vector" | "fts" | "both" | "graph";
+}
+
+/**
+ * Per-cosine-band verdict statistics for the unified resolution pass (#392).
+ * Bands are labeled from the live floor/ceiling ("0.75-0.8", …, ">=0.92").
+ * The stage report carries the per-run snapshot; state.json
+ * `resolutionBandStats` carries the cumulative series — calibration evidence
+ * for moving the floor/ceiling boundaries later, with data.
+ */
+export interface ResolutionBandStat {
+  /** Candidate pairs judged (or deterministically merged) in this band. */
+  pairs: number;
+  /** Verdict/action counts. `merge` counts gated merges (applied or applicable). */
+  merge: number;
+  corrects: number;
+  supersedes: number;
+  none: number;
+  /** Merge verdicts below the confidence gate — both memories kept. */
+  merge_below_gate: number;
+  /** Sum of verdict confidences (divide by `pairs` for the mean). Deterministic merges count 1.0 each. */
+  conf_sum: number;
+  /** Deterministic band only: clusters refused by the metadata rails. */
+  metadata_skipped?: number;
+}
+
+/**
+ * Report of the deterministic merge zone (#392) — the >= dedupAutoMergeThreshold
+ * band, merged by the dedup core's union-find clustering with ZERO LLM calls.
+ * Computed in dedup.ts (runDeterministicMergeZone); surfaced verbatim as
+ * `stages.reconsolidation.merges`.
+ */
+export interface DeterministicMergeZoneReport {
+  /** The cosine ceiling in force (config dedupAutoMergeThreshold; default 0.92). */
+  threshold: number;
+  /** The pacing cap in force (dedupNightlyMaxMerges; 0 = machinery disabled). */
+  max_merges: number;
+  /** Every cluster found at the threshold (mergeable + mismatch-skipped). */
+  clusters_found: number;
+  /** Clusters that passed the metadata rails (would merge). */
+  mergeable_clusters: number;
+  /** Clusters actually merged this run (apply only; 0 on dry-run). */
+  merged_clusters: number;
+  /** Loser rows absorbed (hidden from recall, kept as evidence) this run. */
+  losers_merged: number;
+  /** Loser links re-pointed onto canonicals this run. */
+  links_repointed: number;
+  /** Clusters skipped — members disagree on project / source_agent. */
+  skipped_metadata_mismatch: number;
+  /** Mergeable clusters NOT attempted because the pacing cap was exhausted. */
+  capped: number;
+  /** Clusters whose merge transaction failed (rolled back; retried next run). */
+  failed: number;
+  /** Apply only: the capture lock was busy — zero merges, fail-soft. */
+  lock_busy?: boolean;
+  /** Apply only: the pre-merge backup failed — zero merges, fail-soft. */
+  backup_failed?: boolean;
+  /** Apply only: path of the pre-merge DB backup. */
+  backup_path?: string;
+  /** Dry-run only: bounded preview of the first 10 mergeable clusters. */
+  preview?: Array<{ size: number; canonical_id: string; loser_ids: string[] }>;
 }
 
 /** Report returned by the consolidation pipeline. */
@@ -149,6 +219,81 @@ export interface ConsolidationReport {
       skipped_idempotent: number;
       /** supersessionCursor after this run (unchanged in dry-run). */
       cursor: number;
+    };
+    /**
+     * Reconsolidation (#384) — runs after supersession, before decay/prune.
+     * Since #392 this is THE unified resolution stage: its verdict also carries
+     * a `merge` disposition, and the deterministic merge zone (pairs at/above
+     * `dedupAutoMergeThreshold`) runs inside it, LLM-free, before the scan.
+     */
+    reconsolidation?: {
+      /** Candidates examined this run (rowid > cursor; no shape filter). */
+      scanned: number;
+      /** Pairs actually sent to the verdict LLM (detection + explicit-mark verification). */
+      pairs_evaluated: number;
+      /**
+       * #394: pairs the similarity floor discovered this run (KNN neighbors
+       * at/above correctionMinSimilarity), counted before any skip or
+       * judgment — the only sizing number a dry-run can show, where
+       * pairs_evaluated is always 0.
+       */
+      pairs_discovered: number;
+      /** #394: discovered pairs with no resolution link yet — the actionable
+       * candidates (deterministic-zone work + would-be verdict calls). */
+      pairs_discovered_unlinked: number;
+      /** Targets rewritten in place this run (one history row each). */
+      rewritten: number;
+      /** Triggers absorbed (invisible to recall: vector + FTS dropped). */
+      absorbed: number;
+      /** Triggers kept live by their disposition (standalone substance). */
+      kept_linked: number;
+      /** Memories marked status 'superseded' (mark-only path). */
+      marked_superseded: number;
+      /** Memories marked status 'retracted' (mark-only: below gate / non-fact / failed contract). */
+      marked_retracted: number;
+      /** Verdicts that were `corrects` but below correctionRewriteMinConfidence. */
+      below_gate: number;
+      /** Rewrite groups degraded to mark-only on a failed rewrite contract. */
+      contract_failed: number;
+      /** Verdict/rewrite calls skipped on a parse/infra error (retried naturally). */
+      skipped_infra: number;
+      /** Pairs skipped because a resolution link already existed (either direction). */
+      skipped_idempotent: number;
+      /** Explicit ingest marks verified and upgraded into a rewrite group. */
+      explicit_verified: number;
+      /** Explicit marks whose verification diverged (mark retained untouched). */
+      explicit_divergent: number;
+      /** reconsolidationCursor after this run (unchanged in dry-run). */
+      cursor: number;
+      /**
+       * #392: the deterministic merge zone's own report (pairs >= the
+       * ceiling, union-find merged, zero LLM). Present on every run —
+       * including quiet-night skips (a stock install with a pre-upgrade
+       * backlog still drains it, LLM-free).
+       */
+      merges: DeterministicMergeZoneReport;
+      /** #392: judged-zone pair merges applied this run (merge verdicts at/above the confidence gate). */
+      merge_pairs_applied: number;
+      /** #392: merge verdicts below correctionRewriteMinConfidence — both memories kept. */
+      merge_below_gate: number;
+      /**
+       * #392: pairs the scan saw at/above the ceiling — owned by the
+       * deterministic zone (or waiting for its cap), never LLM-judged.
+       */
+      skipped_above_ceiling: number;
+      /**
+       * #392: judged merge pairs refused by the metadata rails (project /
+       * source_agent disagreement). Both memories kept; the cursor advances —
+       * the verdict was rendered, this is not an infra failure.
+       */
+      skipped_metadata_mismatch: number;
+      /**
+       * #392: per-run verdict statistics by cosine band ("0.75-0.8" …
+       * ">=0.92"; labels derive from the live floor/ceiling). Calibration
+       * evidence for moving the boundaries later; the cumulative series lives
+       * in state.json `resolutionBandStats`.
+       */
+      band_stats: Record<string, ResolutionBandStat>;
     };
     decay_prune?: {
       candidates: number;
@@ -347,6 +492,18 @@ export interface HicortexConfig {
    * when it finishes early. Read in llm.ts; see #220.
    */
   maxTokens?: number;
+  /**
+   * Max output tokens for the classify tier ONLY — the short JSON-verdict
+   * calls: correction/supersession verdicts, rewrite contracts, and type +
+   * domain tag classification. Default 1024. A ceiling, not a target
+   * (generation stops at the model's natural end) — raise it when a
+   * reasoning-style model spends the budget on internal reasoning and returns
+   * empty verdicts (the pre-#391 hardcoded per-call caps starved exactly that
+   * shape; a local non-reasoning model is unaffected by the raise).
+   * `maxTokens` continues to govern the heavy phases (distill/reflect).
+   * Read in llm.ts; see #391.
+   */
+  classifyMaxTokens?: number;
   /**
    * Toggle the model's internal reasoning ("thinking") stream on the openai-compat
    * path — applies to ALL phases (distill / reflect / classify / scoring) since one
@@ -549,6 +706,45 @@ export interface HicortexConfig {
   orgName?: string;
   /** Plan/tier label rendered as a small badge (e.g. "Cloud · Early bird"). */
   planLabel?: string;
+  /**
+   * Minimum cosine similarity for a reconsolidation candidate pair (#384):
+   * each new-since-cursor memory is paired with up to 5 older KNN neighbors
+   * at/above this bar before the verdict call. Default 0.75 — a touch wider
+   * than the supersession stage's 0.80 because a retraction often rides inside
+   * an otherwise unrelated memory; the verdict + confidence gate carry the
+   * precision. Number in (0, 1]; invalid/absent keeps the default.
+   */
+  correctionMinSimilarity?: number;
+  /**
+   * Minimum verdict confidence for the REWRITE fork of reconsolidation (#384):
+   * a `corrects` verdict at/above this bar on a fact-shaped target is rewritten
+   * in place; below it the pair degrades to mark-only (a weak mark is
+   * recoverable, a weak rewrite is corruption). Default 0.80. Number in
+   * (0, 1]; invalid/absent keeps the default. Since #392 this same gate also
+   * decides whether a `merge` verdict is applied (analogous reasoning: a weak
+   * merge keeps both memories, a confirmed merge hides one).
+   */
+  correctionRewriteMinConfidence?: number;
+  /**
+   * Deterministic merge ceiling for the unified resolution pass (#392): memory
+   * pairs at/above this cosine are merged by the dedup core's union-find
+   * clustering with ZERO LLM calls; pairs in [correctionMinSimilarity, this
+   * value) get the one unified verdict call (merge/corrects/supersedes/none).
+   * Default 0.92 (the #100/#191 calibration). The legacy `dedupMergeThreshold`
+   * key is honored as a fallback when this key is absent. Number in (0, 1];
+   * invalid/absent keeps the default. Also read by the manual `hicortex dedup`
+   * CLI (same precedence: --threshold > this key > legacy key > 0.92).
+   */
+  dedupAutoMergeThreshold?: number;
+  /**
+   * Pacing cap on merge OPERATIONS per nightly run (#392): deterministic-zone
+   * clusters plus judged pair merges count against ONE cap, so a
+   * misbehaving-distiller burst is bounded and a large pre-existing backlog
+   * drains over a few nights rather than in one run. Default 250. `0` disables
+   * the merge machinery entirely (the deterministic zone is skipped; a
+   * confirmed merge verdict keeps both memories). Non-negative integer.
+   */
+  dedupNightlyMaxMerges?: number;
 }
 
 /** A config-owned life-sphere domain (see HicortexConfig.domains). */

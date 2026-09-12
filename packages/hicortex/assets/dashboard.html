@@ -121,6 +121,69 @@
     display: inline-block; padding: 1px 8px; border-radius: 10px;
     background: rgba(128,128,128,0.18); font-size: 11px; color: var(--text-dim);
   }
+
+  /* ---- account menu (#365) ---- */
+  /* Dropdown under the nav account element: token reveal/copy, connect
+     snippets, plan & billing, sign-out. The wrapper (#nav-account) becomes
+     the positioning context; the panel is absolute + right-aligned under it,
+     above page content (nav is z-50, the panel gets 60). */
+  .hc-nav-account { position: relative; }
+  #plan-billing { scroll-margin-top: 68px; } /* sticky nav clears the anchor jump */
+  .acct-trigger {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: transparent; color: var(--text); border: none; border-radius: 6px;
+    padding: 4px 8px; font: inherit; cursor: pointer;
+  }
+  .acct-trigger:hover { background: rgba(128,128,128,0.15); }
+  .acct-caret { color: var(--text-dim); font-size: 10px; }
+  .acct-menu {
+    display: none; position: absolute; top: calc(100% + 8px); right: 0;
+    min-width: 320px; max-width: min(420px, calc(100vw - 40px));
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px;
+    padding: 12px; z-index: 60;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+    color: var(--text); font-size: 13px; text-align: left;
+  }
+  .acct-menu.open { display: block; }
+  .acct-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;
+    color: var(--text-dim); margin: 8px 0 4px;
+  }
+  .acct-menu .acct-label:first-child { margin-top: 0; }
+  .acct-token-row { display: flex; align-items: center; gap: 6px; }
+  .acct-token {
+    flex: 1; min-width: 0;
+    font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: var(--bg); border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 4px 8px; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .acct-btn {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .acct-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .acct-btn:disabled { opacity: 0.5; cursor: default; }
+  .acct-menu details { border-top: 1px solid var(--panel-border); margin-top: 10px; padding-top: 8px; }
+  .acct-menu summary { cursor: pointer; color: var(--text-dim); font-size: 13px; }
+  .acct-menu summary:hover { color: var(--accent); }
+  .acct-snippet { margin-bottom: 8px; }
+  .acct-snippet pre {
+    background: var(--bg); border: 1px solid var(--panel-border); border-radius: 4px;
+    padding: 8px; margin: 4px 0;
+    font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+    max-height: 200px; overflow-y: auto;
+  }
+  .acct-link {
+    display: block; width: 100%; text-align: left;
+    background: transparent; border: none; border-radius: 4px;
+    color: var(--text); font: inherit; font-size: 13px;
+    padding: 6px 8px; cursor: pointer;
+  }
+  .acct-link:hover { background: rgba(128,128,128,0.15); }
+  .acct-link.acct-danger:hover { color: var(--danger); }
 </style>
 </head>
 <body>
@@ -180,7 +243,10 @@
   </div>
 </div>
 
-<div class="panel" style="margin-bottom:24px;">
+<!-- #plan-billing: the always-rendered "upgrade + usage" digest panel — the
+     account menu's "Plan & billing" scrolls here, and the monthly plan
+     selector lands in this section (#371, separate issue). -->
+<div id="plan-billing" class="panel" style="margin-bottom:24px;">
   <h2>Nightly activity digest — <span id="digest-date" class="muted"></span></h2>
   <div id="digest-stages" style="margin-bottom:12px;"></div>
   <h2 style="margin-top:16px;">New memories (sample, rendered as in recall)</h2>
@@ -667,19 +733,22 @@ function escapeHtml(s) {
 }
 
 // ---------------------------------------------------------------------------
-// Render: account identity (hosted) — "Name · Org" + plan pill in the nav.
-// Rendered ONLY when at least one field is non-null (all-null = self-hosted
-// default → no element, no empty pill). Values are operator-set config, but
-// escapeHtml anyway (same posture as every other innerHTML sink here).
+// Render: account identity (hosted) — "Name · Org" + plan pill in the nav,
+// wrapped as the ACCOUNT MENU trigger (#365). Rendered ONLY when at least one
+// field is non-null (all-null = self-hosted default → no element, no empty
+// pill, no menu). Values are operator-set config, but escapeHtml anyway (same
+// posture as every other innerHTML sink here).
 // ---------------------------------------------------------------------------
 function renderAccount(a) {
   const host = $("nav-account");
   // Trial users (no plan) get the Upgrade pill — the checkout entry (#298 drill,
   // #299's first brick). Session-authenticated: the browser's hicortex-session
   // cookie rides this same-origin fetch; the router maps it to the tenant.
+  // #365: the Upgrade button keeps its render position + behavior but sits
+  // OUTSIDE the menu trigger; stopPropagation so it never toggles the menu.
   const upgrade =
     a && a.plan === null
-      ? ' <button id="nav-upgrade" type="button" style="background:var(--accent);color:#fff;border:none;border-radius:4px;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer;">Upgrade</button>'
+      ? '<button id="nav-upgrade" type="button" style="background:var(--accent);color:#fff;border:none;border-radius:4px;padding:4px 12px;font:inherit;font-size:13px;cursor:pointer;">Upgrade</button>'
       : "";
   if (!a || (a.name === null && a.org === null && a.plan === null)) {
     host.innerHTML = upgrade || "";
@@ -693,9 +762,250 @@ function renderAccount(a) {
   const plan = typeof a.plan === "string" && a.plan !== ""
     ? `<span class="plan">${escapeHtml(a.plan)}</span>`
     : "";
-  host.innerHTML = (who ? who + " " : "") + plan + upgrade;
-  if (upgrade) wireUpgrade();
+  host.innerHTML = `
+    <button id="acct-trigger" type="button" class="acct-trigger" aria-haspopup="menu" aria-expanded="false">
+      ${who ? who + " " : ""}${plan}<span class="acct-caret" aria-hidden="true">▾</span>
+    </button>${upgrade}
+    <div id="acct-menu" class="acct-menu">
+      <div class="acct-label">Connection token</div>
+      <div class="acct-token-row">
+        <code id="acct-token-val" class="acct-token">…</code>
+        <button id="acct-reveal" type="button" class="acct-btn" disabled>Reveal</button>
+        <button id="acct-copy-token" type="button" class="acct-btn" disabled>Copy</button>
+      </div>
+      <details id="acct-connect">
+        <summary>Connect an agent</summary>
+        <div class="acct-label">CLI</div>
+        <div class="acct-snippet">
+          <pre id="acct-cli"></pre>
+          <button id="acct-copy-cli" type="button" class="acct-btn" disabled>Copy</button>
+        </div>
+        <div class="acct-label">MCP — ~/.claude.json</div>
+        <div class="acct-snippet">
+          <pre id="acct-mcp"></pre>
+          <button id="acct-copy-mcp" type="button" class="acct-btn" disabled>Copy</button>
+        </div>
+      </details>
+      <button id="acct-plan" type="button" class="acct-link">Plan &amp; billing</button>
+      <button id="acct-signout" type="button" class="acct-link acct-danger">Sign out</button>
+    </div>`;
+  wireAcctMenu();
+  if (upgrade) {
+    wireUpgrade();
+    $("nav-upgrade").addEventListener("click", (e) => e.stopPropagation());
+  }
 }
+
+// ---------------------------------------------------------------------------
+// Account menu (#365) — dropdown under the nav account element. The token
+// displayed is AUTHORITATIVE server truth: a lazy GET /account/token on the
+// FIRST open (echo-only endpoint — the fetch already proves the caller holds
+// the token). localStorage is NEVER trusted for the display: it can be stale
+// after token rotation and is absent entirely for browser sessions the
+// hosted router authenticates via its session→bearer injection. On fetch
+// failure the row fails explicitly ("token unavailable", actions disabled).
+// ---------------------------------------------------------------------------
+let acctToken = null;             // token from /account/token (server truth)
+let acctTokenState = "unfetched"; // "unfetched" | "ok" | "unavailable"
+let acctTokenFetched = false;     // one lazy fetch attempt per page load
+let acctRevealed = false;         // unmasked while the menu is open
+
+function maskToken(t) {
+  // hctx-••••••23f9 — first 5 chars + 6 bullets + last 4. Real tokens are
+  // hctx-<32hex>; the guard keeps a degenerate short token from leaking.
+  if (typeof t !== "string" || t.length < 10) return "••••••••••";
+  return t.slice(0, 5) + "••••••" + t.slice(-4);
+}
+
+// The connect line: server URL + token on ONE line, space-separated.
+function acctConnectLine() {
+  return location.origin + " " + acctToken;
+}
+
+// CLI snippet — init has NO --token flag; it prompts interactively. The
+// comment mirrors init.ts's own printed hint ("When prompted for the token,
+// paste: …").
+function acctCliText() {
+  return "# When prompted for the token, paste: " + acctToken +
+    "\nnpx @gamaze/hicortex init --server " + location.origin;
+}
+
+// MCP snippet — mirrors EXACTLY what runClientInit writes into ~/.claude.json
+// (init.ts): SSE transport at <origin>/sse with a bearer Authorization header.
+function acctMcpText() {
+  return JSON.stringify({
+    mcpServers: {
+      hicortex: {
+        type: "sse",
+        url: location.origin + "/sse",
+        headers: { Authorization: "Bearer " + acctToken },
+      },
+    },
+  }, null, 2);
+}
+
+function renderAcctToken() {
+  const val = $("acct-token-val");
+  if (!val) return; // menu not rendered (self-hosted all-null account)
+  const revealBtn = $("acct-reveal");
+  const copyToken = $("acct-copy-token");
+  const copyCli = $("acct-copy-cli");
+  const copyMcp = $("acct-copy-mcp");
+  if (acctTokenState !== "ok") {
+    val.textContent = acctTokenState === "unfetched" ? "…" : "token unavailable";
+    revealBtn.disabled = true;
+    copyToken.disabled = true;
+    copyCli.disabled = true;
+    copyMcp.disabled = true;
+    $("acct-cli").textContent = acctTokenState === "unfetched" ? "" : "token unavailable";
+    $("acct-mcp").textContent = acctTokenState === "unfetched" ? "" : "token unavailable";
+    return;
+  }
+  revealBtn.disabled = false;
+  copyToken.disabled = false;
+  copyCli.disabled = false;
+  copyMcp.disabled = false;
+  val.textContent = acctRevealed ? acctToken : maskToken(acctToken);
+  revealBtn.textContent = acctRevealed ? "Hide" : "Reveal";
+  $("acct-cli").textContent = acctCliText();
+  $("acct-mcp").textContent = acctMcpText();
+}
+
+async function fetchAcctToken() {
+  if (acctTokenFetched) return;
+  acctTokenFetched = true;
+  const headers = {};
+  if (token) headers["Authorization"] = "Bearer " + token; // same as loadAccount
+  try {
+    const resp = await fetch("/account/token", { headers });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    if (typeof data.token !== "string" || !data.token) throw new Error("bad payload");
+    acctToken = data.token;
+    acctTokenState = "ok";
+  } catch (e) {
+    acctTokenState = "unavailable"; // fail explicitly — no localStorage fallback
+  }
+  renderAcctToken();
+}
+
+function closeAcctMenu() {
+  const menu = document.getElementById("acct-menu");
+  if (!menu) return;
+  menu.classList.remove("open");
+  const trigger = document.getElementById("acct-trigger");
+  if (trigger) trigger.setAttribute("aria-expanded", "false");
+  // Masked again + connect section collapsed on EVERY close (locked design).
+  acctRevealed = false;
+  const details = document.getElementById("acct-connect");
+  if (details) details.removeAttribute("open");
+  renderAcctToken();
+}
+
+function openAcctMenu() {
+  const menu = document.getElementById("acct-menu");
+  if (!menu) return;
+  menu.classList.add("open");
+  document.getElementById("acct-trigger").setAttribute("aria-expanded", "true");
+  fetchAcctToken(); // lazy — one attempt, on first open only
+}
+
+// Clipboard helper: async API when available, temporary <textarea> +
+// execCommand fallback (http remote origins lack the async clipboard API).
+// Brief "Copied" feedback (label swap for ~1.5 s); total failure alerts.
+function copyToClipboard(text, btn) {
+  const flash = () => {
+    const orig = btn.dataset.origLabel || (btn.dataset.origLabel = btn.textContent);
+    btn.textContent = "Copied";
+    clearTimeout(btn._copiedTimer);
+    btn._copiedTimer = setTimeout(() => { btn.textContent = orig; }, 1500);
+  };
+  const legacy = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) { return false; }
+  };
+  const fallback = () => {
+    if (legacy()) { flash(); return; }
+    alert("Copy failed — select the text and copy it manually.");
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(flash, fallback);
+  } else {
+    fallback();
+  }
+}
+
+// Sign-out is CLIENT-SIDE ONLY (#365): there is no server session to
+// invalidate in the Hicortex server itself — auth is per-request bearer, so
+// dropping the locally stored tokens IS the sign-out. (The hosted router
+// separately keeps a Google session cookie and offers /auth/logout — out of
+// scope here; this only ends the browser's console session.)
+function signOut() {
+  try {
+    localStorage.removeItem("hicortexToken");
+    localStorage.removeItem("hicortex-dashboard-token");
+  } catch (e) { /* private mode — reload anyway */ }
+  location.reload(); // back to the unauthenticated 401-prompt state
+}
+
+function wireAcctMenu() {
+  const trigger = document.getElementById("acct-trigger");
+  if (!trigger) return;
+  trigger.addEventListener("click", () => {
+    const menu = document.getElementById("acct-menu");
+    if (menu && menu.classList.contains("open")) closeAcctMenu();
+    else openAcctMenu();
+  });
+  $("acct-reveal").addEventListener("click", () => {
+    acctRevealed = !acctRevealed;
+    renderAcctToken();
+  });
+  const copyToken = $("acct-copy-token");
+  copyToken.addEventListener("click", () => {
+    if (acctTokenState === "ok") copyToClipboard(acctConnectLine(), copyToken);
+  });
+  const copyCli = $("acct-copy-cli");
+  copyCli.addEventListener("click", () => {
+    if (acctTokenState === "ok") {
+      copyToClipboard("npx @gamaze/hicortex init --server " + location.origin, copyCli);
+    }
+  });
+  const copyMcp = $("acct-copy-mcp");
+  copyMcp.addEventListener("click", () => {
+    if (acctTokenState === "ok") copyToClipboard(acctMcpText(), copyMcp);
+  });
+  // Plan & billing (same page): close the menu, scroll to the digest panel's
+  // budget/usage section — the area #371's plan selector will land in.
+  $("acct-plan").addEventListener("click", () => {
+    closeAcctMenu();
+    const el = document.getElementById("plan-billing");
+    if (el) el.scrollIntoView({ behavior: "smooth" });
+  });
+  $("acct-signout").addEventListener("click", signOut);
+  renderAcctToken();
+}
+
+// Click-outside + Escape close the menu (wired once at document level; the
+// handlers no-op when the menu isn't rendered).
+document.addEventListener("click", (e) => {
+  const menu = document.getElementById("acct-menu");
+  if (!menu || !menu.classList.contains("open")) return;
+  const wrap = document.getElementById("nav-account");
+  if (wrap && wrap.contains(e.target)) return;
+  closeAcctMenu();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeAcctMenu();
+});
 
 // Account data source: the dedicated lightweight GET /account (same shape as
 // the account block /dashboard/data still carries — kept there for the stable

@@ -40,6 +40,10 @@ export interface LlmConfig {
   provider: string;
   /** Max output tokens for all phases (one model). Default 8192. */
   maxTokens?: number;
+  /** Max output tokens for the CLASSIFY tier only — the short JSON-verdict
+   *  calls (correction/supersession verdicts, rewrite contracts, type + tag
+   *  classification). Default 1024. See HicortexConfig.classifyMaxTokens (#391). */
+  classifyMaxTokens?: number;
   /** Toggle thinking on the openai-compat path for all phases. Absent = no kwarg sent.
    *  LOCAL-endpoint only (ollama / mlx-lm gateway); see HicortexConfig.enableThinking. */
   enableThinking?: boolean;
@@ -130,18 +134,19 @@ export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
 
 /**
  * Validate + copy the tuning keys (#220: maxTokens + enableThinking + numCtx +
- * ollama flush) from the saved disk config onto a runtime LlmConfig. Called by
- * BOTH LlmConfig construction sites — the daemon in mcp-server.ts (runs
- * distill) AND resolveSavedLlmConfig below (the nightly runs reflect +
- * classify) — so every process honors the keys, and a future site calling this
- * inherits them by construction.
+ * ollama flush; #391: classifyMaxTokens) from the saved disk config onto a
+ * runtime LlmConfig. Called by BOTH LlmConfig construction sites — the daemon
+ * in mcp-server.ts (runs distill) AND resolveSavedLlmConfig below (the nightly
+ * runs reflect + classify) — so every process honors the keys, and a future
+ * site calling this inherits them by construction.
  *
- * All keys are optional; absent = call-site defaults (maxTokens 8192, numCtx
- * 8192, thinking kwarg omitted, flush off). Wrong-typed values warn and are
- * dropped (readPositiveConfig / readStrictBoolean / readNonNegativeConfig) —
- * notably a JSON slip `"enableThinking": "false"` (string) is rejected rather
- * than coerced to truthy thinking-on, which would silently invert the fix this
- * key exists to apply.
+ * All keys are optional; absent = call-site defaults (maxTokens 8192,
+ * classifyMaxTokens 1024, numCtx 8192, thinking kwarg omitted, flush off).
+ * Wrong-typed values warn and are dropped (readPositiveConfig /
+ * readStrictBoolean / readNonNegativeConfig) — notably a JSON slip
+ * `"enableThinking": "false"` (string) is rejected rather than coerced to
+ * truthy thinking-on, which would silently invert the fix this key exists to
+ * apply.
  */
 export function applyTierTuningOverlay(
   llmConfig: LlmConfig,
@@ -150,6 +155,9 @@ export function applyTierTuningOverlay(
   if (!savedConfig) return;
   if (savedConfig.maxTokens !== undefined) {
     llmConfig.maxTokens = readPositiveConfig(savedConfig, "maxTokens", 8192);
+  }
+  if (savedConfig.classifyMaxTokens !== undefined) {
+    llmConfig.classifyMaxTokens = readPositiveConfig(savedConfig, "classifyMaxTokens", 1024);
   }
   const thinking = readStrictBoolean(savedConfig, "enableThinking");
   if (thinking !== undefined) {
@@ -581,11 +589,18 @@ export class LlmClient {
   }
 
   /**
-   * Classification-tier completion (memory tag classification). One model
-   * serves all phases (#231) — thin wrapper kept for call-site readability.
+   * Classification-tier completion (verdicts + tag/type classification). One
+   * model serves all phases (#231) — thin wrapper kept for call-site
+   * readability, but the tier keeps its OWN output ceiling (#391).
    */
   async completeClassify(prompt: string, maxTokens?: number): Promise<LlmResult> {
-    const tokens = maxTokens ?? this.config.maxTokens ?? 8192;
+    // #391: classify-tier ceiling — the call sites' old hardcoded caps
+    // (64/32/20, tuned for a local non-reasoning model) starved reasoning
+    // models whose internal thinking consumed the whole budget, leaving
+    // verdicts empty. Deliberately NOT this.config.maxTokens: that knob
+    // governs the heavy phases; this tier has its own (a ceiling, not a
+    // target — generation still stops at the model's natural end).
+    const tokens = maxTokens ?? this.config.classifyMaxTokens ?? 1024;
     return this.complete(this.config.model, prompt, tokens, this.config.timeoutMs ?? 900_000);
   }
 

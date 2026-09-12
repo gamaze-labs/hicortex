@@ -31,7 +31,7 @@ import { embed, warmEmbedder } from "./embedder.js";
 import * as storage from "./storage.js";
 import { getNeighbors, shortestPath, detectHubs, exportGraph, EXPORT_DEFAULT_LIMIT } from "./graph.js";
 import { createAuthMiddleware, vizHandler, vizVendorHandler, identityUiHandler, dashboardHandler } from "./viz.js";
-import { dashboardDataHandler, accountHandler } from "./dashboard.js";
+import { dashboardDataHandler, accountHandler, accountTokenHandler } from "./dashboard.js";
 import {
   handleIdentityGet,
   handleIdentityPut,
@@ -43,7 +43,7 @@ import {
 } from "./identity-store.js";
 import * as retrieval from "./retrieval.js";
 import { SessionRecallRegistry } from "./recall-registry.js";
-import { isReservedSectionName, MEMORY_SECTION_NAME } from "./memory-instructions.js";
+import { isReservedSectionName, MEMORY_SECTION_NAME, resolveMcpInstructions } from "./memory-instructions.js";
 import { handleRecallIndex, handleMemoryGet, formatMemoryGetText, createRecallRetrieveFn, resolveNoveltyFloorSlots, type RecallIndexOptions } from "./recall-index.js";
 import { labelForType, normalizeMemoryType, ACCEPTED_MEMORY_TYPES } from "./type-labels.js";
 import { publicHealthResponse, detailedHealthResponse, logAndSendInternalError } from "./health.js";
@@ -51,6 +51,11 @@ import { injectSeedLesson } from "./seed-lesson.js";
 import { buildIdentityToolResult } from "./learnings-identity.js";
 import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
 import { countExistingSegment, countExistingSession } from "./dedup.js";
+import {
+  checkExplicitMarkTarget,
+  applyExplicitMark,
+  type ExplicitMarkInput,
+} from "./reconsolidation.js";
 import { redact } from "./redact.js";
 import { ensureAndPersistAgentId, loadConfigStrict } from "./init.js";
 import type { MemorySearchResult } from "./types.js";
@@ -141,11 +146,21 @@ try {
 // MCP Server setup
 // ---------------------------------------------------------------------------
 
-function createMcpServer(): McpServer {
-  const server = new McpServer({
-    name: "hicortex",
-    version: VERSION,
-  });
+/**
+ * Build the McpServer with all Hicortex tools, one per /sse connection.
+ * Exported for tests (protocol-level initialize-result checks, #383).
+ */
+export function createMcpServer(): McpServer {
+  // #383: the initialize-result instructions are the only product-owned
+  // guidance passive MCP clients (e.g. Claude Desktop — no hooks, no injected
+  // sections) ever see: the MCP-native SessionStart. Same off-switch as the
+  // identity `memory` section (config `memoryInstructions: false`); the
+  // module var is read at call time, so per-connection construction
+  // preserves the boot-time gate.
+  const server = new McpServer(
+    { name: "hicortex", version: VERSION },
+    { instructions: resolveMcpInstructions(memoryInstructionsEnabled) },
+  );
 
   // -- hicortex_search --
   server.tool(
@@ -211,15 +226,31 @@ function createMcpServer(): McpServer {
   // -- hicortex_ingest --
   server.tool(
     "hicortex_ingest",
-    "Store a new memory in long-term storage. Use for Knowledge, Decisions, or Learnings.",
+    "Store a new memory in long-term storage. Use for Knowledge, Decisions, or Learnings. Capture is automatic (nightly) — use this ONLY for explicitly requested learnings, never routine content.",
     {
       content: z.string().describe("Memory content to store"),
       project: z.string().optional().describe("Project this memory belongs to"),
       memory_type: z.enum(["knowledge", "experience", "decisions", "learnings", "fact", "episode", "decision", "lesson"]).optional().describe("Type of memory (default: Experience). Accepted: Knowledge/Experience/Decisions/Learnings (legacy raw enum also accepted, normalized to the canonical term)."),
+      corrects: z.string().optional().describe("ID (8-char prefix or full UUID) of an existing memory this one CORRECTS — records a corrected_by link and retracts the old memory (deterministic, no LLM). Mutually exclusive with supersedes."),
+      supersedes: z.string().optional().describe("ID (8-char prefix or full UUID) of an existing memory this one SUPERSEDES — records a superseded_by link and marks the old memory superseded (deterministic, no LLM). Mutually exclusive with corrects."),
     },
-    async ({ content, project, memory_type }) => {
+    async ({ content, project, memory_type, corrects, supersedes }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
       try {
+        // #384 explicit mark — validated BEFORE storing (an unknown/ambiguous
+        // target fails the whole call; nothing is written).
+        if (corrects !== undefined && supersedes !== undefined) {
+          return { content: [{ type: "text" as const, text: "Provide at most one of 'corrects' or 'supersedes'" }], isError: true };
+        }
+        const rawMark = corrects !== undefined ? corrects : supersedes;
+        let explicitMark: ExplicitMarkInput | undefined;
+        if (rawMark !== undefined) {
+          explicitMark = { kind: corrects !== undefined ? "corrects" : "supersedes", target: rawMark };
+          const check = checkExplicitMarkTarget(db, explicitMark);
+          if (!check.ok) {
+            return { content: [{ type: "text" as const, text: `Ingest failed: ${check.error}` }], isError: true };
+          }
+        }
         const embedding = await embed(content);
         const id = storage.insertMemory(db, content, embedding, {
           sourceAgent: "claude-code/manual",
@@ -227,7 +258,8 @@ function createMcpServer(): McpServer {
           // Normalize legacy raw enum to the canonical term the DB stores.
           memoryType: memory_type ? normalizeMemoryType(memory_type) : "experience",
         });
-        return { content: [{ type: "text" as const, text: `Memory stored (id: ${id.slice(0, 8)})` }] };
+        if (explicitMark) applyExplicitMark(db, id, explicitMark);
+        return { content: [{ type: "text" as const, text: `Memory stored (id: ${id.slice(0, 8)})${explicitMark ? ` — marked as ${explicitMark.kind === "corrects" ? "correcting" : "superseding"} ${explicitMark.target}` : ""}` }] };
       } catch (err) {
         return { content: [{ type: "text" as const, text: `Ingest failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
       }
@@ -250,6 +282,13 @@ function createMcpServer(): McpServer {
         // Resolve short ID prefix to full ID
         const fullId = resolveMemoryId(db, id);
         if (!fullId) return { content: [{ type: "text" as const, text: `Memory not found: ${id}` }], isError: true };
+
+        // #384: absorbed memories are invisible evidence — an update would
+        // re-embed and resurrect them. Refuse; roll back the rewrite first.
+        const target = storage.getMemory(db, fullId);
+        if (target?.status === "absorbed") {
+          return { content: [{ type: "text" as const, text: `Memory ${fullId.slice(0, 8)} is absorbed (folded into a corrected memory) — roll back the absorbing rewrite first (hicortex history --rollback)` }], isError: true };
+        }
 
         const fields: Record<string, unknown> = {};
         if (content !== undefined) fields.content = content;
@@ -325,13 +364,13 @@ function createMcpServer(): McpServer {
   };
   server.tool(
     "hicortex_learnings",
-    "Get actionable Learnings from past sessions. Auto-generated insights about mistakes to avoid.",
+    "Get actionable Learnings — auto-generated insights about mistakes to avoid. CALL THIS before retrying an approach that failed before, or when picking up work where past problems may have been recorded.",
     learningsSchema,
     learningsHandler
   );
   server.tool(
     "hicortex_lessons",
-    "Get actionable Learnings from past sessions. (Alias for hicortex_learnings.)",
+    "Get actionable Learnings from past sessions — call it before retrying an approach that failed before. (Alias for hicortex_learnings.)",
     learningsSchema,
     learningsHandler
   );
@@ -373,7 +412,7 @@ function createMcpServer(): McpServer {
   // -- hicortex_index --
   server.tool(
     "hicortex_index",
-    "Get the knowledge domain index — shows what topics and projects are stored in memory, grouped by domain.",
+    "Get the knowledge domain index — shows what topics and projects are stored in memory, grouped by domain. Call before a broad search to see which knowledge domains exist, or when unsure what the memory covers.",
     {},
     async () => {
       const state = loadState(stateDir);
@@ -407,7 +446,7 @@ function createMcpServer(): McpServer {
   // -- hicortex_graph --
   server.tool(
     "hicortex_graph",
-    "Query the memory knowledge graph — find connected memories, hub nodes, or paths between memories.",
+    "Query the memory knowledge graph — find connected memories, hub nodes, or paths between memories. Use it to explore memories connected to one you just fetched, or to find hub memories in a domain.",
     {
       operation: z.enum(["neighbors", "hubs", "path"]).describe("Graph operation to perform"),
       id: z.string().optional().describe("Memory ID (required for neighbors and path operations)"),
@@ -959,7 +998,7 @@ export async function startServer(options: {
   app.post("/ingest", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
 
-    const { content, source_agent, source_agent_id, source_domain, project, memory_type, privacy, source_session, session_date } = req.body ?? {};
+    const { content, source_agent, source_agent_id, source_domain, project, memory_type, privacy, source_session, session_date, corrects, supersedes } = req.body ?? {};
 
     if (!content || typeof content !== "string") {
       res.status(400).json({ error: "Missing or invalid 'content' field" });
@@ -975,6 +1014,29 @@ export async function startServer(options: {
     // canonical term the DB stores (knowledge/experience/decisions/learnings).
     // Canonical values pass through unchanged.
     const normalizedType = memory_type ? normalizeMemoryType(memory_type) : memory_type;
+
+    // #384 explicit write-time marking: `corrects` XOR `supersedes`, a single
+    // memory id reference. Validated BEFORE anything is written — an unknown
+    // or ambiguous target fails the WHOLE request (nothing is stored with a
+    // half-applied mark). Deterministic link + status, zero LLM.
+    if (corrects !== undefined && supersedes !== undefined) {
+      res.status(400).json({ error: "Provide at most one of 'corrects' or 'supersedes'" });
+      return;
+    }
+    let explicitMark: ExplicitMarkInput | undefined;
+    const rawMarkValue = corrects !== undefined ? corrects : supersedes;
+    if (rawMarkValue !== undefined) {
+      if (typeof rawMarkValue !== "string" || !rawMarkValue) {
+        res.status(400).json({ error: `'${corrects !== undefined ? "corrects" : "supersedes"}' must be a memory id (8-char prefix or full UUID)` });
+        return;
+      }
+      explicitMark = { kind: corrects !== undefined ? "corrects" : "supersedes", target: rawMarkValue };
+      const check = checkExplicitMarkTarget(db, explicitMark);
+      if (!check.ok) {
+        res.status(check.httpStatus).json({ error: check.error });
+        return;
+      }
+    }
 
     // Dedup by source_session (idempotent — skip if already ingested)
     if (source_session) {
@@ -1002,7 +1064,12 @@ export async function startServer(options: {
         privacy: typeof privacy === "string" ? privacy : null,
         createdAt: session_date ? new Date(session_date).toISOString() : undefined,
       });
-      res.status(201).json({ id, message: "Memory ingested" });
+      if (explicitMark) applyExplicitMark(db, id, explicitMark);
+      res.status(201).json({
+        id,
+        message: "Memory ingested",
+        ...(explicitMark ? { marked: explicitMark.kind } : {}),
+      });
     } catch (err) {
       res.status(500).json({ error: "Ingestion failed" });
       console.error(`[hicortex] /ingest: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
@@ -1417,6 +1484,17 @@ export async function startServer(options: {
       return;
     }
 
+    // #384: an absorbed memory is invisible evidence — updating its content
+    // would re-embed and resurrect a row the store deliberately folded into a
+    // corrected target. Roll back the absorbing rewrite first.
+    const target = storage.getMemory(db, fullId);
+    if (target?.status === "absorbed") {
+      res.status(409).json({
+        error: `Memory ${fullId.slice(0, 8)} is absorbed (folded into a corrected memory) — roll back the absorbing rewrite first (hicortex history --rollback)`,
+      });
+      return;
+    }
+
     const fields: Record<string, unknown> = {};
     if (content !== undefined) fields.content = content;
     if (project !== undefined) fields.project = project;
@@ -1684,6 +1762,19 @@ export async function startServer(options: {
   // bypass applies. Handler lives in src/dashboard.ts next to its twin.
   app.get("/account", accountHandler(
     () => readConfigFile(stateDir),
+  ));
+
+  // GET /account/token — the install's connection token for the console
+  // account menu (#365). Echo-only (see accountTokenHandler's JSDoc): the
+  // caller must already present the token (bearer or localhost bypass), so
+  // this grants no privilege — it exists so the menu shows authoritative
+  // server-side truth instead of a possibly-stale localStorage copy. Passes
+  // the boot-resolved PRIMARY token (the one the auth middleware itself
+  // accepts as current — survives rotation, never echoes the grace token).
+  // Bearer-only like /account: standard auth middleware, no shell exemption
+  // (it carries data); localhost bypass applies.
+  app.get("/account/token", accountTokenHandler(
+    () => authToken,
   ));
 
   // SSE endpoint — each connection gets its own McpServer + transport

@@ -1,11 +1,12 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.20.3",
+  "version": "0.20.7",
   "description": "Persistent agent identity for AI agents — a hand-edited identity layer, nightly-distilled experience, and lessons injected every session, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, Pi, and opencode.",
   "main": "dist/index.js",
   "bin": {
     "hicortex": "dist/cli.js"
   },
+  "mcpName": "io.github.gamaze-labs/hicortex",
   "openclaw": {
     "extensions": [
       "./dist/index.js"
@@ -32,6 +33,7 @@
     "opencode-plugin/",
     "openclaw.plugin.json",
     "domains.example.json",
+    "server.json",
     "README.md",
     "THIRD_PARTY_NOTICES.md"
   ],

@@ -1,41 +1,60 @@
 /**
- * `hicortex dedup` — cluster + merge near-duplicate memories (issue #100).
+ * `hicortex dedup` + the nightly deterministic merge zone (issues #100, #392).
  *
  * Corpus-quality companion to `hicortex relink`/`classify-domains`: instead of
- * discovering NEW structure, this command collapses memories that are
- * near-identical (top-10 KNN cosine >= dedupMergeThreshold, default 0.92,
- * union-find clustered — same math as the #191 D1 duplicate-rate audit; see
- * cluster.ts). Default is a DRY RUN: report only, zero writes. `--apply`
- * executes the merge.
+ * discovering NEW structure, this collapses memories that are near-identical
+ * (top-10 KNN cosine >= threshold, default 0.92, union-find clustered — same
+ * math as the #191 D1 duplicate-rate audit; see cluster.ts). Two surfaces,
+ * ONE core:
  *
- * Per cluster:
+ *  - `runDedup` — the manual CLI. Default is a DRY RUN: report only, zero
+ *    writes. `--apply` executes the merge. Threshold resolution:
+ *    `--threshold` > config `dedupAutoMergeThreshold` > legacy config
+ *    `dedupMergeThreshold` > 0.92.
+ *  - `runDeterministicMergeZone` (#392) — the nightly's LLM-free merge zone:
+ *    pairs at/above the ceiling merge deterministically, ZERO LLM calls, under
+ *    its own pacing cap (`dedupNightlyMaxMerges`). Called from the
+ *    reconsolidation stage (and from the quiet-night skip path in
+ *    consolidate.ts) so one stage report covers all resolution work.
+ *
+ * Per cluster (shared `planDedup`/`mergeCluster` core — no forks):
  *   - Canonical = highest access_count (tie: oldest created_at, then
  *     lexicographically smallest id — fully deterministic for audit).
  *   - Losers' links are re-pointed onto the canonical (a link that would
  *     become a self-link, or one whose (canonical, target) ordered pair
  *     ALREADY holds an edge, is skipped rather than overwritten — see
- *     planLinkRepoints for why `relationship` cannot be part of that guard).
+ *     planLinkRepoints for why `relationship` cannot be part of that guard);
+ *     the losers' own link rows are then deleted (previously cascade-deleted
+ *     with the row).
  *   - canonical.access_count/shown_count = summed across the cluster;
  *     last_accessed = max; base_strength = max.
  *   - Tags are UNIONED onto the canonical (weights NULL — the next nightly's
  *     reconsolidation pass recomputes weights and the derived primary from
- *     the merged tag set).
- *   - A `dedup_log` row is written per loser BEFORE it is deleted — audit
- *     trail AND the safety net /distill consults (mcp-server.ts) so a
- *     deleted loser's `source_session` marker still blocks a re-ingest.
- *   - Losers are deleted via storage.deleteMemory (cascades links/tags/
- *     vectors/FTS).
+ *     the merged tag set); the losers' tag rows are cleared and their domain
+ *     set NULL — a loser must not count in moduleIndex/tag recomputes.
+ *   - A `dedup_log` row is written per loser — audit trail AND the safety net
+ *     /distill consults (mcp-server.ts) so an absorbed loser's
+ *     `source_session` marker still blocks a re-ingest.
+ *   - Losers are ABSORBED (storage.absorbMemory), not deleted (#392): status
+ *     'absorbed', vector + FTS rows dropped, plain row retained — invisible
+ *     to recall, fetchable by id as evidence. Same vocabulary as the
+ *     reconsolidation rewrite path. Merges are NOT history-rollback-able —
+ *     dedup_log (loser_id → canonical_id) + the retained loser row is the
+ *     record.
  *
- * A cluster whose members disagree on project, privacy, or source_agent is
- * SKIPPED entirely and listed for manual review — no --force in this release.
+ * A cluster whose members disagree on project or source_agent is SKIPPED
+ * entirely and listed for manual review — no --force in this release.
  *
- * Safety rails on --apply:
+ * Safety rails when applying (CLI and zone alike):
  *   - A full DB backup (SQLite backup API) is taken FIRST, to
- *     ~/.hicortex/backups/pre-dedup-<ISO>.db. Abort (no merges attempted) if
- *     the backup fails.
+ *     <state>/backups/pre-dedup-<ISO>.db, pruned to `backupRetention` newest
+ *     (pattern-scoped: full `hicortex-*.tar.gz` artifacts keep their own
+ *     count). The CLI aborts (no merges attempted) if the backup fails; the
+ *     nightly zone is fail-soft (backup_failed flag, zero merges).
  *   - The existing single-flight capture lock (capture.ts) is held for the
  *     duration of the merge so a concurrent nightly/capture run can't race
- *     the dedup_log bookkeeping the merge relies on.
+ *     the dedup_log bookkeeping the merge relies on. The CLI fails fast on a
+ *     busy lock; the zone reports lock_busy and merges nothing.
  *
  * Server-mode only (needs the local DB), like relink/classify-domains.
  */
@@ -53,17 +72,34 @@ import {
   type ClusterMetadataMismatch,
 } from "./cluster.js";
 import { acquireCaptureLock } from "./capture.js";
+import { updateState } from "./state.js";
+import { readNonNegativeConfig } from "./config-read.js";
+import { DEFAULT_BACKUP_RETENTION, pruneBackupArtifacts } from "./backup.js";
+import type { DeterministicMergeZoneReport, ResolutionBandStat } from "./types.js";
 
 const HICORTEX_HOME = hicortexHome();
 
 /**
  * Default merge threshold. Measured on the #191 mechanical audit corpus:
  * 89 clusters / 110 excess rows at 0.92 (data/audit-20260729/eval-report.md).
+ * #392: also the default `dedupAutoMergeThreshold` — the deterministic/LLM
+ * boundary of the unified resolution pass.
  */
 export const DEFAULT_DEDUP_MERGE_THRESHOLD = 0.92;
 
+/**
+ * Default pacing cap on merge OPERATIONS per nightly run (#392): the zone's
+ * clusters and the stage's judged pair merges count against ONE cap. Bounds a
+ * misbehaving-distiller burst; a large backlog drains over a few nights.
+ * `0` disables the merge machinery entirely.
+ */
+export const DEFAULT_DEDUP_NIGHTLY_MAX_MERGES = 250;
+
 /** KNN neighbors considered per memory — same as the #191 audit (cluster.ts default). */
 const DEDUP_KNN_K = 10;
+
+/** Pre-merge backup filename pattern (takePreDedupBackup) — scoped retention. */
+const PRE_DEDUP_BACKUP_PATTERN = /^pre-dedup-.*\.db$/;
 
 function readConfig(stateDir: string): Record<string, unknown> | null {
   try {
@@ -73,6 +109,13 @@ function readConfig(stateDir: string): Record<string, unknown> | null {
   }
 }
 
+/**
+ * Threshold resolution for the manual CLI (#392): explicit `--threshold` >
+ * config `dedupAutoMergeThreshold` > legacy config `dedupMergeThreshold` >
+ * DEFAULT. An invalid explicit value throws (existing error style); invalid
+ * config values fall through to the next step, matching the pre-#392
+ * silent-fallback boundary behavior.
+ */
 function resolveThreshold(explicit: number | undefined, config: Record<string, unknown> | null): number {
   if (explicit !== undefined) {
     if (!Number.isFinite(explicit) || explicit <= 0 || explicit > 1) {
@@ -80,19 +123,24 @@ function resolveThreshold(explicit: number | undefined, config: Record<string, u
     }
     return explicit;
   }
-  const fromConfig = Number(config?.dedupMergeThreshold);
-  return Number.isFinite(fromConfig) && fromConfig > 0 && fromConfig <= 1
-    ? fromConfig
-    : DEFAULT_DEDUP_MERGE_THRESHOLD;
+  for (const key of ["dedupAutoMergeThreshold", "dedupMergeThreshold"] as const) {
+    const fromConfig = Number(config?.[key]);
+    if (Number.isFinite(fromConfig) && fromConfig > 0 && fromConfig <= 1) {
+      return fromConfig;
+    }
+  }
+  return DEFAULT_DEDUP_MERGE_THRESHOLD;
 }
 
 // ---------------------------------------------------------------------------
-// Cluster loading + merge decision
+// Cluster loading + merge decision (the shared core — CLI and nightly zone)
 // ---------------------------------------------------------------------------
 
 /**
  * Row shape read from `memories` for merge decisions — a superset of the
  * fields the Memory type declares (shown_count isn't on that interface yet).
+ * `status` rides along so judged-pair merges can defensively drop rows that
+ * were absorbed between verdict and apply.
  */
 interface DedupMemberRow {
   id: string;
@@ -106,6 +154,7 @@ interface DedupMemberRow {
   privacy: string | null;
   source_agent: string;
   source_session: string | null;
+  status: string | null;
 }
 
 export interface DedupClusterPlan {
@@ -152,8 +201,8 @@ export interface DedupReport {
   linksSkippedExisting: number;
   /** --apply only: clusters actually merged. */
   merged?: number;
-  /** --apply only: loser rows deleted. */
-  losersDeleted?: number;
+  /** --apply only: loser rows absorbed (hidden from recall, kept as evidence). */
+  losersAbsorbed?: number;
   /** --apply only: clusters that errored mid-merge (rolled back; left for a re-run). */
   failedClusters?: number;
   /** --apply only: path to the pre-merge backup. */
@@ -163,7 +212,7 @@ export interface DedupReport {
 export interface DedupOptions {
   /** Execute the merge. Default false = dry run (report only, zero writes). */
   apply?: boolean;
-  /** Override config.dedupMergeThreshold for one run. */
+  /** Override the configured threshold for one run. */
   threshold?: number;
   /** DB path override (tests / manual snapshot verification). Defaults to resolveDbPath(). */
   dbPath?: string;
@@ -175,7 +224,7 @@ export interface DedupOptions {
   acquireLock?: typeof acquireCaptureLock;
   /**
    * Test-only failure injection: called once per cluster merge, after the
-   * link/tag/counter writes but before the audit-log + delete step. Throwing
+   * link/tag/counter writes but before the audit-log + absorb step. Throwing
    * here proves a mid-merge error rolls the WHOLE cluster's writes back
    * (better-sqlite3 transaction semantics) rather than leaving a half-merged
    * cluster. Never set in production.
@@ -188,7 +237,7 @@ function loadMembers(db: Database.Database, ids: string[]): DedupMemberRow[] {
   return db
     .prepare(
       `SELECT id, content, access_count, shown_count, last_accessed, base_strength,
-              created_at, project, privacy, source_agent, source_session
+              created_at, project, privacy, source_agent, source_session, status
        FROM memories WHERE id IN (${placeholders})`,
     )
     .all(...ids) as DedupMemberRow[];
@@ -300,16 +349,75 @@ function planLinkRepoints(
   return { toAdd, skippedSelfLink, skippedExisting };
 }
 
+/** One cluster's execution plan from `planDedup` — canonical, losers, members. */
+export interface DedupMergePlan {
+  canonical: DedupMemberRow;
+  losers: DedupMemberRow[];
+  /** All member rows, oldest first (CLI preview lines derive from this). */
+  membersOldestFirst: DedupMemberRow[];
+}
+
+export interface PlanDedupResult {
+  /** Every cluster found at the threshold (mergeable + mismatch-skipped). */
+  clusterCount: number;
+  /** Clusters that passed the metadata rails, in discovery order. */
+  mergePlans: DedupMergePlan[];
+  mismatchSkipped: DedupMismatchCluster[];
+}
+
+/**
+ * Discovery + merge planning at a cosine threshold (read-only — no writes).
+ * The ONE clustering core shared by the manual CLI (`runDedup`) and the
+ * nightly deterministic merge zone (`runDeterministicMergeZone`): KNN edges
+ * (k=10) → union-find clusters → member load → metadata-rail classification →
+ * canonical pick. Never forked.
+ */
+export function planDedup(db: Database.Database, threshold: number): PlanDedupResult {
+  const edges = buildKnnEdges(db, { k: DEDUP_KNN_K, minCosine: threshold });
+  const clusters = clusterEdges(edges, threshold);
+
+  const mergePlans: DedupMergePlan[] = [];
+  const mismatchSkipped: DedupMismatchCluster[] = [];
+
+  for (const memberIds of clusters) {
+    const members = loadMembers(db, memberIds);
+    if (members.length < 2) continue; // defensive — a member vanished between KNN and load
+
+    const mismatch = clusterMetadataMismatch(members);
+    if (mismatch.projectMismatch || mismatch.sourceAgentMismatch) {
+      mismatchSkipped.push({ size: members.length, memberIds: members.map((m) => m.id), mismatch });
+      continue;
+    }
+
+    const { canonical, losers } = pickCanonical(members);
+    mergePlans.push({
+      canonical,
+      losers,
+      membersOldestFirst: [...members].sort((a, b) => a.created_at.localeCompare(b.created_at)),
+    });
+  }
+
+  return { clusterCount: clusters.length, mergePlans, mismatchSkipped };
+}
+
 /**
  * Apply one cluster's merge. Pure DB writes against the passed connection —
  * the caller wraps this in db.transaction() so a mid-merge error rolls back
  * the whole cluster (dup-over-loss: a failed cluster is retried on a later
- * `dedup --apply`, never left half-merged).
+ * run, never left half-merged).
+ *
+ * #392 absorb semantics: losers LEAVE RECALL but stay fetchable by id —
+ * links re-pointed onto the canonical then deleted from the losers, tags
+ * unioned onto the canonical then cleared from the losers (domain NULL),
+ * counters summed, a dedup_log row written, and the loser absorbed via
+ * storage.absorbMemory (status 'absorbed', vector + FTS rows dropped, plain
+ * row retained as evidence). This mirrors the reconsolidation rewrite path's
+ * absorb mechanics exactly — one vocabulary, one primitive.
  *
  * Returns the link-repoint plan that was actually applied (computed live,
  * here, against current DB state — NOT a caller-supplied discovery-time
- * snapshot, so it stays correct even if an earlier cluster in the same
- * --apply run already rewrote a link that touches this cluster).
+ * snapshot, so it stays correct even if an earlier cluster in the same run
+ * already rewrote a link that touches this cluster).
  */
 function mergeCluster(
   db: Database.Database,
@@ -323,9 +431,18 @@ function mergeCluster(
     storage.addLink(db, link.source, link.target, link.relationship, link.strength);
   }
 
-  // 2. Union tags onto the canonical. Weights NULL — the next nightly's
-  // reconsolidation pass (recomputeAllTagWeights/refreshPrimaries) recomputes
-  // them and the derived primary from the merged tag set.
+  // 2. Delete the losers' own link rows — the pre-#392 delete cascaded them
+  // with the row; with the row retained, the stale edges must go explicitly
+  // (they were either re-pointed in step 1 or deliberately skipped).
+  const deleteLoserLinks = db.prepare(
+    "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?",
+  );
+  for (const loser of losers) deleteLoserLinks.run(loser.id, loser.id);
+
+  // 3. Union tags onto the canonical (reads the losers' tags BEFORE they are
+  // cleared below). Weights NULL — the next nightly's reconsolidation pass
+  // (recomputeAllTagWeights/refreshPrimaries) recomputes them and the derived
+  // primary from the merged tag set.
   const allTags = new Set<string>(storage.getMemoryTags(db, canonical.id));
   for (const loser of losers) {
     for (const tag of storage.getMemoryTags(db, loser.id)) allTags.add(tag);
@@ -337,7 +454,15 @@ function mergeCluster(
     });
   }
 
-  // 3. Merge counters onto the canonical.
+  // 4. Clear the losers' tag rows + domain NULL — closest to the old delete
+  // semantics: an absorbed loser must not count in moduleIndex/tag recomputes.
+  const clearLoserTags = db.prepare("DELETE FROM memory_tags WHERE memory_id = ?");
+  for (const loser of losers) {
+    clearLoserTags.run(loser.id);
+    storage.updateMemory(db, loser.id, { domain: null });
+  }
+
+  // 5. Merge counters onto the canonical.
   const accessCount = canonical.access_count + losers.reduce((s, l) => s + l.access_count, 0);
   const shownCount = (canonical.shown_count ?? 0) + losers.reduce((s, l) => s + (l.shown_count ?? 0), 0);
   const lastAccessed = [canonical, ...losers]
@@ -355,9 +480,9 @@ function mergeCluster(
 
   injectFailure?.(canonical.id);
 
-  // 4. Audit trail (BEFORE delete — dedup_log is the only surviving record of
-  // a loser's source_session) then delete each loser (cascades links/tags/
-  // vectors/FTS via storage.deleteMemory).
+  // 6. Audit trail (dedup_log is the merge record — and the only surviving
+  // marker of a loser's source_session) then absorb each loser (never delete:
+  // the row stays as evidence, session lineage, and the dedup_log companion).
   const mergedAt = new Date().toISOString();
   const logStmt = db.prepare(
     `INSERT OR REPLACE INTO dedup_log (loser_id, canonical_id, source_session, content_head, merged_at)
@@ -365,16 +490,279 @@ function mergeCluster(
   );
   for (const loser of losers) {
     logStmt.run(loser.id, canonical.id, loser.source_session, loser.content.slice(0, 200), mergedAt);
-    storage.deleteMemory(db, loser.id);
+    storage.absorbMemory(db, loser.id);
   }
 
   return plan;
 }
 
+export type MergeMemoryIdsResult =
+  | { ok: true; canonicalId: string; loserIds: string[]; linksRepointed: number }
+  | { ok: false; reason: "metadata_mismatch" | "no_members" };
+
+/**
+ * Merge an explicit set of memories (the judged-pair phase of #392: the
+ * reconsolidation stage queues verdict-confirmed pairs and applies them
+ * through THIS function so the merge math stays single-definition). Loads the
+ * LIVE rows at apply time — members that vanished or were absorbed between
+ * verdict and apply are dropped defensively; a metadata disagreement refuses
+ * the merge (both memories stay live). One transaction for the whole set.
+ */
+export function mergeMemoryIds(db: Database.Database, ids: string[]): MergeMemoryIdsResult {
+  const unique = [...new Set(ids)];
+  const members = loadMembers(db, unique).filter((m) => m.status !== "absorbed");
+  if (members.length < 2) return { ok: false, reason: "no_members" };
+
+  const mismatch = clusterMetadataMismatch(members);
+  if (mismatch.projectMismatch || mismatch.sourceAgentMismatch) {
+    return { ok: false, reason: "metadata_mismatch" };
+  }
+
+  const { canonical, losers } = pickCanonical(members);
+  const tx = db.transaction(() => mergeCluster(db, canonical, losers));
+  const plan = tx();
+  return {
+    ok: true,
+    canonicalId: canonical.id,
+    loserIds: losers.map((l) => l.id),
+    linksRepointed: plan.toAdd.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Pre-merge backup (shared by the CLI and the nightly zone)
+// ---------------------------------------------------------------------------
+
+/**
+ * Take a pre-merge DB backup to <stateDir>/backups/pre-dedup-<ISO>.db and
+ * prune older pre-dedup backups to `backupRetention` (config, default 7;
+ * pattern-scoped so full `hicortex-*.tar.gz` artifacts keep their own,
+ * independent retention count). THROWS on failure — the callers own the
+ * policy: the CLI aborts, the nightly zone is fail-soft. Returns the path.
+ */
+export async function takePreDedupBackup(
+  db: Database.Database,
+  stateDir: string,
+  config?: Record<string, unknown> | null,
+): Promise<string> {
+  const backupDir = join(stateDir, "backups");
+  mkdirSync(backupDir, { recursive: true });
+  const backupPath = join(backupDir, `pre-dedup-${new Date().toISOString().replace(/[:.]/g, "-")}.db`);
+  await db.backup(backupPath);
+  const retention = readNonNegativeConfig(config ?? {}, "backupRetention", DEFAULT_BACKUP_RETENTION);
+  pruneBackupArtifacts(backupDir, retention, PRE_DEDUP_BACKUP_PATTERN);
+  return backupPath;
+}
+
+// ---------------------------------------------------------------------------
+// The deterministic merge zone (#392)
+// ---------------------------------------------------------------------------
+
+export interface DeterministicMergeZoneOptions {
+  /** State dir (lock + backup + band-stats persistence). Defaults to ~/.hicortex. */
+  stateDir?: string;
+  /** Cosine ceiling; validated (0,1] → DEFAULT_DEDUP_MERGE_THRESHOLD. */
+  threshold?: number;
+  /**
+   * Pacing cap on merge operations this run; validated >= 0 →
+   * DEFAULT_DEDUP_NIGHTLY_MAX_MERGES. `0` disables the machinery entirely
+   * (discovery skipped, zeroed report).
+   */
+  maxMerges?: number;
+  /** Discovery + bounded preview only — zero writes, no lock, no backup. */
+  dryRun?: boolean;
+  /** Config override (backupRetention) — defaults to reading stateDir/config.json. */
+  config?: Record<string, unknown> | null;
+  /** Capture-lock acquirer override (tests). Defaults to the real capture.ts lock. */
+  acquireLock?: typeof acquireCaptureLock;
+}
+
+/**
+ * The >= dedupAutoMergeThreshold band of the unified resolution pass (#392):
+ * planDedup discovery + per-cluster mergeCluster — LLM-free, budget-free, so
+ * an LLM-less night still drains duplicates. Its own short capture-lock
+ * window and pre-merge backup; fail-soft on a busy lock (lock_busy) and on a
+ * backup failure (backup_failed) — zero merges either way, never a throw.
+ *
+ * Also persists the deterministic band's cumulative statistics to state.json
+ * `resolutionBandStats` (label `>=threshold`; losers count as merge verdicts
+ * at confidence 1.0, mismatch clusters as metadata_skipped) — skipped
+ * entirely on dry-run. Called from the reconsolidation stage (main path) and
+ * from runConsolidation's quiet-night skip path — exactly one of the two per
+ * run.
+ */
+export async function runDeterministicMergeZone(
+  db: Database.Database,
+  opts: DeterministicMergeZoneOptions = {},
+): Promise<DeterministicMergeZoneReport> {
+  const validNumber = (v: unknown, fallback: number, ok: (n: number) => boolean): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && ok(n) ? n : fallback;
+  };
+  const threshold = validNumber(opts.threshold, DEFAULT_DEDUP_MERGE_THRESHOLD, (n) => n > 0 && n <= 1);
+  const maxMerges = validNumber(opts.maxMerges, DEFAULT_DEDUP_NIGHTLY_MAX_MERGES, (n) => n >= 0);
+  const stateDir = opts.stateDir ?? HICORTEX_HOME;
+  const dryRun = opts.dryRun ?? false;
+
+  // 0 = the merge machinery is disabled — skip discovery entirely.
+  if (maxMerges === 0) {
+    return {
+      threshold, max_merges: 0, clusters_found: 0, mergeable_clusters: 0,
+      merged_clusters: 0, losers_merged: 0, links_repointed: 0,
+      skipped_metadata_mismatch: 0, capped: 0, failed: 0,
+    };
+  }
+
+  try {
+    const plan = planDedup(db, threshold);
+    const report: DeterministicMergeZoneReport = {
+      threshold,
+      max_merges: maxMerges,
+      clusters_found: plan.clusterCount,
+      mergeable_clusters: plan.mergePlans.length,
+      merged_clusters: 0,
+      losers_merged: 0,
+      links_repointed: 0,
+      skipped_metadata_mismatch: plan.mismatchSkipped.length,
+      capped: 0,
+      failed: 0,
+    };
+
+    // Dry-run: discovery counts + a bounded preview (first 10 clusters) only —
+    // zero writes, no lock, no backup, no state.json persistence.
+    if (dryRun) {
+      report.preview = plan.mergePlans.slice(0, 10).map((p) => ({
+        size: p.membersOldestFirst.length,
+        canonical_id: p.canonical.id,
+        loser_ids: p.losers.map((l) => l.id),
+      }));
+      return report;
+    }
+
+    // Cumulative deterministic-band stats (state.json) — one write at zone
+    // end, on every apply-path exit, never when there is nothing to record.
+    const persistBand = (): void => {
+      if (report.losers_merged === 0 && report.skipped_metadata_mismatch === 0) return;
+      updateState((s) => {
+        const label = `>=${threshold}`;
+        const bands = s.resolutionBandStats ?? {};
+        const b = bands[label] ?? {
+          pairs: 0, merge: 0, corrects: 0, supersedes: 0, none: 0,
+          merge_below_gate: 0, conf_sum: 0,
+        };
+        bands[label] = {
+          ...b,
+          pairs: b.pairs + report.losers_merged,
+          merge: b.merge + report.losers_merged,
+          // Deterministic merges carry no verdict — model confidence 1.0 each
+          // (the calibration line: measured ~100% same-memory at the ceiling).
+          conf_sum: b.conf_sum + report.losers_merged,
+          metadata_skipped: (b.metadata_skipped ?? 0) + report.skipped_metadata_mismatch,
+        } satisfies ResolutionBandStat;
+        s.resolutionBandStats = bands;
+      }, stateDir);
+    };
+
+    // Idle corpus: nothing mergeable at the ceiling — no lock window, no
+    // backup (a clean corpus pays discovery only; the metadata rails' skips
+    // still record in the band stats). This is the common nightly case.
+    if (plan.mergePlans.length === 0) {
+      persistBand();
+      return report;
+    }
+
+    // Short single-flight lock window (waitMs 0): a busy capture/nightly run
+    // defers the whole zone to the next run — fail-soft, never a wait.
+    const acquire = opts.acquireLock ?? acquireCaptureLock;
+    const release = await acquire(stateDir, 0);
+    if (!release) {
+      report.lock_busy = true;
+      persistBand();
+      console.warn(
+        `[hicortex] deterministic-merge zone: capture lock busy — zero merges this run (retried next run).`,
+      );
+      return report;
+    }
+
+    try {
+      // Backup FIRST — abort all merges (fail-soft) if it fails.
+      let backupPath: string;
+      try {
+        const config = opts.config !== undefined ? opts.config : readConfig(stateDir);
+        backupPath = await takePreDedupBackup(db, stateDir, config);
+      } catch (err) {
+        report.backup_failed = true;
+        console.error(
+          `[hicortex] deterministic-merge zone: pre-merge backup failed ` +
+            `(${err instanceof Error ? err.message : String(err)}) — zero merges attempted.`,
+        );
+        persistBand();
+        return report;
+      }
+      report.backup_path = backupPath;
+
+      // Discovery order, capped at maxMerges merge OPERATIONS. Capped
+      // clusters wait for the cap (they are the zone's backlog — the verdict
+      // scan never touches them), so a large pre-existing corpus drains over
+      // a few nights.
+      const toAttempt = plan.mergePlans.slice(0, maxMerges);
+      report.capped = plan.mergePlans.length - toAttempt.length;
+
+      for (const p of toAttempt) {
+        try {
+          const tx = db.transaction(() => mergeCluster(db, p.canonical, p.losers));
+          const appliedPlan = tx();
+          report.merged_clusters++;
+          report.losers_merged += p.losers.length;
+          report.links_repointed += appliedPlan.toAdd.length;
+        } catch (err) {
+          report.failed++;
+          console.error(
+            `[hicortex] deterministic-merge zone: cluster merge FAILED (canonical ` +
+              `${p.canonical.id.slice(0, 8)}): ${err instanceof Error ? err.message : String(err)} ` +
+              `— rolled back, left for a re-run`,
+          );
+        }
+      }
+
+      console.log(
+        `[hicortex] deterministic-merge zone (>= ${threshold}): ${report.merged_clusters}/${plan.mergePlans.length} ` +
+          `cluster(s) merged, ${report.losers_merged} loser(s) absorbed, ` +
+          `${report.skipped_metadata_mismatch} skipped (metadata mismatch)` +
+          (report.capped > 0 ? `, ${report.capped} capped (dedupNightlyMaxMerges)` : "") +
+          (report.failed > 0 ? `, ${report.failed} FAILED` : ""),
+      );
+
+      persistBand();
+      return report;
+    } finally {
+      release();
+    }
+  } catch (err) {
+    // Total fail-soft: the zone must never take the nightly down. A
+    // discovery-level failure is logged and reported as an empty run.
+    console.error(
+      `[hicortex] deterministic-merge zone failed: ${err instanceof Error ? err.message : String(err)} ` +
+        `(no merges attempted; retried next run).`,
+    );
+    return {
+      threshold, max_merges: maxMerges, clusters_found: 0, mergeable_clusters: 0,
+      merged_clusters: 0, losers_merged: 0, links_repointed: 0,
+      skipped_metadata_mismatch: 0, capped: 0, failed: 0,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The manual CLI (`hicortex dedup`)
+// ---------------------------------------------------------------------------
+
 /**
  * Run `hicortex dedup`. Dry run by default (options.apply falsy) — discovery
  * + merge planning only, zero writes. `options.apply` executes: backup, then
- * one transaction per cluster.
+ * one transaction per cluster. Fails fast (throws) on a busy capture lock or
+ * a failed backup — a deliberate manual command should be retried by the
+ * operator, not silently deferred (the nightly zone is the fail-soft twin).
  */
 export async function runDedup(options: DedupOptions = {}): Promise<DedupReport> {
   const stateDir = options.stateDir ?? HICORTEX_HOME;
@@ -398,40 +786,25 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
       `[hicortex] dedup starting (${apply ? "APPLY" : "dry-run"}): threshold ${threshold}, db ${dbPath}`,
     );
 
-    const edges = buildKnnEdges(db, { k: DEDUP_KNN_K, minCosine: threshold });
-    const clusters = clusterEdges(edges, threshold);
+    // Shared discovery core (planDedup) — the manual CLI and the nightly
+    // zone must never disagree on what a cluster is.
+    const plan = planDedup(db, threshold);
 
     const mergeable: DedupClusterPlan[] = [];
-    const mismatchSkipped: DedupMismatchCluster[] = [];
-    const plans: Array<{ canonical: DedupMemberRow; losers: DedupMemberRow[] }> = [];
-
-    for (const memberIds of clusters) {
-      const members = loadMembers(db, memberIds);
-      if (members.length < 2) continue; // defensive — a member vanished between KNN and load
-
-      const mismatch = clusterMetadataMismatch(members);
-      if (mismatch.projectMismatch || mismatch.sourceAgentMismatch) {
-        mismatchSkipped.push({ size: members.length, memberIds: members.map((m) => m.id), mismatch });
-        continue;
-      }
-
-      const { canonical, losers } = pickCanonical(members);
-      plans.push({ canonical, losers });
+    for (const p of plan.mergePlans) {
       // Read-only preview against the CURRENT DB state — see planLinkRepoints
       // for why apply recomputes this live rather than reusing this snapshot.
-      const linkPlan = planLinkRepoints(db, canonical, losers);
+      const linkPlan = planLinkRepoints(db, p.canonical, p.losers);
       mergeable.push({
-        size: members.length,
-        canonicalId: canonical.id,
-        loserIds: losers.map((l) => l.id),
-        members: [...members]
-          .sort((a, b) => a.created_at.localeCompare(b.created_at))
-          .map((m) => ({
-            id: m.id,
-            created_at: m.created_at,
-            access_count: m.access_count,
-            preview: m.content.slice(0, 80),
-          })),
+        size: p.membersOldestFirst.length,
+        canonicalId: p.canonical.id,
+        loserIds: p.losers.map((l) => l.id),
+        members: p.membersOldestFirst.map((m) => ({
+          id: m.id,
+          created_at: m.created_at,
+          access_count: m.access_count,
+          preview: m.content.slice(0, 80),
+        })),
         linksRepointed: linkPlan.toAdd.length,
         linksSkippedSelfLink: linkPlan.skippedSelfLink,
         linksSkippedExisting: linkPlan.skippedExisting,
@@ -444,16 +817,16 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
     const report: DedupReport = {
       dryRun: !apply,
       threshold,
-      clusterCount: clusters.length,
+      clusterCount: plan.clusterCount,
       mergeable,
-      mismatchSkipped,
+      mismatchSkipped: plan.mismatchSkipped,
       plannedMerges,
       linksSkippedExisting: linksSkippedExistingPreview,
     };
 
     console.log(
-      `[hicortex] dedup: ${clusters.length} cluster(s) found, ${mergeable.length} mergeable ` +
-        `(${plannedMerges} row(s) would be removed), ${mismatchSkipped.length} skipped (metadata mismatch), ` +
+      `[hicortex] dedup: ${plan.clusterCount} cluster(s) found, ${mergeable.length} mergeable ` +
+        `(${plannedMerges} row(s) would be absorbed), ${plan.mismatchSkipped.length} skipped (metadata mismatch), ` +
         `${linksSkippedExistingPreview} link(s) would be skipped (existing edge on the canonical)`,
     );
 
@@ -466,7 +839,7 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
             `${c.linksSkippedSelfLink} skipped (self-link)`,
         );
       }
-      for (const c of mismatchSkipped) {
+      for (const c of plan.mismatchSkipped) {
         const reasons = Object.entries(c.mismatch)
           .filter(([, v]) => v)
           .map(([k]) => k)
@@ -492,11 +865,9 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
 
     try {
       // Backup FIRST — abort entirely (no merges attempted) if it fails.
-      const backupDir = join(stateDir, "backups");
-      mkdirSync(backupDir, { recursive: true });
-      const backupPath = join(backupDir, `pre-dedup-${new Date().toISOString().replace(/[:.]/g, "-")}.db`);
+      let backupPath: string;
       try {
-        await db.backup(backupPath);
+        backupPath = await takePreDedupBackup(db, stateDir, config);
       } catch (err) {
         throw new Error(
           `[hicortex] dedup --apply aborted: backup failed (${err instanceof Error ? err.message : String(err)}). No merges attempted.`,
@@ -506,42 +877,43 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
       report.backupPath = backupPath;
 
       let merged = 0;
-      let losersDeleted = 0;
+      let losersAbsorbed = 0;
       let failedClusters = 0;
       // Recomputed from the ACTUAL, live per-cluster merges below (may differ
       // from the discovery-time preview if an earlier cluster in this same
       // run rewrote a link that a later cluster's plan also touches).
       let linksSkippedExistingApplied = 0;
 
-      for (const plan of plans) {
+      for (const p of plan.mergePlans) {
         try {
           const tx = db.transaction(() =>
-            mergeCluster(db, plan.canonical, plan.losers, options._injectFailureAfterWrites),
+            mergeCluster(db, p.canonical, p.losers, options._injectFailureAfterWrites),
           );
           const appliedPlan = tx();
           merged++;
-          losersDeleted += plan.losers.length;
+          losersAbsorbed += p.losers.length;
           linksSkippedExistingApplied += appliedPlan.skippedExisting;
           console.log(
-            `[hicortex]   merged cluster: canonical ${plan.canonical.id.slice(0, 8)} absorbed ${plan.losers.length} loser(s), ` +
+            `[hicortex]   merged cluster: canonical ${p.canonical.id.slice(0, 8)} absorbed ${p.losers.length} loser(s), ` +
               `${appliedPlan.toAdd.length} link(s) re-pointed, ${appliedPlan.skippedExisting} skipped (existing edge)`,
           );
         } catch (err) {
           failedClusters++;
           console.error(
-            `[hicortex]   cluster merge FAILED (canonical ${plan.canonical.id.slice(0, 8)}): ` +
+            `[hicortex]   cluster merge FAILED (canonical ${p.canonical.id.slice(0, 8)}): ` +
               `${err instanceof Error ? err.message : String(err)} — rolled back, left for a re-run`,
           );
         }
       }
 
       report.merged = merged;
-      report.losersDeleted = losersDeleted;
+      report.losersAbsorbed = losersAbsorbed;
       report.failedClusters = failedClusters;
       report.linksSkippedExisting = linksSkippedExistingApplied;
 
       console.log(
-        `[hicortex] dedup complete: ${merged} cluster(s) merged, ${losersDeleted} loser(s) deleted` +
+        `[hicortex] dedup complete: ${merged} cluster(s) merged, ${losersAbsorbed} loser(s) absorbed ` +
+          `(hidden from recall, kept as evidence)` +
           (failedClusters > 0 ? `, ${failedClusters} cluster(s) FAILED (see errors above)` : ""),
       );
 
@@ -558,12 +930,13 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
 // /distill dedup_log consultation (shared with mcp-server.ts)
 // ---------------------------------------------------------------------------
 //
-// A merged-away loser's `source_session` marker moves to `dedup_log` (see
-// mergeCluster above) before the memories row is deleted. /distill's dedup
-// prechecks must therefore consult BOTH tables — otherwise a
-// `--recapture-window` run (or any retried capture) could re-ingest content a
-// dedup merge already consolidated, because the only memories row carrying
-// that session's marker is gone.
+// A merged-away loser's `source_session` marker is recorded in `dedup_log`
+// (see mergeCluster above). Since #392 the loser row itself is retained
+// (absorbed, not deleted), so the marker survives on the row too — but
+// pre-#392 merges DELETED their losers, and /distill's dedup prechecks must
+// consult BOTH tables so a `--recapture-window` run (or any retried capture)
+// can never re-ingest content a dedup merge already consolidated regardless
+// of which era merged it.
 
 /** Escape SQL LIKE wildcards — session ids (e.g. Hermes) can contain "_"/"%". */
 export function escapeLikeSessionId(s: string): string {

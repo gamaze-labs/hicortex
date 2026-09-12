@@ -143,6 +143,10 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   "privacy",
   "memory_type",
   "updated_at",
+  // Reconsolidation state (#384, migration v14): written by the
+  // reconsolidation stage, explicit ingest marks, and history rollback.
+  // Code-defined vocabulary — see Memory.status.
+  "status",
 ]);
 
 /**
@@ -221,6 +225,39 @@ export function deleteMemory(
   db.prepare("DELETE FROM memory_tags WHERE memory_id = ?").run(memoryId);
   db.prepare("DELETE FROM memory_vectors WHERE id = ?").run(memoryId);
   db.prepare("DELETE FROM memories WHERE id = ?").run(memoryId);
+}
+
+/**
+ * A memory's rowid in `memories` (the FTS table's rowid), or null when the
+ * row does not exist. Shared by the absorb primitive below and the
+ * reconsolidation stage's FTS bookkeeping (#384/#392).
+ */
+export function memoryRowid(db: Database.Database, memoryId: string): number | null {
+  const row = db.prepare("SELECT rowid AS rid FROM memories WHERE id = ?").get(memoryId) as
+    | { rid: number }
+    | undefined;
+  return row?.rid ?? null;
+}
+
+/**
+ * Drop a memory's retrieval candidacy: status `absorbed`, vector row deleted,
+ * FTS row deleted (direct DELETE — the AFTER UPDATE trigger's `UPDATE … WHERE
+ * rowid` is a silent no-op on the missing row, so later column edits cannot
+ * resurrect it). The plain row + links are KEPT (evidence, session lineage,
+ * rollback reference). Must run inside a transaction.
+ *
+ * The shared absorb primitive (#392): the reconsolidation stage's rewrite
+ * path (via the `absorbTrigger` re-export) AND dedup merge losers both fold a
+ * row into invisible-evidence state through this ONE function, so the
+ * "absorbed" vocabulary can never drift between them. Tags/domain are the
+ * CALLER's concern (the rewrite path clears the target's; a dedup merge
+ * clears the loser's before absorbing).
+ */
+export function absorbMemory(db: Database.Database, memoryId: string): void {
+  const rid = memoryRowid(db, memoryId);
+  updateMemory(db, memoryId, { status: "absorbed" });
+  db.prepare("DELETE FROM memory_vectors WHERE id = ?").run(memoryId);
+  if (rid !== null) db.prepare("DELETE FROM memories_fts WHERE rowid = ?").run(rid);
 }
 
 // ---------------------------------------------------------------------------
@@ -592,13 +629,15 @@ export function addLink(
   relationship: string,
   strength = 0.5
 ): void {
-  // Guard: superseded_by is the sole ranking-demotion signal, so never let a
-  // different relationship clobber an existing superseded_by link for the same
-  // pair — INSERT OR REPLACE would otherwise silently remove the demotion.
-  if (relationship !== "superseded_by") {
+  // Guard: superseded_by and corrected_by are the ranking-demotion /
+  // correction-resolution signals, so never let a different relationship
+  // clobber an existing one for the same pair — INSERT OR REPLACE would
+  // otherwise silently remove the resolution (corrected_by is protected
+  // exactly like superseded_by, #384 AC9).
+  if (relationship !== "superseded_by" && relationship !== "corrected_by") {
     const protectedLink = db
       .prepare(
-        "SELECT 1 FROM memory_links WHERE source_id = ? AND target_id = ? AND relationship = 'superseded_by' LIMIT 1"
+        "SELECT 1 FROM memory_links WHERE source_id = ? AND target_id = ? AND relationship IN ('superseded_by', 'corrected_by') LIMIT 1"
       )
       .get(sourceId, targetId);
     if (protectedLink) return;
@@ -725,6 +764,8 @@ export function countMemories(db: Database.Database): number {
 
 /**
  * Get memories created in the last N days, newest first.
+ * Absorbed memories are excluded (#384): they are invisible to recall — the
+ * plain row is evidence only, never a recent-recall candidate.
  */
 export function getRecentMemories(
   db: Database.Database,
@@ -734,7 +775,7 @@ export function getRecentMemories(
   const rows = db
     .prepare(
       `SELECT * FROM memories
-       WHERE created_at >= datetime('now', ?)
+       WHERE created_at >= datetime('now', ?) AND COALESCE(status, '') != 'absorbed'
        ORDER BY created_at DESC LIMIT ?`
     )
     .all(`-${days} days`, limit) as Array<Record<string, unknown>>;
@@ -833,12 +874,14 @@ export function getAllLinkCounts(
 
 /**
  * Get all memories with default base_strength (never scored).
+ * Absorbed memories are excluded (#384): they are invisible to recall, so
+ * importance-scoring one would spend an LLM call on dead evidence.
  */
 export function getUnscoredMemories(db: Database.Database): Memory[] {
   const rows = db
     .prepare(
       `SELECT * FROM memories
-       WHERE base_strength = 0.5
+       WHERE base_strength = 0.5 AND COALESCE(status, '') != 'absorbed'
        ORDER BY ingested_at ASC`
     )
     .all() as Array<Record<string, unknown>>;

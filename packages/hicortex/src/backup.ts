@@ -376,19 +376,27 @@ export function newestBackupArtifactMs(dir: string): number | undefined {
 }
 
 /**
- * Prune a backup dir to the `retention` newest artifacts (#327). Matches ONLY
- * files named `hicortex-*.tar.gz` (the nightly/CLI artifact pattern) — anything
- * else in the dir (operator copies, notes) is never touched. Keeps the newest
- * `retention` by mtime, with the ISO filename (time-ordered by construction)
- * as a DESCENDING tie-break so equal mtimes resolve deterministically (the
- * just-written artifact is the newest and always survives); deletes the rest,
- * oldest first. `retention <= 0` keeps all.
+ * Prune a backup dir to the `retention` newest artifacts (#327). By default
+ * matches ONLY files named `hicortex-*.tar.gz` (the nightly/CLI artifact
+ * pattern); the optional `pattern` override scopes the prune to another
+ * product-owned filename family — e.g. the pre-dedup merge backups
+ * (`pre-dedup-*.db`, #392) keep their own retention count INDEPENDENT of the
+ * full-backup artifacts. Anything else in the dir (operator copies, notes) is
+ * never touched. Keeps the newest `retention` by mtime, with the ISO filename
+ * (time-ordered by construction) as a DESCENDING tie-break so equal mtimes
+ * resolve deterministically (the just-written artifact is the newest and
+ * always survives); deletes the rest, oldest first. `retention <= 0` keeps
+ * all.
  *
  * Best-effort by design: a per-file unlink failure logs and continues (a
  * stale extra artifact is cheap; failing the nightly AFTER a good backup was
  * written is not). Returns the number actually removed.
  */
-export function pruneBackupArtifacts(dir: string, retention: number): number {
+export function pruneBackupArtifacts(
+  dir: string,
+  retention: number,
+  pattern: RegExp = /^hicortex-.*\.tar\.gz$/,
+): number {
   if (!Number.isFinite(retention) || retention <= 0) return 0;
   let names: string[];
   try {
@@ -398,7 +406,7 @@ export function pruneBackupArtifacts(dir: string, retention: number): number {
     return 0;
   }
   const artifacts = names
-    .filter((n) => /^hicortex-.*\.tar\.gz$/.test(n))
+    .filter((n) => pattern.test(n))
     .map((n) => {
       const abs = join(dir, n);
       let mtimeMs = 0;
