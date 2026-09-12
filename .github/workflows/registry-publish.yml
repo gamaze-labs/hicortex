@@ -1,0 +1,30 @@
+name: Publish to MCP Registry
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type 'publish' to confirm"
+        required: true
+        default: ""
+
+jobs:
+  publish:
+    if: github.event.inputs.confirm == 'publish'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mcp-publisher
+        run: |
+          curl -sSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher-linux-amd64" -o /usr/local/bin/mcp-publisher
+          chmod +x /usr/local/bin/mcp-publisher
+      - name: Login via OIDC (authenticates as the org)
+        run: mcp-publisher login github-oidc
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MCP_REGISTRY_CALLBACK: ${{ vars.MCP_REGISTRY_CALLBACK }}
+          GITHUB_ACTIONS: true
+      - name: Publish
+        run: cd packages/hicortex && mcp-publisher publish
