@@ -18,13 +18,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install mcp-publisher
         run: |
-          curl -sSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher-linux-amd64" -o /usr/local/bin/mcp-publisher
-          chmod +x /usr/local/bin/mcp-publisher
+          curl -sSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz
+          sudo mv mcp-publisher /usr/local/bin/
+          mcp-publisher --version
       - name: Login via OIDC (authenticates as the org)
         run: mcp-publisher login github-oidc
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          MCP_REGISTRY_CALLBACK: ${{ vars.MCP_REGISTRY_CALLBACK }}
           GITHUB_ACTIONS: true
       - name: Publish
         run: cd packages/hicortex && mcp-publisher publish
