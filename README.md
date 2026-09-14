@@ -1,4 +1,4 @@
-# Hicortex
+# Hicortex — AI Fleet Memory
 
 [![Hicortex MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/gamaze-labs/hicortex/badges/score.svg)](https://glama.ai/mcp/servers/gamaze-labs/hicortex)
 
