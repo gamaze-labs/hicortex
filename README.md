@@ -1,5 +1,7 @@
 # Hicortex
 
+[![Hicortex MCP server – quality and maintenance score on Glama](https://glama.ai/mcp/servers/gamaze-labs/hicortex/badges/score.svg)](https://glama.ai/mcp/servers/gamaze-labs/hicortex)
+
 <img src="docs/dashboard-composition.png" alt="Hicortex dashboard — live memory analytics" width="800">
 
 [![npm](https://img.shields.io/npm/v/@gamaze/hicortex.svg)](https://www.npmjs.com/package/@gamaze/hicortex)
