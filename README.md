@@ -9,10 +9,10 @@
 [![License: PolyForm NC](https://img.shields.io/badge/License-PolyForm_NC_1.0-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 
-**Memory that shows up before your agent asks.** One memory across every agent, every project, every machine — they stop assuming and start knowing.
+**Shared memory for AI agents — it corrects itself overnight, and what one agent learns, the whole fleet knows.** One memory across every agent, every project, every machine — they stop assuming and start knowing.
 
 - **One brain, every harness** — Claude Code, Hermes, OpenClaw, Pi, OpenCode, and any MCP-compatible agent share the same memory.
-- **Pushed, not pulled** — a compact recall index is injected on *every prompt*, so the decisions, corrections, and context an agent needs are already in front of it. No re-explaining, no copy-paste, nothing to maintain. **Zero LLM calls per turn** — no API cost or rate-limit hit from recall.
+- **Pushed, not pulled** — in every supported coding agent, a compact recall index is injected on *every prompt*, so the decisions, corrections, and context an agent needs are already in front of it. No re-explaining, no copy-paste, nothing to maintain. **Zero LLM calls per turn** — no API cost or rate-limit hit from recall.
 - **Consolidates overnight** — each night it reads the day's sessions, distills what matters, and turns it into Learnings, links, and a knowledge graph.
 - **Local-first** — raw sessions never leave the machine; only distilled memory is stored.
 
@@ -20,6 +20,7 @@
 
 ```bash
 npx @gamaze/hicortex init
+Claude Desktop: one "yes" during init.
 ```
 
 Auto-detects your environment, configures one LLM (Ollama, the Claude CLI, or an API key), installs a local daemon (launchd on macOS, systemd on Linux), and registers MCP tools with Claude Code.
@@ -30,7 +31,7 @@ For multi-machine setups, point thin clients at a shared server — no local DB 
 npx @gamaze/hicortex init --server https://your-server.example.com
 ```
 
-`init` auto-detects the other harnesses and installs their clients: a Pi extension (`~/.pi/agent/extensions/hicortex.ts` — pushed recall, identity + lessons, the nine tools; or copy `pi-extension/hicortex/index.ts` there manually), an OpenCode plugin (`~/.config/opencode/plugins/hicortex.ts` — the same trio; or copy `opencode-plugin/hicortex/index.ts` there manually), the Hermes plugin, and the OpenClaw plugin. [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) remains a generic MCP escape hatch for any harness (verified against the SSE endpoint) — Pi no longer needs it. See the [install docs](https://hicortex.gamaze.com/docs/installation).
+`init` auto-detects the other harnesses and installs their clients: a Pi extension (`~/.pi/agent/extensions/hicortex.ts` — pushed recall, identity + lessons, the ten tools; or copy `pi-extension/hicortex/index.ts` there manually), an OpenCode plugin (`~/.config/opencode/plugins/hicortex.ts` — the same trio; or copy `opencode-plugin/hicortex/index.ts` there manually), the Hermes plugin, and the OpenClaw plugin. [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) remains a generic MCP escape hatch for any harness (verified against the SSE endpoint) — Pi no longer needs it. See the [install docs](https://hicortex.gamaze.com/docs/installation).
 
 ## How it works
 
@@ -44,6 +45,8 @@ sessions → denoise       score · reflect · link            a compact index o
 
 Memories strengthen when agents use them, fade when they don't, and link to related ones automatically. Retrieval is hybrid BM25 + vector search — zero-LLM at query time.
 
+The first nightly run captures the last 7 days of sessions by default (not your entire history) — run `hicortex nightly --recapture-window <days>` once to import more.
+
 ## Features
 
 - **Per-prompt recall push** — relevant memory lands in context every turn; the agent fetches full content with `hicortex_get` only when it needs it.
@@ -51,7 +54,9 @@ Memories strengthen when agents use them, fade when they don't, and link to rela
 - **Knowledge graph** at `/viz` — memories clustered by domain, connected by relationship edges.
 - **Domains & tags** — multi-tag classification with a configurable vocabulary; your categories drift with your data.
 - **Learnings from reflection** — nightly reflection extracts general, reusable Learnings, not just Experience logs.
-- **Dedup & supersession** — near-duplicates merged; stale decisions and corrections superseded, not re-surfaced.
+- **Self-correcting store** — every night, stale facts are rewritten in place with dated provenance; near-duplicates resolve into one (verbatim copies kept free, merges recoverable); superseded decisions are demoted, never re-surfaced. No zombie memory.
+- **Unprompted by design** — coding agents get recall injected via hooks; instruction-capable clients (Claude Desktop, Cursor-class) get standing instructions, so memory is used without being asked. Plain MCP clients keep full search.
+- **Self-calibrating** — recall, decay and merge boundaries report their own statistics; tuning is measured, never guessed.
 - **Standing context layer** — hand-edited "who you are / how to work" Markdown, injected every session, never decayed.
 
 ## MCP
