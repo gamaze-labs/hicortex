@@ -8,9 +8,9 @@
  * ONE core:
  *
  *  - `runDedup` — the manual CLI. Default is a DRY RUN: report only, zero
- *    writes. `--apply` executes the merge. Threshold resolution:
- *    `--threshold` > config `dedupAutoMergeThreshold` > legacy config
- *    `dedupMergeThreshold` > 0.92.
+ *    writes. `--apply` executes the merge. Threshold resolution (#408):
+ *    `--threshold` > the release-managed calibration ceiling (0.92,
+ *    calibration.ts DEDUP_AUTO_MERGE_THRESHOLD — the config keys are gone).
  *  - `runDeterministicMergeZone` (#392) — the nightly's LLM-free merge zone:
  *    pairs at/above the ceiling merge deterministically, ZERO LLM calls,
  *    bounded by the run-wide pipeline deadline's stop-check (#405 — the
@@ -76,6 +76,7 @@ import {
 import { acquireCaptureLock } from "./capture.js";
 import { updateState } from "./state.js";
 import { readNonNegativeConfig } from "./config-read.js";
+import * as CALIBRATION from "./calibration.js";
 import { DEFAULT_BACKUP_RETENTION, pruneBackupArtifacts } from "./backup.js";
 import type { DeterministicMergeZoneReport, ResolutionBandStat } from "./types.js";
 import type { RunDeadline } from "./run-deadline.js";
@@ -83,12 +84,13 @@ import type { RunDeadline } from "./run-deadline.js";
 const HICORTEX_HOME = hicortexHome();
 
 /**
- * Default merge threshold. Measured on the #191 mechanical audit corpus:
- * 89 clusters / 110 excess rows at 0.92 (data/audit-20260729/eval-report.md).
- * #392: also the default `dedupAutoMergeThreshold` — the deterministic/LLM
- * boundary of the unified resolution pass.
+ * Default merge threshold — RELEASE-MANAGED since #408: the constant (with
+ * its provenance: measured on the #191 mechanical audit corpus, 89 clusters /
+ * 110 excess rows at 0.92, data/audit-20260729/eval-report.md) lives in
+ * calibration.ts. #392: also the deterministic/LLM boundary of the unified
+ * resolution pass.
  */
-export const DEFAULT_DEDUP_MERGE_THRESHOLD = 0.92;
+export const DEFAULT_DEDUP_MERGE_THRESHOLD = CALIBRATION.DEDUP_AUTO_MERGE_THRESHOLD;
 
 /** KNN neighbors considered per memory — same as the #191 audit (cluster.ts default). */
 const DEDUP_KNN_K = 10;
@@ -105,24 +107,18 @@ function readConfig(stateDir: string): Record<string, unknown> | null {
 }
 
 /**
- * Threshold resolution for the manual CLI (#392): explicit `--threshold` >
- * config `dedupAutoMergeThreshold` > legacy config `dedupMergeThreshold` >
- * DEFAULT. An invalid explicit value throws (existing error style); invalid
- * config values fall through to the next step, matching the pre-#392
- * silent-fallback boundary behavior.
+ * Threshold resolution for the manual CLI (#408): explicit `--threshold` >
+ * the release-managed calibration constant. An invalid explicit value throws
+ * (existing error style). The config keys (`dedupAutoMergeThreshold` /
+ * legacy `dedupMergeThreshold`) are gone from the surface — a config carrying
+ * them changes nothing (warned at the config boundary, config-read.ts).
  */
-function resolveThreshold(explicit: number | undefined, config: Record<string, unknown> | null): number {
+function resolveThreshold(explicit: number | undefined): number {
   if (explicit !== undefined) {
     if (!Number.isFinite(explicit) || explicit <= 0 || explicit > 1) {
       throw new Error(`[hicortex] dedup: invalid --threshold value: ${explicit} (must be in (0, 1])`);
     }
     return explicit;
-  }
-  for (const key of ["dedupAutoMergeThreshold", "dedupMergeThreshold"] as const) {
-    const fromConfig = Number(config?.[key]);
-    if (Number.isFinite(fromConfig) && fromConfig > 0 && fromConfig <= 1) {
-      return fromConfig;
-    }
   }
   return DEFAULT_DEDUP_MERGE_THRESHOLD;
 }
@@ -177,6 +173,12 @@ export interface DedupMismatchCluster {
   mismatch: ClusterMetadataMismatch;
 }
 
+/** #393 guard-C: a cluster set aside because a member pair is conflicts-linked. */
+export interface DedupConflictCluster {
+  size: number;
+  memberIds: string[];
+}
+
 export interface DedupReport {
   dryRun: boolean;
   threshold: number;
@@ -184,6 +186,8 @@ export interface DedupReport {
   clusterCount: number;
   mergeable: DedupClusterPlan[];
   mismatchSkipped: DedupMismatchCluster[];
+  /** #393 guard-C: clusters skipped because a member pair is conflicts-linked. */
+  conflictSkipped: DedupConflictCluster[];
   /** Rows that would disappear if every mergeable cluster merged (loser count). */
   plannedMerges: number;
   /**
@@ -358,14 +362,35 @@ export interface PlanDedupResult {
   /** Clusters that passed the metadata rails, in discovery order. */
   mergePlans: DedupMergePlan[];
   mismatchSkipped: DedupMismatchCluster[];
+  /** #393 guard-C: clusters set aside on a conflicts-linked member pair. */
+  conflictSkipped: DedupConflictCluster[];
+}
+
+/**
+ * True when ANY member pair of the set holds a `conflicts` link. The member-set
+ * IN(...) on both endpoints makes the check symmetric by construction —
+ * whichever direction the edge was written in, both ids are in the set. #393
+ * guard-C: a conflicts link is the judge's word that two records cannot both
+ * be true, so no merge path may ever blend them.
+ */
+function clusterHasConflictLink(db: Database.Database, memberIds: string[]): boolean {
+  if (memberIds.length < 2) return false;
+  const placeholders = memberIds.map(() => "?").join(", ");
+  const row = db
+    .prepare(
+      `SELECT 1 FROM memory_links WHERE relationship = 'conflicts'
+       AND source_id IN (${placeholders}) AND target_id IN (${placeholders}) LIMIT 1`,
+    )
+    .get(...memberIds, ...memberIds);
+  return !!row;
 }
 
 /**
  * Discovery + merge planning at a cosine threshold (read-only — no writes).
  * The ONE clustering core shared by the manual CLI (`runDedup`) and the
  * nightly deterministic merge zone (`runDeterministicMergeZone`): KNN edges
- * (k=10) → union-find clusters → member load → metadata-rail classification →
- * canonical pick. Never forked.
+ * (k=10) → union-find clusters → member load → conflicts/metadata-rail
+ * classification → canonical pick. Never forked.
  */
 export function planDedup(db: Database.Database, threshold: number): PlanDedupResult {
   const edges = buildKnnEdges(db, { k: DEDUP_KNN_K, minCosine: threshold });
@@ -373,10 +398,21 @@ export function planDedup(db: Database.Database, threshold: number): PlanDedupRe
 
   const mergePlans: DedupMergePlan[] = [];
   const mismatchSkipped: DedupMismatchCluster[] = [];
+  const conflictSkipped: DedupConflictCluster[] = [];
 
   for (const memberIds of clusters) {
     const members = loadMembers(db, memberIds);
     if (members.length < 2) continue; // defensive — a member vanished between KNN and load
+
+    // #393 guard-C: the conflicts check runs BEFORE the metadata rails — a
+    // conflicts link is the judge's semantic verdict ("never blend"), which
+    // outranks the metadata classification; a cluster that is both
+    // conflict-linked and metadata-mismatched reports as conflict-skipped
+    // (the stronger, semantic reason).
+    if (clusterHasConflictLink(db, members.map((m) => m.id))) {
+      conflictSkipped.push({ size: members.length, memberIds: members.map((m) => m.id) });
+      continue;
+    }
 
     const mismatch = clusterMetadataMismatch(members);
     if (mismatch.projectMismatch || mismatch.sourceAgentMismatch) {
@@ -392,7 +428,7 @@ export function planDedup(db: Database.Database, threshold: number): PlanDedupRe
     });
   }
 
-  return { clusterCount: clusters.length, mergePlans, mismatchSkipped };
+  return { clusterCount: clusters.length, mergePlans, mismatchSkipped, conflictSkipped };
 }
 
 /**
@@ -457,7 +493,9 @@ function mergeCluster(
     storage.updateMemory(db, loser.id, { domain: null });
   }
 
-  // 5. Merge counters onto the canonical.
+  // 5. Merge counters onto the canonical. promotion_last_count moves WITH the
+  // summed access_count (#448): a held baseline would replay the losers'
+  // lifetime accesses as fresh promotions on the next nightly run.
   const accessCount = canonical.access_count + losers.reduce((s, l) => s + l.access_count, 0);
   const shownCount = (canonical.shown_count ?? 0) + losers.reduce((s, l) => s + (l.shown_count ?? 0), 0);
   const lastAccessed = [canonical, ...losers]
@@ -471,6 +509,7 @@ function mergeCluster(
     shown_count: shownCount,
     ...(lastAccessed ? { last_accessed: lastAccessed } : {}),
     base_strength: baseStrength,
+    promotion_last_count: accessCount,
   });
 
   injectFailure?.(canonical.id);
@@ -493,7 +532,7 @@ function mergeCluster(
 
 export type MergeMemoryIdsResult =
   | { ok: true; canonicalId: string; loserIds: string[]; linksRepointed: number }
-  | { ok: false; reason: "metadata_mismatch" | "no_members" };
+  | { ok: false; reason: "metadata_mismatch" | "conflict_linked" | "no_members" };
 
 /**
  * Merge an explicit set of memories (the judged-pair phase of #392: the
@@ -501,12 +540,20 @@ export type MergeMemoryIdsResult =
  * through THIS function so the merge math stays single-definition). Loads the
  * LIVE rows at apply time — members that vanished or were absorbed between
  * verdict and apply are dropped defensively; a metadata disagreement refuses
- * the merge (both memories stay live). One transaction for the whole set.
+ * the merge (both memories stay live); a conflicts-linked pair refuses it
+ * exactly the same way (#393 guard-C). One transaction for the whole set.
  */
 export function mergeMemoryIds(db: Database.Database, ids: string[]): MergeMemoryIdsResult {
   const unique = [...new Set(ids)];
   const members = loadMembers(db, unique).filter((m) => m.status !== "absorbed");
   if (members.length < 2) return { ok: false, reason: "no_members" };
+
+  // #393 guard-C: a conflicts-linked pair is never blended — the mirror of the
+  // metadata rails (both memories stay live; the caller's verdict was still
+  // rendered, so its cursor advances).
+  if (clusterHasConflictLink(db, members.map((m) => m.id))) {
+    return { ok: false, reason: "conflict_linked" };
+  }
 
   const mismatch = clusterMetadataMismatch(members);
   if (mismatch.projectMismatch || mismatch.sourceAgentMismatch) {
@@ -609,6 +656,7 @@ export async function runDeterministicMergeZone(
       losers_merged: 0,
       links_repointed: 0,
       skipped_metadata_mismatch: plan.mismatchSkipped.length,
+      skipped_conflict: plan.conflictSkipped.length,
       capped: 0,
       failed: 0,
     };
@@ -632,7 +680,7 @@ export async function runDeterministicMergeZone(
         const label = `>=${threshold}`;
         const bands = s.resolutionBandStats ?? {};
         const b = bands[label] ?? {
-          pairs: 0, merge: 0, corrects: 0, supersedes: 0, none: 0,
+          pairs: 0, merge: 0, corrects: 0, supersedes: 0, conflicts: 0, none: 0,
           merge_below_gate: 0, conf_sum: 0,
         };
         bands[label] = {
@@ -725,7 +773,8 @@ export async function runDeterministicMergeZone(
       console.log(
         `[hicortex] deterministic-merge zone (>= ${threshold}): ${report.merged_clusters}/${plan.mergePlans.length} ` +
           `cluster(s) merged, ${report.losers_merged} loser(s) absorbed, ` +
-          `${report.skipped_metadata_mismatch} skipped (metadata mismatch)` +
+          `${report.skipped_metadata_mismatch} skipped (metadata mismatch), ` +
+          `${report.skipped_conflict} skipped (conflict-flagged)` +
           (report.capped > 0 ? `, ${report.capped} deferred (run deadline)` : "") +
           (report.failed > 0 ? `, ${report.failed} FAILED` : ""),
       );
@@ -745,7 +794,7 @@ export async function runDeterministicMergeZone(
     return {
       threshold, clusters_found: 0, mergeable_clusters: 0,
       merged_clusters: 0, losers_merged: 0, links_repointed: 0,
-      skipped_metadata_mismatch: 0, capped: 0, failed: 0,
+      skipped_metadata_mismatch: 0, skipped_conflict: 0, capped: 0, failed: 0,
     };
   }
 }
@@ -773,7 +822,7 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
     );
   }
 
-  const threshold = resolveThreshold(options.threshold, config);
+  const threshold = resolveThreshold(options.threshold);
   const apply = options.apply ?? false;
   const dbPath = resolveDbPath(options.dbPath);
   const db = initDb(dbPath);
@@ -817,6 +866,7 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
       clusterCount: plan.clusterCount,
       mergeable,
       mismatchSkipped: plan.mismatchSkipped,
+      conflictSkipped: plan.conflictSkipped,
       plannedMerges,
       linksSkippedExisting: linksSkippedExistingPreview,
     };
@@ -824,6 +874,7 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
     console.log(
       `[hicortex] dedup: ${plan.clusterCount} cluster(s) found, ${mergeable.length} mergeable ` +
         `(${plannedMerges} row(s) would be absorbed), ${plan.mismatchSkipped.length} skipped (metadata mismatch), ` +
+        `${plan.conflictSkipped.length} skipped (conflict-flagged), ` +
         `${linksSkippedExistingPreview} link(s) would be skipped (existing edge on the canonical)`,
     );
 
@@ -843,6 +894,13 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
           .join(", ");
         console.log(
           `[hicortex]   SKIPPED (${reasons}): ${c.memberIds.map((id) => id.slice(0, 8)).join(", ")}`,
+        );
+      }
+      // #393 guard-C: listed for review like the mismatch clusters — a
+      // conflicts-linked near-duplicate pair is deliberate, not an error.
+      for (const c of plan.conflictSkipped) {
+        console.log(
+          `[hicortex]   SKIPPED (conflict-flagged): ${c.memberIds.map((id) => id.slice(0, 8)).join(", ")}`,
         );
       }
       return report;

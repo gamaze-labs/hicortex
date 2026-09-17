@@ -37,9 +37,11 @@
  */
 
 import { l2Normalize, weightedAdd } from "./schema-prototypes.js";
+import * as CALIBRATION from "./calibration.js";
 
 export interface RecallRegistryOptions {
-  /** Turns a shown id stays suppressed. Config `recallReshowTurns`, default 30. */
+  /** Turns a shown id stays suppressed. Release-managed since #408 —
+   *  calibration.ts RECALL_RESHOW_TURNS (30); this field is the eval/test seam. */
   reshowTurns?: number;
   /** Max tracked sessions before LRU eviction. */
   maxSessions?: number;
@@ -56,7 +58,7 @@ interface SessionState {
   centroid?: Float32Array;
 }
 
-export const DEFAULT_RESHOW_TURNS = 30;
+export const DEFAULT_RESHOW_TURNS = CALIBRATION.RECALL_RESHOW_TURNS;
 const DEFAULT_MAX_SESSIONS = 500;
 
 export class SessionRecallRegistry {

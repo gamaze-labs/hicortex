@@ -15,11 +15,58 @@
  * #392 — one zone system, ONE verdict per pair: below `correctionMinSimilarity`
  * (floor, 0.75) pairs are not candidates; in [floor, `dedupAutoMergeThreshold`)
  * (ceiling, 0.92) each unlinked pair gets ONE verdict call whose action is
- * `merge` | `corrects` | `supersedes` | `none`; at/above the ceiling the
- * deterministic merge zone (dedup.ts runDeterministicMergeZone — LLM-free,
- * budget-free) owns the pair. The merge disposition reuses the dedup core's
- * execution (canonical pick, link re-point, dedup_log, metadata rails); a
- * merge verdict below `correctionRewriteMinConfidence` keeps both memories.
+ * `merge` | `corrects` | `supersedes` | `conflicts` | `none`; at/above the
+ * ceiling the deterministic merge zone (dedup.ts runDeterministicMergeZone —
+ * LLM-free, budget-free) owns the pair. The merge disposition reuses the
+ * dedup core's execution (canonical pick, link re-point, dedup_log, metadata
+ * rails); a merge verdict below `correctionRewriteMinConfidence` keeps both
+ * memories.
+ *
+ * #393 increment B — the SCOUT, a second detection source with the SAME
+ * judge: the similarity floor is structurally blind to corrections riding
+ * inside topically unrelated memories (the field failure — cosine ~0.5-0.6 to
+ * their target, zero `corrects` verdicts in the whole corpus baseline), so
+ * per NEW memory ONE classify-tier shape call asks whether it corrects/
+ * retracts/supersedes/CONTRADICTS something previously recorded (guard-C
+ * extended the question); correction-shaped
+ * memories FTS the corpus with the referenced claim's distinctive terms (the
+ * correction CONTAINS the words of what it corrects) and the hits become
+ * candidate pairs in the SAME verdict loop — no similarity gate for this
+ * source: cosine is a ranker/link strength, never a blocker. Per-source
+ * counters (scout_scanned / scout_correction_shaped / scout_candidates_found)
+ * ride the stage report; cosine band stats stay similarity-source-only.
+ *
+ * #393 guard-C — the conflicts flag + the zone-runs-last order: judgment
+ * OUTRANKS the deterministic sweep. A `conflicts` verdict writes a symmetric
+ * `conflicts` link (the pair genuinely disagrees — cannot both be true) and
+ * NOTHING else: no status change, no rewrite, no merge queue; both records
+ * stay live so the consumer sees both truths. Both merge paths (the zone's
+ * planDedup and the judged mergeMemoryIds) refuse to blend a conflicts-linked
+ * pair, counted as conflict_skipped. The zone therefore runs AFTER the scan —
+ * with the zone first, a >=0.92 conflict pair was blended
+ * before the judge ever saw it (the planted-eval harm: canonical=older, the
+ * newer truth erased); running it last means verdicts/marks/binds land first
+ * and the zone merges only what no verdict claimed — a conflicts bind set by
+ * this run's scan guards the SAME run's zone.
+ *
+ * #439 apply-on-confirm — confirmed merges and rewrite groups apply at the
+ * candidate BOUNDARY (the end of the scan iteration that confirmed them), not
+ * in post-scan phases. The old end-of-run batch was a completion assumption
+ * written when nightlies finished in an hour; under #405 budget pressure it
+ * became a days-long queue where confirmed work never landed and every night
+ * re-paid the judgment cost (cursor held below un-applied groups, pairs
+ * re-detected, re-judged). Now each judged-merge pair applies via
+ * mergeMemoryIds in its OWN transaction at confirmation time, each rewrite
+ * group via its own rewrite call + applyRewriteGroup transaction; the cursor
+ * advances per APPLIED candidate, so a deferral holds it below exactly ONE
+ * candidate's pairs. One pre-merge backup per run (lazy, before the first
+ * application); the capture lock is taken per boundary batch with a same-run
+ * retry list + a final drain. A shared trigger IS the current candidate, so
+ * the multi-target keep rule resolves across the boundary's groups (any keep
+ * keeps). A target corrected by two different candidates takes two sequential
+ * rewrites — the second composes the already-corrected story — instead of one
+ * grouped call (the ONE-call grouping was a cost optimization, not a
+ * correctness invariant; accepted semantics change).
  *
  * Status vocabulary (code-defined, extensible — deliberately NOT config):
  *   NULL/'active' default | 'superseded' + 'retracted' demote in ranking |
@@ -41,11 +88,12 @@ import type Database from "better-sqlite3";
 import type { LlmClient, LlmUsage } from "./llm.js";
 import type { Memory, ConsolidationReport, ResolutionBandStat } from "./types.js";
 import type { EmbedFn } from "./retrieval.js";
-import { l2ToCosine } from "./retrieval.js";
+import { l2ToCosine, cosineBetweenVectors } from "./retrieval.js";
 import * as storage from "./storage.js";
 import { loadState, updateState } from "./state.js";
 import { resolveDbPath, initDb } from "./db.js";
 import { acquireCaptureLock } from "./capture.js";
+import * as CALIBRATION from "./calibration.js";
 import { hicortexHome } from "./paths.js";
 import {
   runDeterministicMergeZone,
@@ -63,20 +111,22 @@ import type { RunDeadline } from "./run-deadline.js";
 export const RECONSOLIDATION_STAGE_LABEL = "reconsolidation";
 
 /**
- * Default minimum COSINE similarity for a correction candidate pair. Lower
- * than the supersession stage's 0.80 on purpose: a retraction often rides
- * inside an otherwise unrelated memory (the field failure that opened this
- * issue), so the neighborhood gate must be a touch wider while the LLM
- * verdict + confidence gate carry the precision load.
+ * Default minimum COSINE similarity for a correction candidate pair —
+ * RELEASE-MANAGED since #408 (calibration.ts CORRECTION_MIN_SIMILARITY;
+ * provenance there). Lower than the supersession stage's 0.80 on purpose: a
+ * retraction often rides inside an otherwise unrelated memory (the field
+ * failure that opened this issue), so the neighborhood gate must be a touch
+ * wider while the LLM verdict + confidence gate carry the precision load.
  */
-export const DEFAULT_CORRECTION_MIN_SIMILARITY = 0.75;
+export const DEFAULT_CORRECTION_MIN_SIMILARITY = CALIBRATION.CORRECTION_MIN_SIMILARITY;
 
 /**
- * Default minimum verdict confidence for the REWRITE fork. Below this a
+ * Default minimum verdict confidence for the REWRITE fork — release-managed
+ * (calibration.ts CORRECTION_REWRITE_MIN_CONFIDENCE). Below this a
  * `corrects` verdict degrades to mark-only — a weak mark is recoverable, a
  * weak rewrite is corruption.
  */
-export const DEFAULT_CORRECTION_REWRITE_MIN_CONFIDENCE = 0.8;
+export const DEFAULT_CORRECTION_REWRITE_MIN_CONFIDENCE = CALIBRATION.CORRECTION_REWRITE_MIN_CONFIDENCE;
 
 /** Neighbor pool size before older/similarity filtering narrows to top 5 (supersession mirror). */
 const CORRECTION_NEIGHBOR_POOL = 15;
@@ -108,16 +158,18 @@ export interface StageBudget {
 }
 
 export interface ReconsolidationOptions {
-  /** correctionMinSimilarity (config; default 0.75). Invalid → default. */
+  /** Correction-pair cosine floor. Release-managed default (calibration.ts
+   *  CORRECTION_MIN_SIMILARITY, 0.75); this field is the eval/test seam.
+   *  Invalid → default. */
   minSimilarity?: number;
-  /** correctionRewriteMinConfidence (config; default 0.80). Invalid → default. */
+  /** Rewrite-fork confidence floor. Release-managed default (calibration.ts
+   *  CORRECTION_REWRITE_MIN_CONFIDENCE, 0.80); seam only. Invalid → default. */
   rewriteMinConfidence?: number;
   /**
-   * dedupAutoMergeThreshold (config; default 0.92; legacy dedupMergeThreshold
-   * honored by nightly.ts when the new key is absent). The deterministic/LLM
-   * boundary of the unified resolution pass (#392): pairs at/above it merge
-   * via the LLM-free zone, pairs in [floor, ceiling) get the verdict.
-   * Invalid → default.
+   * The deterministic/LLM boundary of the unified resolution pass (#392):
+   * pairs at/above it merge via the LLM-free zone, pairs in [floor, ceiling)
+   * get the verdict. Release-managed default (calibration.ts
+   * DEDUP_AUTO_MERGE_THRESHOLD, 0.92); seam only. Invalid → default.
    */
   autoMergeThreshold?: number;
   /**
@@ -131,9 +183,9 @@ export interface ReconsolidationOptions {
    */
   deadline?: RunDeadline;
   /**
-   * Capture-lock acquirer override (tests) — the deterministic zone and the
-   * judged-merge phase each hold a short lock window. Defaults to the real
-   * capture.ts lock. DedupOptions.acquireLock pattern.
+   * Capture-lock acquirer override (tests) — the deterministic zone and each
+   * #439 boundary's judged-merge batch hold a short lock window. Defaults to
+   * the real capture.ts lock. DedupOptions.acquireLock pattern.
    */
   acquireLock?: typeof acquireCaptureLock;
 }
@@ -156,11 +208,11 @@ export function isFactShapedTarget(mem: { memory_type: string; content: string }
   return mem.memory_type === "knowledge" || mem.content.includes("[Facts Learned]");
 }
 
-/** True when a superseded_by OR corrected_by link already exists between the pair, either direction. */
+/** True when a superseded_by / corrected_by / conflicts link already exists between the pair, either direction. */
 function alreadyResolutionLinked(db: Database.Database, oldId: string, newId: string): boolean {
   const row = db
     .prepare(
-      `SELECT 1 FROM memory_links WHERE relationship IN ('superseded_by', 'corrected_by')
+      `SELECT 1 FROM memory_links WHERE relationship IN ('superseded_by', 'corrected_by', 'conflicts')
        AND ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))`,
     )
     .get(oldId, newId, newId, oldId);
@@ -183,12 +235,88 @@ function nowIso(): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The unified resolution verdict (#392): ONE call per unlinked pair decides
- * how the newer memory relates to the older — merge (same underlying
- * fact/verdict, differing in wording/qualifiers), corrects, supersedes, or
- * none (related but distinct).
+ * The unified resolution verdict (#392, #393 guard-C): ONE call per unlinked
+ * pair decides how the newer memory relates to the older — merge (same
+ * underlying fact/verdict, differing in wording/qualifiers), corrects,
+ * supersedes, conflicts (genuine disagreement — cannot both be true; flag,
+ * keep both, never blend), or none (related but distinct).
  */
-export type ResolutionAction = "merge" | "corrects" | "supersedes" | "none";
+export type ResolutionAction = "merge" | "corrects" | "supersedes" | "conflicts" | "none";
+
+// ---------------------------------------------------------------------------
+// Scout shape contract (per NEW memory) — {"correction","references","confidence"}
+// (#393 increment B — the reference-extraction detection source)
+// ---------------------------------------------------------------------------
+
+/**
+ * The scout's correction-shape answer (#393 B, guard-C): does this NEW memory
+ * correct, retract, supersede, or CONTRADICT something previously recorded —
+ * and if so, which distinctive terms does the referenced (old) claim carry?
+ * `correction: true` means "resolution-shaped": corrects/retracts/supersedes/
+ * contradicts an earlier claim. `references` feeds an FTS query against the
+ * corpus; the shape call is the ONLY LLM work the scout adds per memory
+ * (non-corrections stop there), and it rides the same `complete()` surface +
+ * stage budget as every other call (#405 — there is no separate classify-tier
+ * ceiling to configure).
+ */
+export interface ScoutShape {
+  correction: boolean;
+  /** Distinctive terms of the referenced old claim ("" when not resolution-shaped). */
+  references: string;
+  /** Informational only — never gates behavior (no uncalibrated parameters). */
+  confidence: number;
+}
+
+/**
+ * Build the constrained correction-shape prompt (classify-tier cost profile:
+ * 1500-char truncation, supersession/verdict precedent). The wording asks for
+ * the OLD claim's distinctive terms — the field-failure mechanism is that a
+ * correction CONTAINS the words of what it corrects, even when the surrounding
+ * topics (and therefore the embedding cosine) are unrelated. Guard-C extends
+ * the question to contradictions: two records that disagree on the same
+ * quantity share even MORE wording than a cross-topic correction does.
+ */
+export function buildScoutShapePrompt(content: string): string {
+  const trunc = (s: string) => (s.length > PROMPT_TRUNCATE_CHARS ? `${s.slice(0, PROMPT_TRUNCATE_CHARS)}…` : s);
+  return (
+    `You are scanning a memory that was just added to an AI agent's long-term memory store.\n\n` +
+    `MEMORY:\n${trunc(content)}\n\n` +
+    `Does this memory correct, retract, supersede, or contradict a claim, decision, or state that was ` +
+    `previously recorded elsewhere in the store? A mere duplicate, elaboration, independent ` +
+    `fact, or new information that invalidates nothing is NOT a correction.\n` +
+    `If it is a correction/retraction/supersession/contradiction, list the most distinctive terms of the ` +
+    `OLD claim it references — words likely to appear verbatim in the older record.\n\n` +
+    `Reply with ONLY a JSON object, no prose: ` +
+    `{"correction": true | false, "references": "<distinctive terms of the referenced old claim, or empty string>", ` +
+    `"confidence": <number between 0 and 1>}`
+  );
+}
+
+/**
+ * Parse the scout shape reply. Null on unparseable JSON, a missing/non-boolean
+ * `correction`, or a missing/out-of-range `confidence` — the caller counts
+ * skipped_infra and moves on (parseSupersessionReply discipline: never
+ * mis-detect on ambiguity). `references` is lenient (missing/non-string → "")
+ * because an empty string simply yields no FTS hits — a harmless miss, not a
+ * mis-judgment.
+ */
+export function parseScoutShape(reply: string): ScoutShape | null {
+  if (!reply) return null;
+  const start = reply.indexOf("{");
+  const end = reply.lastIndexOf("}");
+  if (start === -1 || end === -1 || end <= start) return null;
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(reply.slice(start, end + 1)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (typeof obj.correction !== "boolean") return null;
+  const confidence = Number(obj.confidence);
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return null;
+  const references = typeof obj.references === "string" ? obj.references : "";
+  return { correction: obj.correction, references: references.trim(), confidence };
+}
 
 /** Build the constrained pair-verdict prompt (1500-char truncation, supersession precedent). */
 export function buildCorrectionVerdictPrompt(oldContent: string, newContent: string): string {
@@ -204,9 +332,12 @@ export function buildCorrectionVerdictPrompt(oldContent: string, newContent: str
     `wrong, no longer true, or was retracted, and the newer memory carries the corrected fact.\n` +
     `- "supersedes": the newer memory replaces a decision, plan, or state that was valid at the time but is ` +
     `now outdated — a replacement, not a factual correction.\n` +
+    `- "conflicts": the two memories make claims that cannot both be true — they disagree on a fact, value, ` +
+    `or state, and neither one corrects, supersedes, or restates the other (for example two sources report ` +
+    `different values for the same quantity). Keep both; flag the conflict.\n` +
     `- "none": unrelated, merely similar, or both can still be true (an addition or elaboration).\n\n` +
     `Reply with ONLY a JSON object, no prose: ` +
-    `{"action": "merge" | "corrects" | "supersedes" | "none", "confidence": <number between 0 and 1>}`
+    `{"action": "merge" | "corrects" | "supersedes" | "conflicts" | "none", "confidence": <number between 0 and 1>}`
   );
 }
 
@@ -232,7 +363,15 @@ export function parseCorrectionVerdict(reply: string): CorrectionVerdict | null 
     return null;
   }
   const action = obj.action;
-  if (action !== "merge" && action !== "corrects" && action !== "supersedes" && action !== "none") return null;
+  if (
+    action !== "merge" &&
+    action !== "corrects" &&
+    action !== "supersedes" &&
+    action !== "conflicts" &&
+    action !== "none"
+  ) {
+    return null;
+  }
   const confidence = Number(obj.confidence);
   if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return null;
   return { action, confidence };
@@ -555,7 +694,7 @@ export function bandForCosine(bands: ResolutionBand[], cosine: number): Resoluti
 
 /** An empty band-stat record (fresh accumulation starts from zeroes). */
 function emptyBandStat(): ResolutionBandStat {
-  return { pairs: 0, merge: 0, corrects: 0, supersedes: 0, none: 0, merge_below_gate: 0, conf_sum: 0 };
+  return { pairs: 0, merge: 0, corrects: 0, supersedes: 0, conflicts: 0, none: 0, merge_below_gate: 0, conf_sum: 0 };
 }
 
 /** Add a run's per-band counts into a cumulative record (in place). */
@@ -564,6 +703,7 @@ function accumulateBandStat(cumulative: ResolutionBandStat, run: ResolutionBandS
   cumulative.merge += run.merge;
   cumulative.corrects += run.corrects;
   cumulative.supersedes += run.supersedes;
+  cumulative.conflicts += run.conflicts;
   cumulative.none += run.none;
   cumulative.merge_below_gate += run.merge_below_gate;
   cumulative.conf_sum += run.conf_sum;
@@ -617,6 +757,62 @@ async function findOlderCorrectionNeighbors(
     .slice(0, CORRECTION_NEIGHBOR_TOP_K);
 }
 
+/**
+ * A detection pair entering the verdict loop, tagged by its SOURCE (#393 B):
+ * "similarity" — the KNN/cosine-floor source (the pre-B baseline; pairs enter
+ * bands, ceiling-skip applies); "scout" — the FTS/reference-extraction source
+ * (no similarity gate: cosine is a ranker and link strength, never a blocker;
+ * never recorded in the cosine bands, per the refine addendum's Q2 ruling).
+ */
+interface CandidateNeighbor {
+  mem: Memory;
+  /** Measured pair cosine (KNN distance → cosine, or stored-vector cosine for scout hits). */
+  cosine: number;
+  source: "similarity" | "scout";
+}
+
+/**
+ * The scout source (#393 increment B): for a correction-shaped NEW memory, FTS
+ * the corpus with the referenced claim's distinctive terms and return the OLDER
+ * hits as candidate pairs. This is the reference-extraction half — it finds the
+ * old claim even when the overall topics differ (and therefore the cosine sits
+ * below the similarity floor) because the correction CONTAINS the words of
+ * what it corrects. Deterministic: ONE FTS query, zero LLM. Filters: self,
+ * non-older (detection only pairs older → newer, the KNN mirror), and
+ * defensively non-absorbed hits. Pool/top-K reuse the KNN constants; FTS rank
+ * (BM25, best first) is the order. Dedup against the KNN neighbor ids is the
+ * caller's job (a pair found by both sources is judged once, as similarity).
+ */
+function findScoutNeighbors(
+  db: Database.Database,
+  candidate: Memory,
+  references: string,
+  candidateEmbedding: Float32Array | null,
+): Array<CandidateNeighbor> {
+  if (!references) return [];
+  try {
+    const hits = storage.searchFts(db, references, CORRECTION_NEIGHBOR_POOL);
+    return hits
+      .filter(
+        (m) =>
+          m.id !== candidate.id &&
+          m.created_at < candidate.created_at &&
+          m.status !== "absorbed",
+      )
+      .slice(0, CORRECTION_NEIGHBOR_TOP_K)
+      .map((m) => {
+        const hitVec = storage.getStoredEmbedding(db, m.id);
+        const cosine =
+          candidateEmbedding && hitVec ? cosineBetweenVectors(candidateEmbedding, hitVec) : 0;
+        return { mem: m, cosine, source: "scout" as const };
+      });
+  } catch {
+    // FTS is deterministic infrastructure — a throw here is a bug or a corrupt
+    // index, never a judgment question. Fail soft: no scout pairs this memory.
+    return [];
+  }
+}
+
 async function classifyPair(
   llm: LlmClient,
   oldContent: string,
@@ -631,32 +827,55 @@ async function classifyPair(
 }
 
 /**
- * Nightly reconsolidation stage (#384, #392 — THE unified resolution stage).
+ * Nightly reconsolidation stage (#384, #392 — THE unified resolution stage;
+ * #439 apply-on-confirm).
  *
- * Phase 0 (#392): the deterministic merge zone (pairs >= the ceiling) runs
- * first — LLM-free, budget-free, own lock/backup/cap.
+ * Phase order (#393 guard-C): the deterministic merge zone (pairs >= the
+ * ceiling) runs LAST — after the scan (which now includes every judged-merge
+ * application and rewrite, #439). Judgment outranks the deterministic sweep:
+ * verdicts, marks, and binds land first and the zone merges only what no
+ * verdict claimed. With the zone first, a >=0.92 genuine-conflict pair was
+ * blended before the judge ever saw it (the planted-eval harm); running it
+ * last means a `conflicts` bind set by this run's scan guards the SAME run's
+ * zone. Zone internals (lock, backup, deadline, persistBand, fail-soft) are
+ * unchanged.
  *
  * Scan: every memory with rowid > reconsolidationCursor (no shape filter;
  * absorbed candidates are skipped — invisible memories are not re-judged).
- * Each candidate's pairs: incoming explicit marks (verified once, AC7) then
- * up-to-5 older KNN neighbors in [floor, ceiling) (verdict call per unlinked
- * pair, AC2 — pairs at/above the ceiling are counted, never judged). Confirmed
- * `corrects` pairs above the confidence gate on fact-shaped targets group by
- * target into ONE rewrite call each (AC3); confirmed `merge` pairs queue for
- * the merge phase; everything else is mark-only.
+ * Each candidate's pairs: incoming explicit marks (verified once, AC7), then
+ * ONE scout shape call (#393 B — flags correction shape; non-corrections stop
+ * there), then up-to-5 older KNN neighbors in [floor, ceiling) (verdict call
+ * per unlinked pair, AC2 — pairs at/above the ceiling are counted, never
+ * judged) plus the scout's FTS hits for correction-shaped memories (same
+ * verdict loop, NO similarity gate; guard-C: a scout hit whose KNN twin sits
+ * at/above the ceiling is re-tagged scout so the pair IS judged instead of
+ * being left for the zone to blend). Confirmed `corrects` pairs above the
+ * confidence gate on fact-shaped targets group by target; a `conflicts`
+ * verdict writes the conflicts link and nothing else (both live); everything
+ * else is mark-only.
  *
- * Merge phase (#392): queued pairs merge through the dedup core under one
- * lock/backup window, capped with the zone by dedupNightlyMaxMerges. A pair
- * that cannot apply keeps both memories and holds the cursor.
+ * #439 BOUNDARY apply: at the END of each candidate iteration everything it
+ * confirmed applies IMMEDIATELY — merges first (each judged-merge pair via
+ * mergeMemoryIds in its own transaction, under the boundary's short lock
+ * window; ONE lazy pre-merge backup per run), then the iteration's rewrite
+ * groups (one rewrite LLM call + one applyRewriteGroup transaction each;
+ * dispositions resolved ACROSS the boundary's groups — the multi-target keep
+ * rule: a trigger absorbed only if every group's contract says absorb). A
+ * busy capture lock pushes the boundary's merges onto a same-run retry list
+ * (retried at the next boundary and once in a final drain after the scan);
+ * a deadline, a backup failure, or a rewrite-call refusal/infra error defers
+ * the remaining work and holds the cursor.
  *
- * Cursor discipline mirrors stageSupersession: the cursor advances past a
- * candidate once its neighbor set has been considered, regardless of infra
- * skips — EXCEPT when rewrite groups or confirmed merges could not be applied
- * (budget exhausted / rewrite-call infra error / merge cap or lock): the
- * cursor then holds BELOW the earliest candidate contributing to the
- * un-applied work, so those pairs are re-detected next run (dup-over-loss —
- * an un-marked, un-rewritten, un-merged confirmed resolution must never be
- * silently dropped by the cursor passing it).
+ * Cursor discipline: the cursor advances past a candidate only when its
+ * iteration's confirmed work has LANDED (or was refused-with-verdict-rendered:
+ * metadata mismatch, conflict-linked, mark-only fallback). A deferral holds
+ * the cursor BELOW the current candidate — bounded to ONE candidate's pairs,
+ * re-detected and re-judged next run (dup-over-loss — a confirmed resolution
+ * must never be silently dropped by the cursor passing it). The separate
+ * scan high-water (state.reconsolidationScannedRowid) records the max
+ * candidate rowid ENTERED and is never held back, so the report can split
+ * verdict calls into pairs_reevaluated (at/below the prior high-water) vs
+ * pairs_new — the convergence measurement.
  *
  * Dry-run: the zone's discovery + the free idempotency check only — zero LLM
  * calls, zero writes, no cursor or band-stats persistence. Gate discovery is
@@ -703,19 +922,6 @@ export async function stageReconsolidation(
   const deadlineHit = (stageLabel = RECONSOLIDATION_STAGE_LABEL): boolean =>
     deadline?.hit(stageLabel) ?? false;
 
-  // ---- #392 phase 0: the deterministic merge zone (pairs >= the ceiling),
-  // LLM-free and budget-free — an LLM-less night still drains duplicates. Its
-  // own short lock window, pre-merge backup, and #405 deadline stop-check;
-  // fail-soft, never a throw. Runs FIRST so the scan below never sees the
-  // pairs it owns.
-  const merges = await runDeterministicMergeZone(db, {
-    stateDir: stateDir ?? hicortexHome(),
-    threshold: autoMergeThreshold,
-    dryRun,
-    acquireLock: options.acquireLock,
-    deadline,
-  });
-
   // Per-run verdict statistics by cosine band (#392) — report snapshot here,
   // cumulative series in state.json at stage end (never on dry-run).
   const bands = buildResolutionBands(minSimilarity, autoMergeThreshold);
@@ -731,6 +937,14 @@ export async function stageReconsolidation(
   };
 
   const startCursor = loadState(stateDir).reconsolidationCursor ?? 0;
+  // #439 convergence measurement: the scan high-water is the max candidate
+  // rowid any run has ENTERED — never held back by un-applied work. This
+  // run's re-judged/new split keys on the PREVIOUS run's persisted value: a
+  // verdict on a candidate at/below it re-judges pairs a prior run already
+  // judged but could not apply (the cursor held below them, so they
+  // re-detect). Once the backlog drains, pairs_reevaluated reads 0.
+  const prevScannedRowid = loadState(stateDir).reconsolidationScannedRowid ?? startCursor;
+  let scannedRowidHighwater = startCursor;
   // NO shape filter (AC2) — unlike stageSupersession. Absorbed rows are
   // excluded: they are invisible to recall and must not re-enter judgment.
   const rows = db
@@ -760,22 +974,48 @@ export async function stageReconsolidation(
   let skippedAboveCeiling = 0;
   let skippedMetadataMismatch = 0;
   let mergePairsApplied = 0;
+  // #393 guard-C: conflicts verdicts rendered (link written, both live) and
+  // judged-path merge refusals on a conflicts-linked pair.
+  let conflictFlagged = 0;
+  let conflictSkippedJudged = 0;
+  // #393 B scout counters (per-source observability, the #394 discipline):
+  // shape calls made / correction-shaped verdicts / FTS hits that became
+  // candidate pairs. 0 on dry-run (the shape call is LLM work).
+  let scoutScanned = 0;
+  let scoutCorrectionShaped = 0;
+  let scoutCandidatesFound = 0;
+  // #439 observability: the re-judged/new verdict split (keyed on the prior
+  // run's scan high-water) + the scan-stability guard's skip count + the
+  // confirmed-merge deferral count (still un-applied at run end).
+  let pairsReevaluated = 0;
+  let pairsNew = 0;
+  let skippedAbsorbed = 0;
+  let mergePairsDeferred = 0;
   let cursor = startCursor;
 
-  // #392: confirmed merge verdicts queued for the merge phase (applied AFTER
-  // the scan, under one lock/backup window). candidateRowid = the NEWER
-  // memory's rowid — the cursor-hold anchor when a queued merge cannot apply.
+  // #439: a confirmed judged-merge pair awaiting its boundary apply.
+  // candidateRowid = the NEWER memory's rowid — the cursor-hold anchor when
+  // the pair cannot apply.
   interface QueuedMerge {
     oldId: string;
     newId: string;
     candidateRowid: number;
   }
-  const queuedMerges: QueuedMerge[] = [];
-
-  // #392 cursor-hold anchor, shared by the merge phase and the rewrite phase:
-  // un-applied work holds the cursor BELOW the earliest contributing
-  // candidate so the pairs are re-detected next run (dup-over-loss).
-  let pendingMinRowid: number | null = null;
+  // Lock-busy survivors: boundary merges that could not take the capture
+  // lock, plus (fix round, #440 review finding 1) deadline/backup-dropped
+  // tails re-queued at their boundary instead of discarded. Same-run only —
+  // retried (in full) at the next boundary and once in the final drain after
+  // the scan. While the list is non-empty, every persisted checkpoint clamps
+  // below the earliest contributing candidate (pendingRetryFloor — the kill
+  // window cannot strand them); still un-applied at run end, the drain holds
+  // the cursor below that same floor (dup-over-loss).
+  const retryMerges: QueuedMerge[] = [];
+  // ONE pre-merge backup per run (#439): takePreDedupBackup is a full SQLite
+  // copy, so a per-boundary backup would be hundreds of full-DB copies on a
+  // backlog night. Taken LAZILY, immediately before the first judged-merge
+  // application; remembered for the rest of the run (the zone takes its own,
+  // independent backup, as before).
+  let mergeWindowBackedUp = false;
 
   // Links created by THIS stage in THIS run — lets the explicit-mark pass
   // distinguish operator marks (pre-existing) from stage output.
@@ -785,41 +1025,58 @@ export async function stageReconsolidation(
     linksCreatedThisRun.add(`${oldId}|${newId}`);
   };
 
-  // ---- #401: mid-scan cursor persistence. Called at EVERY scan-loop exit
-  // path (deadline, budget cap, mark-verify budget stop, discovery
-  // failure) AND after every fully-considered candidate, so a killed run
-  // loses at most the candidate in flight. The end-of-stage updateState
-  // below stays the authoritative final write (it also applies the
-  // pendingMinRowid hold — that variable is only ever set AFTER the scan
-  // loop, so it is null at every call site here). updateState is
-  // load→mutate→temp-rename atomic.
+  // ---- #401/#439 mid-scan cursor persistence. Called at EVERY scan-loop
+  // exit path AND at the end of every candidate iteration — AFTER that
+  // iteration's boundary apply, so the persisted cursor only ever advances
+  // past candidates whose confirmed work has landed; a killed run loses at
+  // most the candidate in flight. The ONE exception is lock-busy retry
+  // survivors: they intentionally ride the retry list while the scan
+  // continues (the lock may clear this run), so while any are pending every
+  // persisted checkpoint CLAMPS below their earliest contributor — a SIGKILL
+  // in the window between a busy boundary and the pair landing must never
+  // strand a confirmed merge behind the cursor (the #402 orphan-floor
+  // discipline, re-scoped to the retry list; the clamp lifts automatically
+  // once a later boundary or the final drain applies them). Also persists
+  // the scan high-water (never held back). updateState is load→mutate→
+  // temp-rename atomic.
   let deadlineStopped = false;
-  // #402 follow-up (reviewer note 1): the hard-kill orphan floor. Queued
-  // merges and open rewrite groups are applied only in the POST-scan
-  // phases — until then their verdicts exist only in memory, and a
-  // SIGKILL/OOM between two persists would strand them BEHIND the persisted
-  // cursor (the next run would skip them forever). This tracks the smallest
-  // candidate rowid contributing to queued-but-unapplied work;
-  // persistCursor clamps every checkpoint below it so a resumed run
-  // re-detects the pairs (dup-over-loss). Deliberately SEPARATE from the
-  // post-loop pendingMinRowid hold above — different lifetime, different
-  // writers.
-  let scanPendingMinRowid: number | null = null;
-  const notePendingRowid = (rowid: number): void => {
-    scanPendingMinRowid =
-      scanPendingMinRowid === null ? rowid : Math.min(scanPendingMinRowid, rowid);
+  // #439: once an iteration's confirmed work deferred (deadline at the
+  // boundary, backup failure, rewrite refusal/infra error), the cursor never
+  // advances again this run — a later iteration must not push it past the
+  // held candidate's rowid.
+  let cursorHold = false;
+  // Fix round (#440 review, finding 1): the floor below the earliest
+  // candidate contributing to a still-un-applied retry merge. Applied at
+  // every persist so the kill-with-pending-retry window cannot strand them.
+  const pendingRetryFloor = (): number | null =>
+    retryMerges.length > 0
+      ? Math.min(...retryMerges.map((p) => p.candidateRowid)) - 1
+      : null;
+  const clampedCursor = (): number => {
+    const floor = pendingRetryFloor();
+    return floor !== null ? Math.min(cursor, floor) : cursor;
   };
   const persistCursor = (): void => {
     if (dryRun) return;
-    const checkpoint =
-      scanPendingMinRowid !== null ? Math.min(cursor, scanPendingMinRowid - 1) : cursor;
     updateState((s) => {
-      s.reconsolidationCursor = checkpoint;
+      s.reconsolidationCursor = clampedCursor();
+      s.reconsolidationScannedRowid = Math.max(scannedRowidHighwater, s.reconsolidationScannedRowid ?? 0);
     }, stateDir);
   };
 
-  const groups = new Map<string, RewriteGroup>();
-  const addTrigger = (target: Memory, trigger: Memory & { __rowid: number }, confidence: number, cosine: number | null, explicit: boolean): void => {
+  // #439: rewrite groups live ONLY inside the candidate iteration that
+  // formed them (its boundary applies or degrades them, then they are
+  // discarded). Every trigger is the current candidate — a target corrected
+  // by two different candidates takes two sequential rewrites instead of
+  // the old one grouped call.
+  const addTrigger = (
+    groups: Map<string, RewriteGroup>,
+    target: Memory,
+    trigger: Memory & { __rowid: number },
+    confidence: number,
+    cosine: number | null,
+    explicit: boolean,
+  ): void => {
     let group = groups.get(target.id);
     if (!group) {
       group = { targetId: target.id, target, triggers: [] };
@@ -834,11 +1091,10 @@ export async function stageReconsolidation(
         candidateRowid: trigger.__rowid,
         explicit,
       });
-      notePendingRowid(trigger.__rowid); // orphan floor — group unapplied until the rewrite phase
     }
   };
 
-  for (const candidate of rows) {
+  for (const snapshotted of rows) {
     // #401: runtime bounds first — exit cleanly at the last fully-considered
     // candidate boundary (cursor = the previous candidate's rowid here).
     if (!dryRun && deadlineHit()) {
@@ -850,7 +1106,50 @@ export async function stageReconsolidation(
       persistCursor();
       break;
     }
+
+    // ---- #439 scan-stability guard: `rows` is ONE snapshot fetched at stage
+    // start with status != 'absorbed'; boundary applies (merge losers,
+    // rewrite triggers absorbed) can mark FUTURE rows of that snapshot
+    // absorbed after the filter ran. Without this re-read such a candidate
+    // would be scouted/judged on stale content and its KNN would silently
+    // re-embed it (its vector row is gone). Absorbed → skip (counted,
+    // cursor passes it); otherwise the LIVE row's content/status drives the
+    // rest of the iteration (refreshes content rewritten by an earlier
+    // boundary when created_at and rowid order diverge).
+    const live = db
+      .prepare(`SELECT rowid AS __rowid, * FROM memories WHERE rowid = ?`)
+      .get(snapshotted.__rowid) as (Memory & { __rowid: number }) | undefined;
+    if (!live) {
+      // Vanished entirely (deleted out from under the scan) — defensive;
+      // nothing to judge, the cursor passes it (never past an active hold).
+      scannedRowidHighwater = Math.max(scannedRowidHighwater, snapshotted.__rowid);
+      if (!cursorHold) cursor = snapshotted.__rowid;
+      persistCursor();
+      continue;
+    }
+    if (live.status === "absorbed") {
+      skippedAbsorbed++;
+      scannedRowidHighwater = Math.max(scannedRowidHighwater, live.__rowid);
+      if (!cursorHold) cursor = live.__rowid;
+      persistCursor();
+      continue;
+    }
+    const candidate = live;
     scanned++;
+    // The high-water advances as candidates are ENTERED — even when the
+    // iteration's work later defers (it is the SCAN mark, never held back).
+    scannedRowidHighwater = Math.max(scannedRowidHighwater, candidate.__rowid);
+
+    // #439 per-iteration confirmed work, applied at the boundary below.
+    const iterMerges: QueuedMerge[] = [];
+    const iterGroups = new Map<string, RewriteGroup>();
+    // This iteration's confirmed work could not land (deadline at the
+    // boundary, backup failure, rewrite refusal/infra error): the cursor
+    // holds below this candidate.
+    let boundaryHold = false;
+    // Stop the scan AFTER the boundary (budget stop / rewrite-infra
+    // deferral / backup failure): further verdicts could not land anyway.
+    let stopScan = false;
 
     // ---- AC7: verify incoming explicit marks (corrected_by/superseded_by
     // links targeting this candidate) before they can join a rewrite group.
@@ -883,12 +1182,14 @@ export async function stageReconsolidation(
         const { verdict, usage } = await classifyPair(llm, target.content, candidate.content);
         budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, usage);
         pairsEvaluated++;
+        if (candidate.__rowid <= prevScannedRowid) pairsReevaluated++;
+        else pairsNew++;
         if (!verdict) {
           skippedInfra++; // mark retained; the neighborhood is revisited via newer candidacies
           continue;
         }
         if (verdict.action === "corrects" && verdict.confidence >= rewriteMinConfidence && isFactShapedTarget(target)) {
-          addTrigger(target, candidate, verdict.confidence, null, true);
+          addTrigger(iterGroups, target, candidate, verdict.confidence, null, true);
           explicitVerified++;
         } else {
           // Divergent: the nightly verdict did not confirm a rewrite. The mark
@@ -902,36 +1203,114 @@ export async function stageReconsolidation(
         }
       }
       if (markBudgetStop) {
-        persistCursor(); // #401: this candidate's remaining marks re-verify next run
-        break;
+        // #401: this candidate's remaining marks re-verify next run — the
+        // cursor HOLDS below it (boundaryHold), and #439 still runs the
+        // boundary: marks confirmed before the stop apply, exactly as they
+        // did when the rewrite phase was post-scan.
+        stopScan = true;
+        boundaryHold = true;
       }
     }
 
-    // ---- AC2: detection pairs against older KNN neighbors.
-    let neighbors: Array<Memory & { distance: number }>;
-    try {
-      neighbors = await findOlderCorrectionNeighbors(db, candidate, embedFn, minSimilarity);
-    } catch (err) {
-      console.warn(
-        `[hicortex] reconsolidation: discovery failed for ${candidate.id.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
-      );
-      cursor = candidate.__rowid;
-      persistCursor(); // #401: every exit path persists
-      continue;
+    // ---- #393 B: scout shape call — ONE classify-tier call per candidate,
+    // budget-metered under the same stage label as verdicts. Flags whether
+    // this memory corrects/retracts/supersedes something previously recorded;
+    // non-corrections stop here (zero follow-up). A parse/infra failure skips
+    // the scout source for this memory only (fail-soft — the similarity
+    // source below still runs) and counts skipped_infra, the verdict-skip
+    // discipline. Dry-run skips the call entirely: it is LLM work, and
+    // dry-runs make zero LLM calls (the scout counters read 0 there).
+    let scoutReferences: string | null = null;
+    if (!dryRun && !stopScan) {
+      if (!budget.use(RECONSOLIDATION_STAGE_LABEL)) {
+        // Shape call refused — this candidate re-scouts next run: the cursor
+        // HOLDS below it (the candidate was entered but not considered).
+        stopScan = true;
+        boundaryHold = true;
+      } else {
+        scoutScanned++;
+        try {
+          const r = await llm.complete(buildScoutShapePrompt(candidate.content));
+          budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, r.usage);
+          const shape = parseScoutShape(r.text);
+          if (!shape) {
+            skippedInfra++;
+          } else if (shape.correction) {
+            scoutCorrectionShaped++;
+            scoutReferences = shape.references;
+          }
+        } catch {
+          skippedInfra++;
+        }
+      }
     }
 
-    for (const neighbor of neighbors) {
-      pairsDiscovered++; // every neighbor passed the floor gate
-      if (alreadyResolutionLinked(db, neighbor.id, candidate.id)) {
+    // ---- AC2: detection pairs against older neighbors — TWO sources (#393 B):
+    // the KNN similarity source (floor-gated, the pre-B baseline) and, for
+    // correction-shaped candidates, the scout's FTS source (the referenced
+    // claim's terms → corpus search; NO similarity gate — cosine is a ranker,
+    // never a blocker). Merged + deduped by neighbor id: a pair found by both
+    // sources is judged ONCE, as similarity (with band attribution).
+    let discoveryFailed = false;
+    let neighbors: Array<Memory & { distance: number }> = [];
+    if (!stopScan) {
+      try {
+        neighbors = await findOlderCorrectionNeighbors(db, candidate, embedFn, minSimilarity);
+      } catch (err) {
+        console.warn(
+          `[hicortex] reconsolidation: discovery failed for ${candidate.id.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
+        );
+        // #439: skip this candidate's neighbor judgments but still run the
+        // boundary below — marks confirmed earlier this iteration apply
+        // (they did when the phases were post-scan).
+        discoveryFailed = true;
+      }
+    }
+    const neighborEntries: CandidateNeighbor[] = neighbors.map((n) => ({
+      mem: n,
+      cosine: l2ToCosine(n.distance),
+      source: "similarity" as const,
+    }));
+    if (!discoveryFailed && scoutReferences !== null) {
+      const candidateVec = storage.getStoredEmbedding(db, candidate.id);
+      const knnById = new Map(neighborEntries.map((e) => [e.mem.id, e]));
+      for (const entry of findScoutNeighbors(db, candidate, scoutReferences, candidateVec)) {
+        const knn = knnById.get(entry.mem.id);
+        if (knn) {
+          // Both sources found the pair. Below the ceiling the KNN entry
+          // would be judged anyway — similarity keeps it (band attribution,
+          // judged once). At/above the ceiling the similarity entry would be
+          // ceiling-skipped (zone territory, never judged) — yet the zone now
+          // runs AFTER the scan, and a genuine conflict at >=0.92 is exactly
+          // the pair it would blend with no judge in the loop (guard-C's
+          // harm). Re-tag the entry to the scout source so the pair IS
+          // judged: the scout's no-gate exemption applies, a `conflicts`
+          // verdict can plant the guard link, and the zone's own guard then
+          // refuses the cluster in this same run.
+          if (knn.cosine >= autoMergeThreshold) knn.source = "scout";
+          continue;
+        }
+        neighborEntries.push(entry);
+      }
+    }
+
+    for (const entry of neighborEntries) {
+      pairsDiscovered++; // gate discovery (#394), both sources, before any skip/judgment
+      if (entry.source === "scout") scoutCandidatesFound++;
+      if (alreadyResolutionLinked(db, entry.mem.id, candidate.id)) {
         skippedIdempotent++;
         continue;
       }
       pairsDiscoveredUnlinked++; // still unlinked — the actionable candidate
-      // #392: pairs at/above the ceiling belong to the deterministic zone —
-      // counted here, never LLM-judged (the zone merges them or holds them
-      // for its cap; re-detection is structural, not cursor-based).
-      const pairCosine = l2ToCosine(neighbor.distance);
-      if (pairCosine >= autoMergeThreshold) {
+      const pairCosine = entry.cosine;
+      // #392: SIMILARITY-source pairs at/above the ceiling belong to the
+      // deterministic zone — counted here, never LLM-judged (the zone merges
+      // them at stage end or defers them to a later run; re-detection is
+      // structural, not cursor-based). Scout pairs are exempt (#393 B):
+      // cosine never blocks this source — guard-C's re-tag above relies on
+      // it, and a judged merge re-passes the same metadata/conflict rails
+      // the zone enforces.
+      if (entry.source === "similarity" && pairCosine >= autoMergeThreshold) {
         skippedAboveCeiling++;
         continue;
       }
@@ -939,44 +1318,65 @@ export async function stageReconsolidation(
 
       // #405: the ONE run budget's refusal is the only call cap.
       if (!budget.use(RECONSOLIDATION_STAGE_LABEL)) {
-        persistCursor(); // cursor still points at the last fully-considered candidate
+        stopScan = true; // the boundary below still applies what this candidate already confirmed
         break;
       }
-      const { verdict, usage } = await classifyPair(llm, neighbor.content, candidate.content);
+      const { verdict, usage } = await classifyPair(llm, entry.mem.content, candidate.content);
       budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, usage);
       pairsEvaluated++;
+      if (candidate.__rowid <= prevScannedRowid) pairsReevaluated++;
+      else pairsNew++;
       if (!verdict) {
         skippedInfra++;
         continue;
       }
-      recordBand(pairCosine, verdict.action, verdict.confidence);
+      // Bands stay similarity-source-only (refine Q2 ruling): they are the
+      // calibration evidence for the floor/ceiling boundaries, and scout
+      // pairs reach them through a different, cosine-blind door.
+      if (entry.source === "similarity") recordBand(pairCosine, verdict.action, verdict.confidence);
 
-      // #392: a merge verdict is queued for the merge phase (below) — no
-      // link, no write here. Below the confidence gate BOTH memories stay
+      // #392/#439: a merge verdict queues for THIS iteration's boundary —
+      // no link, no write here. Below the confidence gate BOTH memories stay
       // live: a weak mark is recoverable, and there is nothing to mark for a
       // duplicate — keeping both is the recoverable outcome.
       if (verdict.action === "merge") {
         if (verdict.confidence < rewriteMinConfidence) {
           mergeBelowGate++;
-          const band = bandForCosine(bands, pairCosine);
-          if (band) {
-            const stat = runBands.get(band.label) ?? emptyBandStat();
-            stat.merge_below_gate++;
-            runBands.set(band.label, stat);
+          if (entry.source === "similarity") {
+            const band = bandForCosine(bands, pairCosine);
+            if (band) {
+              const stat = runBands.get(band.label) ?? emptyBandStat();
+              stat.merge_below_gate++;
+              runBands.set(band.label, stat);
+            }
           }
         } else {
-          queuedMerges.push({ oldId: neighbor.id, newId: candidate.id, candidateRowid: candidate.__rowid });
-          notePendingRowid(candidate.__rowid); // orphan floor — merge unapplied until the merge phase
+          iterMerges.push({ oldId: entry.mem.id, newId: candidate.id, candidateRowid: candidate.__rowid });
         }
         continue;
       }
 
       if (verdict.action === "supersedes") {
-        markLink(neighbor.id, candidate.id, "superseded_by", l2ToCosine(neighbor.distance));
-        storage.updateMemory(db, neighbor.id, { status: "superseded" });
+        markLink(entry.mem.id, candidate.id, "superseded_by", pairCosine);
+        storage.updateMemory(db, entry.mem.id, { status: "superseded" });
         markedSuperseded++;
         console.log(
-          `[hicortex] Reconsolidation: ${neighbor.id.slice(0, 8)} superseded_by ${candidate.id.slice(0, 8)} (mark-only)`,
+          `[hicortex] Reconsolidation: ${entry.mem.id.slice(0, 8)} superseded_by ${candidate.id.slice(0, 8)} (mark-only)`,
+        );
+        continue;
+      }
+
+      // #393 guard-C: a genuine conflict — link ONLY. No status change on
+      // either memory (both stay live so the consumer sees both truths), no
+      // rewrite, no merge queue; the link is the guard both merge paths
+      // consult. Ungated like the other mark actions (a weak flag is
+      // recoverable; a weak merge is not).
+      if (verdict.action === "conflicts") {
+        markLink(entry.mem.id, candidate.id, "conflicts", pairCosine);
+        conflictFlagged++;
+        console.log(
+          `[hicortex] Reconsolidation: ${entry.mem.id.slice(0, 8)} conflicts ${candidate.id.slice(0, 8)} ` +
+            `(flag-only) — both kept live, never merged`,
         );
         continue;
       }
@@ -987,31 +1387,257 @@ export async function stageReconsolidation(
           // Below the gate: mark-only, never rewrite. The
           // trigger stays live — it is the only carrier of the correction.
           belowGate++;
-          markLink(neighbor.id, candidate.id, "corrected_by", cosine);
-          storage.updateMemory(db, neighbor.id, { status: "retracted" });
+          markLink(entry.mem.id, candidate.id, "corrected_by", cosine);
+          storage.updateMemory(db, entry.mem.id, { status: "retracted" });
           markedRetracted++;
           continue;
         }
-        if (!isFactShapedTarget(neighbor)) {
+        if (!isFactShapedTarget(entry.mem)) {
           // Decisions/plans/experiences are history, not error — mark only.
-          markLink(neighbor.id, candidate.id, "corrected_by", cosine);
-          storage.updateMemory(db, neighbor.id, { status: "retracted" });
+          markLink(entry.mem.id, candidate.id, "corrected_by", cosine);
+          storage.updateMemory(db, entry.mem.id, { status: "retracted" });
           markedRetracted++;
           continue;
         }
-        addTrigger(neighbor, candidate, verdict.confidence, cosine, false);
+        addTrigger(iterGroups, entry.mem, candidate, verdict.confidence, cosine, false);
       }
       // verdict "none" → nothing to do
     }
 
-    cursor = candidate.__rowid;
+    // ---- #439 BOUNDARY: apply everything this candidate confirmed, NOW —
+    // merges first, then rewrite groups (the order the old post-scan phases
+    // used; preserves the existing tolerance where a merge loser that is
+    // also a rewrite trigger stays absorbed while the rewrite still composes
+    // its content). Each application is its own transaction
+    // (mergeMemoryIds / applyRewriteGroup — group-internal atomicity
+    // preserved); a busy capture lock defers merges to the same-run retry
+    // list, everything else defers by holding the cursor below this
+    // candidate (bounded to ONE candidate's pairs).
+    if (!dryRun) {
+      // Earlier lock-busy survivors retry FIRST (oldest verdicts land
+      // first), ahead of this candidate's fresh confirmations.
+      const mergeBatch = [...retryMerges.splice(0, retryMerges.length), ...iterMerges];
+      if (mergeBatch.length > 0) {
+        if (deadlineHit()) {
+          deadlineStopped = true;
+          // Fix round (#440 review, finding 1): never DROP the batch — it can
+          // begin with lock-busy survivors contributed by EARLIER candidates
+          // that the cursor has already passed. Re-queue for the final drain;
+          // its hold-below-earliest-contributor (and the persist clamp) keeps
+          // every un-applied pair re-detectable next run.
+          retryMerges.push(...mergeBatch);
+          boundaryHold = true;
+          console.log(
+            `[hicortex] Reconsolidation: ${mergeBatch.length} confirmed merge(s) re-queued for the final drain — run deadline reached`,
+          );
+        } else {
+          const acquire = options.acquireLock ?? acquireCaptureLock;
+          const release = await acquire(stateDir ?? hicortexHome(), 0);
+          if (!release) {
+            // Busy capture run — the batch rides the same-run retry list:
+            // retried at the next boundary and once in the final drain. Not
+            // a cursor hold yet (the lock may clear this run).
+            retryMerges.push(...mergeBatch);
+            console.warn(
+              `[hicortex] Reconsolidation: capture lock busy — ${mergeBatch.length} confirmed merge(s) deferred to a retry this run`,
+            );
+          } else {
+            try {
+              let backupOk = true;
+              if (!mergeWindowBackedUp) {
+                try {
+                  await takePreDedupBackup(db, stateDir ?? hicortexHome());
+                  mergeWindowBackedUp = true;
+                } catch (err) {
+                  backupOk = false;
+                  console.error(
+                    `[hicortex] Reconsolidation: pre-merge backup failed ` +
+                      `(${err instanceof Error ? err.message : String(err)}) — ${mergeBatch.length} merge(s) deferred`,
+                  );
+                }
+              }
+              if (!backupOk) {
+                // Verdicts that cannot land must not keep being paid: stop
+                // the scan. The batch re-queues for the final drain — a
+                // TRANSIENT backup failure can still recover there; a
+                // persistent one ends with the drain holding the cursor
+                // below the earliest contributor (never just this candidate,
+                // when retry survivors ride the batch).
+                retryMerges.push(...mergeBatch);
+                boundaryHold = true;
+                stopScan = true;
+              } else {
+                for (let i = 0; i < mergeBatch.length; i++) {
+                  const pair = mergeBatch[i];
+                  // #405: the deadline stop-check between local merge
+                  // transactions — a safe boundary; deferred pairs hold the
+                  // cursor below this candidate and retry next run.
+                  if (deadlineHit()) {
+                    deadlineStopped = true;
+                    // Fix round (#440 review, finding 1): the un-applied tail
+                    // re-queues (it can contain earlier candidates' retry
+                    // survivors) — the final drain applies or holds it.
+                    retryMerges.push(...mergeBatch.slice(i));
+                    boundaryHold = true;
+                    console.log(
+                      `[hicortex] Reconsolidation: ${mergeBatch.length - i} confirmed merge(s) re-queued for the final drain — run deadline reached`,
+                    );
+                    break;
+                  }
+                  const result = mergeMemoryIds(db, [pair.oldId, pair.newId]);
+                  if (result.ok) {
+                    mergePairsApplied++;
+                    console.log(
+                      `[hicortex] Reconsolidation: merged ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
+                        `into canonical ${result.canonicalId.slice(0, 8)} (${result.linksRepointed} link(s) re-pointed)`,
+                    );
+                  } else if (result.reason === "metadata_mismatch") {
+                    skippedMetadataMismatch++;
+                    console.log(
+                      `[hicortex] Reconsolidation: merge of ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
+                        `skipped (metadata mismatch) — both kept`,
+                    );
+                  } else if (result.reason === "conflict_linked") {
+                    // #393 guard-C: the pair is conflicts-linked (operator-planted
+                    // or a prior verdict) — never blended; the cursor advances,
+                    // this verdict was rendered.
+                    conflictSkippedJudged++;
+                    console.log(
+                      `[hicortex] Reconsolidation: merge of ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
+                        `skipped (conflict-flagged) — both kept`,
+                    );
+                  }
+                  // "no_members": a member vanished/was absorbed since the
+                  // verdict — nothing to merge, nothing to hold; the cursor
+                  // advances past it.
+                }
+              }
+            } finally {
+              release();
+            }
+          }
+        }
+      }
 
-    // #402 follow-up (reviewer note 1): persist after EVERY fully-considered
-    // candidate — the 50-candidate batch left a kill window that could
-    // strand several candidates of scan progress. updateState is an atomic
-    // temp-rename of a small file and the loop cadence is seconds per
-    // candidate; the cost is negligible.
+      if (iterGroups.size > 0) {
+        // One rewrite call per group — the group's triggers are all THIS
+        // candidate (#439: a target corrected by two different candidates
+        // takes two sequential rewrites, one per boundary; the second call
+        // composes the already-corrected story). A call that was never made
+        // (budget/infra/deadline) defers the group — untouched, never
+        // partially applied — and holds the cursor below this candidate.
+        const contracts = new Map<string, RewriteContract | null>(); // null = contract failed
+        let rewritesDeferred = false;
+        for (const group of iterGroups.values()) {
+          if (deadlineHit()) {
+            deadlineStopped = true;
+            rewritesDeferred = true;
+            break;
+          }
+          if (!budget.use(RECONSOLIDATION_STAGE_LABEL)) {
+            rewritesDeferred = true;
+            stopScan = true;
+            break;
+          }
+          const triggersArg = group.triggers.map((t) => ({ id: t.id, content: t.memory.content }));
+          let contract: RewriteContract | null = null;
+          let infraError = false;
+          try {
+            const r = await llm.complete(buildRewritePrompt(group.target.content, triggersArg));
+            contract = parseRewriteReply(r.text, group.triggers.map((t) => t.id), group.target.content);
+            budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, r.usage);
+          } catch {
+            infraError = true;
+          }
+          if (infraError) {
+            skippedInfra++;
+            rewritesDeferred = true; // group NOT marked, NOT rewritten — retried next run
+            stopScan = true; // verdicts past this hold could not advance the cursor anyway
+            break;
+          }
+          contracts.set(group.targetId, contract);
+          if (!contract) contractFailed++;
+        }
+
+        if (rewritesDeferred) {
+          boundaryHold = true;
+        } else {
+          // Multi-target keep rule WITHIN the boundary: the shared trigger is
+          // the current candidate, so every group it touches resolves here —
+          // absorbed only if EVERY contract says absorb (any keep keeps).
+          const finalOutcome = new Map<string, "absorb" | "keep">();
+          for (const contract of contracts.values()) {
+            if (!contract) continue;
+            for (const t of contract.triggers) {
+              if (t.disposition === "keep" || finalOutcome.get(t.id) === "keep") finalOutcome.set(t.id, "keep");
+              else finalOutcome.set(t.id, "absorb");
+            }
+          }
+          // Counted from APPLIED groups only (a deferred group's dispositions
+          // never took effect); a trigger in several applied groups counts once.
+          const appliedOutcome = new Map<string, "absorb" | "keep">();
+          for (const group of iterGroups.values()) {
+            const contract = contracts.get(group.targetId);
+            if (contract === undefined) continue; // pending group — untouched this run
+            if (contract === null) {
+              // Failed rewrite contract → whole group mark-only, never a partial
+              // apply. Content untouched, NO trigger absorbed.
+              try {
+                applyMarkOnlyGroup(db, group);
+              } catch (err) {
+                console.warn(
+                  `[hicortex] reconsolidation: mark-only fallback failed for ${group.targetId.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
+                );
+                skippedInfra++;
+                boundaryHold = true; // retried next run
+                continue;
+              }
+              markedRetracted++;
+              console.log(
+                `[hicortex] Reconsolidation: rewrite contract failed for ${group.targetId.slice(0, 8)} — group degraded to mark-only`,
+              );
+              continue;
+            }
+            let applied = false;
+            try {
+              applied = await applyRewriteGroup(db, group, contract, finalOutcome, embedFn);
+            } catch (err) {
+              console.warn(
+                `[hicortex] reconsolidation: rewrite apply failed for ${group.targetId.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+            if (!applied) {
+              skippedInfra++; // defensive absorbed-target guard, or an apply error — retry next run
+              boundaryHold = true;
+              continue;
+            }
+            rewritten++;
+            for (const t of contract.triggers) {
+              const outcome = finalOutcome.get(t.id) ?? "keep";
+              if (outcome === "keep" || appliedOutcome.get(t.id) === "keep") appliedOutcome.set(t.id, "keep");
+              else appliedOutcome.set(t.id, "absorb");
+            }
+          }
+          for (const outcome of appliedOutcome.values()) {
+            if (outcome === "absorb") absorbed++;
+            else keptLinked++;
+          }
+        }
+      }
+    }
+
+    // #439 cursor advance: past this candidate ONLY when its confirmed work
+    // landed (or was refused-with-verdict-rendered). Once anything deferred,
+    // the latch holds the cursor below that candidate for the rest of the
+    // run — a later iteration must never advance past an earlier hold.
+    if (boundaryHold) cursorHold = true;
+    if (!cursorHold) cursor = candidate.__rowid;
+
+    // #402/#439: persist after EVERY candidate — AFTER the boundary apply,
+    // so the checkpoint only ever crosses candidates whose work landed. A
+    // SIGKILL between persists re-detects at most the in-flight candidate.
     persistCursor();
+    if (stopScan || deadlineStopped) break;
   }
 
   if (deadlineStopped) {
@@ -1021,61 +1647,63 @@ export async function stageReconsolidation(
     );
   }
 
-  // ---- #392 judged-merge phase: apply the queued pair merges through the
-  // dedup core (mergeMemoryIds — same canonical pick, link re-points,
-  // dedup_log, absorb). One short lock/backup window for the whole batch, one
-  // transaction per pair. #405: the dedupNightlyMaxMerges cap is gone — the
-  // run deadline bounds the merge loop (a stop-check between local
-  // transactions; the deferred pairs hold the cursor below their candidates).
-  // A pair that cannot apply (deadline, busy lock, failed backup) keeps BOTH
-  // memories live and holds the cursor below its candidate — a confirmed
-  // merge is never silently dropped by the cursor passing it (dup-over-loss).
-  // A metadata-rail refusal is different: the verdict WAS rendered, both
-  // memories stay live, the cursor advances.
-  let mergePairsDeferred = 0;
-  if (!dryRun && queuedMerges.length > 0) {
-    const holdQueued = (from: number): void => {
-      for (let i = from; i < queuedMerges.length; i++) {
-        pendingMinRowid =
-          pendingMinRowid === null
-            ? queuedMerges[i].candidateRowid
-            : Math.min(pendingMinRowid, queuedMerges[i].candidateRowid);
-      }
+  // ---- #439 final drain: lock-busy merge survivors get ONE more attempt
+  // right after the scan (the retry list is same-run only — everything else
+  // applied at its boundary). Still busy (or the deadline/backup refuses) →
+  // the pairs stay un-applied, counted, and the cursor holds below the
+  // earliest contributing candidate (dup-over-loss; logged).
+  if (!dryRun && retryMerges.length > 0) {
+    const batch = retryMerges.splice(0, retryMerges.length);
+    // Hold below the earliest contributor of the UN-APPLIED tail only (fix
+    // round, minor review note: the old whole-batch min over-held past pairs
+    // that had just applied in the same loop).
+    const holdBelow = (fromIndex: number): void => {
+      cursor = Math.min(cursor, Math.min(...batch.slice(fromIndex).map((p) => p.candidateRowid)) - 1);
     };
-
-    {
+    if (deadlineHit()) {
+      deadlineStopped = true;
+      mergePairsDeferred += batch.length;
+      holdBelow(0);
+      console.log(
+        `[hicortex] Reconsolidation: ${batch.length} confirmed merge(s) deferred — run deadline reached`,
+      );
+    } else {
       const acquire = options.acquireLock ?? acquireCaptureLock;
       const release = await acquire(stateDir ?? hicortexHome(), 0);
       if (!release) {
-        mergePairsDeferred = queuedMerges.length;
-        holdQueued(0); // a busy capture run defers the batch — fail-soft
+        mergePairsDeferred += batch.length;
+        holdBelow(0);
         console.warn(
-          `[hicortex] Reconsolidation: capture lock busy — ${mergePairsDeferred} confirmed merge(s) deferred to next run`,
+          `[hicortex] Reconsolidation: capture lock busy at the final drain — ` +
+            `${batch.length} confirmed merge(s) deferred to next run`,
         );
       } else {
         try {
           let backupOk = true;
-          try {
-            await takePreDedupBackup(db, stateDir ?? hicortexHome());
-          } catch (err) {
-            backupOk = false;
-            console.error(
-              `[hicortex] Reconsolidation: pre-merge backup failed ` +
-                `(${err instanceof Error ? err.message : String(err)}) — ${queuedMerges.length} merge(s) deferred`,
-            );
+          if (!mergeWindowBackedUp) {
+            try {
+              await takePreDedupBackup(db, stateDir ?? hicortexHome());
+              mergeWindowBackedUp = true;
+            } catch (err) {
+              backupOk = false;
+              console.error(
+                `[hicortex] Reconsolidation: pre-merge backup failed ` +
+                  `(${err instanceof Error ? err.message : String(err)}) — ${batch.length} merge(s) deferred`,
+              );
+            }
           }
-          if (backupOk) {
-            for (let i = 0; i < queuedMerges.length; i++) {
-              const pair = queuedMerges[i];
-              // #405: the deadline stop-check between local merge
-              // transactions — a safe boundary; deferred pairs hold the
-              // cursor below their candidates and retry next run.
+          if (!backupOk) {
+            mergePairsDeferred += batch.length;
+            holdBelow(0);
+          } else {
+            for (let i = 0; i < batch.length; i++) {
+              const pair = batch[i];
               if (deadlineHit()) {
                 deadlineStopped = true;
-                mergePairsDeferred = queuedMerges.length - i;
-                holdQueued(i);
+                mergePairsDeferred += batch.length - i;
+                holdBelow(i);
                 console.log(
-                  `[hicortex] Reconsolidation: ${mergePairsDeferred} confirmed merge(s) deferred — run deadline reached`,
+                  `[hicortex] Reconsolidation: ${batch.length - i} confirmed merge(s) deferred — run deadline reached`,
                 );
                 break;
               }
@@ -1092,14 +1720,16 @@ export async function stageReconsolidation(
                   `[hicortex] Reconsolidation: merge of ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
                     `skipped (metadata mismatch) — both kept`,
                 );
+              } else if (result.reason === "conflict_linked") {
+                conflictSkippedJudged++;
+                console.log(
+                  `[hicortex] Reconsolidation: merge of ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
+                    `skipped (conflict-flagged) — both kept`,
+                );
               }
               // "no_members": a member vanished/was absorbed since the
-              // verdict — nothing to merge, nothing to hold; the cursor
-              // advances past it.
+              // verdict — nothing to merge, nothing to hold.
             }
-          } else {
-            mergePairsDeferred = queuedMerges.length;
-            holdQueued(0);
           }
         } finally {
           release();
@@ -1108,135 +1738,26 @@ export async function stageReconsolidation(
     }
   }
 
-  // ---- Rewrite phase (AC3/AC4/AC5). Three sub-phases so the multi-target
-  // keep rule can be honored: (R1) collect contracts, (R2) resolve every
-  // trigger's FINAL disposition across all groups, (R3) apply one transaction
-  // per group. A group whose rewrite call was never made (budget/infra) is
-  // left untouched and holds the cursor — never partially applied.
-  const contracts = new Map<string, RewriteContract | null>(); // null = contract failed
-  // pendingMinRowid (min candidate rowid among un-applied work) is declared
-  // above — shared with the merge phase's holdQueued.
-  const deferFrom = (fromTargetId: string): void => {
-    let seen = false;
-    for (const group of groups.values()) {
-      if (!seen && group.targetId !== fromTargetId) continue;
-      seen = true;
-      for (const t of group.triggers) {
-        pendingMinRowid = pendingMinRowid === null ? t.candidateRowid : Math.min(pendingMinRowid, t.candidateRowid);
-      }
-    }
-  };
-
-  if (!dryRun && groups.size > 0) {
-    for (const group of groups.values()) {
-      // #401: the bounds stop the rewrite phase too — a group whose rewrite
-      // call was never made is left untouched and holds the cursor (never
-      // partially applied), exactly like the budget-exhausted path below.
-      if (deadlineHit()) {
-        deadlineStopped = true;
-        deferFrom(group.targetId);
-        break;
-      }
-      if (!budget.use(RECONSOLIDATION_STAGE_LABEL)) {
-        deferFrom(group.targetId);
-        break;
-      }
-      const triggersArg = group.triggers.map((t) => ({ id: t.id, content: t.memory.content }));
-      let contract: RewriteContract | null = null;
-      let infraError = false;
-      try {
-        const r = await llm.complete(buildRewritePrompt(group.target.content, triggersArg));
-        contract = parseRewriteReply(r.text, group.triggers.map((t) => t.id), group.target.content);
-        budget.recordUsage(RECONSOLIDATION_STAGE_LABEL, r.usage);
-      } catch {
-        infraError = true;
-      }
-      if (infraError) {
-        skippedInfra++;
-        deferFrom(group.targetId); // group NOT marked, NOT rewritten — retried next run
-        break;
-      }
-      contracts.set(group.targetId, contract);
-      if (!contract) contractFailed++;
-    }
-
-    // R2: final per-trigger disposition — a trigger in multiple groups is
-    // absorbed only if EVERY disposition says absorb (any keep keeps it).
-    const finalOutcome = new Map<string, "absorb" | "keep">();
-    for (const contract of contracts.values()) {
-      if (!contract) continue;
-      for (const t of contract.triggers) {
-        if (t.disposition === "keep" || finalOutcome.get(t.id) === "keep") finalOutcome.set(t.id, "keep");
-        else finalOutcome.set(t.id, "absorb");
-      }
-    }
-
-    // R3: apply (one transaction per group). An apply that fails mid-flight
-    // (embed error, DB error) writes NOTHING (the transaction never ran) —
-    // the group is deferred like a pending one so it retries next run.
-    const appliedOutcome = new Map<string, "absorb" | "keep">();
-    const deferGroup = (group: RewriteGroup): void => {
-      for (const t of group.triggers) {
-        pendingMinRowid = pendingMinRowid === null ? t.candidateRowid : Math.min(pendingMinRowid, t.candidateRowid);
-      }
-    };
-    for (const group of groups.values()) {
-      const contract = contracts.get(group.targetId);
-      if (contract === undefined) continue; // pending group — untouched this run
-      if (contract === null) {
-        // Failed rewrite contract → whole group mark-only, never a partial
-        // apply. Content untouched, NO trigger absorbed.
-        try {
-          applyMarkOnlyGroup(db, group);
-        } catch (err) {
-          console.warn(
-            `[hicortex] reconsolidation: mark-only fallback failed for ${group.targetId.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
-          );
-          skippedInfra++;
-          deferGroup(group);
-          continue;
-        }
-        markedRetracted++;
-        console.log(
-          `[hicortex] Reconsolidation: rewrite contract failed for ${group.targetId.slice(0, 8)} — group degraded to mark-only`,
-        );
-        continue;
-      }
-      let applied = false;
-      try {
-        applied = await applyRewriteGroup(db, group, contract, finalOutcome, embedFn);
-      } catch (err) {
-        console.warn(
-          `[hicortex] reconsolidation: rewrite apply failed for ${group.targetId.slice(0, 8)} — ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-      if (!applied) {
-        skippedInfra++; // defensive absorbed-target guard, or an apply error — retry next run
-        deferGroup(group);
-        continue;
-      }
-      rewritten++;
-      // Counted from APPLIED groups only (a deferred group's dispositions
-      // never took effect); a trigger in several applied groups counts once.
-      for (const t of contract.triggers) {
-        const outcome = finalOutcome.get(t.id) ?? "keep";
-        if (outcome === "keep" || appliedOutcome.get(t.id) === "keep") appliedOutcome.set(t.id, "keep");
-        else appliedOutcome.set(t.id, "absorb");
-      }
-    }
-
-    for (const outcome of appliedOutcome.values()) {
-      if (outcome === "absorb") absorbed++;
-      else keptLinked++;
-    }
-  }
-
-  // Cursor hold: un-applied work (rewrite groups, confirmed merges) holds the
-  // cursor BELOW its earliest contributing candidate so the pairs are
-  // re-detected next run.
-  if (pendingMinRowid !== null) {
-    cursor = Math.min(cursor, pendingMinRowid - 1);
-  }
+  // ---- #393 guard-C zone reorder: the deterministic merge zone (pairs >=
+  // the ceiling) runs LAST — after the scan (which includes every #439
+  // boundary apply: judged merges + rewrites). Judgment outranks the
+  // deterministic sweep: verdicts, marks, and binds land first, and the zone
+  // merges only what no verdict claimed. With the zone first, a >=0.92
+  // genuine-conflict pair was blended before the judge ever saw it
+  // (canonical = oldest, the newer truth erased — the planted-eval harm);
+  // running it last means a `conflicts` bind set by THIS run's scan guards
+  // the SAME run's zone. LLM-free and budget-free — an LLM-less night still
+  // drains duplicates (a deadline-deferred cluster re-detects next run at
+  // zero token cost — content-based discovery, no cursor involvement). Its
+  // own short lock window, pre-merge backup, and #405 deadline stop-check;
+  // fail-soft, never a throw.
+  const merges = await runDeterministicMergeZone(db, {
+    stateDir: stateDir ?? hicortexHome(),
+    threshold: autoMergeThreshold,
+    dryRun,
+    acquireLock: options.acquireLock,
+    deadline,
+  });
 
   // Report snapshot: the deterministic band (from the zone's own numbers —
   // losers are merge verdicts at confidence 1.0; the zone persists the
@@ -1258,10 +1779,15 @@ export async function stageReconsolidation(
   for (const [label, stat] of runBands) bandStats[label] = stat;
 
   if (!dryRun) {
-    // #401: the authoritative FINAL cursor write — the mid-scan persists
-    // above are checkpoints; this one also applies the pendingMinRowid hold.
+    // #401/#439: the authoritative FINAL write — the mid-scan persists above
+    // are checkpoints; this one applies the final-drain cursor hold (already
+    // folded into `cursor`) and the scan high-water. The retry floor is
+    // applied defensively too: the drain splices retryMerges empty on every
+    // path, but a non-empty list here would mean a confirmed merge stranded
+    // behind the cursor — clamp, never write past un-applied work.
     updateState((s) => {
-      s.reconsolidationCursor = cursor;
+      s.reconsolidationCursor = clampedCursor();
+      s.reconsolidationScannedRowid = Math.max(scannedRowidHighwater, s.reconsolidationScannedRowid ?? 0);
       // Cumulative judged-band accumulation (#392) — the zone already
       // persisted the deterministic band under its own label.
       if (runBands.size > 0) {
@@ -1276,15 +1802,21 @@ export async function stageReconsolidation(
     }, stateDir);
   }
 
-  if (rows.length > 0 || groups.size > 0 || mergePairsApplied > 0 || mergeBelowGate > 0) {
+  if (rows.length > 0 || mergePairsApplied > 0 || mergeBelowGate > 0) {
     console.log(
-      `[hicortex] Reconsolidation: ${scanned} scanned, ${pairsEvaluated} pairs evaluated, ` +
+      `[hicortex] Reconsolidation: ${scanned} scanned, ${pairsEvaluated} pairs evaluated ` +
+        `(${pairsReevaluated} re-judged / ${pairsNew} new), ` +
         `${rewritten} rewritten (${absorbed} triggers absorbed, ${keptLinked} kept), ` +
-        `${mergePairsApplied} pair(s) merged, ${markedSuperseded} superseded, ` +
+        `${mergePairsApplied} pair(s) merged (${mergePairsDeferred} deferred), ` +
+        `${markedSuperseded} superseded, ` +
         `${markedRetracted} retracted (${belowGate} below gate, ${mergeBelowGate} merge below gate, ` +
         `${contractFailed} contract failed), ${skippedInfra} infra-skipped, ${skippedIdempotent} ` +
-        `already-linked, ${skippedAboveCeiling} above ceiling, ${explicitVerified} explicit verified, ` +
-        `${explicitDivergent} explicit divergent (cursor ${cursor})`,
+        `already-linked, ${skippedAbsorbed} absorbed-skip, ${skippedAboveCeiling} above ceiling, ` +
+        `${explicitVerified} explicit verified, ` +
+        `${explicitDivergent} explicit divergent, scout ${scoutScanned} scanned / ` +
+        `${scoutCorrectionShaped} correction-shaped / ${scoutCandidatesFound} candidate pair(s), ` +
+        `${conflictFlagged} conflict-flagged, ${conflictSkippedJudged + merges.skipped_conflict} conflict-skipped ` +
+        `(cursor ${cursor})`,
     );
   }
 
@@ -1305,11 +1837,20 @@ export async function stageReconsolidation(
     explicit_verified: explicitVerified,
     explicit_divergent: explicitDivergent,
     cursor,
+    pairs_reevaluated: pairsReevaluated,
+    pairs_new: pairsNew,
+    skipped_absorbed: skippedAbsorbed,
+    merge_pairs_deferred: mergePairsDeferred,
     merges,
     merge_pairs_applied: mergePairsApplied,
     merge_below_gate: mergeBelowGate,
     skipped_above_ceiling: skippedAboveCeiling,
     skipped_metadata_mismatch: skippedMetadataMismatch,
+    conflict_flagged: conflictFlagged,
+    conflict_skipped: conflictSkippedJudged + merges.skipped_conflict,
+    scout_scanned: scoutScanned,
+    scout_correction_shaped: scoutCorrectionShaped,
+    scout_candidates_found: scoutCandidatesFound,
     band_stats: bandStats,
   };
 }

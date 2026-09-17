@@ -1,10 +1,12 @@
 /**
- * /dashboard — view-only memory analytics (#224).
+ * /dashboard — view-only memory analytics (#224) + the console's live-data
+ * endpoints (#409/#421 Phase 1: /dashboard/field, /dashboard/events).
  *
  * STRICTLY view-only: this module computes metrics, reads snapshots, writes
  * ONE snapshot row per full nightly run (the writer is here because the
  * metric SQL lives next to its definition, not in nightly.ts), and exposes
- * the pure data handler mounted at GET /dashboard/data. There are NO mutation
+ * the pure data handlers mounted at GET /dashboard/data,
+ * GET /dashboard/field and GET /dashboard/events. There are NO mutation
  * endpoints on the dashboard surface — the only write path is the nightly
  * snapshot writer + the one-time backfill, both internal.
  *
@@ -21,11 +23,27 @@
 
 import type express from "express";
 import type Database from "better-sqlite3";
+import { gzipSync } from "node:zlib";
 
-import { formatIndexLine } from "./recall-index.js";
+import { formatIndexLine, memoryTitle } from "./recall-index.js";
 import { readPositiveConfig, readNonNegativeConfig, readAccount } from "./config-read.js";
 import { resolveMemorySoftCap } from "./consolidate.js";
+import { readCaptureHealth, readCaptureHealthWindow, type CaptureHealthRow } from "./capture-health.js";
+import { listCapturePauses, readFleetLastSeen, setCapturePause } from "./capture-pause.js";
 import { loadState } from "./state.js";
+import { effectiveStrength } from "./retrieval.js";
+import { deriveStage, type Stage } from "./stages.js";
+import {
+  RECALL_TITLE_CHARS,
+  RECALL_MIN_SIMILARITY,
+  RECALL_USES_LOW_MAX,
+  RECALL_USES_NORMAL_MAX,
+  RECALL_USES_AXIS_MAX,
+  STAGE_FADING_DAYS,
+  STAGE_FADING_STRENGTH,
+  STAGE_BELIEF_STRENGTH,
+  STAGE_TRUTH_STRENGTH,
+} from "./calibration.js";
 
 // ---------------------------------------------------------------------------
 // Types — the JSON blob shape documented in the issue (a stable contract the
@@ -35,10 +53,29 @@ import { loadState } from "./state.js";
 /** Corpus-shape snapshot. `adoption` is null in backfilled rows (point-in-time,
  *  can't be reconstructed from created_at). */
 export interface DashboardMetrics {
-  totals: { mem: number; lesson: number; link: number };
+  /**
+   * `mem` counts ALL rows (backcompat — the growth chart's series). #422 adds
+   * `live_mem` (non-absorbed: what recall serves + the field paints) and
+   * `absorbed` (= mem − live_mem, the dedup/reconsol evidence rows). Both are
+   * undefined on backfilled rows — whether a historical row was absorbed at
+   * that moment is not reconstructable from created_at (honest omission).
+   */
+  totals: { mem: number; lesson: number; link: number; live_mem?: number; absorbed?: number };
+  /**
+   * #422 Phase 2 — per-stage counts over LIVE (non-absorbed) rows, derived
+   * with the SAME math as /dashboard/field (the shared deriveStageForRow —
+   * one formula, two surfaces, drift impossible). Undefined on backfilled
+   * rows (historical strengths are not reconstructable). Drives the
+   * graduation deltas in the activity bars.
+   */
+  stage_counts?: { forming: number; belief: number; truth: number; fading: number };
   by_type: Record<string, number>;
   by_domain: Record<string, number>;
   by_source_agent: Record<string, number>;
+  /** #421 machine × harness: memories per capture machine. Rows written
+   *  before migration v15 have NULL source_machine → grouped under
+   *  "(unstamped)" (the console labels them "earlier captures"). */
+  by_source_machine: Record<string, number>;
   /** Per-run deltas; undefined on backfilled rows (created_at can't reconstruct
    *  what a given nightly produced). */
   new_this_run?: {
@@ -106,6 +143,16 @@ export interface DashboardMetrics {
       bytes: number;
       path?: string;
     };
+    /**
+     * #427: reconsolidation scout counters, flat snake_case mirroring the
+     * stage report (scout_scanned / scout_correction_shaped /
+     * scout_candidates_found). Present whenever consolidation ran —
+     * quiet-night zeros are real values; undefined = no consolidation that
+     * night (and always absent on backfill rows).
+     */
+    scout_scanned?: number;
+    scout_correction_shaped?: number;
+    scout_candidates_found?: number;
   };
   /** Corpus capacity (#245). `memory_soft_cap` is the configured ceiling (0 =
    *  disabled); always present in real snapshots, undefined on backfilled
@@ -140,6 +187,12 @@ export interface DashboardData {
   account: { name: string | null; org: string | null; plan: string | null };
   headline: {
     total_memories: number;
+    /**
+     * #422 Phase 2 — LIVE (non-absorbed) memory count: what recall serves and
+     * the field paints. The console's overview counter and cap bar key off
+     * THIS (total_memories stays ALL rows for backcompat — the growth chart).
+     */
+    live_memories: number;
     uses_per_showing: number | null;
     cold_count: number;
     /** Corpus vs cap (#245). `memory_soft_cap` is 0 when the cap is disabled
@@ -159,12 +212,50 @@ export interface DashboardData {
       period_start: string | null;
     };
   };
-  range: "7d" | "30d" | "90d" | "all";
+  range: "7d" | "30d" | "90d" | "180d" | "all";
   series: DashboardSnapshot[];
   composition: {
     by_type: Record<string, number>;
     by_domain: Record<string, number>;
     by_source_agent: Record<string, number>;
+    /** #421 machine × harness; "(unstamped)" = pre-v15 rows. */
+    by_source_machine: Record<string, number>;
+  };
+  /**
+   * #422 Phase 2 — capture health: per machine × agent /distill outcome
+   * accounting. ALWAYS present; {day: null, rows: []} when nothing is
+   * recorded (fresh install / all rows pruned — the page degrades to the
+   * phase-1 counts-only rows).
+   *
+   * #409 fix round 7 (owner ruling 2026-09-14: "the normal 30 day as the
+   * other cards"): `day`/`rows` keep the NEWEST night with rows (secondary
+   * info — the card's "tonight" suffix), while `window_days`/`window_rows`
+   * carry the ROLLING capture window's per machine × agent sums — the card's
+   * face. Both derive from the same distill_activity rows and the same
+   * CAPTURE_HEALTH_WINDOW_DAYS constant (retention == window). window_rows
+   * is [] exactly when rows is (same table) — the counts fallback then still
+   * applies. A pre-round-7 server sends neither window key; the page guards.
+   */
+  capture_health: {
+    day: string | null;
+    rows: CaptureHealthRow[];
+    /** Echoed window length (the page renders "last N days" from it — never
+     *  hardcoded client-side). */
+    window_days: number;
+    /** Per machine × agent sums over the rolling window (posts / sessions /
+     *  bytes / held / retried), bytes DESC. */
+    window_rows: CaptureHealthRow[];
+  };
+  /**
+   * #423 phase 3 — fleet presence: the operator's capture pauses + per-bundle
+   * last-seen (derived ONLY from /distill activity — see capture-pause.ts's
+   * module doc for why recall traffic can never attribute). ALWAYS present;
+   * empty arrays when nothing is recorded (fresh install). The page degrades
+   * to the phase-2 rendering when the block is absent (pre-phase-3 server).
+   */
+  fleet: {
+    pauses: Array<{ machine: string; harness: string; paused_at: string }>;
+    last_seen: Array<{ machine: string; harness: string; last_seen: string; last_outcome: string }>;
   };
   digest: {
     date: string | null;
@@ -208,15 +299,19 @@ export interface DashboardData {
 // returns a value. No side effects, no I/O beyond the open db handle.
 // ---------------------------------------------------------------------------
 
-function countBy(db: Database.Database, col: string): Record<string, number> {
+function countBy(
+  db: Database.Database,
+  col: string,
+  nullLabel = "(unscoped)",
+): Record<string, number> {
   // Column name is from a fixed allowlist at the call site (never user input).
   const rows = db
     .prepare(
-      `SELECT COALESCE(${col}, '(unscoped)') AS k, COUNT(*) AS c
+      `SELECT COALESCE(${col}, ?) AS k, COUNT(*) AS c
          FROM memories
         GROUP BY ${col}`
     )
-    .all() as Array<{ k: string; c: number }>;
+    .all(nullLabel) as Array<{ k: string; c: number }>;
   const out: Record<string, number> = {};
   for (const r of rows) out[r.k] = r.c;
   return out;
@@ -225,11 +320,23 @@ function countBy(db: Database.Database, col: string): Record<string, number> {
 /**
  * Compute the full corpus-shape metrics from the live DB. The same function
  * backs both the nightly snapshot writer and the live /dashboard/data
- * composition view — one definition of corpus shape.
+ * composition view — one definition of corpus shape. #422 adds the
+ * live/absorbed split (`totals.live_mem`/`absorbed`) and `stage_counts` —
+ * both derived here so every snapshot row carries them automatically.
  */
 export function computeDashboardMetrics(db: Database.Database): DashboardMetrics {
   const mem = (
     db.prepare("SELECT COUNT(*) AS c FROM memories").get() as { c: number }
+  ).c;
+  // LIVE = non-absorbed (the same predicate as /dashboard/field and the cap
+  // eviction stage — #317's one-definition discipline). Absorbed rows are
+  // retained evidence, invisible to recall; they must not read as "memories
+  // the brain has" in the console's headline (the field paints live only, so
+  // the band number and the field must agree).
+  const liveMem = (
+    db
+      .prepare("SELECT COUNT(*) AS c FROM memories WHERE COALESCE(status, '') != 'absorbed'")
+      .get() as { c: number }
   ).c;
   const lesson = (
     db
@@ -252,10 +359,12 @@ export function computeDashboardMetrics(db: Database.Database): DashboardMetrics
     .get() as { shown: number; uses: number; cold: number };
 
   return {
-    totals: { mem, lesson, link },
+    totals: { mem, lesson, link, live_mem: liveMem, absorbed: mem - liveMem },
+    stage_counts: computeStageCounts(db),
     by_type: countBy(db, "memory_type"),
     by_domain: countBy(db, "domain"),
     by_source_agent: countBy(db, "source_agent"),
+    by_source_machine: countBy(db, "source_machine", "(unstamped)"),
     adoption: {
       shown_sum: adoptionRow.shown,
       used_sum: adoptionRow.uses,
@@ -267,6 +376,71 @@ export function computeDashboardMetrics(db: Database.Database): DashboardMetrics
           : null,
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Stage derivation — ONE formula shared by /dashboard/field (per-memory
+// stage on the wire) and the snapshot stage_counts (#422). Extracted so the
+// two surfaces cannot drift; both feed deriveStage from calibration-tier
+// constants via the same effectiveStrength + recency rule.
+// ---------------------------------------------------------------------------
+
+/** The decay-relevant columns every stage derivation reads. */
+interface StageRow {
+  id: string;
+  base_strength: number | null;
+  last_accessed: string | null;
+  created_at: string;
+}
+
+/**
+ * Derive one memory's {strength, stage} — the exact math of the field
+ * payload: effectiveStrength (importance = base) rounded to the 1e-6 wire
+ * format, then the recency gate (days since
+ * last_accessed, falling back to created_at; unparseable → null, the gate is
+ * skipped rather than guessing "very old") and the calibrated strength bands.
+ */
+function deriveStageForRow(
+  row: StageRow,
+  now: Date,
+  nowDay: number,
+): { strength: number; stage: Stage } {
+  const base = row.base_strength ?? 0.5;
+  const effStr = effectiveStrength(base, row.last_accessed, now, {
+    importance: base,
+  });
+  const strength = Math.round(effStr * 1e6) / 1e6;
+  const refDay = utcDayNumber(row.last_accessed) ?? utcDayNumber(row.created_at);
+  const daysSince = refDay === null ? null : nowDay - refDay;
+  return { strength, stage: deriveStage(strength, daysSince) };
+}
+
+/**
+ * Count LIVE (non-absorbed) memories per derived stage — the snapshot's
+ * `stage_counts` (#422 Phase 2). Same math as the field payload via the
+ * shared deriveStageForRow; absorbed rows are excluded exactly like the
+ * field paints them (invisible evidence is not a maturity stage).
+ */
+export function computeStageCounts(db: Database.Database): {
+  forming: number;
+  belief: number;
+  truth: number;
+  fading: number;
+} {
+  const now = new Date();
+  const nowDay = Math.floor(now.getTime() / 86_400_000);
+  const rows = db
+    .prepare(
+      `SELECT id, base_strength, last_accessed, created_at
+         FROM memories
+        WHERE COALESCE(status, '') != 'absorbed'`,
+    )
+    .all() as StageRow[];
+  const counts = { forming: 0, belief: 0, truth: 0, fading: 0 };
+  for (const r of rows) {
+    counts[deriveStageForRow(r, now, nowDay).stage]++;
+  }
+  return counts;
 }
 
 // ---------------------------------------------------------------------------
@@ -334,6 +508,15 @@ export interface NightlyDelta {
   backupPath?: string;
   backupBytes?: number;
   backupOk?: boolean;
+  /**
+   * #427: reconsolidation scout counters. Forwarded whenever consolidation
+   * ran (the stage's quiet-night shape carries real zeros — the scan doesn't
+   * run on a quiet night); undefined when consolidation didn't run at all.
+   * Stamped flat snake_case, mirroring the stage report.
+   */
+  scoutScanned?: number;
+  scoutCorrectionShaped?: number;
+  scoutCandidatesFound?: number;
 }
 
 /**
@@ -412,6 +595,16 @@ export function writeSnapshot(
             ...(delta.backupPath ? { path: delta.backupPath } : {}),
           },
         }
+      : {}),
+    // #427: scout counters — flat snake_case mirroring the stage report,
+    // forwarded whenever consolidation ran (zeros are real quiet-night
+    // values). Backfill rows never reach this writer with them set.
+    ...(delta.scoutScanned !== undefined ? { scout_scanned: delta.scoutScanned } : {}),
+    ...(delta.scoutCorrectionShaped !== undefined
+      ? { scout_correction_shaped: delta.scoutCorrectionShaped }
+      : {}),
+    ...(delta.scoutCandidatesFound !== undefined
+      ? { scout_candidates_found: delta.scoutCandidatesFound }
       : {}),
   };
   if (memorySoftCap !== undefined) {
@@ -556,6 +749,9 @@ export function backfillSnapshots(db: Database.Database): number {
         by_type: { ...byType },
         by_domain: { ...byDomain },
         by_source_agent: { ...byAgent },
+        // Backfilled history predates stamping by construction — every
+        // synthesized row is honestly "(unstamped)" (#421).
+        by_source_machine: { "(unstamped)": mem },
         // new_this_run on a backfill row = the deltas DERIVED for that day
         // (added/lesson/dedup/supersession); lessonsGenerated is undefined
         // (it's a stage-outcome, not a row count — can't be reconstructed).
@@ -580,7 +776,7 @@ export function backfillSnapshots(db: Database.Database): number {
 // the current corpus shape), and builds the digest for the selected day.
 // ---------------------------------------------------------------------------
 
-const VALID_RANGES = new Set(["7d", "30d", "90d", "all"]);
+const VALID_RANGES = new Set(["7d", "30d", "90d", "180d", "all"]);
 const DEFAULT_RANGE = "30d";
 const DEFAULT_DIGEST_LIMIT = 10;
 
@@ -647,7 +843,7 @@ export function handleDashboardData(
 ): { status: number; body: DashboardData } {
   const rangeParam =
     typeof query.range === "string" && VALID_RANGES.has(query.range)
-      ? (query.range as "7d" | "30d" | "90d" | "all")
+      ? (query.range as "7d" | "30d" | "90d" | "180d" | "all")
       : DEFAULT_RANGE;
   const digestLimit = readPositiveConfig(
     config ?? {},
@@ -689,6 +885,10 @@ export function handleDashboardData(
   const tokenState = loadState().llmTokensThisPeriod;
   const headline = {
     total_memories: live.totals.mem,
+    // #422: the field paints live rows only, so the band number must too —
+    // this closes the "console says 574 more than the field shows" gap.
+    // `?? mem` is type-narrowing only (computeDashboardMetrics always sets it).
+    live_memories: live.totals.live_mem ?? live.totals.mem,
     uses_per_showing: live.adoption?.uses_per_showing ?? null,
     cold_count: live.adoption?.cold_count ?? 0,
     memory_soft_cap: resolveMemorySoftCap(config?.memorySoftCap),
@@ -840,6 +1040,14 @@ export function handleDashboardData(
         by_type: live.by_type,
         by_domain: live.by_domain,
         by_source_agent: live.by_source_agent,
+        by_source_machine: live.by_source_machine,
+      },
+      capture_health: { ...readCaptureHealth(db), ...readCaptureHealthWindow(db) },
+      // #423 phase 3: pauses + presence in one block — one source of truth
+      // for the rail's dots, toggles and the capture card's PAUSED badges.
+      fleet: {
+        pauses: listCapturePauses(db),
+        last_seen: readFleetLastSeen(db),
       },
       digest,
     },
@@ -916,6 +1124,841 @@ export function accountTokenHandler(
         return;
       }
       res.status(200).json({ token });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /dashboard/field — the console flight-field payload (#409/#421 Phase 1).
+//
+// The whole LIVE store as minimal fields (no content bodies — titles are the
+// same ≤100-char de-markdowned first line the recall index shows, via the
+// IMPORTED memoryTitle) plus every link edge as {a, b, rel}. Derived stage
+// rides every memory: the E-reframe holds — stages are presentation computed
+// here from effectiveStrength + recency, never stored state.
+//
+// HIDDEN rows are excluded with the store's own predicate: dedup/reconsol
+// losers carry status 'absorbed' (retained as evidence, invisible to recall —
+// no vector, no FTS row). Superseded/retracted/corrected rows stay in: they
+// are demoted, not hidden, and the field should show the whole living graph.
+// ---------------------------------------------------------------------------
+
+/** One memory in the field payload — minimal fields, no content body. */
+export interface DashboardFieldMemory {
+  id: string;
+  /** First content line, de-markdowned, ≤ RECALL_TITLE_CHARS (memoryTitle). */
+  title: string;
+  /** Derived primary domain (argmax tag weight); null = unscoped. */
+  domain: string | null;
+  /** Derived maturity stage (E-reframe: presentation, never stored). */
+  stage: Stage;
+  /** effectiveStrength rounded to 1e-6, same as retrieval's wire format. */
+  strength: number;
+  access_count: number;
+  created_at: string;
+  source_agent: string | null;
+  /** Machine the capture ran on (#421 machine × harness). Null on rows
+   *  written before migration v15 — the console groups those under
+   *  "earlier captures". */
+  source_machine: string | null;
+}
+
+/** One link edge — endpoints + relationship only (strength stays off-wire). */
+export interface DashboardFieldLink {
+  a: string;
+  b: string;
+  rel: string;
+}
+
+/** The /dashboard/field response. */
+export interface DashboardField {
+  generated_at: string;
+  /** The thresholds the stages were derived with, echoed so the page paints
+   *  from the same constants the server scored with (calibration.ts is the
+   *  single home — the echo is display, not a second source). Recall grades
+   *  are GONE (#426 owner semantics ruling 2026-09-13: recall depends on the
+   *  conversation, a graded scale implies a target that does not exist). */
+  thresholds: {
+    stage: { fading_days: number; fading_strength: number; belief: number; truth: number };
+    /** The recall relevance floor (RECALL_MIN_SIMILARITY) — echoed so the
+     *  console gates its /search calls with the same constant the server's
+     *  own recall gates with (#409 console polish; the echo is display, not
+     *  a second source — same rule as the stage bands). Absent nothing: the
+     *  key always rides the payload; a pre-polish page ignores it. */
+    recall_min_similarity: number;
+    /** #426 final ruling 2026-09-13: the console's recall-level band edges
+     *  (RECALL_USES_* — PROVISIONAL, owner anchor 2026-09-13, pending fleet
+     *  telemetry). Same echo rule as recall_min_similarity: calibration.ts is
+     *  the single home, the page never hardcodes the edges, and a page older
+     *  than this key simply ignores it (no band). These classify the console
+     *  card's zone word and position the gradient; per-memory recall grades
+     *  remain GONE from the field payload (the earlier #426 ruling — a
+     *  memory's recall fitness is conversation-dependent). */
+    recall_uses: {
+      /** Below this reads Low. */
+      low_max: number;
+      /** Below this (and ≥ low_max) reads Normal; at/above reads Overfetching. */
+      normal_max: number;
+      /** Display-axis maximum (marker clamps here). */
+      axis_max: number;
+    };
+  };
+  memories: DashboardFieldMemory[];
+  links: DashboardFieldLink[];
+}
+
+/** UTC day number (days since epoch) for an ISO timestamp; null when the
+ *  string does not parse — the night-resolution clock for stage recency. */
+function utcDayNumber(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? Math.floor(t / 86_400_000) : null;
+}
+
+/**
+ * The pure data handler for GET /dashboard/field. Reads the whole live store
+ * (minus absorbed rows) + all link edges, derives stage + effective strength
+ * per memory, and returns the field payload. Never throws on empty stores —
+ * an empty brain is a valid field.
+ */
+export function handleDashboardField(
+  db: Database.Database,
+): { status: number; body: DashboardField } {
+  const now = new Date();
+  const nowDay = Math.floor(now.getTime() / 86_400_000);
+
+  const rows = db
+    .prepare(
+      `SELECT id, content, base_strength, last_accessed, access_count,
+              created_at, domain, source_agent, source_machine
+         FROM memories
+        WHERE COALESCE(status, '') != 'absorbed'
+        ORDER BY created_at ASC, id ASC`,
+    )
+    .all() as Array<{
+    id: string;
+    content: string;
+    base_strength: number | null;
+    last_accessed: string | null;
+    access_count: number | null;
+    created_at: string;
+    domain: string | null;
+    source_agent: string | null;
+    source_machine: string | null;
+  }>;
+
+  const memories: DashboardFieldMemory[] = rows.map((r) => {
+    // Shared per-row derivation — the SAME math the snapshot stage_counts
+    // uses (deriveStageForRow); the field only adds its wire fields.
+    const { strength, stage } = deriveStageForRow(r, now, nowDay);
+    return {
+      id: r.id,
+      title: memoryTitle(r.content, RECALL_TITLE_CHARS),
+      domain: r.domain,
+      stage,
+      strength,
+      access_count: r.access_count ?? 0,
+      created_at: r.created_at,
+      source_agent: r.source_agent,
+      source_machine: r.source_machine ?? null,
+    };
+  });
+
+  const linkRows = db
+    .prepare(
+      "SELECT source_id, target_id, relationship FROM memory_links ORDER BY created_at ASC",
+    )
+    .all() as Array<{ source_id: string; target_id: string; relationship: string }>;
+
+  return {
+    status: 200,
+    body: {
+      generated_at: now.toISOString(),
+      // #426 owner semantics ruling 2026-09-13: recall grades are REMOVED —
+      // recall depends on the conversation, higher is not a target. Only the
+      // stage thresholds ride the echo (calibrated 2026-09-13), plus the two
+      // #409/#426 display keys: the search floor and the recall-level band
+      // edges (PROVISIONAL — see calibration.ts).
+      thresholds: {
+        stage: {
+          fading_days: STAGE_FADING_DAYS,
+          fading_strength: STAGE_FADING_STRENGTH,
+          belief: STAGE_BELIEF_STRENGTH,
+          truth: STAGE_TRUTH_STRENGTH,
+        },
+        recall_min_similarity: RECALL_MIN_SIMILARITY,
+        recall_uses: {
+          low_max: RECALL_USES_LOW_MAX,
+          normal_max: RECALL_USES_NORMAL_MAX,
+          axis_max: RECALL_USES_AXIS_MAX,
+        },
+      },
+      memories,
+      links: linkRows.map((l) => ({ a: l.source_id, b: l.target_id, rel: l.relationship })),
+    },
+  };
+}
+
+/** True when the request genuinely accepts a gzip response (quality-aware —
+ *  `gzip;q=0` negotiates to no). Uses the framework's content negotiation
+ *  rather than substring-matching the header (#424 review). */
+function acceptsGzip(req: express.Request): boolean {
+  return req.acceptsEncodings("gzip") === "gzip";
+}
+
+/**
+ * Express adapter for GET /dashboard/field. Bearer-only by construction
+ * (mounted after createAuthMiddleware — no exemption). Gzips the payload
+ * when the client advertises Accept-Encoding: gzip: the field is one row per
+ * memory on possibly very large stores, so the wire cost is the point
+ * (minimal fields + compression, per the #409 payload-size risk note).
+ * Failures surface as a 500 {error} like the sibling adapters.
+ */
+export function dashboardFieldHandler(
+  getDb: () => Database.Database,
+): express.RequestHandler {
+  return (req, res) => {
+    try {
+      const { status, body } = handleDashboardField(getDb());
+      if (status !== 200) {
+        res.status(status).json(body);
+        return;
+      }
+      if (acceptsGzip(req)) {
+        const buf = gzipSync(JSON.stringify(body));
+        res
+          .set({
+            "Content-Type": "application/json",
+            "Content-Encoding": "gzip",
+            "Vary": "Accept-Encoding",
+          })
+          .status(status)
+          .send(buf);
+        return;
+      }
+      res.status(status).json(body);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// /dashboard/events — the console's night-resolution event ledger
+// (#409/#421 Phase 1; truth-management sources #452).
+//
+// A SYNTHESIS query over existing tables (no event-sourcing store, no schema
+// change): added from memories.created_at (absorbed rows INCLUDED — the
+// replay needs their birth AND their merge-out), enriched from
+// memory_history.created_at (distinct memory per night, EXCLUDING
+// reconsolidation rewrites — those render as `rewritten`, one caption
+// instead of "Enriched"+"Rewritten"), merged from dedup_log.merged_at,
+// linked from memory_links.created_at, superseded from
+// memory_links.created_at WHERE relationship='superseded_by' (the link ALSO
+// rings `linked` — supersession is still a connection), retracted from
+// corrected_by links whose SOURCE's current status is 'retracted' (INNER
+// JOIN so the current-status filter applies — rewrite-path corrected_by
+// links leave status 'corrected' and are NOT retractions; marks write no
+// memory_history row), rewritten from memory_history WHERE
+// cause='reconsolidation'. Only nights with ≥1 event are returned (the
+// scrub spaces by date; empty nights would render nothing). Every count
+// reconciles with its source table by construction — a night's `merged`
+// length equals the dedup_log rows for that UTC day, `superseded` the
+// superseded_by link rows, `retracted` the status-filtered corrected_by
+// rows, `rewritten` the distinct reconsolidation-rewritten memories.
+// ---------------------------------------------------------------------------
+
+/** One night of the replay ledger. `by_agent` keys are source_agent strings
+ *  ("(unknown)" when the memory row is gone); learned counts added, enriched
+ *  counts distinct enriched memories, merged counts dedup losers, and the
+ *  #452 truth-management keys count superseded/retracted sources and
+ *  reconsolidation rewrites (agent = the OLD memory's source — the event
+ *  belongs to the memory that was demoted). */
+export interface DashboardEventsNight {
+  date: string;
+  added: string[];
+  enriched: string[];
+  merged: Array<{ loser: string; canonical: string }>;
+  linked: Array<{ a: string; b: string }>;
+  /** #452 — superseded_by links born that night ({old, by} ids). */
+  superseded: Array<{ old: string; by: string }>;
+  /** #452 — corrected_by links whose source is currently status='retracted'. */
+  retracted: Array<{ old: string; by: string }>;
+  /** #452 — distinct memories reconsolidation rewrote that night. */
+  rewritten: string[];
+  by_agent: Record<
+    string,
+    {
+      learned: number;
+      enriched: number;
+      merged: number;
+      superseded: number;
+      retracted: number;
+      rewritten: number;
+    }
+  >;
+}
+
+/** The /dashboard/events response. */
+export interface DashboardEvents {
+  nights: DashboardEventsNight[];
+}
+
+// #452 (owner directive 2026-09-16): the default window is 30 days for ALL
+// views — longer ranges are opt-in via the page's selector. MAX stays 365:
+// it is the generic API cap and an explicit ?days= is honored up to it.
+const EVENTS_DEFAULT_DAYS = 30;
+const EVENTS_MAX_DAYS = 365;
+
+/** Parse the ?days= param: integer 1..365, default 30. Returns null when the
+ *  value is present but invalid (→ 400); undefined when absent (→ default). */
+function parseEventsDays(raw: unknown): number | null | undefined {
+  if (raw === undefined) return undefined;
+  const first = Array.isArray(raw) ? raw[0] : raw;
+  const n = typeof first === "number" ? first : Number(first);
+  if (!Number.isInteger(n) || n < 1 || n > EVENTS_MAX_DAYS) return null;
+  return n;
+}
+
+/**
+ * The pure data handler for GET /dashboard/events?days=N. Buckets the event
+ * sources into UTC nights (only nights with events, ascending) within the
+ * last `days` calendar days (today inclusive).
+ */
+export function handleDashboardEvents(
+  db: Database.Database,
+  query: { days?: unknown },
+): { status: number; body: DashboardEvents | { error: string } } {
+  const parsed = parseEventsDays(query.days);
+  if (parsed === null) {
+    return {
+      status: 400,
+      body: { error: `Invalid 'days' — expected an integer between 1 and ${EVENTS_MAX_DAYS}` },
+    };
+  }
+  const days = parsed ?? EVENTS_DEFAULT_DAYS;
+
+  // Calendar-day window: today's UTC day back through (days - 1) days ago.
+  const todayDay = Math.floor(Date.now() / 86_400_000);
+  const cutoffDay = todayDay - (days - 1);
+  const cutoffIso = new Date(cutoffDay * 86_400_000).toISOString();
+
+  const nights = new Map<string, DashboardEventsNight>();
+  const inWindow = (iso: string | null): string | null => {
+    const d = utcDayNumber(iso);
+    if (d === null || d < cutoffDay || d > todayDay) return null;
+    return new Date(d * 86_400_000).toISOString().slice(0, 10);
+  };
+  const nightFor = (date: string): DashboardEventsNight => {
+    let n = nights.get(date);
+    if (!n) {
+      n = {
+        date,
+        added: [],
+        enriched: [],
+        merged: [],
+        linked: [],
+        superseded: [],
+        retracted: [],
+        rewritten: [],
+        by_agent: {},
+      };
+      nights.set(date, n);
+    }
+    return n;
+  };
+  const bumpAgent = (
+    n: DashboardEventsNight,
+    agent: string | null,
+    key: "learned" | "enriched" | "merged" | "superseded" | "retracted" | "rewritten",
+  ): void => {
+    const k = agent ?? "(unknown)";
+    const rec =
+      n.by_agent[k] ?? {
+        learned: 0,
+        enriched: 0,
+        merged: 0,
+        superseded: 0,
+        retracted: 0,
+        rewritten: 0,
+      };
+    rec[key] += 1;
+    n.by_agent[k] = rec;
+  };
+
+  // added — every memory row born in the window (absorbed included: the
+  // replay needs the birth of rows a later merge folds away).
+  const addedRows = db
+    .prepare("SELECT id, source_agent, created_at FROM memories WHERE created_at >= ?")
+    .all(cutoffIso) as Array<{ id: string; source_agent: string | null; created_at: string }>;
+  for (const r of addedRows) {
+    const date = inWindow(r.created_at);
+    if (date === null) continue;
+    const n = nightFor(date);
+    n.added.push(r.id);
+    bumpAgent(n, r.source_agent, "learned");
+  }
+
+  // enriched — memory_history rows, DISTINCT memory per night (one rewrite of
+  // the same memory on a night is one enrichment). LEFT JOIN: the memory row
+  // can be gone (hard-deleted legacy losers); those count under "(unknown)".
+  // #452: reconsolidation rewrites are EXCLUDED — they render as `rewritten`
+  // below, so one rewrite is one caption, never "Enriched"+"Rewritten".
+  const enrichRows = db
+    .prepare(
+      `SELECT h.memory_id, h.created_at, m.source_agent AS agent
+         FROM memory_history h LEFT JOIN memories m ON m.id = h.memory_id
+        WHERE h.created_at >= ? AND h.cause <> 'reconsolidation'`,
+    )
+    .all(cutoffIso) as Array<{ memory_id: string; created_at: string; agent: string | null }>;
+  const enrichedSeen = new Set<string>(); // `${date}|${memory_id}` dedup
+  for (const r of enrichRows) {
+    const date = inWindow(r.created_at);
+    if (date === null) continue;
+    const key = `${date}|${r.memory_id}`;
+    if (enrichedSeen.has(key)) continue;
+    enrichedSeen.add(key);
+    const n = nightFor(date);
+    n.enriched.push(r.memory_id);
+    bumpAgent(n, r.agent, "enriched");
+  }
+
+  // merged — dedup_log rows; agent = the LOSER's source_agent (the merge
+  // event belongs to the memory that went away).
+  const mergedRows = db
+    .prepare(
+      `SELECT d.loser_id, d.canonical_id, d.merged_at, m.source_agent AS agent
+         FROM dedup_log d LEFT JOIN memories m ON m.id = d.loser_id
+        WHERE d.merged_at >= ?`,
+    )
+    .all(cutoffIso) as Array<{
+    loser_id: string;
+    canonical_id: string;
+    merged_at: string;
+    agent: string | null;
+  }>;
+  for (const r of mergedRows) {
+    const date = inWindow(r.merged_at);
+    if (date === null) continue;
+    const n = nightFor(date);
+    n.merged.push({ loser: r.loser_id, canonical: r.canonical_id });
+    bumpAgent(n, r.agent, "merged");
+  }
+
+  // linked — memory_links rows born in the window.
+  const linkedRows = db
+    .prepare("SELECT source_id, target_id, created_at FROM memory_links WHERE created_at >= ?")
+    .all(cutoffIso) as Array<{ source_id: string; target_id: string; created_at: string }>;
+  for (const r of linkedRows) {
+    const date = inWindow(r.created_at);
+    if (date === null) continue;
+    nightFor(date).linked.push({ a: r.source_id, b: r.target_id });
+  }
+
+  // superseded (#452) — superseded_by links born in the window; agent = the
+  // OLD memory's source (the event belongs to the demoted claim). The link
+  // ALSO stays in `linked` above — supersession is still a connection, the
+  // ring is unchanged.
+  const supersededRows = db
+    .prepare(
+      `SELECT l.source_id, l.target_id, l.created_at, m.source_agent AS agent
+         FROM memory_links l LEFT JOIN memories m ON m.id = l.source_id
+        WHERE l.relationship = 'superseded_by' AND l.created_at >= ?`,
+    )
+    .all(cutoffIso) as Array<{
+    source_id: string;
+    target_id: string;
+    created_at: string;
+    agent: string | null;
+  }>;
+  for (const r of supersededRows) {
+    const date = inWindow(r.created_at);
+    if (date === null) continue;
+    const n = nightFor(date);
+    n.superseded.push({ old: r.source_id, by: r.target_id });
+    bumpAgent(n, r.agent, "superseded");
+  }
+
+  // retracted (#452) — corrected_by links whose SOURCE's CURRENT status is
+  // 'retracted'. INNER JOIN so the status filter applies: rewrite-path
+  // corrected_by links leave status 'corrected' (or NULL on legacy rows) and
+  // are NOT retractions. Marks write no memory_history row (grounding: the
+  // only two INSERT sites are the reconsolidation rewrite + rollback), so
+  // the link + current status IS the retraction record. Dedup per
+  // (date, source_id) — the enriched pattern — in case a pair's link row was
+  // re-created on the same night.
+  const retractedRows = db
+    .prepare(
+      `SELECT l.source_id, l.target_id, l.created_at, m.source_agent AS agent
+         FROM memory_links l JOIN memories m ON m.id = l.source_id
+        WHERE l.relationship = 'corrected_by' AND m.status = 'retracted' AND l.created_at >= ?`,
+    )
+    .all(cutoffIso) as Array<{
+    source_id: string;
+    target_id: string;
+    created_at: string;
+    agent: string | null;
+  }>;
+  const retractedSeen = new Set<string>(); // `${date}|${source_id}` dedup
+  for (const r of retractedRows) {
+    const date = inWindow(r.created_at);
+    if (date === null) continue;
+    const key = `${date}|${r.source_id}`;
+    if (retractedSeen.has(key)) continue;
+    retractedSeen.add(key);
+    const n = nightFor(date);
+    n.retracted.push({ old: r.source_id, by: r.target_id });
+    bumpAgent(n, r.agent, "retracted");
+  }
+
+  // rewritten (#452) — memory_history rows from the reconsolidation rewrite
+  // (cause='reconsolidation'; rollback rows keep their own cause and stay
+  // enriched-shaped). DISTINCT memory per night, the enriched pattern.
+  const rewrittenRows = db
+    .prepare(
+      `SELECT h.memory_id, h.created_at, m.source_agent AS agent
+         FROM memory_history h LEFT JOIN memories m ON m.id = h.memory_id
+        WHERE h.cause = 'reconsolidation' AND h.created_at >= ?`,
+    )
+    .all(cutoffIso) as Array<{ memory_id: string; created_at: string; agent: string | null }>;
+  const rewrittenSeen = new Set<string>(); // `${date}|${memory_id}` dedup
+  for (const r of rewrittenRows) {
+    const date = inWindow(r.created_at);
+    if (date === null) continue;
+    const key = `${date}|${r.memory_id}`;
+    if (rewrittenSeen.has(key)) continue;
+    rewrittenSeen.add(key);
+    const n = nightFor(date);
+    n.rewritten.push(r.memory_id);
+    bumpAgent(n, r.agent, "rewritten");
+  }
+
+  const sorted = Array.from(nights.values())
+    .filter(
+      (n) =>
+        n.added.length +
+          n.enriched.length +
+          n.merged.length +
+          n.linked.length +
+          n.superseded.length +
+          n.retracted.length +
+          n.rewritten.length >
+        0,
+    )
+    .sort((x, y) => (x.date < y.date ? -1 : x.date > y.date ? 1 : 0));
+
+  return { status: 200, body: { nights: sorted } };
+}
+
+/**
+ * Express adapter for GET /dashboard/events. Bearer-only by construction
+ * (mounted after createAuthMiddleware — no exemption). The ledger is ids
+ * only (no titles), so it stays plain JSON — gzip is the /field adapter's
+ * concern. Failures surface as a 500 {error} like the sibling adapters.
+ */
+export function dashboardEventsHandler(
+  getDb: () => Database.Database,
+): express.RequestHandler {
+  return (req, res) => {
+    try {
+      const { status, body } = handleDashboardEvents(getDb(), req.query as Record<string, unknown>);
+      res.status(status).json(body);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GET/PUT /dashboard/model — the console's model-settings surface (#422
+// Phase 2).
+//
+// The dashboard stays view-only EXCEPT this one scoped writer: model knobs are
+// the install's operational identity, the console is where the operator looks
+// at them, and the alternative (hand-editing config.json over SSH) is exactly
+// the failure mode the strict loader exists for. The surface is deliberately
+// NARROW — an allowlisted subset of the llm*/maxTokens/enableThinking keys,
+// validated per-key, persisted through init.ts persistConfigUpdates (strict
+// load; a malformed config throws and the file is never overwritten).
+//
+// SECURITY: no key material on the wire, ever. GET reports only `api_key_set`
+// (a boolean); PUT accepts a NEW key (write-only). The GET/PUT handlers are
+// pure; the express adapters follow the dashboardDataHandler convention.
+// ---------------------------------------------------------------------------
+
+/** The GET /dashboard/model + PUT-success response shape (snake_case wire). */
+export interface DashboardModelSettings {
+  /** Boot-resolved runtime provider label (e.g. "ollama", "claude-cli",
+   *  "openai" for the openai-compat path); null when the daemon runs no LLM.
+   *  Runtime truth, not config — the card's model line comes from
+   *  /health/detail, this carries only the provider. */
+  provider: string | null;
+  /** config llmBackend — null when unset (baseUrl+apiKey = openai-compat). */
+  backend: string | null;
+  /** config llmBaseUrl — null when unset (defaults are the UI's placeholders,
+   *  never resolved here). */
+  base_url: string | null;
+  /** config llmModel — null when unset. */
+  model: string | null;
+  /** config maxTokens — null when unset. */
+  max_tokens: number | null;
+  /** config enableThinking — null when unset. */
+  enable_thinking: boolean | null;
+  /** Whether llmApiKey is set. The VALUE is never on the wire. */
+  api_key_set: boolean;
+  /** Constant true — the daemon resolves config at boot, so every write
+   *  lands on restart. The modal footnotes it. */
+  applies_on_restart: true;
+}
+
+/** A config value echoed as a non-blank string, else null. */
+function configString(v: unknown): string | null {
+  return typeof v === "string" && v.trim().length > 0 ? v : null;
+}
+
+/**
+ * The pure GET handler: echo the CONFIG values raw (null when unset — the UI
+ * shows defaults as placeholders, so this never resolves them) + the runtime
+ * provider from the daemon's in-memory llmConfig.
+ */
+export function handleDashboardModelGet(
+  config: Record<string, unknown> | null | undefined,
+  llmConfig: { provider: string } | null,
+): { status: 200; body: DashboardModelSettings } {
+  const cfg = config ?? {};
+  return {
+    status: 200,
+    body: {
+      provider: llmConfig?.provider ?? null,
+      backend: configString(cfg.llmBackend),
+      base_url: configString(cfg.llmBaseUrl),
+      model: configString(cfg.llmModel),
+      max_tokens: typeof cfg.maxTokens === "number" && Number.isFinite(cfg.maxTokens)
+        ? cfg.maxTokens
+        : null,
+      enable_thinking: typeof cfg.enableThinking === "boolean" ? cfg.enableThinking : null,
+      api_key_set: Boolean(configString(cfg.llmApiKey)),
+      applies_on_restart: true,
+    },
+  };
+}
+
+/** The PUT's allowlisted body keys → the config keys they write. */
+const MODEL_PUT_KEYS: Record<string, string> = {
+  backend: "llmBackend",
+  base_url: "llmBaseUrl",
+  model: "llmModel",
+  api_key: "llmApiKey",
+  max_tokens: "maxTokens",
+  enable_thinking: "enableThinking",
+};
+
+/** The backends init ever writes (absence of llmBackend + baseUrl+apiKey =
+ *  the openai-compat path). "" clears (the modal's "auto" option). */
+const MODEL_BACKEND_VALUES = new Set(["", "ollama", "claude-cli"]);
+
+/**
+ * The pure PUT handler: validate the allowlisted subset, persist via the
+ * injected writer (which THROWS on a malformed config — the adapter maps that
+ * to a 500 and the file stays untouched), answer with the fresh GET shape
+ * built from the post-write config. `null` REMOVES a config key.
+ */
+export function handleDashboardModelPut(
+  body: unknown,
+  persist: (updates: Record<string, unknown>) => Record<string, unknown>,
+  getLlmConfig: () => { provider: string } | null,
+): { status: number; body: DashboardModelSettings | { error: string } } {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "Body must be a JSON object of model settings" } };
+  }
+  const input = body as Record<string, unknown>;
+
+  const updates: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    const configKey = MODEL_PUT_KEYS[key];
+    if (!configKey) {
+      return {
+        status: 400,
+        body: {
+          error: `Unknown key '${key}' — allowed: ${Object.keys(MODEL_PUT_KEYS).join(", ")}`,
+        },
+      };
+    }
+    // Per-key validation → a SPECIFIC message (the modal surfaces it in the
+    // toast). null is valid everywhere (the clear).
+    if (value === null) {
+      updates[configKey] = null;
+      continue;
+    }
+    switch (key) {
+      case "backend":
+        if (typeof value !== "string" || !MODEL_BACKEND_VALUES.has(value)) {
+          return {
+            status: 400,
+            body: { error: `Invalid 'backend' — expected null, "", "ollama" or "claude-cli" (absent + base_url + api_key = OpenAI-compatible)` },
+          };
+        }
+        // "" (the modal's "auto / OpenAI-compatible" option) means NO named
+        // backend — normalize to the clear so config.json never carries a
+        // vestigial "" key (absence IS the openai-compat path).
+        if (value === "") {
+          updates[configKey] = null;
+          continue;
+        }
+        break;
+      case "base_url": {
+        if (typeof value !== "string") {
+          return { status: 400, body: { error: "Invalid 'base_url' — expected null or an http(s) URL string" } };
+        }
+        let url: URL;
+        try {
+          url = new URL(value);
+        } catch {
+          return { status: 400, body: { error: `Invalid 'base_url' — "${value}" does not parse as a URL` } };
+        }
+        if (url.protocol !== "http:" && url.protocol !== "https:") {
+          return { status: 400, body: { error: `Invalid 'base_url' — protocol must be http(s), got "${url.protocol}"` } };
+        }
+        break;
+      }
+      case "model":
+        if (typeof value !== "string" || value.trim().length === 0) {
+          return { status: 400, body: { error: "Invalid 'model' — expected null or a non-empty string" } };
+        }
+        break;
+      case "api_key":
+        // Empty string is a 400, NOT a clear — the classic "pasted nothing"
+        // typo guard. Clearing the key entirely is null (deliberate).
+        if (typeof value !== "string" || value.length === 0) {
+          return { status: 400, body: { error: "Invalid 'api_key' — expected null (clear) or a non-empty string" } };
+        }
+        break;
+      case "max_tokens":
+        // Strict integer ≥ 1 — floats and numeric strings are rejected so the
+        // config never carries a value the runtime would have to re-coerce.
+        if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+          return { status: 400, body: { error: "Invalid 'max_tokens' — expected null or an integer ≥ 1" } };
+        }
+        break;
+      case "enable_thinking":
+        // Strict boolean — "false" (string) is the JSON-encoder artifact this
+        // catches; null clears back to the default.
+        if (typeof value !== "boolean") {
+          return { status: 400, body: { error: "Invalid 'enable_thinking' — expected null or a boolean" } };
+        }
+        break;
+    }
+    updates[configKey] = value;
+  }
+
+  // persist THROWS on a malformed config (strict load) — propagated to the
+  // adapter → 500, file untouched. On success it returns the fresh config.
+  const fresh = persist(updates);
+  return handleDashboardModelGet(fresh, getLlmConfig());
+}
+
+/**
+ * Express adapter for GET /dashboard/model. Bearer-only by construction
+ * (mounted after createAuthMiddleware — NO exemption, unlike the page shells:
+ * this carries install config). Failures surface as a 500 {error}.
+ */
+export function dashboardModelGetHandler(
+  getConfig: () => Record<string, unknown> | null | undefined,
+  getLlmConfig: () => { provider: string } | null,
+): express.RequestHandler {
+  return (_req, res) => {
+    try {
+      const { status, body } = handleDashboardModelGet(getConfig(), getLlmConfig());
+      res.status(status).json(body);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+/**
+ * Express adapter for PUT /dashboard/model. Same auth posture as the GET.
+ * The injected persist closure owns the config path (the server passes
+ * init.ts persistConfigUpdates over stateDir/config.json); its load/persist
+ * failures (malformed config, unwritable file) map to a 500 {error} with the
+ * file left untouched — never a silent partial write.
+ */
+export function dashboardModelPutHandler(
+  persist: (updates: Record<string, unknown>) => Record<string, unknown>,
+  getLlmConfig: () => { provider: string } | null,
+): express.RequestHandler {
+  return (req, res) => {
+    try {
+      const { status, body } = handleDashboardModelPut(req.body ?? null, persist, getLlmConfig);
+      res.status(status).json(body);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// PUT /dashboard/capture-pause — the console's pause/resume toggle (#423
+// phase 3, D3). Same layering as the model PUT: a pure validation handler +
+// an injected setter closure (the live adapter wires setCapturePause over
+// the daemon's db), so the route stays thin and the logic is unit-testable.
+// ---------------------------------------------------------------------------
+
+/** The PUT's body: {machine?: string|null, harness: string, paused: boolean}. */
+export function handleDashboardCapturePausePut(
+  body: unknown,
+  setPause: (machine: string, harness: string, paused: boolean) => string | null,
+): { status: number; body: Record<string, unknown> } {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "Body must be a JSON object {harness, paused, machine?}" } };
+  }
+  const { machine, harness, paused } = body as Record<string, unknown>;
+
+  // harness: the bundle's harness half, as the /distill pause key derives it.
+  // Not trimmed — the key must match the traffic byte-for-byte; the console
+  // derives it from already-normalized ids.
+  if (typeof harness !== "string" || harness.length === 0 || harness.length > 128) {
+    return { status: 400, body: { error: "Invalid 'harness' — expected a non-empty string of at most 128 chars" } };
+  }
+  // machine: null/undefined/"" → the unstamped bundle (''); any other value
+  // must be a non-empty string ≤128 (never a number/object from a bad caller).
+  let machineKey: string;
+  if (machine === null || machine === undefined || machine === "") {
+    machineKey = "";
+  } else if (typeof machine === "string" && machine.length > 0 && machine.length <= 128) {
+    machineKey = machine;
+  } else {
+    return { status: 400, body: { error: "Invalid 'machine' — expected null, \"\", or a non-empty string of at most 128 chars" } };
+  }
+  // Strict boolean — "false" (string) is the JSON-encoder artifact this
+  // catches; there is no clear/null form of a two-state toggle.
+  if (typeof paused !== "boolean") {
+    return { status: 400, body: { error: "Invalid 'paused' — expected a boolean" } };
+  }
+
+  const pausedAt = setPause(machineKey, harness, paused);
+  return { status: 200, body: { machine: machineKey, harness, paused, paused_at: pausedAt } };
+}
+
+/**
+ * Express adapter for PUT /dashboard/capture-pause. Bearer-only by
+ * construction (mounted after createAuthMiddleware, no shell exemption).
+ * The effect is immediate — no restart: the /distill handler reads the
+ * pause table on every post, so the very next capture POST from the bundle
+ * is skipped (200) or captured as before.
+ */
+export function dashboardCapturePausePutHandler(
+  getDb: () => Database.Database,
+): express.RequestHandler {
+  return (req, res) => {
+    try {
+      const { status, body } = handleDashboardCapturePausePut(
+        req.body ?? null,
+        (machine, harness, paused) => setCapturePause(getDb(), machine, harness, paused),
+      );
+      res.status(status).json(body);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }

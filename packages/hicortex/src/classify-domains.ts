@@ -64,7 +64,7 @@ import {
   applyNoAssociationDecay,
   applyWeakPrimary,
   resolveNoFit,
-  resolveWeakPrimaryFloor,
+  DEFAULT_WEAK_PRIMARY_FLOOR,
   type NoFitResolution,
 } from "./nofit.js";
 import type { EmbedFn } from "./retrieval.js";
@@ -86,6 +86,12 @@ export interface ClassifyDomainsOptions {
   llm?: LlmClient;
   /** Config override (tests). Defaults to reading stateDir/config.json. */
   config?: Record<string, unknown> | null;
+  /**
+   * Weak-primary floor (#408): release-managed default (calibration.ts via
+   * nofit's DEFAULT_WEAK_PRIMARY_FLOOR); this field is the eval/test seam —
+   * the config key is gone from the surface. Invalid → default.
+   */
+  weakPrimaryFloor?: number;
   /**
    * Embedder override (tests). Used only for domain-description prototype
    * seeds; defaults to the local ONNX embedder, loaded lazily on first need
@@ -170,7 +176,14 @@ export async function runClassifyDomains(
         "No fallback bucket is needed — no-fit memories are handled automatically.",
     );
   }
-  const weakPrimaryFloor = resolveWeakPrimaryFloor(config);
+  // #408: the floor is a release-managed calibration constant; the Options
+  // field is the eval/test seam (invalid values keep the default, the stage
+  // knob-validation style — silent fallback, no warn).
+  const floorRaw = Number(options.weakPrimaryFloor);
+  const weakPrimaryFloor =
+    Number.isFinite(floorRaw) && floorRaw > 0 && floorRaw < 1
+      ? floorRaw
+      : DEFAULT_WEAK_PRIMARY_FLOOR;
 
   // Resolve the LLM (one model serves all phases — #231).
   let llm: LlmClient;

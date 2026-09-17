@@ -40,6 +40,7 @@ import {
   type DesktopServerEntry,
 } from "./claude-desktop.js";
 import { parseHours, readNonNegativeConfig } from "./config-read.js";
+import { DEFAULT_FIRST_RUN_LOOKBACK_DAYS } from "./calibration.js";
 import { resolveNightlyTimeBudgetMinutes } from "./run-deadline.js";
 import { sanitizeAgentId } from "./identity-store.js";
 import type { DomainDef } from "./types.js";
@@ -1056,7 +1057,7 @@ function saveConfig(configPath: string, config: Record<string, unknown>): void {
  * and the writer then OVERWROTE the file — `persistAuthToken` minted a fresh
  * token (fleet-wide 401), `scaffoldDefaultDomains` re-seeded the generic
  * vocabulary over the owner list, etc. `authToken` / `licenseKey` /
- * `llmApiKey` / `domains` / `weakPrimaryFloor` / `identityClients` (was
+ * `llmApiKey` / `domains` / `identityClients` (was
  * `contextClients`) all gone.
  * The early-return guards (existing-key checks) did NOT save them: those only
  * fire on a VALID parse that reads the key, not on a corrupted file.
@@ -1121,6 +1122,32 @@ export function loadConfigStrict(configPath: string): { config: Record<string, u
 }
 
 /**
+ * Apply a sparse set of config updates atomically-ish (strict load → merge →
+ * save): the HTTP-side sibling of persistLlmConfig (which drives the
+ * interactive init flow). `null` values DELETE the key — the console's
+ * "clear field" semantic. Values are assumed VALIDATED by the caller (the
+ * /dashboard/model PUT validates its allowlisted subset BEFORE calling); this
+ * function only owns load-strictly + merge + save, so a malformed existing
+ * config throws here and the file is left UNTOUCHED (the 0.16.x contract —
+ * see loadConfigStrict). Returns the freshly persisted config so the caller
+ * can answer with the post-write truth (re-read, not echo).
+ *
+ * Exported for dashboard.ts's PUT handler + tests.
+ */
+export function persistConfigUpdates(
+  configPath: string,
+  updates: Record<string, unknown>,
+): Record<string, unknown> {
+  const { config } = loadConfigStrict(configPath);
+  for (const [k, v] of Object.entries(updates)) {
+    if (v === null) delete config[k];
+    else config[k] = v;
+  }
+  saveConfig(configPath, config);
+  return config;
+}
+
+/**
  * `init --repair-config` escape hatch: move a malformed config.json aside so
  * init can rebuild, instead of dead-ending on loadConfigStrict's throw.
  *
@@ -1172,7 +1199,7 @@ export function quarantineMalformedConfig(
     console.log(`    Keys found in the old file: ${keys.join(", ")}`);
   }
   console.log(`    ACTION REQUIRED: copy any of licenseKey / llmApiKey /`);
-  console.log(`    domains / weakPrimaryFloor back from the backup by hand.`);
+  console.log(`    domains back from the backup by hand.`);
   console.log(`    A NEW authToken will be generated — every thin client pointing at this`);
   console.log(`    server must be updated, or their recall will 401 (silently, fail-soft).`);
 
@@ -1247,7 +1274,7 @@ export function ensureAgentId(config: Record<string, unknown>): { agentId: strin
  * + unconditional save WIPES config.json when the file exists but is
  * unparseable (a hand-edit syntax slip) — the catch swallows the parse error,
  * {} is seeded, and the save overwrites the file with just {"agentId": ...},
- * destroying authToken / licenseKey / domains / weakPrimaryFloor, then
+ * destroying authToken / licenseKey / domains, then
  * cascades into scaffoldDefaultDomains re-seeding the generic vocabulary.
  * This wrapper refuses that path:
  *   - ENOENT (file genuinely absent) → seed {} is correct (new install).
@@ -2076,6 +2103,9 @@ export async function runInit(
   // the install → first-nightly → retained funnel is measurable. Never blocks:
   // failures are swallowed inside sendLifecycleEvent.
   await sendLifecycleEvent("install", HICORTEX_HOME, readHomeConfig(HICORTEX_HOME), pkgVersion());
+  // #436: the first-run lookback cap is invisible until it bites — tell the
+  // long-history user where the rest went and how to get it, once, at install.
+  console.log(`History import: the first nightly captures the last ${DEFAULT_FIRST_RUN_LOOKBACK_DAYS} days of your agents' sessions by default — run \`hicortex nightly --recapture-window <days>\` once to import more.`);
   console.log("Next steps:");
   // Counter-based so the list stays contiguous (1,2,3,4) whether or not Hermes
   // was detected — a conditional middle step used to leave a "1, 3, 4" gap.
@@ -2273,6 +2303,9 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
   // the install → first-nightly → retained funnel is measurable. Never blocks:
   // failures are swallowed inside sendLifecycleEvent.
   await sendLifecycleEvent("install", HICORTEX_HOME, readHomeConfig(HICORTEX_HOME), pkgVersion());
+  // #436: the first-run lookback cap is invisible until it bites — tell the
+  // long-history user where the rest went and how to get it, once, at install.
+  console.log(`History import: the first nightly captures the last ${DEFAULT_FIRST_RUN_LOOKBACK_DAYS} days of your agents' sessions on this machine by default — run \`hicortex nightly --recapture-window <days>\` once to import more.`);
   console.log("How it works:");
   console.log("  • MCP tools (search, identity, ingest) talk to the remote server");
   console.log("  • Nightly pipeline denoises CC transcripts, POSTs to server for distillation");
@@ -2331,7 +2364,8 @@ const DEFAULT_TIMER_JITTER_SEC = 3600;
 
 /**
  * Resolve the timer-jitter spread (seconds) from config. 0 = disabled. Uses
- * readNonNegativeConfig (0 is a valid "off", mirroring ollamaFlushEvery).
+ * readNonNegativeConfig (0 is a valid "off", like memorySoftCap's eviction
+ * opt-out).
  */
 export function resolveTimerJitterSeconds(configDir = HICORTEX_HOME): number {
   let config: Record<string, unknown> = {};

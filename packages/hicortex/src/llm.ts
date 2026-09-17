@@ -17,7 +17,10 @@
  * OpenAI, Anthropic, Google, Ollama, OpenRouter, and Claude CLI.
  */
 
-import { readPositiveConfig, readStrictBoolean, readNonNegativeConfig } from "./config-read.js";
+import { readPositiveConfig, readStrictBoolean } from "./config-read.js";
+// #408: the diagnostic tier (numCtx + ollama flush) resolves from the
+// calibration env resolvers — the config keys are gone from the surface.
+import { resolveNumCtx, resolveOllamaFlushEvery, resolveOllamaFlushWaitMs } from "./calibration.js";
 // #355: single-flight guard + canonical home (where the per-endpoint flight
 // lock files live — the daemon and the nightly share the home, so the lock
 // serializes them across processes).
@@ -43,11 +46,15 @@ export interface LlmConfig {
   /** Toggle thinking on the openai-compat path for all phases. Absent = no kwarg sent.
    *  LOCAL-endpoint only (ollama / mlx-lm gateway); see HicortexConfig.enableThinking. */
   enableThinking?: boolean;
-  /** Context window for ollama (the one model, all phases). Default 8192. */
+  /** Context window for ollama (the one model, all phases). Default 8192.
+   *  #408 diagnostic tier: resolved from HICORTEX_NUM_CTX (env) by
+   *  applyTierTuningOverlay — never a config key. */
   numCtx?: number;
-  /** Flush ollama memory every N ollama calls (0 = off). See HicortexConfig.ollamaFlushEvery. */
+  /** Flush ollama memory every N ollama calls (0 = off). #408 diagnostic
+   *  tier: resolved from HICORTEX_OLLAMA_FLUSH_EVERY by the overlay. */
   ollamaFlushEvery?: number;
-  /** Ms to wait after an ollama flush for the runner to release. */
+  /** Ms to wait after an ollama flush for the runner to release. #408
+   *  diagnostic tier: resolved from HICORTEX_OLLAMA_FLUSH_WAIT_MS. */
   ollamaFlushWaitMs?: number;
   /** ONE per-call timeout ceiling for every phase (#337). Default 900000 — the
    *  AbortSignal.timeout value passed by the single complete() surface (the old
@@ -119,26 +126,35 @@ export function resolveExplicitLlmConfig(overrides?: {
 export const resolveLlmConfigForCC = resolveExplicitLlmConfig;
 
 /**
- * Validate + copy the tuning keys (#220: maxTokens + enableThinking + numCtx +
- * ollama flush) from the saved disk config onto a runtime LlmConfig. Called by
- * BOTH LlmConfig construction sites — the daemon in mcp-server.ts (runs
- * distill) AND resolveSavedLlmConfig below (the nightly runs reflect +
- * classify) — so every process honors the keys, and a future site calling this
- * inherits them by construction.
+ * Validate + copy the tuning keys (#220: maxTokens + enableThinking) from the
+ * saved disk config onto a runtime LlmConfig, and resolve the DIAGNOSTIC
+ * TIER (#408: numCtx + the ollama-flush family) from the calibration env
+ * resolvers. Called by BOTH LlmConfig construction sites — the daemon in
+ * mcp-server.ts (runs distill) AND resolveSavedLlmConfig below (the nightly
+ * runs reflect + classify) — so this is the ONE resolution point per process
+ * for every one of these values, and a future site calling this inherits
+ * them by construction.
  *
- * All keys are optional; absent = call-site defaults (maxTokens 8192,
- * numCtx 8192, thinking kwarg omitted, flush off). Wrong-typed values warn
- * and are dropped (readPositiveConfig / readStrictBoolean /
- * readNonNegativeConfig) — notably a JSON slip `"enableThinking": "false"`
- * (string) is rejected rather than coerced to truthy thinking-on, which would
- * silently invert the fix this key exists to apply. #405: classifyMaxTokens
- * is deleted — maxTokens is the single output ceiling for every call (the
- * key is warned as ignored at the config-read boundary).
+ * Config keys are optional; absent = call-site defaults (maxTokens 8192,
+ * thinking kwarg omitted). Wrong-typed values warn and are dropped
+ * (readPositiveConfig / readStrictBoolean) — notably a JSON slip
+ * `"enableThinking": "false"` (string) is rejected rather than coerced to
+ * truthy thinking-on, which would silently invert the fix this key exists to
+ * apply. #405: classifyMaxTokens is deleted — maxTokens is the single output
+ * ceiling for every call (warned as ignored at the config-read boundary).
+ * #408: numCtx / ollamaFlushEvery / ollamaFlushWaitMs are NO LONGER config
+ * keys — the env tier always resolves them (env > calibration constant;
+ * invalid env warns + falls back), independent of `savedConfig`.
  */
 export function applyTierTuningOverlay(
   llmConfig: LlmConfig,
   savedConfig: Record<string, unknown> | null | undefined,
 ): void {
+  // #408 diagnostic tier — resolved BEFORE the config early-return so the
+  // tier applies on every construction site call, config or not.
+  llmConfig.numCtx = resolveNumCtx();
+  llmConfig.ollamaFlushEvery = resolveOllamaFlushEvery();
+  llmConfig.ollamaFlushWaitMs = resolveOllamaFlushWaitMs();
   if (!savedConfig) return;
   if (savedConfig.maxTokens !== undefined) {
     llmConfig.maxTokens = readPositiveConfig(savedConfig, "maxTokens", 8192);
@@ -146,15 +162,6 @@ export function applyTierTuningOverlay(
   const thinking = readStrictBoolean(savedConfig, "enableThinking");
   if (thinking !== undefined) {
     llmConfig.enableThinking = thinking;
-  }
-  if (savedConfig.numCtx !== undefined) {
-    llmConfig.numCtx = readPositiveConfig(savedConfig, "numCtx", 8192);
-  }
-  if (savedConfig.ollamaFlushEvery !== undefined) {
-    llmConfig.ollamaFlushEvery = readNonNegativeConfig(savedConfig, "ollamaFlushEvery", 0);
-  }
-  if (savedConfig.ollamaFlushWaitMs !== undefined) {
-    llmConfig.ollamaFlushWaitMs = readPositiveConfig(savedConfig, "ollamaFlushWaitMs", 180000);
   }
   // #337 resilience knobs. Same boundary discipline as the keys above: absent =
   // call-site defaults (timeout 900 s, probe timeout 60 s, probe TTL 5 min),
@@ -222,8 +229,9 @@ export function resolveSavedLlmConfig(
     });
   }
 
-  // Tuning overlay (#220: maxTokens + enableThinking + numCtx + flush). Applied
-  // at both construction sites (daemon + nightly) so every phase honors the keys.
+  // Tuning overlay (#220: maxTokens + enableThinking; #408: the diagnostic
+  // env tier). Applied at both construction sites (daemon + nightly) so every
+  // phase honors the same values.
   if (llmConfig) {
     applyTierTuningOverlay(llmConfig, savedConfig as Record<string, unknown> | null);
   }

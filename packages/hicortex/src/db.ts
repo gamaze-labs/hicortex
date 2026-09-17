@@ -576,6 +576,133 @@ const MIGRATIONS: Migration[] = [
       db.exec("CREATE INDEX IF NOT EXISTS idx_memory_history_memory ON memory_history(memory_id)");
     },
   },
+  {
+    version: 15,
+    name: "source_machine",
+    up: (db) => {
+      // #421 owner direction (machine × harness identity): nullable, NO
+      // backfill — honesty over guesses. Rows written before this column
+      // stay NULL and group under "earlier captures" in the console; that
+      // bucket shrinks as nights accumulate stamped captures. Stamped by the
+      // nightly capture path (config `machineName` ?? os.hostname()) and
+      // accepted optionally by /distill + /ingest. Idempotent via hasColumn.
+      if (!hasColumn(db, "memories", "source_machine")) {
+        db.exec("ALTER TABLE memories ADD COLUMN source_machine TEXT");
+      }
+    },
+  },
+  {
+    version: 16,
+    name: "distill_activity",
+    up: (db) => {
+      // #422 Phase 2 — /distill capture-health accounting. One row per POST
+      // (every outcome incl. held/skipped), written by
+      // capture-health.ts:recordDistillActivity from the /distill handler's
+      // exits. This is OPERATIONS telemetry, not memory data: rows prune
+      // after 7 days (in-module, once per process per UTC day), so the table
+      // stays bounded while giving the console's capture-health card a real
+      // posts/sessions/bytes/held picture per machine × agent. `retried` is
+      // computed at insert (an earlier row with the same session_id +
+      // segment_id means this POST is a client retry of a cursor-held
+      // segment) — never updated afterwards. Sidecar table (no memories FK):
+      // the memory rows of a failed POST may never exist; the activity row
+      // must record the attempt anyway. Idempotent: IF NOT EXISTS everywhere.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS distill_activity (
+          ts TEXT NOT NULL,
+          day TEXT NOT NULL,
+          machine TEXT NOT NULL DEFAULT '',
+          agent TEXT NOT NULL DEFAULT '',
+          session_id TEXT,
+          segment_id TEXT,
+          bytes INTEGER NOT NULL DEFAULT 0,
+          outcome TEXT NOT NULL,
+          retried INTEGER NOT NULL DEFAULT 0
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_distill_activity_day ON distill_activity(day)");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_distill_activity_session_segment ON distill_activity(session_id, segment_id)",
+      );
+    },
+  },
+  {
+    version: 17,
+    name: "memory_corroboration",
+    up: (db) => {
+      // #423 phase 3 — explicit owner corroboration trail (POST /enrich).
+      // DEFAULT 0 with NO backfill: a pre-v17 row was never enriched and 0 is
+      // the honest count. /memory rides it via SELECT * (the console detail's
+      // "corroborated × N"); the enrich itself writes base_strength — it
+      // never fakes access/shown counts (those are the recall-adoption
+      // signal). Idempotent via hasColumn (the v15 pattern).
+      if (!hasColumn(db, "memories", "corroboration_count")) {
+        db.exec("ALTER TABLE memories ADD COLUMN corroboration_count INTEGER NOT NULL DEFAULT 0");
+      }
+    },
+  },
+  {
+    version: 18,
+    name: "capture_pauses",
+    up: (db) => {
+      // #423 phase 3, D3 — server-side 200-skip for a paused machine ×
+      // harness bundle. A row EXISTS = paused; absence = capturing (no
+      // "paused" flag to keep honest). Deliberately NO retention/pruning: the
+      // rows are few and operator-owned, and pruning one would silently
+      // resume capture the operator meant to hold. Idempotent: IF NOT EXISTS.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS capture_pauses (
+          machine TEXT NOT NULL DEFAULT '',
+          harness TEXT NOT NULL,
+          paused_at TEXT NOT NULL,
+          PRIMARY KEY(machine, harness)
+        )
+      `);
+    },
+  },
+  {
+    version: 19,
+    name: "add_importance_scored_at",
+    up: (db) => {
+      // #425 — scored-at watermark for importance scoring. getUnscoredMemories
+      // keys on importance_scored_at IS NULL (v19+), replacing the old
+      // base_strength = 0.5 sentinel, which re-rolled every row the model
+      // genuinely scored 0.5 every night. Backfill: existing rows that are NOT
+      // at the 0.5 sentinel are stamped "settled" (COALESCE(updated_at,
+      // ingested_at, created_at)) — they carry a real historical score and
+      // leave the nightly pool. Rows AT the sentinel stay NULL so the next
+      // nightly scores them ONCE under the new rubric (bounded — the watermark
+      // write in stageImportance then takes them out of the pool). The
+      // rescore-importance backfill CLI re-judges settled rows wholesale under
+      // its own cursor; this migration only makes the NIGHTLY pool honest.
+      // Idempotent via hasColumn (the v8 pattern).
+      if (!hasColumn(db, "memories", "importance_scored_at")) {
+        db.exec("ALTER TABLE memories ADD COLUMN importance_scored_at TEXT");
+      }
+      db.exec(
+        `UPDATE memories SET importance_scored_at = COALESCE(updated_at, ingested_at, created_at)
+         WHERE importance_scored_at IS NULL AND base_strength != 0.5`
+      );
+    },
+  },
+  {
+    version: 20,
+    name: "add_promotion_last_count",
+    up: (db) => {
+      // #448 — promotion baseline: the access_count the nightly promotion
+      // stage (stagePromotion) last consumed. Backfilled to access_count so
+      // the first post-upgrade nightly does not replay lifetime counts as
+      // promotions (v19 backfill precedent). Written by the stage, this
+      // backfill, and dedup merges (the baseline moves with the summed
+      // counter). Idempotent via hasColumn (the v8 pattern).
+      if (!hasColumn(db, "memories", "promotion_last_count")) {
+        db.exec("ALTER TABLE memories ADD COLUMN promotion_last_count INTEGER");
+      }
+      db.exec(
+        "UPDATE memories SET promotion_last_count = access_count WHERE promotion_last_count IS NULL"
+      );
+    },
+  },
 ];
 
 /**

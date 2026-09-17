@@ -78,9 +78,10 @@ const SEARCH_FALLBACK_TIMEOUT_MS = 5000;
  *  instruction points at a 0.14+ endpoint that 404s on these servers). */
 const LEGACY_CONTENT_CAP = 500;
 /** Default max memories per recall on the legacy /search fallback (config
- *  `recallLimit`, #316). The pushed /recall-index is sized by SERVER config
- *  (`recallMaxItems`) — the server accepts no client limit — so this knob
- *  applies where a client limit actually exists: the pre-0.14 fallback. */
+ *  `recallLimit`, #316). The pushed /recall-index is sized by the server's
+ *  release-managed calibration (#408) — the server accepts no client limit —
+ *  so this knob applies where a client limit actually exists: the pre-0.14
+ *  fallback. */
 const DEFAULT_RECALL_LIMIT = 8;
 /** Cap for the per-session LRU trackers (#316 CR: raised from 50 — a
  *  multi-agent gateway fans sessions across agents; evicting a live session's

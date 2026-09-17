@@ -53,7 +53,7 @@ export function readStrictBoolean(
 /**
  * Read a non-negative finite number (allows 0, unlike readPositiveConfig).
  * Returns `def` when absent OR invalid. Used for keys where 0 is a valid "off"
- * value (e.g. ollamaFlushEvery).
+ * value (e.g. memorySoftCap's eviction opt-out, timerJitterSeconds).
  */
 export function readNonNegativeConfig(
   config: Record<string, unknown>,
@@ -207,6 +207,45 @@ const REMOVED_CONFIG_KEYS: Record<string, string> = {
 };
 
 /**
+ * Config keys that became RELEASE-MANAGED CALIBRATION constants (#408): the
+ * ~35 tuning keys of the 0.15–0.20 era. Their values are ignored — the
+ * constants ship with each release (src/calibration.ts) and change only in
+ * releases with eval evidence linked in the changelog. Like the #405 list,
+ * this is deliberately WIDER than the `HicortexConfig` type ever was: several
+ * keys (supersessionPenalty, the rrf/bm25 knob set, recallTitleChars, ...)
+ * were README-documented but never typed. Don't trim the list to match the
+ * interface — the warn exists precisely for the untyped surface.
+ */
+const RELEASE_MANAGED_CONFIG_KEYS = [
+  "decayHalfLifeDays", "searchLimit", "recentLimit", "recentWindowDays",
+  "coldExposureSlots", "recallMaxItems", "recallMinSimilarity",
+  "recallReshowTurns", "recallMinPromptChars", "recallTitleChars",
+  "sessionIntentWeight", "noveltyFloorSlots", "scoreSimilarityWeight",
+  "scoreStrengthWeight", "scoreConnectionsWeight", "scoreRecencyWeight",
+  "freshnessBoostDays", "freshnessBoostWeight", "supersededDemotion",
+  "projectAffinityWeight", "domainAffinityWeight", "rrfK",
+  "rrfCompositeWeight", "rrfFtsWeight", "rrfVectorWeight",
+  "bm25WeightBody", "bm25WeightProject", "bm25WeightDomain",
+  "dedupAutoMergeThreshold", "dedupMergeThreshold",
+  "supersessionMinSimilarity", "supersessionPenalty",
+  "correctionMinSimilarity", "correctionRewriteMinConfidence",
+  "weakPrimaryFloor",
+] as const;
+
+/**
+ * Config keys MOVED to the diagnostic env tier (#408): the ollama-operational
+ * family left config.json and now resolves from environment variables
+ * (calibration.ts resolvers; env > constant, invalid env warns + falls back).
+ * Each entry maps the old config key to its env replacement so the warning
+ * can name the exact variable.
+ */
+const ENV_MOVED_CONFIG_KEYS: Record<string, string> = {
+  numCtx: "HICORTEX_NUM_CTX",
+  ollamaFlushEvery: "HICORTEX_OLLAMA_FLUSH_EVERY",
+  ollamaFlushWaitMs: "HICORTEX_OLLAMA_FLUSH_WAIT_MS",
+};
+
+/**
  * Warn if the saved config carries keys that 0.16.8+ ignores. Call at every
  * config read (daemon boot + nightly). The warning clears once the keys are
  * removed and (for the model keys) the model is consolidated into
@@ -237,6 +276,31 @@ export function warnIgnoredConfigKeys(
     console.warn(
       `[hicortex] config has keys REMOVED by the budget simplification (#405): ${detail}. ` +
       `They have no effect. Remove them to clear this warning.`,
+    );
+  }
+  // #408: tuning keys that became release-managed calibration constants —
+  // one line naming every present key (their VALUES are ignored; the
+  // constants ship with each release and change only with published eval
+  // evidence linked in the changelog).
+  const releaseManaged = RELEASE_MANAGED_CONFIG_KEYS
+    .filter((k) => savedConfig[k] !== undefined);
+  if (releaseManaged.length > 0) {
+    console.warn(
+      `[hicortex] config has keys that are now RELEASE-MANAGED CALIBRATION ` +
+      `(${releaseManaged.join(", ")}): their values are ignored — calibration ` +
+      `ships with each release and changes only with published eval evidence. ` +
+      `Remove them to clear this warning.`,
+    );
+  }
+  // #408: the diagnostic-tier keys that moved to environment variables —
+  // one line naming each old key AND its env replacement.
+  const envMoved = Object.entries(ENV_MOVED_CONFIG_KEYS)
+    .filter(([k]) => savedConfig[k] !== undefined);
+  if (envMoved.length > 0) {
+    const detail = envMoved.map(([k, env]) => `${k} → set ${env} instead`).join(", ");
+    console.warn(
+      `[hicortex] config has keys that MOVED to environment variables (#408): ${detail}. ` +
+      `The config keys are ignored. Remove them to clear this warning.`,
     );
   }
 }

@@ -11,23 +11,46 @@
 
 /**
  * Importance scoring prompt. Takes a {memories_block} with indexed memories.
+ *
+ * RE-ANCHORED (#425): the pre-fix anchors put "useful context" at 0.3-0.5 —
+ * but the distiller's ephemera gate already removes trivia before anything
+ * reaches this scorer, so the model only ever saw curated material and the
+ * distribution compressed upward (measured on the production snapshot via
+ * eval:importance: median base 0.8, ~11% at exactly 1.0, which the decay
+ * model never forgets). The anchors now place routine-but-curated content
+ * LOW and add an explicit distribution instruction (owner decision D2,
+ * 2026-09-13: target median 0.30-0.40, p90 <= 0.75; 1.0 is never a valid
+ * score). The strict JSON-array response contract is unchanged.
  */
 export function importanceScoring(memoriesBlock: string): string {
   return `You are a memory importance scorer. Rate each memory's long-term value.
 
 Score each memory from 0.0 (trivial/ephemeral) to 1.0 (critical/foundational).
+These memories are pre-filtered for durability, so ordinary competent work is
+the NORMAL case — use the full scale and keep the bulk of a batch in the lower
+half. When torn between two bands, choose the LOWER.
 
 Scoring guide:
-- 0.0-0.2: Routine actions, transient state, trivial fixes
-- 0.3-0.5: Useful context, minor decisions, standard patterns
-- 0.6-0.8: Important decisions, debugging breakthroughs, architectural choices
-- 0.9-1.0: Foundational principles, critical constraints, core identity facts
+- 0.0-0.2: Ephemeral state, routine actions, one-off fixes
+- 0.2-0.4: Useful context, ordinary decisions, standard patterns — THE DEFAULT
+  BAND; most memories belong here
+- 0.4-0.6: Notable decisions, recurring patterns, project-shaping context —
+  only rows that clearly stand above ordinary work
+- 0.6-0.8: Important decisions, debugging breakthroughs, architectural
+  choices — rare; at most one or two in a typical batch
+- 0.8-0.95: ONLY genuinely foundational principles, critical constraints, core
+  identity facts — material that would be serious to lose. Never score 1.0.
+
+Distribution: a typical batch should have a median around 0.35 — half the
+batch sits at 0.2-0.4. A score of 0.5 or more says "among the more important
+quarter of everything in long-term memory"; a score above 0.8 must be rare
+and immediately defensible as costly to lose.
 
 MEMORIES:
 ${memoriesBlock}
 
 Respond with ONLY a JSON array of scores in the same order, e.g.:
-[0.3, 0.7, 0.5, 0.9]
+[0.3, 0.4, 0.2, 0.7]
 
 No explanations. Just the JSON array.`;
 }

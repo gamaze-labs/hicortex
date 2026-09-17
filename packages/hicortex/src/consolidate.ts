@@ -8,13 +8,13 @@ import type Database from "better-sqlite3";
 import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain, ResolutionBandStat } from "./types.js";
 import type { LlmClient } from "./llm.js";
 import type { EmbedFn } from "./retrieval.js";
-import { effectiveStrength, l2ToCosine } from "./retrieval.js";
+import { effectiveStrength, l2ToCosine, findDemotedIds } from "./retrieval.js";
 import * as storage from "./storage.js";
 import { readNonNegativeConfig, readPositiveConfig } from "./config-read.js";
 import { importanceScoring, reflection, domainCuration } from "./prompts.js";
 import { createHash } from "node:crypto";
 import { isPro } from "./features.js";
-import { louvainCommunities, detectHubs } from "./graph.js";
+import { louvainCommunities } from "./graph.js";
 import { loadState, updateState } from "./state.js";
 import {
   classifyMemoryTags,
@@ -39,6 +39,7 @@ import {
   DEFAULT_DEDUP_MERGE_THRESHOLD,
 } from "./dedup.js";
 import type { RunDeadline } from "./run-deadline.js";
+import * as CALIBRATION from "./calibration.js";
 
 // Default config constants (matching Python config.py)
 /**
@@ -229,6 +230,31 @@ export class BudgetTracker {
   }
 }
 
+/**
+ * #427 observability: warn when a consolidation run made LLM CALLS but
+ * metered ZERO tokens — the endpoint returned no usage objects on its
+ * completions (recordUsage skips undefined by design, never fabricates a
+ * zero). Such a run still spends budget calls but its snapshot carries token
+ * nulls, which read as a mystery on the dashboard. The warn is a structured
+ * event in the same journald-greppable style as `event=budget_exhausted`
+ * (grep `event=tokens_unmetered`), so the blind spot is visible instead of
+ * silent. Returns true when it warned (for tests); no fabrication either
+ * way — the numbers stay exactly what the endpoint reported.
+ */
+export function warnUnmeteredTokensRun(
+  budget: NonNullable<ConsolidationReport["budget"]>,
+): boolean {
+  const calls = budget.calls_used ?? 0;
+  const tokens = budget.tokens_total?.total ?? 0;
+  if (calls <= 0 || tokens > 0) return false;
+  console.warn(
+    `[hicortex] event=tokens_unmetered calls_used=${calls} — the LLM endpoint ` +
+      `returned no usage objects on its completions; this run's snapshot carries ` +
+      `no token metering (budget calls were still counted).`,
+  );
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Token fair-use throttle decision (#246)
 // ---------------------------------------------------------------------------
@@ -367,21 +393,40 @@ function stagePrecheck(
 // Stage 2: Importance Scoring
 // ---------------------------------------------------------------------------
 
-async function stageImportance(
+/**
+ * The shared importance-scoring loop (#425 extraction): one LLM call per
+ * 10-memory batch through the production `importanceScoring` prompt, each
+ * written score clamped at IMPORTANCE_CEILING and stamped with the
+ * importance_scored_at watermark. Used by the nightly's stageImportance AND
+ * `hicortex rescore-importance` — there is exactly one scoring code path
+ * (no forked backfill logic; cap + watermark write identically everywhere).
+ *
+ * Failure semantics: a batch whose LLM call THROWS writes nothing (counted
+ * in `failed` — retried naturally later); a batch whose reply parses to a
+ * non-array falls back to 0.5 per memory (written + watermarked — the
+ * endpoint answered, the answer was unusable).
+ */
+export async function scoreMemoriesImportance(
   db: Database.Database,
   memories: Memory[],
   llm: LlmClient,
-  budget: BudgetTracker,
-  dryRun: boolean,
-  deadline?: RunDeadline
+  opts: {
+    budget?: BudgetTracker;
+    deadline?: RunDeadline;
+    dryRun?: boolean;
+    onBatch?: (written: number, failed: number) => void;
+  } = {}
 ): Promise<{ scored: number; failed: number; skipped_budget: number }> {
   const batchSize = 10;
+  const budget = opts.budget;
+  const deadline = opts.deadline;
+  const dryRun = opts.dryRun ?? false;
   let scored = 0;
   let failed = 0;
   let skippedBudget = 0;
 
   for (let i = 0; i < memories.length; i += batchSize) {
-    if (budget.exhausted) {
+    if (budget?.exhausted) {
       skippedBudget += memories.length - i;
       break;
     }
@@ -399,14 +444,14 @@ async function stageImportance(
 
     if (dryRun) continue;
 
-    if (!budget.use("importance")) {
+    if (budget && !budget.use("importance")) {
       skippedBudget += memories.length - i;
       break;
     }
 
     try {
       const r = await llm.complete(prompt);
-      budget.recordUsage("importance", r.usage);
+      budget?.recordUsage("importance", r.usage);
       let scores = parseJsonLenient<number[] | null>(r.text, null);
 
       if (!Array.isArray(scores)) {
@@ -416,6 +461,8 @@ async function stageImportance(
       while (scores.length < batch.length) scores.push(0.5);
       scores = scores.slice(0, batch.length);
 
+      let batchWritten = 0;
+      let batchFailed = 0;
       for (let j = 0; j < batch.length; j++) {
         let scoreVal = 0.5;
         try {
@@ -425,19 +472,43 @@ async function stageImportance(
           scoreVal = 0.5;
         }
 
+        // #425: the write cap — importance exactly 1.0 has decay rate exactly
+        // 1.0 and never decays, so no row is ever born immortal. The scored-at
+        // watermark lands in the SAME update, taking the row out of the
+        // nightly's unscored pool however it scored (the pre-#425 0.5-sentinel
+        // re-rolled genuinely-0.5 rows every night).
+        scoreVal = Math.min(scoreVal, CALIBRATION.IMPORTANCE_CEILING);
         try {
-          storage.updateMemory(db, batch[j].id, { base_strength: scoreVal });
+          storage.updateMemory(db, batch[j].id, {
+            base_strength: scoreVal,
+            importance_scored_at: new Date().toISOString(),
+          });
           scored++;
+          batchWritten++;
         } catch {
           failed++;
+          batchFailed++;
         }
       }
+      opts.onBatch?.(batchWritten, batchFailed);
     } catch {
       failed += batch.length;
+      opts.onBatch?.(0, batch.length);
     }
   }
 
   return { scored, failed, skipped_budget: skippedBudget };
+}
+
+async function stageImportance(
+  db: Database.Database,
+  memories: Memory[],
+  llm: LlmClient,
+  budget: BudgetTracker,
+  dryRun: boolean,
+  deadline?: RunDeadline
+): Promise<{ scored: number; failed: number; skipped_budget: number }> {
+  return scoreMemoriesImportance(db, memories, llm, { budget, deadline, dryRun });
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,42 +1227,6 @@ export function classifyRelationship(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 3.5: Hub Detection & Strength Boost
-// ---------------------------------------------------------------------------
-
-const HUB_BOOST = 0.1;
-const HUB_STRENGTH_CAP = 1.0;
-
-function stageHubBoost(
-  db: Database.Database,
-  dryRun: boolean,
-): { hubs_found: number; boosted: number } {
-  const hubs = detectHubs(db);
-  if (hubs.length === 0) return { hubs_found: 0, boosted: 0 };
-
-  let boosted = 0;
-  if (!dryRun) {
-    const stmt = db.prepare(
-      "UPDATE memories SET base_strength = MIN(?, base_strength + ?) WHERE id = ? AND base_strength < ?"
-    );
-    const tx = db.transaction(() => {
-      for (const hub of hubs) {
-        const result = stmt.run(HUB_STRENGTH_CAP, HUB_BOOST, hub.id, HUB_STRENGTH_CAP);
-        if (result.changes > 0) boosted++;
-      }
-    });
-    tx();
-  } else {
-    boosted = hubs.length;
-  }
-
-  if (hubs.length > 0) {
-    console.log(`[hicortex] Hub detection: ${hubs.length} hubs found, ${boosted} boosted (+${HUB_BOOST})`);
-  }
-  return { hubs_found: hubs.length, boosted };
-}
-
-// ---------------------------------------------------------------------------
 // Stage 3.7: Supersession Detection (#191 Phase B)
 // ---------------------------------------------------------------------------
 //
@@ -1206,15 +1241,16 @@ function stageHubBoost(
 // Scope: memories with `rowid > supersessionCursor` (state.json; starts 0 —
 // the corpus is back-processed gradually) whose shape suggests a
 // decision/correction. For each, KNN top-5 OLDER same-shape neighbors
-// at/above `supersessionMinSimilarity`; one constrained classify-tier LLM
+// at/above the release-managed similarity floor (calibration.ts); one constrained classify-tier LLM
 // call per pair decides `superseded: true| false`. A parse/infra error skips
 // just that PAIR (retried naturally next night since the cursor still
 // advances past the memory — see the cursor note below); it never mis-links.
 // #405: no per-stage call cap — the ONE run budget (nightlyLlmCallBudget)
 // and the run deadline are the only bounds, like every other stage.
 
-/** Default minimum COSINE similarity for a supersession candidate pair. */
-export const DEFAULT_SUPERSESSION_MIN_SIMILARITY = 0.8;
+/** Default minimum COSINE similarity for a supersession candidate pair —
+ *  RELEASE-MANAGED since #408 (calibration.ts SUPERSESSION_MIN_SIMILARITY). */
+export const DEFAULT_SUPERSESSION_MIN_SIMILARITY = CALIBRATION.SUPERSESSION_MIN_SIMILARITY;
 /** Default multiplier applied to a superseded memory's base_strength. */
 /** Floor under which a superseded memory's base_strength never drops. */
 /** Neighbor pool size before shape/older/similarity filtering narrows to top 5. */
@@ -1222,6 +1258,8 @@ const SUPERSESSION_NEIGHBOR_POOL = 15;
 /** Older-neighbor pairs kept per candidate after filtering. */
 const SUPERSESSION_NEIGHBOR_TOP_K = 5;
 export interface SupersessionOptions {
+  /** Candidate-pair cosine floor. Release-managed default (calibration.ts);
+   *  this field is the eval/test seam. Invalid → default. */
   minSimilarity?: number;
   /** The run-wide pipeline deadline (#405) — checked at each candidate
    *  boundary; on expiry the scan stops and the cursor holds at the last
@@ -1535,24 +1573,13 @@ export function stageDecayPrune(
   );
 
   const oldUnaccessed = storage.getPruneCandidates(db, cutoff.toISOString());
-  const linkCounts = storage.getAllLinkCounts(db);
 
   let candidates = 0;
   let pruned = 0;
   let failed = 0;
 
   for (const mem of oldUnaccessed) {
-    const memLinkCount = linkCounts.get(mem.id) ?? 0;
-
-    const eff = effectiveStrength(
-      mem.base_strength ?? 0.5,
-      mem.last_accessed,
-      now,
-      {
-        accessCount: 0,
-        linkCount: memLinkCount,
-      }
-    );
+    const eff = effectiveStrength(mem.base_strength ?? 0.5, mem.last_accessed, now);
 
     if (eff >= 0.01) continue;
 
@@ -1572,6 +1599,129 @@ export function stageDecayPrune(
 }
 
 // ---------------------------------------------------------------------------
+// Stage: Strength promotion (#448) — the strength model's upward path
+// ---------------------------------------------------------------------------
+//
+// Real use of a memory (a surfaced /search or /recent hit, a hicortex_get)
+// bumps access_count (storage.strengthenMemory). This stage converts that use
+// signal into STRENGTH: every run, each memory whose access_count exceeds its
+// stored baseline (promotion_last_count, migration v20 — backfilled to
+// access_count at upgrade so lifetime counts are never replayed) is promoted
+// once per new use by the calibration formula, capped at the importance
+// ceiling. Decay stays untouched and uniform (#448 removed the hardening
+// terms) — promotion is the only way use raises a score.
+//
+// Deterministic (zero LLM) and idempotent: the baseline advances to
+// access_count in the same write, so a delta-less night is a no-op and a
+// crashed run replays exactly the unconsumed delta. The demotion set
+// (findDemotedIds: superseded/retracted rows + superseded_by-link sources)
+// plus status 'absorbed' rows (named explicitly — findDemotedIds excludes
+// them by design; they are filtered at candidacy elsewhere, but this stage
+// reads the memories table directly) get NO bump — hidden evidence must not
+// rise — but their baseline still advances, so a later un-mark never replays
+// a stale delta.
+
+/**
+ * ONE application of the #448 promotion formula:
+ * `S + PROMOTION_RATE × (1 − S / IMPORTANCE_CEILING) × S^(−0.3)`, clamped at
+ * the ceiling. Pure + exported for exact-value tests; the stage applies it
+ * iterated once per new use — iteration is what makes the ceiling asymptotic
+ * (a count-sized single shot would overshoot it).
+ *
+ * The formula's S input is floored at PROMOTION_STRENGTH_FLOOR (#453 review,
+ * owner decision 2026-09-16): S^(−0.3) has a zero-singularity, and a writable
+ * base_strength of 0.0 would otherwise leap to the ceiling via Infinity→clamp
+ * on a single access. The floor bounds the first boost at ≈+0.13; it clamps
+ * the INPUT only — the stored 0.0 row is not rewritten, and the promoted
+ * result is nonzero from then on.
+ */
+export function applyStrengthPromotion(baseStrength: number): number {
+  const s = Math.max(baseStrength, CALIBRATION.PROMOTION_STRENGTH_FLOOR);
+  return Math.min(
+    s +
+      CALIBRATION.PROMOTION_RATE *
+        (1 - s / CALIBRATION.IMPORTANCE_CEILING) *
+        Math.pow(s, -0.3),
+    CALIBRATION.IMPORTANCE_CEILING,
+  );
+}
+
+export function stagePromotion(
+  db: Database.Database,
+  dryRun: boolean,
+): { promoted: number; demoted_skipped: number } {
+  // Candidates: rows with at least one use since their stored baseline.
+  // COALESCE treats a NULL baseline as 0 — dup-over-loss: an unknown baseline
+  // promotes once, a held one never forgets a use.
+  const rows = db
+    .prepare(
+      `SELECT id, base_strength, access_count, status,
+              access_count - COALESCE(promotion_last_count, 0) AS delta
+         FROM memories
+        WHERE access_count > COALESCE(promotion_last_count, 0)`,
+    )
+    .all() as Array<{
+    id: string;
+    base_strength: number | null;
+    access_count: number | null;
+    status: string | null;
+    delta: number;
+  }>;
+
+  if (rows.length === 0) return { promoted: 0, demoted_skipped: 0 };
+
+  const demoted = findDemotedIds(db, rows.map((r) => r.id));
+
+  let promoted = 0;
+  let demotedSkipped = 0;
+  const writes: Array<{ id: string; fields: Record<string, unknown> }> = [];
+
+  for (const row of rows) {
+    const accessCount = row.access_count ?? 0;
+    // Absorbed rows are invisible to recall but sit in the memories table —
+    // they are demotion-set members this query CAN see (findDemotedIds
+    // deliberately excludes them), so name them here.
+    if (demoted.has(row.id) || row.status === "absorbed") {
+      demotedSkipped++;
+      writes.push({ id: row.id, fields: { promotion_last_count: accessCount } });
+      continue;
+    }
+    // base_strength is NOT NULL after scoring; the `?? 0.5` mirrors
+    // stageDecayPrune's defensive default for unscored rows (inserts at 0.5).
+    let strength = row.base_strength ?? 0.5;
+    for (let i = 0; i < row.delta; i++) strength = applyStrengthPromotion(strength);
+    promoted++;
+    writes.push({
+      id: row.id,
+      fields: { base_strength: strength, promotion_last_count: accessCount },
+    });
+  }
+
+  if (dryRun) {
+    console.log(
+      `[hicortex] Strength promotion (dry-run): would promote ${promoted} memories ` +
+        `(${demotedSkipped} demotion-set rows advance their baseline only).`,
+    );
+    return { promoted, demoted_skipped: demotedSkipped };
+  }
+
+  // One transaction for the whole stage (the stageMemoryCapEviction pattern):
+  // strength + baseline move together or not at all — a baseline that
+  // advanced without its bump (or vice versa) would lose or replay a use.
+  const tx = db.transaction(() => {
+    for (const w of writes) storage.updateMemory(db, w.id, w.fields);
+  });
+  tx();
+
+  console.log(
+    `[hicortex] Strength promotion: promoted ${promoted} memories ` +
+      `(${demotedSkipped} demotion-set rows advance their baseline only).`,
+  );
+
+  return { promoted, demoted_skipped: demotedSkipped };
+}
+
+// ---------------------------------------------------------------------------
 // Stage 4.5: Memory cap eviction (#245)
 // ---------------------------------------------------------------------------
 //
@@ -1584,10 +1734,13 @@ export function stageDecayPrune(
 //
 // Eviction reuses the SAME effectiveStrength() the recall ranker uses — no
 // formula duplication, so the eviction criterion cannot drift from what
-// surfaces in the top-k. The evicted tail is, by construction, the tail that
-// was not surfacing anyway (cold, decayed). Ties are broken by oldest
-// COALESCE(last_accessed, created_at) — i.e. the memories that have gone
-// longest without anyone looking at them.
+// surfaces in the top-k. #448: the ordering is base + recency ONLY (the
+// access/link hardening terms are gone), and a row used since the last run
+// was promoted by stagePromotion earlier in the SAME run — a promoted row
+// survives a cap it would otherwise have lost. The evicted tail is, by
+// construction, the tail that was not surfacing anyway (cold, decayed). Ties
+// are broken by oldest COALESCE(last_accessed, created_at) — i.e. the
+// memories that have gone longest without anyone looking at them.
 //
 // `cap = 0` disables the stage (indefinite growth — the pre-#245 default is
 // preserved opt-out). The JS-side sort is O(n log n); at 10K memories the
@@ -1651,7 +1804,17 @@ export function stageMemoryCapEviction(
   // rejects negatives at the boundary, but this stage is callable directly).
   if (cap <= 0) return { cap, evicted: 0 };
 
-  const count = storage.countMemories(db);
+  // #422 (#317 discipline): the cap keys off LIVE (non-absorbed) rows on BOTH
+  // the count and the victim SELECT — absorbed rows are invisible evidence
+  // (no vector, no FTS, recall never serves them); they must neither consume
+  // cap headroom nor be picked as eviction victims. The DISPLAYED headroom
+  // (dashboard.ts headline live_memories vs memory_soft_cap) reads the same
+  // predicate, so the enforced and displayed caps cannot disagree.
+  const count = (
+    db
+      .prepare("SELECT COUNT(*) AS c FROM memories WHERE COALESCE(status, '') != 'absorbed'")
+      .get() as { c: number }
+  ).c;
   if (count <= cap) return { cap, evicted: 0 };
 
   const surplus = count - cap;
@@ -1660,35 +1823,27 @@ export function stageMemoryCapEviction(
   // NOT NULL after scoring; the `?? 0.5` mirrors stageDecayPrune's defensive
   // default for unscored rows (inserts at 0.5). last_accessed is NULL until
   // first /recall-index exposure — COALESCE to created_at for the tiebreak so
-  // never-shown memories sort by when they entered the corpus.
+  // never-shown memories sort by when they entered the corpus. Same
+  // non-absorbed predicate as the count above.
   const rows = db
     .prepare(
-      `SELECT id, base_strength, last_accessed, access_count, created_at
-         FROM memories`,
+      `SELECT id, base_strength, last_accessed, created_at
+         FROM memories
+        WHERE COALESCE(status, '') != 'absorbed'`,
     )
     .all() as Array<{
     id: string;
     base_strength: number | null;
     last_accessed: string | null;
-    access_count: number | null;
     created_at: string;
   }>;
 
-  const linkCounts = storage.getAllLinkCounts(db);
   const now = new Date();
 
   // Decorate + sort: lowest effectiveStrength first; ties broken by oldest
   // COALESCE(last_accessed, created_at). The victims are the first `surplus`.
   const decorated = rows.map((r) => {
-    const eff = effectiveStrength(
-      r.base_strength ?? 0.5,
-      r.last_accessed,
-      now,
-      {
-        accessCount: r.access_count ?? 0,
-        linkCount: linkCounts.get(r.id) ?? 0,
-      },
-    );
+    const eff = effectiveStrength(r.base_strength ?? 0.5, r.last_accessed, now);
     return {
       id: r.id,
       eff,
@@ -1747,9 +1902,9 @@ export interface DomainStageOptions {
   domains?: DomainDef[] | null;
   contentDomainsReady?: boolean;
   /**
-   * Weak-primary floor for the no-fit path (see nofit.ts). Resolved by the
-   * caller from config (`weakPrimaryFloor`); defaults to
-   * DEFAULT_WEAK_PRIMARY_FLOOR when absent.
+   * Weak-primary floor for the no-fit path (see nofit.ts). Release-managed
+   * default (#408 — calibration.ts WEAK_PRIMARY_FLOOR via nofit's
+   * DEFAULT_WEAK_PRIMARY_FLOOR); this field stays as the eval/test seam.
    */
   weakPrimaryFloor?: number;
 }
@@ -1795,6 +1950,7 @@ async function skippedRunResolutionReport(
       merge: merges.losers_merged,
       corrects: 0,
       supersedes: 0,
+      conflicts: 0,
       none: 0,
       merge_below_gate: 0,
       conf_sum: merges.losers_merged,
@@ -1821,11 +1977,23 @@ async function skippedRunResolutionReport(
     explicit_verified: 0,
     explicit_divergent: 0,
     cursor: loadState(stateDir).reconsolidationCursor ?? 0,
+    // #439 fields: zeros on a quiet night (no scan ran — nothing re-judged,
+    // new, skipped, or deferred; the type carries them so the report surface
+    // stays uniform).
+    pairs_reevaluated: 0,
+    pairs_new: 0,
+    skipped_absorbed: 0,
+    merge_pairs_deferred: 0,
     merges,
     merge_pairs_applied: 0,
     merge_below_gate: 0,
     skipped_above_ceiling: 0,
     skipped_metadata_mismatch: 0,
+    conflict_flagged: 0, // guard-C: no scan on a quiet night — nothing flagged
+    conflict_skipped: merges.skipped_conflict, // guard-C: the zone's guard still counts
+    scout_scanned: 0, // #393 B: the scan (and its shape calls) doesn't run on a quiet night
+    scout_correction_shaped: 0,
+    scout_candidates_found: 0,
     band_stats: bandStats,
   };
 }
@@ -1848,11 +2016,12 @@ export async function runConsolidation(
    *  config and passes it; unset → `DEFAULT_MEMORY_SOFT_CAP` (10000). `0`
    *  disables eviction (indefinite growth). */
   memorySoftCap?: number,
-  /** Reconsolidation-stage knobs (#384), threaded from config by nightly.ts
-   *  (correctionMinSimilarity / correctionRewriteMinConfidence) exactly like
-   *  supersessionOptions above; unset fields → the stage's defaults.
-   *  Appended AFTER the pre-#384 params so every existing positional caller
-   *  (tests, hosted nightly) keeps its argument meaning. */
+  /** Reconsolidation-stage knobs (#384) — eval/test seams since #408 (the
+   *  values are release-managed calibration constants; nightly.ts threads
+   *  NOTHING), exactly like supersessionOptions above; unset fields → the
+   *  stage's calibration defaults. Appended AFTER the pre-#384 params so
+   *  every existing positional caller (tests, hosted nightly) keeps its
+   *  argument meaning. */
   reconsolidationOptions?: ReconsolidationOptions,
   /**
    * The run-wide pipeline deadline (#405), created at nightly start and
@@ -1906,6 +2075,14 @@ export async function runConsolidation(
     new_memory_count: precheck.newMemories.length,
     unscored_count: scoreMemories.length - precheck.newMemories.length,
   };
+
+  // Strength promotion (#448) — runs in the pre-skip deterministic zone, in
+  // the same placement discipline as memory_cap BELOW it: accesses happen on
+  // quiet nights too (no new memories must still promote the day's uses),
+  // and a used row must be promoted BEFORE eviction victims are chosen (a
+  // promoted row survives a cap it would otherwise lose). Zero LLM — it sits
+  // before the BudgetTracker exists, ungated by budget and deadline.
+  report.stages.promotion = stagePromotion(db, dryRun);
 
   // Memory cap eviction (#245) — runs BEFORE the precheck skip so the corpus
   // is bounded even on quiet nights (no new memories → precheck would skip,
@@ -2010,11 +2187,6 @@ export async function runConsolidation(
         llm,
         budget,
       );
-    }
-
-    // Stage 3.5: Hub Detection — boost highly-connected memories
-    if (!deadline?.hit("hub_boost")) {
-      report.stages.hub_boost = stageHubBoost(db, dryRun);
     }
 
     // Stage 3.7: Supersession Detection (#191 Phase B)

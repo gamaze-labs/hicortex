@@ -79,14 +79,32 @@ export interface HicortexState {
   /**
    * Resume cursor for the nightly's reconsolidation stage (#384) — highest
    * memories.rowid whose candidates have been evaluated (or infra-skipped)
-   * this run. Absent/0 = never run. Same advance-past-considered-candidates
-   * discipline as supersessionCursor, with one addition: when a rewrite group
-   * could not be applied (budget exhausted / rewrite-call infra error), the
-   * cursor holds BELOW the earliest candidate contributing to an un-applied
-   * group so those pairs are re-detected next run — a confirmed correction is
-   * never silently dropped by the cursor passing it.
+   * with all their CONFIRMED work applied. Absent/0 = never run. Same
+   * advance-past-considered-candidates discipline as supersessionCursor,
+   * with one addition (#439): confirmed merges and rewrite groups apply at
+   * the candidate boundary — the END of the iteration that confirmed them —
+   * and the cursor advances past a candidate only when that apply landed.
+   * A deferral (budget refusal at the rewrite call, deadline at the
+   * boundary, backup failure, lock-busy merge surviving the final drain)
+   * holds the cursor BELOW the current candidate, so the hold is bounded to
+   * ONE candidate's pairs: next run re-detects and re-judges exactly those
+   * (dup-over-loss — a confirmed resolution is never silently dropped by the
+   * cursor passing it). The ONE cross-candidate window is the lock-busy
+   * retry list (plus deadline/backup-dropped tails re-queued at their
+   * boundary): while any retry merge is pending, every persisted checkpoint
+   * clamps below its earliest contributor, so a killed or stopped run can
+   * never strand a confirmed merge behind the cursor (fix round, #440).
    */
   reconsolidationCursor?: number;
+  /**
+   * #439 scan high-water for the reconsolidation stage — the highest
+   * memories.rowid any run has ENTERED, never held back by un-applied work
+   * (unlike reconsolidationCursor, which holds below deferred applies).
+   * Seeds the re-judged/new verdict split: a verdict call on a candidate
+   * at/below this mark is a re-judgment of previously judged work. Absent =
+   * never run; persisted alongside the cursor at every checkpoint.
+   */
+  reconsolidationScannedRowid?: number;
   /**
    * Resume cursor for `hicortex classify-types` (#216) — highest memories.rowid
    * whose batch has been fully committed. Absent/0 = never run (or reset).
@@ -94,6 +112,14 @@ export interface HicortexState {
    * interruption never loses more than the in-flight batch.
    */
   typeCursor?: number;
+  /**
+   * Resume cursor for `hicortex rescore-importance` (#425) — highest live
+   * memories.rowid re-judged under the current rubric. Absent/0 = never run
+   * (or reset). Advances per committed batch (LLM calls are 10 rows each
+   * inside a `--batch` slice); an infra error holds it at the last fully
+   * committed slice so a re-run resumes cleanly.
+   */
+  rescoreImportanceCursor?: number;
   /**
    * LLM token usage accrued this billing period (#246). Period reset is
    * monthly: when `periodStart` is in a previous calendar month, the totals

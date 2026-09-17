@@ -1,11 +1,11 @@
 {
   "_readme": [
     "Hicortex memory domains — example config.",
-    "Copy the `domains` key (and optionally `weakPrimaryFloor`) into ~/.hicortex/config.json on the SERVER machine.",
+    "Copy the `domains` key into ~/.hicortex/config.json on the SERVER machine.",
     "Domains are your top-level memory spheres. Each memory gets multiple weighted tags plus a derived primary.",
     "They can be life areas OR project/topic areas — edit to match how YOU think.",
     "The `domains` list below is the generic default that `hicortex init` scaffolds automatically.",
-    "There is NO fallback category: memories that fit nothing are handled automatically (weak-primary floor + decay).",
+    "There is NO fallback category: memories that fit nothing are handled automatically (weak-primary floor + decay — release-managed calibration, not config).",
     "Backfill an existing corpus with: hicortex classify-domains"
   ],
   "domains": [
@@ -34,7 +34,7 @@
     "_readme": [
       "A narrower life-sphere set for users who want tighter buckets.",
       "The PRIMARY domain is derived by argmax association weight (LLM tag order breaks ties) — no manual override flag.",
-      "`weakPrimaryFloor` (default 0.45) is the minimum embedding similarity for a no-fit memory to earn a weak primary; tune it from your corpus."
+      "The weak-primary floor is release-managed since #408 (a calibration constant shipped with each release) — not a config key."
     ],
     "domains": [
       {
@@ -69,7 +69,6 @@
         "name": "Travel",
         "description": "Trips, destinations, bookings, travel plans"
       }
-    ],
-    "weakPrimaryFloor": 0.5
+    ]
   }
 }

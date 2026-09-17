@@ -38,7 +38,8 @@
  *     memory from pruning. Halving does not touch last_accessed/access_count.
  *   - Re-classification: a later run whose LLM tags it, or whose evolved
  *     prototypes clear the floor, gives it a (weak) primary — halving stops.
- *     Its strength is NOT restored; only access does that job.
+ *     Its strength is restored only by the nightly promotion stage (#448),
+ *     which converts each new access_count delta into a base_strength bump.
  *
  * PRUNE INTERACTION (verified against stageDecayPrune + effectiveStrength):
  * prune fires when effectiveStrength < 0.01 for a >90-day-old, never-accessed
@@ -53,41 +54,21 @@ import type Database from "better-sqlite3";
 import type { DomainDef } from "./types.js";
 import * as storage from "./storage.js";
 import { bestPrototypeMatch } from "./schema-prototypes.js";
+import * as CALIBRATION from "./calibration.js";
 
 /**
  * Default weak-primary floor: minimum cosine(memory embedding, best domain
  * prototype) for a no-fit memory to earn a weak primary.
  *
- * TUNING: 0.45 is a starting point for bge-small-en-v1.5 embeddings — it
- * should be tuned from the actual corpus weight distribution (e.g. inspect
- * the memory_tags.weight histogram of LLM-tagged rows and set the floor
- * near its lower tail). Override per install via `weakPrimaryFloor` in
- * ~/.hicortex/config.json.
+ * #408: RELEASE-MANAGED — the constant (and its provenance: a starting point
+ * for bge-small-en-v1.5 embeddings) lives in calibration.ts. There is no
+ * config override anymore; the DomainStageOptions.weakPrimaryFloor field
+ * stays as the eval/test seam.
  */
-export const DEFAULT_WEAK_PRIMARY_FLOOR = 0.45;
+export const DEFAULT_WEAK_PRIMARY_FLOOR = CALIBRATION.WEAK_PRIMARY_FLOOR;
 
 /** Halving never takes base_strength below this (survivable, not zeroed). */
 export const NO_ASSOCIATION_MIN_STRENGTH = 0.05;
-
-/**
- * Resolve the weak-primary floor from a raw config object. Accepts a finite
- * number in (0, 1); anything else (absent, wrong type, out of range) falls
- * back to DEFAULT_WEAK_PRIMARY_FLOOR with a warning for invalid values.
- */
-export function resolveWeakPrimaryFloor(
-  config: Record<string, unknown> | null | undefined,
-): number {
-  const raw = config?.weakPrimaryFloor;
-  if (raw === undefined || raw === null) return DEFAULT_WEAK_PRIMARY_FLOOR;
-  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0 && raw < 1) {
-    return raw;
-  }
-  console.warn(
-    `[hicortex] invalid weakPrimaryFloor in config (${JSON.stringify(raw)}) — ` +
-      `must be a number in (0, 1); using default ${DEFAULT_WEAK_PRIMARY_FLOOR}`,
-  );
-  return DEFAULT_WEAK_PRIMARY_FLOOR;
-}
 
 /** Outcome of resolving a no-fit memory against the domain prototypes. */
 export type NoFitResolution =
