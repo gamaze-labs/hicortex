@@ -277,9 +277,9 @@ export function computeTagWeights(
  *
  * Used by the no-fit path (nofit.ts, owner amendment 07.07): when the LLM
  * says no domain fits, the memory can still earn a WEAK primary from pure
- * embedding association — provided the best cosine clears the configured
- * weakPrimaryFloor (the caller checks the floor; this function just reports
- * the argmax).
+ * embedding association — provided the best cosine clears the weak-primary
+ * floor (release-managed since #408; the caller checks the floor, this
+ * function just reports the argmax).
  *
  * Returns null when the memory has no stored vector or no configured domain
  * has a prototype (nothing to associate against). Ties resolve to the FIRST

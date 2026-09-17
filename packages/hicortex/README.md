@@ -116,11 +116,11 @@ Edit `~/.hicortex/config.json` on the server machine:
 }
 ```
 
-A richer example — including a `compartment: true` work/life firewall and a custom `weakPrimaryFloor` — ships as `domains.example.json` in the package.
+A richer power-user example (a wider life-sphere set) ships as `domains.example.json` in the package.
 
 **How classification works:** the LLM decides only *which* of your domains apply to a memory — never weights or rankings. The weight of each tag is derived from your own data: each domain builds a prototype from the memories already in it, and a tag's weight is how strongly the memory's embedding matches that prototype. The primary domain is picked deterministically from those weights, and everything is recomputed each nightly, so your categories drift with your data instead of going stale. Memories that genuinely fit nothing get a weak association when they are close enough to some domain — and otherwise fade away over time. No junk drawer, no "Unsorted" pile.
 
-`weakPrimaryFloor` (config, default 0.45) sets how close a no-fit memory must be to its nearest domain to earn that weak association instead of fading.
+How close a no-fit memory must be to its nearest domain to earn that weak association (instead of fading) is a release-managed calibration constant — it ships with each release and changes only with published eval evidence, not a config key.
 
 **Backfill an existing corpus** (server mode, needs `domains` in config):
 
@@ -135,6 +135,12 @@ npx @gamaze/hicortex classify-types                # reclassify all episodes (de
 npx @gamaze/hicortex classify-types --all          # reclassify every memory
 npx @gamaze/hicortex classify-types --batch 100    # memories per batch (default: 200)
 npx @gamaze/hicortex classify-types --reset        # restart from the beginning
+
+# Re-judge every memory's importance under the current scoring rubric
+npx @gamaze/hicortex rescore-importance            # dry run: report what would be re-judged
+npx @gamaze/hicortex rescore-importance --apply    # execute (backs up the DB first)
+npx @gamaze/hicortex rescore-importance --apply --batch 100  # rows per invocation (default: 500)
+npx @gamaze/hicortex rescore-importance --reset    # restart from the beginning
 ```
 
 The run is resumable — interrupt it any time and it continues where it stopped. New memories are classified automatically by the nightly; the backfill is only needed once for a pre-existing corpus or after you reshape your domain list.
@@ -205,6 +211,7 @@ npx @gamaze/hicortex nightly                   # Run distill + consolidate (full
 npx @gamaze/hicortex nightly --capture-only    # Capture only, skip consolidation (safe for sub-daily runs)
 npx @gamaze/hicortex nightly --evict-only      # Memory-cap eviction only — pure DB, no capture, no LLM (idempotent; honors --dry-run)
 npx @gamaze/hicortex nightly --dry-run         # Preview without changes
+npx @gamaze/hicortex nightly --recapture-window <days>  # Discover sessions older than the watermark (first run defaults to the last 7 days — this widens)
 npx @gamaze/hicortex classify-domains          # Backfill domain tags over the corpus (see Memory Domains & Tags)
 npx @gamaze/hicortex classify-types            # Reclassify memory types (episode/fact/decision)
 npx @gamaze/hicortex dedup                     # Preview near-duplicate memory clusters (dry run, no changes)
@@ -250,11 +257,8 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `mode` | `"server"` (default) or `"client"` |
 | `serverUrl` | Remote server URL (client mode) |
 | `llmModel` | The one model used by all phases (distill, score, classify, reflect). Set via `init`. |
-| `numCtx` | Context window for ollama (default 8192, one value for all phases). Scoring uses ~850 tokens, so 2048 is ample; distill/reflect/classify need more for `detectChunkSize`'s chunk sizing. |
 | `enableThinking` | Toggle the model's internal reasoning ("thinking") stream for OpenAI-compatible endpoints (default false). Only meaningful for local chat-template-aware servers (ollama, mlx-lm); leave unset for cloud OpenAI/OpenRouter/Groq endpoints (they 400 on the unknown `chat_template_kwargs` field). |
 | `maxTokens` | Max output tokens for all phases (default 8192). A ceiling, not a target — the model stops early when done. |
-| `ollamaFlushEvery` | Flush ollama's accumulated memory every N LLM calls. **Off by default (0)** — opt-in only for an **ollama** install whose runner RSS growth (~171 MB/call) swap-thrashes long consolidations on a RAM-constrained box; N=15 caps a cycle at ~2.5 GB. Gated on the provider being ollama (local **or** remote) — no effect for non-ollama providers. Only you can judge whether your ollama endpoint actually suffers the growth (a managed/cloud ollama host may not), so it stays off until you set it. |
-| `ollamaFlushWaitMs` | Milliseconds to wait after an ollama flush for the runner to exit + release memory (default 180000 = 3 min). |
 | `llmTimeoutMs` | The ONE timeout ceiling on every LLM call in every phase (default 900000 = 15 min). The LLM request paths disable the HTTP client's hidden 5-minute response-header timer, so this knob is the only bound — one place to tune when the endpoint is slow, no per-phase special cases. |
 | `llmProbeTimeoutMs` | Patience of the readiness probe — one minimal 1-token generation request the daemon sends before distilling (default 60000 = 1 min). Catches a gateway that answers health/model-list queries while generation is dead; a failed probe answers `/distill` with a 503 so capture holds its cursor. The nightly no longer probes — its dead-endpoint signal is the circuit breaker (`endpoint_down`, retried next run) |
 | `llmProbeTtlMs` | How long the daemon caches a `/distill` probe outcome (default 300000 = 5 min). A healthy capture cadence pays at most one probe per window; a dead endpoint turns into fast cached 503s instead of every request paying the probe timeout. |
@@ -266,12 +270,12 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | _env_ `HICORTEX_DISTILL_BODY_LIMIT_MB` | Environment override for the `/distill` body limit — **wins over the `distillBodyLimitMb` config key in every mode** (that is the point: a deployment operator pins it so tenant-writable config cannot raise it). Unset = config/default applies. |
 | _env_ `HICORTEX_MEMORY_CAP` | Environment override for the memory soft cap — a **positive** value wins over the `memorySoftCap` config key in every mode; `0`/negative/malformed fall through to the config key, then the 10000 default (an env can pin a cap, never disable one — config `memorySoftCap: 0` still disables when the env is unset). Mode-agnostic operator knob: nightly eviction, the dashboard-snapshot capacity stamp, and the live dashboard gauge all resolve through the same resolver, so the enforced and displayed caps can never disagree. Drives `nightly --evict-only` the same way. |
 | `domains` | Your memory domain list (`[{name, description}]`). Scaffolded by `init`; edit freely — see [Memory Domains & Tags](#memory-domains--tags) |
-| `weakPrimaryFloor` | Minimum similarity for a no-fit memory to keep a weak domain association (default: 0.45) |
 | `lessonsLimit` | Max lessons injected into an agent's session-start context (default: 10). Lessons are ranked per session by project/domain affinity + recency + strength + access, so each session sees its most-relevant slice. Lower = leaner system prompts. |
 | `identityClients` | Which harnesses inject the [identity layer](#identity-layer) at session start (default `["cc"]`; `"all"` or any subset of `cc`/`hermes`/`oc`/`pi`/`opencode`) |
 | `identityAgents` | Per-agent identity modes (0.13): `{ "<id>": "override" \| "global" \| "off" }`. Absent + no `agents/<id>/` dir → every agent gets the global set. Boot-time (restart to apply) — see [Per-agent identity](#per-agent-identity-013) |
 | `agentName` | This install's per-agent identity id sent as `?agent=`. **Unset by default** (CC shares the global identity — no `?agent=` sent). Explicit opt-in via `init --agent-name <name>`; `init --agent-name ""` clears it. An empty/whitespace value equals unset |
 | `captureCooldownHours` | Success-cooldown (hours) for the **capture watchdog** (0.17). The capture timer polls every ~20 min; the watchdog captures only if more than this has elapsed since the last *successful* capture (`state.lastNightly`). Default `6` (≈4 captures/day). A failed preflight retries on the next poll (~20 min) — so a transient fire-instant network miss costs minutes, not a day (#239) |
+| `firstRunLookbackDays` | Days of session history the FIRST nightly run discovers (default `7`). A long-term AI user's entire session store is deliberately not distilled on night one — the first watermark is `now − this many days`, not the beginning of time. Already-running installs are unaffected (they have a real watermark). To import more history, run `hicortex nightly --recapture-window <days>` once — widening-only, per-session cursors keep the re-scan cheap. Invalid value → warn + default (#436) |
 | `consolidationHours` | Hours (0–23, local) for the **consolidation** timer — the full nightly (capture + distill + score + reflect + link). Installed for **server/co-located only** (clients have no local DB). Default `[10, 22]`: the 22:00 evening slot runs after the day's capture waves (same-day results); the 10:00 morning slot runs *after* the morning capture so wake-up pushes are caught. Omitted on clients |
 | `timerJitterSeconds` | Max random delay (seconds) added to **generated** consolidation timers (#256), so a fleet doesn't all fire on the same minute (thundering-herd → LLM-backend contention). systemd: a single `RandomizedDelaySec=<n>`; launchd has no native equivalent so a per-install randomized `Minute` offset is baked into every `StartCalendarInterval` dict (sub-60s values no-op on launchd). Default `3600` (≈±30 min spread on the 2-slot/day cadence); `0` disables. Affects timers on the next `init` (re-init rewrites the unit files; installs that don't re-init keep their existing timers) |
 | `nightlyTimeBudgetMinutes` | The ONE wall-clock budget (minutes) for a nightly run: capture and every consolidation stage share one cooperative deadline, checked at safe boundaries (capture segments, stage boundaries, item loops, the merge zone). A run whose deadline fires reports consolidation `deferred` and resumes from its cursors next run — no work lost, none redone. Default `240`; `0`/invalid → default (a deadline always exists — there is no "off"). The systemd unit's `TimeoutStartSec` is derived from this (+60 min slack) at `init` |
@@ -279,29 +283,11 @@ Config at `~/.hicortex/config.json`. Created by `init`. Key options:
 | `memorySoftCap` | Soft cap on the memory corpus (default 10000). When the corpus exceeds this, the nightly's capacity-eviction stage removes the lowest-`effectiveStrength` memories (ties broken by oldest access) until under the cap — the active forgetting mechanism that bounds DB size, vector-index RAM, and consolidation workload. `0` disables eviction (indefinite growth — the pre-#245 behaviour). The evicted tail is cold by construction (effectiveStrength is the same decay-weighted score the recall ranker uses, so these were not surfacing in the top-k anyway). At 10K memories the load + JS sort is <100 ms |
 | `updateChannel` | Release channel pinned into the generated daemon/timer ExecStart for **npx-thin** installs (global-binary installs use the absolute binary and are unaffected). A dist-tag (`"rc"`, `"next"`) or an exact version (`"0.17.1"`). E.g. `"rc"` → the timer runs `npx -y @gamaze/hicortex@rc nightly`, so the host tracks the rc dist-tag (an internal fleet can ride rc through a pre-promotion soak). Validated as `[\w.\-]+` (rejects anything that'd break the unit/plist templates). Absent → auto-detect (bare on `latest`, else `@next`). (0.17.1) |
 | `nightlyHour` | **Deprecated (0.17) single-slot fallback.** Local hour (0–23) honoured only when `consolidationHours` is absent — yields one daily consolidation slot at that hour (preserves the pre-0.17 "one daily job" intent). New installs should use `consolidationHours` |
-| `scoreSimilarityWeight` | Weight of semantic similarity in the ranking score (default: 0.50) |
-| `scoreStrengthWeight` | Weight of effective strength — importance/use/recency of access (default: 0.20) |
-| `scoreConnectionsWeight` | Weight of graph centrality (default: 0.15) |
-| `scoreRecencyWeight` | Weight of the slow recency curve (default: 0.15) |
-| `freshnessBoostDays` | Fresh-memory window: new memories rank higher for this many days (default: 7) |
-| `freshnessBoostWeight` | Size of the fresh-memory bonus at age 0, fading linearly to 0 at the window edge (default: 0.15; set 0 to disable) |
-| `supersededDemotion` | Score multiplier for a memory a later decision reversed (default: 0.50) |
-| `decayHalfLifeDays` | Memory decay half-life in days at reference importance (default: 365). Larger = slower forgetting; importance, access, and links slow it further |
-| `searchLimit` / `recentLimit` | Default result counts for search (8) and recent (12) |
-| `recentWindowDays` | Candidate window for recent recall (default: 180) |
-| `coldExposureSlots` | Top-k slots reservable for never-accessed memories so the long tail gets exposure (default: 2) |
-| `recallMaxItems` | Max lines in the pushed recall index (default: 5) |
-| `noveltyFloorSlots` | Slots of `recallMaxItems` guaranteed to the top passing hit(s) of the pure-prompt (unblended) search — the novelty floor. Keeps a session whose earlier turns set a strong intent from burying a topic-switching prompt's best matches: the floor's picks render first, turn-based re-show suppression still applies, and the total never exceeds `recallMaxItems` (default: 2; set 0 to disable) |
-| `recallMinSimilarity` | Relevance floor for index entries (default: 0.62; text-search matches always pass) |
-| `recallReshowTurns` | Turns before an already-shown memory may reappear in the same session (default: 30) |
-| `recallMinPromptChars` | Prompts shorter than this skip the recall index (default: 20) |
-| `recallTitleChars` | Chars of each memory's first line shown in an index entry (default: 100, range 40–400). Reverted from 150 on 2026-08-03: a full-corpus relevance eval found 100 and 150 statistically identical while 100 saves ~13% of the block's tokens |
-| `sessionIntentWeight` | Blend weight of the session-intent rolling centroid in the recall search vector: `query = (1-w)·prompt + w·centroid` (default: 0.33; set 0 to disable — pure-prompt recall, the kill-switch). The first turn of a session searches with pure prompt and seeds the centroid; subsequent turns blend so recall follows the session's intent instead of being query-literal. The EMA rate (0.4) is a shipped constant, not configurable |
-| `dedupAutoMergeThreshold` | The deterministic merge ceiling of the unified resolution pass: memory pairs at/above this cosine merge automatically (zero LLM) via the dedup core's clustering; pairs between `correctionMinSimilarity` and this value get the one merge/corrects/supersedes/none verdict. Also the default threshold for `hicortex dedup` (default: 0.92) |
-| `dedupMergeThreshold` | Legacy alias for `dedupAutoMergeThreshold`, still honored when the newer key is absent |
-| `supersessionMinSimilarity` | Minimum cosine similarity for a nightly supersession candidate pair (default: 0.80) |
-| `supersessionPenalty` | Multiplier applied to a superseded memory's `base_strength` (default: 0.5) |
 | `telemetry` | Anonymous usage telemetry. **On by default and not written into config by `init`** — add `"telemetry": false` yourself (or set `HICORTEX_TELEMETRY=off`) to opt out. Inspect exactly what is sent with `hicortex telemetry` |
+
+**Calibration is release-managed.** The ~35 tuning keys earlier releases exposed (recall breadth, relevance floors, ranking weights, decay speed, dedup/supersession/correction thresholds, the weak-primary floor) are no longer config: they are constants that ship with each release and change only in releases, with the eval evidence linked in the changelog. Config values for them are ignored — the server prints a one-time boot warning naming each ignored key. Your config file now describes your *install* (mode, model, schedules, identity, budgets), not the brain's tuning.
+
+**Diagnostic tier (environment).** Three niche, ollama-only operational values moved from config to environment variables: `HICORTEX_NUM_CTX` (context window for ollama, default 8192), `HICORTEX_OLLAMA_FLUSH_EVERY` (flush ollama's accumulated memory every N LLM calls; default 0 = off), and `HICORTEX_OLLAMA_FLUSH_WAIT_MS` (post-flush wait, default 180000). Pin them in a service unit's environment when needed; the old config keys are ignored with a boot warning naming the replacement.
 
 Full docs: [hicortex.gamaze.com/docs/configuration.html](https://hicortex.gamaze.com/docs/configuration.html)
 
@@ -346,7 +332,7 @@ Optional config (add to plugin entry in `~/.openclaw/openclaw.json`):
 | `serverUrl` | `http://127.0.0.1:8787` | Hicortex server URL. Change for remote servers. |
 | `authToken` | _(none)_ | Bearer token. Localhost bypasses auth; required for remote servers. Get the token from `hicortex status` on the server. |
 | `defaultProject` | _(none)_ | Project name sent on recall, search, recent, and ingest whenever the gateway supplies no project (Hermes `default_project` parity). |
-| `recallLimit` | `8` | Max memories per recall on the pre-0.14 `/search` fallback. The pushed recall index is sized by SERVER config (`recallMaxItems`) — the server accepts no client limit. |
+| `recallLimit` | `8` | Max memories per recall on the pre-0.14 `/search` fallback. The pushed recall index is sized by the server's release-managed calibration — the server accepts no client limit. |
 | `scaffoldDeadMan` | `true` | Auto-scaffold the dead-man identity-guard line into the agent workspace bootstrap (`BOOTSTRAP.md`) at startup. Set `false` to disable the write and any file creation entirely. |
 
 If `serverUrl`/`authToken` are absent from the config, the `HICORTEX_URL` and `HICORTEX_AUTH_TOKEN` environment variables are used as fallbacks (config always wins).

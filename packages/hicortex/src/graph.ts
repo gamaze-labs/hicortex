@@ -372,8 +372,7 @@ function makeLabel(content: string): string {
  * Nodes are ranked by effective (decayed) strength and capped at `limit`.
  * Edges include only links where BOTH endpoints made the cut.
  * Link counts come from one aggregate query over memory_links (no per-row
- * queries) and feed both the effectiveStrength hardening term and the
- * per-node linkCount field.
+ * queries) and feed the per-node linkCount field.
  */
 export function exportGraph(
   db: Database.Database,
@@ -400,7 +399,7 @@ export function exportGraph(
   // Candidate memories — domain/type filters pushed into SQL
   let sql =
     `SELECT id, content, memory_type, domain, project, base_strength,
-            last_accessed, access_count, created_at
+            last_accessed, created_at
      FROM memories`;
   const where: string[] = [];
   const params: unknown[] = [];
@@ -425,7 +424,6 @@ export function exportGraph(
     project: string | null;
     base_strength: number | null;
     last_accessed: string | null;
-    access_count: number | null;
     created_at: string | null;
   }>;
 
@@ -434,12 +432,7 @@ export function exportGraph(
   // Score, filter on effective strength, rank, cap
   const scored = rows.map((row) => {
     const linkCount = linkCounts.get(row.id) ?? 0;
-    const strength = effectiveStrength(
-      row.base_strength ?? 0.5,
-      row.last_accessed,
-      now,
-      { accessCount: row.access_count ?? 0, linkCount },
-    );
+    const strength = effectiveStrength(row.base_strength ?? 0.5, row.last_accessed, now);
     return { row, strength, linkCount };
   });
 

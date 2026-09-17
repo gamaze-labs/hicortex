@@ -948,3 +948,58 @@ export function handleIdentityPut(
   }
   return { status: 200, body: respBody, warn };
 }
+
+/**
+ * PUT /identity/mode (#423 phase 3): switch ONE agent's scope to
+ * override/global/off. Pure validation + merge — the ADAPTER (mcp-server.ts)
+ * does three things with the result: (1) persists `agents` as the config's
+ * `identityAgents` (survives restarts), (2) sets the daemon's live boot-time
+ * map to the same merged map (single-writer: the map changes at boot or
+ * here — never diverges), so the switch is live on the very next
+ * GET /identity?agent= (applies: "immediate"), and (3) responds with this
+ * body. Externally hand-edited config still needs a restart (pre-existing
+ * posture — only this endpoint updates the live map).
+ *
+ * Interplay with PUT /identity: its black-hole guard 409s section writes
+ * while config forces off/global for the agent (sections written under
+ * agents/<id>/ would never be served); switching to 'override' here FIRST
+ * unblocks section editing. `dir_present` tells the caller whether an agent
+ * section dir already exists ('real' — agent content to serve) or not
+ * (override on a fresh dir = global content until sections are written).
+ */
+export function handleIdentityModePut(
+  identityDir: string,
+  body: unknown,
+  query: Record<string, unknown>,
+  currentAgents: Record<string, AgentMode>,
+): HandlerResult & { agents?: Record<string, AgentMode> } {
+  const { agentId, error } = extractAgentParam(query);
+  if (error) return { status: 400, body: { error } };
+  if (agentId === null) {
+    return {
+      status: 400,
+      body: { error: "The ?agent= query parameter is required (PUT /identity/mode sets ONE agent's scope)" },
+    };
+  }
+
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    return { status: 400, body: { error: "Body must be a JSON object {mode}" } };
+  }
+  const { mode } = body as { mode?: unknown };
+  if (mode !== "override" && mode !== "global" && mode !== "off") {
+    return { status: 400, body: { error: "Invalid 'mode' — expected one of \"override\", \"global\", \"off\"" } };
+  }
+
+  return {
+    status: 200,
+    body: {
+      agent: agentId,
+      mode,
+      dir_present: agentDirState(identityDir, agentId) === "real",
+      applies: "immediate",
+    },
+    // The merged map the adapter persists AND applies to the live boot-time
+    // map — other agents' entries are preserved untouched.
+    agents: { ...currentAgents, [agentId]: mode },
+  };
+}

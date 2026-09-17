@@ -193,6 +193,36 @@ switch (command) {
     break;
   }
 
+  case "rescore-importance": {
+    // #425 — one-shot LLM backfill: re-judge the corpus under the
+    // re-anchored importance rubric. classify-domains shape (resumable
+    // cursor, --batch, --reset) + dedup discipline (dry-run default,
+    // --apply, DB backup before any write).
+    const args = process.argv.slice(3);
+    const intFlag = (name: string): number | undefined => {
+      const idx = args.indexOf(name);
+      if (idx === -1) return undefined;
+      const val = parseInt(args[idx + 1], 10);
+      if (isNaN(val)) {
+        console.error(`[hicortex] rescore-importance: ${name} requires an integer value`);
+        process.exit(1);
+      }
+      return val;
+    };
+    const rescoreOptions = {
+      apply: args.includes("--apply"),
+      reset: args.includes("--reset"),
+      batchSize: intFlag("--batch"),
+    };
+    import("./rescore-importance.js").then(({ runRescoreImportance }) => {
+      runRescoreImportance(rescoreOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] rescore-importance failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
   case "classify-types": {
     const args = process.argv.slice(3);
     const intFlag = (name: string): number | undefined => {
@@ -426,6 +456,8 @@ Commands:
   backup          Snapshot the DB + identity + state to a tar.gz (online, WAL-safe)
   classify-domains  Backfill content-based domain tags over the corpus (server mode, needs config.domains)
   classify-types    Backfill episode→fact/decision type tags over the corpus (server mode)
+  rescore-importance  Re-judge all memories' importance under the current rubric
+                      (server mode; dry run by default — --apply executes; resumable)
   learnings-identity  Fetch identity + lessons and print Markdown to stdout (CC SessionStart hook)
                       (alias: lessons-context — the pre-#264 name, kept for backcompat)
   recall-hook    Pushed recall index for the current prompt (CC UserPromptSubmit/SessionStart hook)
@@ -450,9 +482,8 @@ Options:
   dedup --apply             Execute the merge (default: dry run, report only)
                             Losers are absorbed — hidden from recall, kept as
                             evidence (fetchable by id; dedup_log audit) — not deleted
-  dedup --threshold <t>     Override the threshold for one run (default: config
-                            dedupAutoMergeThreshold, legacy dedupMergeThreshold
-                            still honored; else 0.92)
+  dedup --threshold <t>     Override the threshold for one run (default: the
+                            release-managed calibration ceiling, 0.92)
   dedup --db <path>         DB path override (defaults to the configured DB)
   history --rollback <row>  Roll back history row <row>: restores prior content/status, un-absorbs triggers
   history --db <path>       DB path override (defaults to the configured DB)
@@ -464,6 +495,10 @@ Options:
   classify-types --all      Reclassify every memory (default: only episodes)
   classify-types --batch <n>  Memories per batch (default: 200)
   classify-types --reset    Restart from the beginning (ignore saved cursor)
+  rescore-importance --apply  Execute the importance backfill (default: dry run, report only)
+                             Takes a DB backup first; resumable via a state.json cursor
+  rescore-importance --batch <n>  Rows per invocation (default: 500; LLM calls are 10 rows each)
+  rescore-importance --reset    Restart from the beginning (ignore saved cursor)
   identity show [name]      Print all identity sections, or just <name> (raw, pipeable)
   identity edit <name>      Edit a section in $EDITOR; PUT only if changed
   identity … --agent <id>   Target a per-agent scope instead of the global set

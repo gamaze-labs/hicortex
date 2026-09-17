@@ -1,6 +1,6 @@
 {
   "name": "@gamaze/hicortex",
-  "version": "0.20.7",
+  "version": "0.22.0",
   "description": "Persistent agent identity for AI agents — a hand-edited identity layer, nightly-distilled experience, and lessons injected every session, shared across your whole fleet. Works with Hermes, OpenClaw, Claude Code, Pi, and opencode.",
   "main": "dist/index.js",
   "bin": {
@@ -43,6 +43,8 @@
     "test:watch": "vitest",
     "eval": "node dist/eval/run-eval.js",
     "eval:planted": "node dist/eval/planted-eval.js",
+    "eval:ranking": "node dist/eval/ranking-eval.js",
+    "eval:importance": "node dist/eval/importance-eval.js",
     "eval:recall-sweep": "node dist/eval/recall-sweep.js",
     "eval:relevance": "node dist/eval/relevance-eval.js",
     "prepack": "npm run build && rm -rf ./hermes-plugin && mkdir -p ./hermes-plugin && cp -r ../../hermes-plugin/hicortex ./hermes-plugin/ && find ./hermes-plugin -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true && rm -rf ./pi-extension && mkdir -p ./pi-extension && cp -r ../../pi-extension/hicortex ./pi-extension/ && rm -rf ./opencode-plugin && mkdir -p ./opencode-plugin && cp -r ../../opencode-plugin/hicortex ./opencode-plugin/",

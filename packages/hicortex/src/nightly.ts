@@ -14,20 +14,20 @@
 import { hicortexHome } from "./paths.js";
 import { readFileSync, statSync, copyFileSync, truncateSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import type Database from "better-sqlite3";
 
 let VERSION = "0.0.0";
 try { VERSION = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version; } catch {}
 
 import { initDb, resolveDbPath } from "./db.js";
-import { readNonNegativeConfig, warnIgnoredConfigKeys } from "./config-read.js";
+import { readNonNegativeConfig, readPositiveConfig, warnIgnoredConfigKeys } from "./config-read.js";
+import { DEFAULT_FIRST_RUN_LOOKBACK_DAYS } from "./calibration.js";
 import { resolveSavedLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
-import { runConsolidation, resolveNightlyLlmCallBudget, resolveMemorySoftCap, stageMemoryCapEviction, shouldThrottleTokens, isStaleTokenPeriod } from "./consolidate.js";
+import { runConsolidation, resolveNightlyLlmCallBudget, resolveMemorySoftCap, stageMemoryCapEviction, shouldThrottleTokens, isStaleTokenPeriod, warnUnmeteredTokensRun } from "./consolidate.js";
 import { parseConfigDomains } from "./domain-classify.js";
-import { resolveWeakPrimaryFloor } from "./nofit.js";
 import { readCcTranscripts, type TranscriptBatch } from "./transcript-reader.js";
 import { readHermesSessions } from "./hermes-transcript-reader.js";
 import { readPiTranscripts } from "./pi-transcript-reader.js";
@@ -58,6 +58,19 @@ const HICORTEX_HOME = hicortexHome();
  * count stays bounded.
  */
 const CONSOLIDATE_ONLY_BACKUP_MIN_AGE_MS = 20 * 60 * 60 * 1000;
+
+/**
+ * #421 machine × harness identity: the stamp every captured segment carries
+ * as `source_machine`. Config `machineName` wins when set (same style as
+ * `agentName` — an owner-set identity key); otherwise the hostname. Applies
+ * to BOTH capture paths (server-local and client-remote) — same package,
+ * same stamp.
+ */
+function resolveCaptureMachine(config: Record<string, unknown> | null | undefined): string {
+  const v = config?.machineName;
+  if (typeof v === "string" && v.trim()) return v.trim().slice(0, 128);
+  return hostname();
+}
 
 function readNightlyConfig(stateDir: string): Record<string, unknown> | null {
   const configPath = join(stateDir, "config.json");
@@ -93,11 +106,11 @@ function readConfigLicenseKey(stateDir: string): string | undefined {
   }
 }
 
-function readLastRun(stateDir: string = HICORTEX_HOME): Date {
+function readLastRun(stateDir: string = HICORTEX_HOME): Date | null {
   const ts = loadState(stateDir).lastNightly;
-  if (!ts) return new Date(0); // First run — process everything
+  if (!ts) return null; // First run — no watermark yet; #436 applies the lookback cap
   const d = new Date(ts);
-  return isNaN(d.getTime()) ? new Date(0) : d;
+  return isNaN(d.getTime()) ? null : d; // corrupt stamp → treated as first run
 }
 
 /**
@@ -110,6 +123,14 @@ function readLastRun(stateDir: string = HICORTEX_HOME): Date {
  * (#189 review, fix 3). Per-session cursors keep the wide re-scan cheap: an
  * already-captured session yields an empty delta.
  *
+ * First run (#436): with NO watermark yet, since = now − firstRunLookbackDays
+ * (default 7 — owner ruling 2026-09-14: full-history first-run ingestion is
+ * not feasible; a long-term AI user's entire session store must not be
+ * discovered night one). The widening-only invariant composes unchanged:
+ * min(now−7d, now−N) — a recapture window wider than the default widens, a
+ * narrower one leaves the floor. Installing more history is the deliberate
+ * `--recapture-window` act, not a default.
+ *
  * Clock-jump clamp (#327): a FUTURE-dated lastNightly (client clock error —
  * NTP not yet synced at write time) would, once the clock corrects, sit ahead
  * of every session mtime and permanently skip quiet sessions (their mtimes
@@ -121,10 +142,12 @@ export function computeSince(
   stateDir: string,
   recaptureWindowDays?: number,
   now: Date = new Date(),
+  firstRunLookbackDays: number = DEFAULT_FIRST_RUN_LOOKBACK_DAYS,
 ): Date {
   const lastRun = readLastRun(stateDir);
-  let effective = lastRun;
-  if (lastRun.getTime() > now.getTime()) {
+  let effective =
+    lastRun ?? new Date(now.getTime() - firstRunLookbackDays * 24 * 60 * 60 * 1000);
+  if (lastRun && lastRun.getTime() > now.getTime()) {
     console.warn(
       `[hicortex] state lastNightly (${lastRun.toISOString()}) is ahead of the clock ` +
       `(${now.toISOString()}) — clamping discovery to now. A future watermark permanently ` +
@@ -319,10 +342,11 @@ export function runEvictionOnly(options: {
   const stateDir = options.stateDir ?? HICORTEX_HOME;
   const savedConfig = readNightlyConfig(stateDir);
   // Same clock as the full nightly (see runNightly's identical trio) — the
-  // eviction ranker reads these module knobs.
-  configureDecay({ halfLifeDays: savedConfig?.decayHalfLifeDays });
-  configureRecall(savedConfig);
-  configureScoring(savedConfig);
+  // eviction ranker reads these module knobs. #408: calibration constants,
+  // never user config — the calls just pin the process to the shipped values.
+  configureDecay();
+  configureRecall();
+  configureScoring();
   const dbPath = resolveDbPath(options.dbPath);
   console.log(`[hicortex] evict-only run${options.dryRun ? " (dry run)" : ""} — DB: ${dbPath}`);
   const db = initDb(dbPath);
@@ -512,10 +536,11 @@ export async function runNightly(options: {
 
   const dbPath = resolveDbPath(options.dbPath);
   // #192: consolidation's decay/prune stage must score with the same clock as
-  // the server's retrieval path (config decayHalfLifeDays, default 365).
-  configureDecay({ halfLifeDays: savedConfig?.decayHalfLifeDays });
-  configureRecall(savedConfig);
-  configureScoring(savedConfig);
+  // the server's retrieval path. #408: that clock is the calibration constant
+  // set (calibration.ts) — both processes resolve identically by construction.
+  configureDecay();
+  configureRecall();
+  configureScoring();
   const modeLabel = consolidateOnly ? " (consolidate-only)" : captureOnly ? " (capture-only)" : dryRun ? " (dry run)" : "";
   console.log(`[hicortex] Nightly pipeline starting${modeLabel}`);
   if (captureOnly) {
@@ -615,7 +640,12 @@ export async function runNightly(options: {
         // Step 1: Read new transcripts (CC + Hermes + Pi + OpenClaw). Discovery
         // is whole-session by mtime/ended_at; per-session cursors slice each
         // discovered session down to its unseen delta (#189).
-        const since = computeSince(stateDir, recaptureWindowDays);
+        const since = computeSince(
+          stateDir,
+          recaptureWindowDays,
+          undefined,
+          readPositiveConfig(savedConfig ?? {}, "firstRunLookbackDays", DEFAULT_FIRST_RUN_LOOKBACK_DAYS),
+        );
         if (recaptureWindowDays) {
           console.log(`[hicortex] --recapture-window ${recaptureWindowDays}d: reading transcripts since ${since.toISOString()}`);
         } else {
@@ -663,6 +693,7 @@ export async function runNightly(options: {
           dryRun,
           sourceAgentId: savedConfig?.agentId as string | undefined,
           sourceDomain: savedConfig?.sourceDomain as string | undefined,
+          sourceMachine: resolveCaptureMachine(savedConfig),
           deadline,
         });
         memoriesIngested = result.memoriesIngested;
@@ -701,6 +732,14 @@ export async function runNightly(options: {
     // snapshot). 0 is a real value (under cap), so this stays undefined only
     // when consolidation didn't run at all (capture-only / no_llm / skipped).
     let evictedCount: number | undefined;
+    // #427: reconsolidation scout counters (hoisted for the dashboard
+    // snapshot). Flat snake_case on the wire, mirroring the stage report.
+    // Undefined only when consolidation didn't run; quiet-night zeros are
+    // REAL values from the stage's quiet-night report shape (the scan doesn't
+    // run on a quiet night — that's a fact about the night, not a gap).
+    let scoutScanned: number | undefined;
+    let scoutCorrectionShaped: number | undefined;
+    let scoutCandidatesFound: number | undefined;
     // Resolved cap (#245) for the dashboard snapshot. Hoisted so the snapshot
     // writer (outside the consolidation block) can stamp `capacity` even when
     // consolidation was skipped (the cap is still "in force" config-wise).
@@ -803,11 +842,13 @@ export async function runNightly(options: {
             const report = await runConsolidation(db, llm, embed, dryRun, false, undefined, {
               domains: cfgDomains,
               contentDomainsReady: true,
-              weakPrimaryFloor: resolveWeakPrimaryFloor(savedConfig),
+              // #408: weakPrimaryFloor is a release-managed calibration
+              // constant now — no config threading; the Options field stays
+              // as the eval/test seam.
             }, {
               // #405: no supersessionMaxCalls — the ONE run budget is the
-              // only call cap.
-              minSimilarity: savedConfig?.supersessionMinSimilarity as number | undefined,
+              // only call cap. #408: minSimilarity defaults to the
+              // calibration constant (seam only).
             },
               // #405: the ONE per-run LLM-call ceiling (default 5000;
               // consolidateMaxLlmCalls honored as a deprecated alias).
@@ -815,17 +856,10 @@ export async function runNightly(options: {
               // #245: soft cap on the corpus (default 10000; 0 disables eviction).
               memorySoftCapResolved,
               {
-                // #384 reconsolidation knobs — threaded exactly like the
-                // supersession pair above; the stage validates and falls back
-                // to its defaults (0.75 / 0.80) on invalid/absent values.
-                minSimilarity: savedConfig?.correctionMinSimilarity as number | undefined,
-                rewriteMinConfidence: savedConfig?.correctionRewriteMinConfidence as number | undefined,
-                // #392: the deterministic-merge ceiling (legacy
-                // dedupMergeThreshold honored when the new key is absent).
-                // #405: maxMerges/reconsolidationMaxCalls are gone — the run
-                // budget + deadline are the only bounds.
-                autoMergeThreshold: (savedConfig?.dedupAutoMergeThreshold ??
-                  savedConfig?.dedupMergeThreshold) as number | undefined,
+                // #384/#392 reconsolidation knobs — eval/test seams since
+                // #408 (release-managed calibration constants; nothing is
+                // threaded from config). The stage validates and falls back
+                // to its calibration defaults on invalid/absent values.
               },
               // #405: the ONE run-wide deadline — capture and every
               // consolidation stage check this same handle.
@@ -855,6 +889,13 @@ export async function runNightly(options: {
             // stage always returns `evicted` (0 when under cap / disabled); report
             // it as 0 (a real value), not undefined, when the stage ran.
             evictedCount = report.stages.memory_cap?.evicted ?? 0;
+            // #427: forward the scout counters whenever the stage ran. The
+            // stage report always carries them (quiet-night shape = zeros),
+            // so `?.` only falls through when the whole stage is absent
+            // (skipped run) — same skip-keys style as lessonsGenerated.
+            scoutScanned = report.stages.reconsolidation?.scout_scanned;
+            scoutCorrectionShaped = report.stages.reconsolidation?.scout_correction_shaped;
+            scoutCandidatesFound = report.stages.reconsolidation?.scout_candidates_found;
             // Only set when reflection actually RAN (not skipped). A skipped stage
             // (e.g. endpoint offline, #232 fail-soft) must NOT collapse to 0 — that
             // would make "endpoint down" indistinguishable from "prompt too tight"
@@ -870,6 +911,12 @@ export async function runNightly(options: {
               tokensThisRun = tokensTotal.total;
               tokensByStage = report.budget?.tokens_by_stage;
             }
+            // #427 observability: calls happened but ZERO tokens metered —
+            // the endpoint returned no usage objects (recordUsage no-ops by
+            // design). The snapshot would carry token nulls for such a run;
+            // make the blind spot GREPPABLE in journald instead of silent,
+            // the same structured-event style as budget_exhausted.
+            if (report.budget) warnUnmeteredTokensRun(report.budget);
             // #255: budget exhaustion — always populated when consolidation ran
             // (report.budget.exhausted is a boolean). The dashboard + telemetry
             // treat true as a quality-degradation health signal. The
@@ -1074,6 +1121,11 @@ export async function runNightly(options: {
           dedup,
           supersession,
           evicted: evictedCount,
+          // #427: scout counters — forwarded whenever consolidation ran
+          // (writeSnapshot omits the keys when undefined).
+          scoutScanned,
+          scoutCorrectionShaped,
+          scoutCandidatesFound,
           // #246: token accounting from this run's consolidation (undefined
           // when consolidation didn't run or made no metered calls).
           tokensThisRun,
@@ -1300,7 +1352,12 @@ async function runClientNightly(
     // logs, denoises, and POSTs the denoised text to the server's /distill
     // endpoint. All readers no-op when their harness isn't installed. Per-session
     // cursors slice each discovered session to its unseen delta (#189).
-    const since = computeSince(stateDir, recaptureWindowDays);
+    const since = computeSince(
+      stateDir,
+      recaptureWindowDays,
+      undefined,
+      readPositiveConfig(config ?? {}, "firstRunLookbackDays", DEFAULT_FIRST_RUN_LOOKBACK_DAYS),
+    );
     if (recaptureWindowDays) {
       console.log(`[hicortex] --recapture-window ${recaptureWindowDays}d: reading transcripts since ${since.toISOString()}`);
     } else {
@@ -1333,6 +1390,7 @@ async function runClientNightly(
         // server stores these alongside source_agent; nothing filters on them.
         sourceAgentId: config.agentId as string | undefined,
         sourceDomain: config.sourceDomain as string | undefined,
+        sourceMachine: resolveCaptureMachine(config),
       });
       memoriesIngested = result.memoriesIngested;
       sessionsSent = result.sessionsSent;

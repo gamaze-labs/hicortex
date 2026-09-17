@@ -68,6 +68,25 @@ export async function runStatus(): Promise<void> {
       console.log(`Memories:     ${stats.memories} (${typeStr || "none"})`);
       console.log(`Links:        ${stats.links}`);
       console.log(`DB size:      ${(stats.db_size_bytes / 1024).toFixed(1)} KB`);
+      // 0.21 migration detection (#425): pre-0.21 stores have inflated importance
+      // scores (median ~0.80 vs the honest ~0.40). If the live median is high,
+      // recommend the one-shot rescore.
+      if (stats.memories > 0) {
+        try {
+          const live = db.prepare(
+            "SELECT base_strength FROM memories WHERE base_strength IS NOT NULL AND (status IS NULL OR status NOT IN ('absorbed','superseded','retracted')) ORDER BY base_strength"
+          ).all() as Array<{ base_strength: number }>;
+          if (live.length >= 10) {
+            const median = live[Math.floor(live.length / 2)].base_strength;
+            if (median >= 0.6) {
+              console.log(``);
+              console.log(`⚠  Pre-0.21 importance scores detected (median ${median.toFixed(2)}).`);
+              console.log(`   Run: npx @gamaze/hicortex rescore-importance --apply`);
+              console.log(`   to re-score your store under the honest rubric.`);
+            }
+          }
+        } catch { /* non-fatal */ }
+      }
       db.close();
     } catch (err) {
       console.log(`DB error:     ${err instanceof Error ? err.message : String(err)}`);

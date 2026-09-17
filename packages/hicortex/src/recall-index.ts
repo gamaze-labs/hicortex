@@ -10,8 +10,9 @@
  * Strengthening semantics (the recall/decay alignment):
  *   - Appearing in the index = exposure: shown_count + last_accessed refresh
  *     (mild, temporary strengthen — the decay clock resets) via
- *     storage.touchMemoriesShown. NO access_count bump: hardening, the prune
- *     shield, and the adoption metric stay driven by real use.
+ *     storage.touchMemoriesShown. NO access_count bump: the promotion signal
+ *     (#448), the prune shield, and the adoption metric stay driven by real
+ *     use.
  *   - hicortex_get = use: full strengthen (access_count + 1).
  *
  * Anti-bloat gates: relevance floor (measured cosine, or a real BM25 match),
@@ -57,11 +58,13 @@ import {
   getSessionIntent,
   recallQueryVector,
 } from "./retrieval.js";
+import * as CALIBRATION from "./calibration.js";
 
 export interface RecallIndexOptions {
-  /** Minimum measured cosine for vector-only candidates (config
-   *  `recallMinSimilarity`). FTS-matched candidates pass regardless — a BM25
-   *  text match is direct evidence of relevance. Default 0.62 (raised from 0.55
+  /** Minimum measured cosine for vector-only candidates (release-managed
+   *  since #408 — calibration.ts RECALL_MIN_SIMILARITY; this field is the
+   *  eval/test seam). FTS-matched candidates pass regardless — a BM25
+   *  text match is direct evidence of relevance. 0.62 (raised from 0.55
    *  on 2026-08-03 per a 0.01-step floor sweep on the rewritten corpus): steady
    *  ~3:1 noise:signal removal with no knee; 0.62 = +2.2pts precision, 10/98
    *  prompts silent, sits below the 0.63 local pessimum. The floor is a noise
@@ -69,53 +72,55 @@ export interface RecallIndexOptions {
    *  comes with ~1.5 wrongly-silenced (real signal); a non-cosine gate is the
    *  real silence fix (eval #3 §4). */
   minSimilarity?: number;
-  /** Max index lines per response (config `recallMaxItems`). Default 5
-   *  (lowered from 6 on 2026-08-03). Per-slot decomposition at floor 0.62:
-   *  slot 6 gives NO prompt its first relevant memory — "6 is wrong" is the
-   *  robust, prompt-set-independent finding, and 5 captures it. The K-sweep
-   *  is monotone (precision@4 33.7% > @6 30.6% > @8 28.3%), so 4 is
-   *  lower-noise — but the 4-vs-5 distinction rests on 5 of 98 prompts and is
-   *  overfitting-fragile (K and the floor were tuned on the same set); 5 hedges
-   *  with coverage at modest cost. Lower to 4 if a fresh-prompt eval replicates. */
+  /** Max index lines per response (release-managed — calibration.ts
+   *  RECALL_MAX_ITEMS; seam only). 5 (lowered from 6 on 2026-08-03). Per-slot
+   *  decomposition at floor 0.62: slot 6 gives NO prompt its first relevant
+   *  memory — "6 is wrong" is the robust, prompt-set-independent finding, and
+   *  5 captures it. The K-sweep is monotone (precision@4 33.7% > @6 30.6% >
+   *  @8 28.3%), so 4 is lower-noise — but the 4-vs-5 distinction rests on 5
+   *  of 98 prompts and is overfitting-fragile (K and the floor were tuned on
+   *  the same set); 5 hedges with coverage at modest cost. */
   maxItems?: number;
   /** Prompts shorter than this are skipped (continuations, "yes", "do it"). */
   minPromptLength?: number;
-  /** Max chars of the memory's first line shown in an index entry (config
-   *  `recallTitleChars`). Default 100 (reverted from 150 on 2026-08-03): the
-   *  full-corpus relevance eval (#3, §5) found 100 vs 150 statistically
-   *  identical (0.6pts apart, N=40, full CI overlap); 100 saves ~13% tokens
-   *  per block. */
+  /** Max chars of the memory's first line shown in an index entry
+   *  (release-managed — calibration.ts RECALL_TITLE_CHARS; seam only).
+   *  100 (reverted from 150 on 2026-08-03): the full-corpus relevance eval
+   *  (#3, §5) found 100 vs 150 statistically identical (0.6pts apart, N=40,
+   *  full CI overlap); 100 saves ~13% tokens per block. */
   titleChars?: number;
   /** Slots of `maxItems` guaranteed to the pure-prompt (unblended) search's
-   *  top passing hit(s) — the #324 novelty floor. Config `noveltyFloorSlots`,
-   *  default 2 (mirrors coldExposureSlots sizing: small, a floor not a
-   *  takeover). 0 disables the pure-prompt search entirely (the kill-switch).
-   *  Clamped to [0, maxItems]. */
+   *  top passing hit(s) — the #324 novelty floor. Release-managed
+   *  (calibration.ts NOVELTY_FLOOR_SLOTS; seam only); 2 mirrors
+   *  coldExposureSlots sizing: small, a floor not a takeover. 0 disables the
+   *  pure-prompt search entirely (the kill-switch). Clamped to [0, maxItems]. */
   noveltyFloorSlots?: number;
 }
 
-/** Relevance-gate floor for vector-only candidates (config `recallMinSimilarity`).
- *  0.62 (was 0.55; raised 2026-08-03 on the fine-grain floor sweep — see the
- *  minSimilarity doc above). */
-const DEFAULT_MIN_SIMILARITY = 0.62;
-/** Max index lines per pushed recall block (config `recallMaxItems`).
- *  5 (was 6; lowered 2026-08-03 — slot 6 is pure padding at floor 0.62). */
-const DEFAULT_MAX_ITEMS = 5;
-const DEFAULT_MIN_PROMPT_LENGTH = 20;
+/** Relevance-gate floor for vector-only candidates (release-managed —
+ *  calibration.ts RECALL_MIN_SIMILARITY). 0.62 (was 0.55; raised 2026-08-03
+ *  on the fine-grain floor sweep — see the minSimilarity doc above). */
+const DEFAULT_MIN_SIMILARITY = CALIBRATION.RECALL_MIN_SIMILARITY;
+/** Max index lines per pushed recall block (release-managed — calibration.ts
+ *  RECALL_MAX_ITEMS). 5 (was 6; lowered 2026-08-03 — slot 6 is pure padding
+ *  at floor 0.62). */
+const DEFAULT_MAX_ITEMS = CALIBRATION.RECALL_MAX_ITEMS;
+const DEFAULT_MIN_PROMPT_LENGTH = CALIBRATION.RECALL_MIN_PROMPT_CHARS;
 /** Default index-line title length. 100 (reverted from 150 on 2026-08-03:
  *  eval #3 §5 showed 100 vs 150 statistically identical; 100 saves ~13% tokens). */
-const DEFAULT_TITLE_CHARS = 100;
-/** Default #324 novelty-floor slots (config `noveltyFloorSlots`). 2 mirrors
- *  coldExposureSlots sizing — enough to guarantee the pure-prompt top hit
- *  plus a runner-up, never a takeover of the index. The floor only SPENDS
- *  slots when a pure-prompt hit differs from the blended picks (topic
- *  switch); continuing-intent sessions pay nothing. Exported for the boot
- *  log's knob line (mcp-server resolves config-vs-default here, once). */
-export const DEFAULT_NOVELTY_FLOOR_SLOTS = 2;
+const DEFAULT_TITLE_CHARS = CALIBRATION.RECALL_TITLE_CHARS;
+/** Default #324 novelty-floor slots (release-managed — calibration.ts
+ *  NOVELTY_FLOOR_SLOTS). 2 mirrors coldExposureSlots sizing — enough to
+ *  guarantee the pure-prompt top hit plus a runner-up, never a takeover of
+ *  the index. The floor only SPENDS slots when a pure-prompt hit differs
+ *  from the blended picks (topic switch); continuing-intent sessions pay
+ *  nothing. Exported for the boot log's knob line (mcp-server prints the
+ *  calibration constant here, once). */
+export const DEFAULT_NOVELTY_FLOOR_SLOTS = CALIBRATION.NOVELTY_FLOOR_SLOTS;
 /** Resolve the EFFECTIVE novelty floor (raw ?? default, clamped to
  *  [0, maxItems]) — one definition shared by the handler and the boot knob
  *  line so the logged value is what handleRecallIndex actually uses.
- *  maxItems may be the handler's already-resolved number OR raw config
+ *  maxItems may be the handler's already-resolved number OR raw/undefined
  *  (boot-log site) — raw is resolved with the handler's exact constants. */
 export function resolveNoveltyFloorSlots(rawSlots: unknown, rawMaxItems: unknown): number {
   const maxItems =
@@ -174,7 +179,7 @@ function formatDate(iso: string): string {
  * Render one production index line. Exported (2026-08-02, relevance eval #v2)
  * so the eval can measure the REAL rendered surface instead of reimplementing
  * it — `maxLen` threads through to `memoryTitle` unchanged (default
- * DEFAULT_TITLE_CHARS = 100, config `recallTitleChars`) so the eval's snippet-length
+ * DEFAULT_TITLE_CHARS = 100, release-managed since #408) so the eval's snippet-length
  * sweep (spec §4.2) can call this SAME function at 100/150/title1sent without
  * duplicating the date/scope/agent/type meta-line logic.
  */

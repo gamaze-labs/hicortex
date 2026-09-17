@@ -18,7 +18,7 @@ Gives [Pi](https://pi.dev) agents self-learning memory backed by a Hicortex serv
 
 ### Pushed recall index
 
-Each user prompt is POSTed to the server's `/recall-index`; the returned **index block** (one line per relevant memory: id, title, date) is injected into the turn. All gating and dedup knobs (`recallMaxItems`, `recallMinSimilarity`, `recallReshowTurns`, …) live in the **server** config — the extension carries none. A dedup reset fired at session start is awaited by the first turn's recall POST, so it can never land after it and wipe the turn state.
+Each user prompt is POSTed to the server's `/recall-index`; the returned **index block** (one line per relevant memory: id, title, date) is injected into the turn. All gating and dedup knobs (`recallMaxItems`, `recallMinSimilarity`, `recallReshowTurns`, …) are release-managed constants on the server (they ship with each release and change only with published eval evidence) — the extension carries none, and neither does the server's config. A dedup reset fired at session start is awaited by the first turn's recall POST, so it can never land after it and wipe the turn state.
 
 ### Identity layer
 

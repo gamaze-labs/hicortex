@@ -76,6 +76,9 @@ export interface DistillBody {
   source_agent_id?: string | null;
   /** Client-declared topic/domain of the capturing agent. Provenance only. */
   source_domain?: string | null;
+  /** Machine this capture ran on (#421 machine × harness): config
+   *  `machineName` ?? os.hostname(), stamped by the nightly. */
+  source_machine?: string | null;
   project: string;
   session_id: string;
   segment_id: string;
@@ -124,6 +127,12 @@ export interface CaptureOptions {
    * `source_domain` provenance. Null when undeclared.
    */
   sourceDomain?: string | null;
+  /**
+   * Machine stamp on every segment (#421 machine × harness): config
+   * `machineName` when set, else os.hostname() — resolved by the nightly
+   * caller. Null disables stamping.
+   */
+  sourceMachine?: string | null;
   /**
    * The run-wide pipeline deadline (#405), checked BETWEEN segment POSTs —
    * a boundary the per-session cursor discipline already guarantees is safe
@@ -345,7 +354,7 @@ export async function captureBatches(
   batches: TranscriptBatch[],
   opts: CaptureOptions,
 ): Promise<CaptureResult> {
-  const { post, cursorStore, dryRun = false, segmentMaxChars = SEGMENT_MAX_CHARS, sourceAgentId, sourceDomain, deadline } = opts;
+  const { post, cursorStore, dryRun = false, segmentMaxChars = SEGMENT_MAX_CHARS, sourceAgentId, sourceDomain, sourceMachine, deadline } = opts;
   let memoriesIngested = 0;
   let sessionsSent = 0;
   let hadTransientFailure = false;
@@ -427,6 +436,7 @@ export async function captureBatches(
         source_agent: batch.sourceAgent ?? `claude-code/${batch.projectName}`,
         source_agent_id: sourceAgentId ?? null,
         source_domain: sourceDomain ?? null,
+        source_machine: sourceMachine ?? null,
         project: batch.projectName,
         session_id: batch.sessionId,
         segment_id: `${genPrefix}${seg.segStart}-${seg.segEnd}${seg.idSuffix}`,

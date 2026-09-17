@@ -2,14 +2,15 @@
  * Retrieval layer with composite scoring, RRF fusion, and graph traversal.
  * Ported from hicortex/retrieval.py — same scoring model and weights.
  *
- * Scoring model (weights are config-driven since 0.15.2 — see configureScoring):
+ * Scoring model (weights are RELEASE-MANAGED since #408 — calibration.ts;
+ * configureScoring is the eval/test seam only):
  *   score = similarity * 0.50 + effective_strength * 0.20
  *         + connection_score * 0.15 + recency * 0.15
  *         + fresh-memory bonus (≤ 0.15, linear over the first 7 days)
  *         then × 0.50 if the memory was superseded by a later decision
  *
  * Decay model (B+E+D):
- *   base_decay = derived from decayHalfLifeDays (config; default 365 → ~1-year
+ *   base_decay = derived from the calibration half-life (365 → ~1-year
  *                half-life at importance 0.5, importance-scaled either way)
  *   decay_rate = 1 - base_decay * (1 - importance)
  *   decay_rate = 1 - (1 - decay_rate) * 0.7^access_count
@@ -23,12 +24,11 @@ import type { Memory, MemorySearchResult } from "./types.js";
 import * as storage from "./storage.js";
 import { l2Normalize, weightedAdd } from "./schema-prototypes.js";
 import { labelForType } from "./type-labels.js";
+import * as CALIBRATION from "./calibration.js";
 
-/** Default decay half-life (days) at importance 0.5. #192: was 0.0005/h
- *  (~115-day half-life at base 0.5) — aggressive enough to bury the long tail
- *  in ranking. Long-term remembering is the product; time preference stays,
- *  but mild. */
-export const DEFAULT_DECAY_HALF_LIFE_DAYS = 365;
+/** Default decay half-life (days) at importance 0.5 — release-managed
+ *  (#408): the constant lives in calibration.ts with its provenance. */
+export const DEFAULT_DECAY_HALF_LIFE_DAYS = CALIBRATION.DECAY_HALF_LIFE_DAYS;
 
 /**
  * Derive the per-hour base decay constant from a half-life target: for the
@@ -44,12 +44,13 @@ export function decayConstantForHalfLife(days: number): number {
 let BASE_DECAY = decayConstantForHalfLife(DEFAULT_DECAY_HALF_LIFE_DAYS);
 
 /**
- * Configure the decay speed from config (`decayHalfLifeDays`). Called at boot
- * by the server and the nightly so both processes score with the same clock.
- * Invalid/absent values keep the default. Exported value for tests.
+ * Configure the decay speed for THIS process (the eval/test seam — #408).
+ * Production NEVER passes an argument: every process scores with the
+ * calibration half-life (calibration.ts DECAY_HALF_LIFE_DAYS). An
+ * invalid/absent value keeps the default. Exported value for tests.
  */
-export function configureDecay(options?: { halfLifeDays?: unknown }): number {
-  const days = Number(options?.halfLifeDays);
+export function configureDecay(halfLifeDays?: number): number {
+  const days = Number(halfLifeDays);
   BASE_DECAY = decayConstantForHalfLife(
     Number.isFinite(days) && days > 0 ? days : DEFAULT_DECAY_HALF_LIFE_DAYS
   );
@@ -57,15 +58,16 @@ export function configureDecay(options?: { halfLifeDays?: unknown }): number {
 }
 
 // ---------------------------------------------------------------------------
-// Recall breadth knobs (#192) — all config-tweakable, never hardcoded at call
-// sites. Config keys (in ~/.hicortex/config.json) → defaults:
-//   searchLimit        → 8    default k for retrieve()
-//   recentLimit        → 12   default k for searchRecent()
-//   recentWindowDays   → 180  searchRecent() candidate window
-//   coldExposureSlots  → 2    top-k slots reservable for never-accessed hits
+// Recall breadth knobs (#192) — RELEASE-MANAGED since #408 (calibration.ts):
+//   searchLimit        8     default k for retrieve()
+//   recentLimit        12    default k for searchRecent()
+//   recentWindowDays   180   searchRecent() candidate window
+//   coldExposureSlots  2     top-k slots reservable for never-accessed hits
+// The configure*() seam exists so the eval + tests can sweep values; config
+// keys no longer reach here.
 // ---------------------------------------------------------------------------
 
-interface RecallDefaults {
+export interface RecallDefaults {
   searchLimit: number;
   recentLimit: number;
   recentWindowDays: number;
@@ -73,58 +75,59 @@ interface RecallDefaults {
 }
 
 const RECALL_DEFAULTS: RecallDefaults = {
-  searchLimit: 8,
-  recentLimit: 12,
-  recentWindowDays: 180,
-  coldExposureSlots: 2,
+  searchLimit: CALIBRATION.SEARCH_LIMIT,
+  recentLimit: CALIBRATION.RECENT_LIMIT,
+  recentWindowDays: CALIBRATION.RECENT_WINDOW_DAYS,
+  coldExposureSlots: CALIBRATION.COLD_EXPOSURE_SLOTS,
 };
 
 let recallDefaults: RecallDefaults = { ...RECALL_DEFAULTS };
 
 /**
- * Configure recall breadth from config. Called at boot next to
- * configureDecay(); invalid/absent values keep the shipped defaults.
- * Returns the resolved values (for logging + tests).
+ * Configure recall breadth from RESOLVED overrides (the eval/test seam —
+ * #408). Production calls this with no argument: the calibration defaults
+ * (calibration.ts) apply. Invalid/absent values keep the shipped default per
+ * key. Returns the resolved values (for logging + tests).
  */
-export function configureRecall(config?: Record<string, unknown> | null): RecallDefaults {
-  const pick = (key: keyof RecallDefaults): number => {
-    const v = Number(config?.[key]);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : RECALL_DEFAULTS[key];
+export function configureRecall(overrides?: Partial<RecallDefaults> | null): RecallDefaults {
+  const pick = (v: unknown, dflt: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt;
   };
   recallDefaults = {
-    searchLimit: Math.max(1, pick("searchLimit")),
-    recentLimit: Math.max(1, pick("recentLimit")),
-    recentWindowDays: Math.max(1, pick("recentWindowDays")),
-    coldExposureSlots: pick("coldExposureSlots"),
+    searchLimit: Math.max(1, pick(overrides?.searchLimit, RECALL_DEFAULTS.searchLimit)),
+    recentLimit: Math.max(1, pick(overrides?.recentLimit, RECALL_DEFAULTS.recentLimit)),
+    recentWindowDays: Math.max(1, pick(overrides?.recentWindowDays, RECALL_DEFAULTS.recentWindowDays)),
+    coldExposureSlots: pick(overrides?.coldExposureSlots, RECALL_DEFAULTS.coldExposureSlots),
   };
   return { ...recallDefaults };
 }
 // ---------------------------------------------------------------------------
-// Composite-score weights + Phase-B ranking knobs (#191). ALL config-driven.
-//   scoreSimilarityWeight   0.50  semantic match (was 0.40 — see below)
-//   scoreStrengthWeight     0.20  effective strength (was 0.30)
-//   scoreConnectionsWeight  0.15  graph centrality (was 0.20)
-//   scoreRecencyWeight      0.15  slow recency curve (was 0.10)
+// Composite-score weights + Phase-B ranking knobs (#191). RELEASE-MANAGED
+// since #408 — the values live in calibration.ts (with their provenance);
+// configureScoring is the eval/test seam only:
+//   similarity              0.50  semantic match (was 0.40 — see below)
+//   strength                0.20  effective strength (was 0.30)
+//   connections             0.15  graph centrality (was 0.20)
+//   recency                 0.15  slow recency curve (was 0.10)
 //   freshnessBoostDays        7   fresh-memory window length
 //   freshnessBoostWeight    0.15  additive bonus at age 0, linear to 0 at edge
 //   supersededDemotion      0.50  multiplier for reversed decisions
-//   projectAffinityWeight   0.15  #203 soft boost on exact project match
-//   domainAffinityWeight    0.15  #203 soft boost on domain-tag overlap
+//   projectAffinity         0.15  #203 soft boost on exact project match
+//   domainAffinity          0.15  #203 soft boost on domain-tag overlap
 //
-//   #205 BM25F + fusion-retune knobs (FTS-side scope):
-//   bm25WeightBody          1.0   content-field BM25 weight
-//   bm25WeightProject       2.0   project-field BM25 weight (down-weight body,
-//   bm25WeightDomain        2.0   domain-field BM25 weight  up-weight scope)
+//   #205 fusion-retune knobs (RRF side; the BM25F field weights live in
+//   storage.ts next to the FTS column declaration they mirror):
 //   rrfK                     60   RRF k parameter (1/(k+rank+1))
 //   rrfCompositeWeight      0.8   composite-score share of the final blend
 //   rrfFtsWeight            0.5   per-list RRF weight for the FTS list
 //   rrfVectorWeight         1.0   per-list RRF weight for the vector list
 //
 // The rebalance is evidence-driven: on the production corpus, effective
-// strength (0.30) outweighed what similarity could recover, so hardened old
-// memories beat exact matches — e.g. an unrelated 0.80-strength memory
-// outranked the on-topic 0.50-strength one for its own topic. Similarity now
-// dominates; strength still breaks ties and rewards real use.
+// strength (0.30) outweighed what similarity could recover, so old
+// high-strength memories beat exact matches — e.g. an unrelated 0.80-strength
+// memory outranked the on-topic 0.50-strength one for its own topic.
+// Similarity now dominates; strength still breaks ties and rewards real use.
 //
 // #203 affinity weights are ADDITIVE, zero-boost neutral, and NEVER a penalty:
 // absent scope ⇒ both terms are 0 (byte-identical to pre-#203); a foreign
@@ -139,7 +142,7 @@ export function configureRecall(config?: Record<string, unknown> | null): Recall
 // not enough to starve keyword search. The eval gates the actual values.
 // ---------------------------------------------------------------------------
 
-interface ScoringWeights {
+export interface ScoringWeights {
   similarity: number;
   strength: number;
   connections: number;
@@ -159,80 +162,73 @@ interface ScoringWeights {
   rrfFtsWeight: number;
   /** #205 per-list RRF weight for the vector list (KNN-driven candidates). */
   rrfVectorWeight: number;
+  /** #425 additive boost for both-channel (vector AND FTS) candidates. */
+  bothChannelBoost: number;
 }
 
 const SCORING_DEFAULTS: ScoringWeights = {
-  similarity: 0.5,
-  strength: 0.2,
-  connections: 0.15,
-  recency: 0.15,
-  freshnessBoostDays: 7,
-  freshnessBoostWeight: 0.15,
-  supersededDemotion: 0.5,
-  projectAffinity: 0.15,
-  domainAffinity: 0.15,
-  // #205 defaults: rrfK + rrfCompositeWeight match the pre-#205 hardcoded
-  // values (60 and 0.8) so the no-config path is byte-identical to 0.15.3
-  // except for the FTS per-list weight (1.0 → 0.5) — the one deliberate
-  // nudge toward vector that the recall-sweep eval gates. The eval showed
-  // 0.7 was too timid (Q4 marine contamination persisted) and 0.5 is the
-  // bisection point where BM25F + composite-affinity finally flip the
-  // token-exact marine body match below the same-scope hardware field
-  // (Q4 ON contamination 0.20 → 0.00). 0.5 is still "conservative" — FTS
-  // contributes half its RRF share, enough that pure-keyword queries (the
-  // focused-family "login/CORS/webhook" turns) keep recall@5 = 1.0.
-  rrfK: 60,
-  rrfCompositeWeight: 0.8,
-  rrfFtsWeight: 0.5,
-  rrfVectorWeight: 1.0,
+  similarity: CALIBRATION.SCORE_SIMILARITY_WEIGHT,
+  strength: CALIBRATION.SCORE_STRENGTH_WEIGHT,
+  connections: CALIBRATION.SCORE_CONNECTIONS_WEIGHT,
+  recency: CALIBRATION.SCORE_RECENCY_WEIGHT,
+  freshnessBoostDays: CALIBRATION.FRESHNESS_BOOST_DAYS,
+  freshnessBoostWeight: CALIBRATION.FRESHNESS_BOOST_WEIGHT,
+  supersededDemotion: CALIBRATION.SUPERSEDED_DEMOTION,
+  projectAffinity: CALIBRATION.PROJECT_AFFINITY_WEIGHT,
+  domainAffinity: CALIBRATION.DOMAIN_AFFINITY_WEIGHT,
+  // #205 (calibration.ts): rrfK + rrfCompositeWeight match the pre-#205
+  // hardcoded values (60 and 0.8); the FTS per-list weight (1.0 → 0.5) is the
+  // one deliberate nudge toward vector — the bisection point where BM25F +
+  // composite-affinity flip the token-exact marine body match below the
+  // same-scope hardware field while pure-keyword queries keep recall@5 = 1.0.
+  rrfK: CALIBRATION.RRF_K,
+  rrfCompositeWeight: CALIBRATION.RRF_COMPOSITE_WEIGHT,
+  rrfFtsWeight: CALIBRATION.RRF_FTS_WEIGHT,
+  rrfVectorWeight: CALIBRATION.RRF_VECTOR_WEIGHT,
+  // #425 (calibration.ts): the both-channel genuine-match boost. 0.10 is
+  // the sweep-chosen size — D3's dominance margin (>= 0.10 x the similarity
+  // weight) with the battery stability gates intact.
+  bothChannelBoost: CALIBRATION.BOTH_CHANNEL_BOOST,
 };
 
 let scoringWeights: ScoringWeights = { ...SCORING_DEFAULTS };
 
 /**
- * Configure scoring weights + ranking knobs from config. Called at boot by the
- * server and the nightly (alongside configureDecay/configureRecall) so
- * retrieval and consolidation rank identically. Invalid/absent values keep the
- * shipped default per key. Returns the resolved set for logging/tests. Also
- * pushes the #205 BM25F field weights into storage (storage.configureBm25Fts)
- * so searchFts ranks with the same config — BM25F weights live in storage.ts
- * (next to the FTS column declaration they mirror) but are read here from the
- * SAME config object for one-place tuning.
+ * Configure scoring weights + ranking knobs from RESOLVED overrides (the
+ * eval/test seam — #408). Production calls this with no argument: the
+ * calibration defaults (calibration.ts) apply, identically in the daemon and
+ * the nightly. Invalid/absent values keep the shipped default per key.
+ * Returns the resolved set for logging/tests. (The #205 BM25F field weights
+ * are NOT touched here — they live in storage.ts and resolve from the same
+ * calibration module via storage.configureBm25Fts.)
  */
-export function configureScoring(config?: Record<string, unknown> | null): ScoringWeights {
-  const num = (key: string, dflt: number, min: number, max: number): number => {
-    const v = Number(config?.[key]);
-    return Number.isFinite(v) && v >= min && v <= max ? v : dflt;
+export function configureScoring(overrides?: Partial<ScoringWeights> | null): ScoringWeights {
+  const num = (v: unknown, dflt: number, min: number, max: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= min && n <= max ? n : dflt;
   };
-  // #205 BM25F weights use a [0, ∞) range (no upper bound — a field can dominate
-  // if the operator wills it; 0 drops the field entirely). Invalid ⇒ default.
-  const numW = (key: string, dflt: number): number => {
-    const v = Number(config?.[key]);
-    return Number.isFinite(v) && v >= 0 ? v : dflt;
+  // #205 BM25F-style weights use a [0, ∞) range (no upper bound; 0 drops the
+  // field/list entirely). Invalid ⇒ default.
+  const numW = (v: unknown, dflt: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : dflt;
   };
   scoringWeights = {
-    similarity: num("scoreSimilarityWeight", SCORING_DEFAULTS.similarity, 0, 1),
-    strength: num("scoreStrengthWeight", SCORING_DEFAULTS.strength, 0, 1),
-    connections: num("scoreConnectionsWeight", SCORING_DEFAULTS.connections, 0, 1),
-    recency: num("scoreRecencyWeight", SCORING_DEFAULTS.recency, 0, 1),
-    freshnessBoostDays: num("freshnessBoostDays", SCORING_DEFAULTS.freshnessBoostDays, 0, 365),
-    freshnessBoostWeight: num("freshnessBoostWeight", SCORING_DEFAULTS.freshnessBoostWeight, 0, 1),
-    supersededDemotion: num("supersededDemotion", SCORING_DEFAULTS.supersededDemotion, 0, 1),
-    projectAffinity: num("projectAffinityWeight", SCORING_DEFAULTS.projectAffinity, 0, 1),
-    domainAffinity: num("domainAffinityWeight", SCORING_DEFAULTS.domainAffinity, 0, 1),
-    rrfK: numW("rrfK", SCORING_DEFAULTS.rrfK),
-    rrfCompositeWeight: num("rrfCompositeWeight", SCORING_DEFAULTS.rrfCompositeWeight, 0, 1),
-    rrfFtsWeight: numW("rrfFtsWeight", SCORING_DEFAULTS.rrfFtsWeight),
-    rrfVectorWeight: numW("rrfVectorWeight", SCORING_DEFAULTS.rrfVectorWeight),
+    similarity: num(overrides?.similarity, SCORING_DEFAULTS.similarity, 0, 1),
+    strength: num(overrides?.strength, SCORING_DEFAULTS.strength, 0, 1),
+    connections: num(overrides?.connections, SCORING_DEFAULTS.connections, 0, 1),
+    recency: num(overrides?.recency, SCORING_DEFAULTS.recency, 0, 1),
+    freshnessBoostDays: num(overrides?.freshnessBoostDays, SCORING_DEFAULTS.freshnessBoostDays, 0, 365),
+    freshnessBoostWeight: num(overrides?.freshnessBoostWeight, SCORING_DEFAULTS.freshnessBoostWeight, 0, 1),
+    supersededDemotion: num(overrides?.supersededDemotion, SCORING_DEFAULTS.supersededDemotion, 0, 1),
+    projectAffinity: num(overrides?.projectAffinity, SCORING_DEFAULTS.projectAffinity, 0, 1),
+    domainAffinity: num(overrides?.domainAffinity, SCORING_DEFAULTS.domainAffinity, 0, 1),
+    rrfK: numW(overrides?.rrfK, SCORING_DEFAULTS.rrfK),
+    rrfCompositeWeight: num(overrides?.rrfCompositeWeight, SCORING_DEFAULTS.rrfCompositeWeight, 0, 1),
+    rrfFtsWeight: numW(overrides?.rrfFtsWeight, SCORING_DEFAULTS.rrfFtsWeight),
+    rrfVectorWeight: numW(overrides?.rrfVectorWeight, SCORING_DEFAULTS.rrfVectorWeight),
+    bothChannelBoost: num(overrides?.bothChannelBoost, SCORING_DEFAULTS.bothChannelBoost, 0, 1),
   };
-  // #205: push BM25F field weights into storage so searchFts uses them. Same
-  // config object, one tuning surface; storage owns the module-level mirror
-  // next to the FTS column declaration (the positional order matters there).
-  storage.configureBm25Fts({
-    bm25WeightBody: numW("bm25WeightBody", 1.0),
-    bm25WeightProject: numW("bm25WeightProject", 2.0),
-    bm25WeightDomain: numW("bm25WeightDomain", 2.0),
-  });
   return { ...scoringWeights };
 }
 
@@ -242,11 +238,11 @@ export function getScoringWeights(): ScoringWeights {
 }
 
 // ---------------------------------------------------------------------------
-// Session-intent keying (#192, 0.15.3). ONE config knob:
-//   sessionIntentWeight  0.33  blend weight of the rolling centroid in the
-//                              search vector: query = (1-w)·prompt + w·centroid.
-//                              0 = DISABLED (pure prompt, the kill-switch —
-//                              current behavior). Range [0, 1].
+// Session-intent keying (#192, 0.15.3). ONE calibration constant (#408):
+//   SESSION_INTENT_WEIGHT  0.33  blend weight of the rolling centroid in the
+//                                search vector: query = (1-w)·prompt + w·centroid.
+//                                configureSessionIntent(0) is the eval-only
+//                                kill-switch (pure prompt). Range [0, 1].
 //
 // The EMA rate α is a shipped constant (SESSION_INTENT_ALPHA, 0.4), not a
 // second knob — owner directive 0.15.3: one knob is enough to tune/disable;
@@ -261,22 +257,22 @@ export function getScoringWeights(): ScoringWeights {
 
 /** EMA rate for the session-intent centroid: centroid_new = (1-α)·old + α·prompt. */
 export const SESSION_INTENT_ALPHA = 0.4;
-const SESSION_INTENT_DEFAULT_WEIGHT = 0.33;
+const SESSION_INTENT_DEFAULT_WEIGHT = CALIBRATION.SESSION_INTENT_WEIGHT;
 
 let sessionIntentWeight = SESSION_INTENT_DEFAULT_WEIGHT;
 
 /**
- * Configure session-intent keying from config. Called at server boot next to
- * configureScoring (the nightly does no recall, so it does not need this).
- * Reads only `sessionIntentWeight` ([0,1]; 0 = disabled). Invalid/out-of-range
- * values keep the shipped default. Returns `{ weight, alpha }` — alpha is the
- * fixed constant, surfaced so the recall closure passes it to the registry in
- * one call.
+ * Configure session-intent keying for THIS process (the eval/test seam —
+ * #408). Production calls this with no argument: the calibration weight
+ * (calibration.ts SESSION_INTENT_WEIGHT) applies. `weight` is [0,1] (0 =
+ * disabled — the eval kill-switch); invalid/out-of-range values keep the
+ * shipped default. Returns `{ weight, alpha }` — alpha is the fixed constant,
+ * surfaced so the recall closure passes it to the registry in one call.
  */
 export function configureSessionIntent(
-  config?: Record<string, unknown> | null
+  weight?: number
 ): { weight: number; alpha: number } {
-  const v = Number(config?.sessionIntentWeight);
+  const v = Number(weight);
   sessionIntentWeight =
     Number.isFinite(v) && v >= 0 && v <= 1 ? v : SESSION_INTENT_DEFAULT_WEIGHT;
   return { weight: sessionIntentWeight, alpha: SESSION_INTENT_ALPHA };
@@ -399,6 +395,138 @@ export function findDemotedIds(
   return new Set(rows.map((r) => r.id));
 }
 
+// ---------------------------------------------------------------------------
+// Belief walk (#393 increment D)
+// ---------------------------------------------------------------------------
+
+/**
+ * Hop cap for the belief walk (#393 D). Supersession edges advance
+ * created_at monotonically (the stage only links old → new), so chains are
+ * acyclic by construction and 10 hops is far beyond any real revision depth;
+ * the cap is cheap insurance (see beliefWalkTerminal for why it is needed
+ * anyway).
+ */
+export const BELIEF_WALK_MAX_HOPS = 10;
+
+/**
+ * The one outgoing supersession edge to follow from `id` (#393 D): when a
+ * memory carries several `superseded_by` edges the NEWEST target by
+ * created_at wins (deterministic target_id tie-break), null when there is
+ * none. Indexed by idx_links_source; one row read.
+ */
+function nextSupersedingId(db: Database.Database, id: string): string | null {
+  const row = db
+    .prepare(
+      `SELECT ml.target_id AS target_id
+         FROM memory_links ml
+         JOIN memories m ON m.id = ml.target_id
+        WHERE ml.source_id = ? AND ml.relationship = 'superseded_by'
+        ORDER BY m.created_at DESC, ml.target_id ASC
+        LIMIT 1`
+    )
+    .get(id) as { target_id: string } | undefined;
+  return row ? row.target_id : null;
+}
+
+/**
+ * Terminal of the supersession chain starting at `id` (#393 D): follow
+ * superseded_by edges transitively until a memory with no outgoing edge and
+ * return it — `id` itself when there is nothing to walk, or whichever node
+ * the walk stopped on when it aborts. Shared by retrieval (the belief-walk
+ * splice in retrieve()/searchRecent()) and the eval harness (the
+ * planted-pairs version_chain class probe), so both agree on what "the
+ * chain's current truth" is.
+ *
+ * Edges advance created_at monotonically (acyclic by construction), BUT
+ * applyExplicitMark does no age check and created_at is backdatable from
+ * session_date — so a cycle or an absurdly long chain is not impossible.
+ * The visited set (seeded with `id`) and the BELIEF_WALK_MAX_HOPS cap are
+ * cheap insurance against exactly that; the supersededDemotion multiplier
+ * in computeScore remains the safety net for rows the walk does not fully
+ * resolve (no edge, cycle, cap abort, absorbed terminal).
+ */
+export function beliefWalkTerminal(
+  db: Database.Database,
+  id: string,
+  maxHops = BELIEF_WALK_MAX_HOPS
+): string {
+  const visited = new Set([id]);
+  let current = id;
+  for (let hop = 0; hop < maxHops; hop++) {
+    const next = nextSupersedingId(db, current);
+    if (next === null || visited.has(next)) return current;
+    visited.add(next);
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * The belief-walk splice (#393 D) — the retrieval-side half of "newest wins
+ * by construction". Applied to the FINAL top-k of retrieve()/searchRecent(),
+ * after the sort and after the cold-exposure splice: a superseded candidate
+ * is replaced IN ITS SLOT by its chain's terminal (beliefWalkTerminal), so a
+ * strong stale record can never outrank — or appear alongside — the truth
+ * that replaced it. The ancestor stays fetchable by id (evidence) but never
+ * surfaces as a competing truth in recall.
+ *
+ * Per entry of `top`, in order:
+ *   - not superseded            → kept untouched (fast path, zero queries)
+ *   - terminal === entry        → kept (no outgoing edge — the entry is its
+ *                                 own terminal; a self-loop aborts here too.
+ *                                 A hop-cap or non-self-cycle abort stops the
+ *                                 walk on a DIFFERENT node, so the entry
+ *                                 falls through to the bullets below — e.g.
+ *                                 a 2-cycle with both members in top drops
+ *                                 both, conservative but nothing stale
+ *                                 surfaces (corrupt-data corner only; edges
+ *                                 advance created_at, acyclic by
+ *                                 construction). supersededDemotion in
+ *                                 computeScore stays the safety net for rows
+ *                                 the walk does not resolve)
+ *   - terminal already surfaced → the entry is DROPPED (its truth is present)
+ *   - otherwise                 → buildReplacement(terminal); null (terminal
+ *                                 unfetchable or absorbed — absorbed rows
+ *                                 are invisible to recall by contract) keeps
+ *                                 the ancestor in-slot, fail-soft
+ *
+ * The replacement takes the ancestor's SLOT (position), not its score — no
+ * re-sort after the splice; ranking remains the sort's verdict. Idempotent
+ * by construction: walk-stable and unsuperseded entries are returned as-is.
+ */
+function applyBeliefWalk<T extends { mem: Memory }>(
+  db: Database.Database,
+  top: T[],
+  supersededIds: Set<string>,
+  buildReplacement: (terminalId: string) => T | null
+): T[] {
+  const present = new Set(top.map((t) => t.mem.id));
+  const out: T[] = [];
+  for (const entry of top) {
+    if (!supersededIds.has(entry.mem.id)) {
+      out.push(entry);
+      continue;
+    }
+    const terminal = beliefWalkTerminal(db, entry.mem.id);
+    if (terminal === entry.mem.id) {
+      out.push(entry);
+      continue;
+    }
+    if (present.has(terminal)) {
+      // The chain's truth is already surfaced — drop the ancestor.
+      continue;
+    }
+    const replacement = buildReplacement(terminal);
+    if (replacement === null) {
+      out.push(entry);
+      continue;
+    }
+    out.push(replacement);
+    present.add(terminal);
+  }
+  return out;
+}
+
 /**
  * Placeholder L2 distance for candidates that have no measured vector
  * distance (FTS-only hits and graph-discovered neighbors). Chosen so that
@@ -428,6 +556,28 @@ export function l2ToCosine(distance: number): number {
   return 1 - (distance * distance) / 2;
 }
 
+/**
+ * Cosine similarity between two stored embeddings (#393 increment B). The
+ * similarity source measures cosines transitively via vec0 L2 distances; the
+ * scout source finds its candidates through FTS (no vec0 query), so it
+ * measures the pair cosine directly from the stored vectors instead —
+ * valid because every embedding we store is L2-normalized (embedder.ts).
+ * Used as link strength / a ranker, never as a gate (the scout has no
+ * similarity floor — that is the point of the increment).
+ */
+export function cosineBetweenVectors(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / Math.sqrt(na * nb);
+}
+
 // ---------------------------------------------------------------------------
 // Timestamp parsing
 // ---------------------------------------------------------------------------
@@ -448,8 +598,22 @@ function parseTimestamp(ts: string | null): Date {
 // ---------------------------------------------------------------------------
 
 /**
- * Compute decayed strength with adaptive decay (B+E+D model).
+ * Compute decayed strength with adaptive decay (B+D model).
  * Exported for use by consolidation decay/prune stage.
+ *
+ * #425 read-side law: the decay-relevant importance is CLAMPED at the
+ * release-managed ceiling (calibration.ts IMPORTANCE_CEILING) — at importance
+ * exactly 1.0 the decay rate is exactly 1.0 and the row never decays, so
+ * legacy base-1.0 rows (and any write site that predates the cap) decay
+ * again. The clamp applies to explicit importance passes too.
+ *
+ * #448: the access/connectivity HARDENING terms are REMOVED — the fade rate
+ * no longer depends on access or link history (a briefly-used memory was
+ * near-immortal: 10 accesses cut the decay rate to 3% of normal). Real use
+ * now raises the STORED score via the nightly promotion stage
+ * (consolidate.ts stagePromotion) instead of slowing future decay, so a
+ * promoted-then-abandoned memory fades on the same 365-day clock as any
+ * other, from a higher anchor.
  */
 export function effectiveStrength(
   baseStrength: number,
@@ -457,13 +621,10 @@ export function effectiveStrength(
   now: Date,
   options?: {
     importance?: number;
-    accessCount?: number;
-    linkCount?: number;
   }
 ): number {
-  const importance = options?.importance ?? baseStrength;
-  const accessCount = options?.accessCount ?? 0;
-  const linkCount = options?.linkCount ?? 0;
+  const rawImportance = options?.importance ?? baseStrength;
+  const importance = Math.min(rawImportance, CALIBRATION.IMPORTANCE_CEILING);
 
   const hours = Math.max(
     (now.getTime() - parseTimestamp(lastAccessed).getTime()) / 3_600_000,
@@ -471,14 +632,7 @@ export function effectiveStrength(
   );
 
   // B: Importance slows decay
-  let decayRate = 1.0 - BASE_DECAY * (1.0 - importance);
-
-  // E: Access hardening
-  const hardening = 0.7;
-  decayRate = 1.0 - (1.0 - decayRate) * Math.pow(hardening, accessCount);
-
-  // E: Connectivity hardening
-  decayRate = 1.0 - (1.0 - decayRate) * Math.pow(hardening, linkCount);
+  const decayRate = 1.0 - BASE_DECAY * (1.0 - importance);
 
   // D: Asymptotic floor
   const floor = baseStrength * importance * 0.1;
@@ -518,6 +672,10 @@ export function computeScore(
     /** Candidate's graded domain tags (memory_tags rows). Loaded batched for
      *  the whole candidate set in retrieve(); used for domain affinity. */
     tagWeights?: Array<{ tag: string; weight: number | null }>;
+    /** #425: the candidate was matched by BOTH retrieval channels (vector
+     *  KNN AND BM25 FTS) — the genuine-match signature. Adds the
+     *  release-managed bothChannelBoost (zero-boost neutral). */
+    bothChannel?: boolean;
   }
 ): number {
   // TRUE cosine similarity (#145). The old `1 − distance` compressed real
@@ -535,8 +693,11 @@ export function computeScore(
     memory.last_accessed,
     now,
     {
-      accessCount: memory.access_count ?? 0,
-      linkCount: connectionCount,
+      // #425: importance passed EXPLICITLY (the same default value
+      // effectiveStrength would apply — base strength IS importance at read
+      // time — now stated at the call site so the triple-win coupling
+      // (score share, decay rate, floor) is visible and single-sourced).
+      importance: memory.base_strength ?? 0.5,
     }
   );
   const connScore =
@@ -560,10 +721,11 @@ export function computeScore(
   // session captured last night ranks as ~1 day old (not 0), and backfilled
   // older content correctly gets no boost. The slow
   // `recency` term above (≈58-day half-life at weight 0.15) could never lift a
-  // day-old memory past a hardened old one — measured case: an exact-match
-  // 1-day-old memory (strength 0.50) lost to an unrelated memory at strength
-  // 0.80. This is an ADDITIVE bonus that decays linearly to zero at the window
-  // edge, so it cannot distort ranking among memories that are all old.
+  // day-old memory past an old high-strength one — measured case: an
+  // exact-match 1-day-old memory (strength 0.50) lost to an unrelated memory
+  // at strength 0.80. This is an ADDITIVE bonus that decays linearly to zero
+  // at the window edge, so it cannot distort ranking among memories that are
+  // all old.
   const ageDays = hoursSinceCreated / 24;
   if (memory.created_at && ageDays < scoringWeights.freshnessBoostDays) {
     const freshness = 1 - ageDays / scoringWeights.freshnessBoostDays;
@@ -597,6 +759,15 @@ export function computeScore(
       if (maxWeight > 0) score += maxWeight * scoringWeights.domainAffinity;
     }
   }
+
+  // #425 both-channel boost: vector KNN and BM25 FTS AGREEING on a candidate
+  // is the genuine-match signature (a distinctive proper noun the user knows
+  // exists — the field failure this fixes: 0.90/0.95-strength domain-adjacent
+  // memories outranked the best-similarity exact-token match). ADDITIVE,
+  // zero-boost neutral, never a penalty; rides the composite side only (like
+  // projectAffinity — the RRF side is #205 territory); applied BEFORE the
+  // superseded multiplier so a superseded both-channel row still demotes.
+  if (options?.bothChannel) score += scoringWeights.bothChannelBoost;
 
   // Superseded demotion (#191 Phase B): a memory whose decision was reversed by
   // a later one keeps its content and strength but must not outrank the
@@ -942,16 +1113,11 @@ export async function retrieve(
       superseded: supersededIds.has(mid),
       scope,
       tagWeights: tagWeightsByMemory?.get(mid),
+      // #425: the two retrieval channels agreeing is the genuine-match
+      // signature — graph-only and single-channel candidates add nothing.
+      bothChannel: source === "both",
     });
-    const effStr = effectiveStrength(
-      mem.base_strength ?? 0.5,
-      mem.last_accessed,
-      now,
-      {
-        accessCount: mem.access_count ?? 0,
-        linkCount: connectionCounts.get(mem.id) ?? 0,
-      }
-    );
+    const effStr = effectiveStrength(mem.base_strength ?? 0.5, mem.last_accessed, now);
 
     const rrf = rrfScores.get(mid) ?? 0;
     const normalizedRrf = maxRrf > 0 ? rrf / maxRrf : 0;
@@ -972,7 +1138,8 @@ export async function retrieve(
   }
 
   // 6. Sort and take top N — with cold-exposure slots (#192).
-  // Access hardening + effective strength make past winners self-reinforcing:
+  // Effective strength + the promotion stage (#448) make past winners
+  // self-reinforcing:
   // 88% of the production corpus had never been returned by any query. Reserve
   // up to 2 of k for the best-scoring never-accessed candidates so the long
   // tail gets nonzero exposure whenever it is semantically in range. Slots are
@@ -994,6 +1161,40 @@ export async function retrieve(
       }
     }
   }
+
+  // 6b. Belief walk (#393 D) — a superseded top-k member is replaced in-slot
+  // by its chain's terminal. A terminal already in `scored` reuses its honest
+  // entry (similarity/RRF/score); one outside the candidate set is computed
+  // fresh with source "graph" and RRF share 0 (it entered by LINK, not by any
+  // retrieval channel — finalScore = composite × rrfCompositeWeight only).
+  // The strengthen() below then fires on the SURFACED set: the terminal
+  // accrues the use signal, the dropped ancestor does not. supersededDemotion
+  // in computeScore stays as the safety net for rows the walk does not reach.
+  const scoredById = new Map(scored.map((s) => [s.mem.id, s]));
+  top = applyBeliefWalk(db, top, supersededIds, (terminalId) => {
+    const existing = scoredById.get(terminalId);
+    if (existing) return existing;
+    const mem = storage.getMemory(db, terminalId);
+    if (!mem || mem.status === "absorbed") return null; // fail-soft
+    // Hard-filter invariant (#393 D): sourceAgent is the one hard filter left
+    // in retrieve(), and the walk must not bypass it — a terminal authored by
+    // a different agent never slips into recall through its link entry
+    // (mirrors the graph pull-in guard above; fail-soft: the ancestor keeps
+    // its slot, demoted).
+    if (sourceAgent && mem.source_agent !== sourceAgent) return null;
+    const connCount = storage.getLinks(db, terminalId, "both").length;
+    const composite = computeScore(
+      mem,
+      DEFAULT_GRAPH_DISTANCE,
+      connCount,
+      maxConnections,
+      now,
+      { superseded: supersededIds.has(terminalId) }
+    );
+    const finalScore = composite * scoringWeights.rrfCompositeWeight;
+    const effStr = effectiveStrength(mem.base_strength ?? 0.5, mem.last_accessed, now);
+    return { mem, finalScore, effStr, connCount, similarity: null, source: "graph" as const };
+  });
 
   const results = top.map((t) =>
     formatResult(t.mem, t.finalScore, t.effStr, t.connCount, {
@@ -1061,20 +1262,42 @@ export function searchRecent(
     const score = computeScore(mem, DEFAULT_GRAPH_DISTANCE, connCount, maxConnections, now, {
       superseded: supersededRecent.has(mem.id),
     });
-    const effStr = effectiveStrength(
-      mem.base_strength ?? 0.5,
-      mem.last_accessed,
-      now,
-      {
-        accessCount: mem.access_count ?? 0,
-        linkCount: connectionCounts.get(mem.id) ?? 0,
-      }
-    );
+    const effStr = effectiveStrength(mem.base_strength ?? 0.5, mem.last_accessed, now);
     scored.push({ mem, score, effStr, connCount });
   }
 
   scored.sort((a, b) => b.score - a.score);
-  const top = scored.slice(0, limit);
+  let top = scored.slice(0, limit);
+
+  // Belief walk (#393 D) — same contract as retrieve(): a superseded recent
+  // memory is replaced in-slot by its chain terminal (this path has no
+  // similarity/RRF channels, so a fresh replacement carries the composite
+  // score only). The trailing strengthen() runs over the WALKED list — the
+  // terminal accrues the use signal, the dropped ancestor does not.
+  // supersededDemotion in computeScore stays as the safety net for rows the
+  // walk does not reach (no edge, absorbed terminal, cycles/caps).
+  top = applyBeliefWalk(db, top, supersededRecent, (terminalId) => {
+    const mem = storage.getMemory(db, terminalId);
+    if (!mem || mem.status === "absorbed") return null; // fail-soft
+    // Hard-filter invariant (#393 D, review fix): project is the one hard
+    // filter in searchRecent(), and the walk must not bypass it — supersession
+    // edges are discovered corpus-wide (no project predicate), so a terminal
+    // in a different project never slips into project-scoped recall through
+    // its link entry (mirrors retrieve()'s sourceAgent guard; fail-soft: the
+    // ancestor keeps its slot, demoted).
+    if (project && mem.project !== project) return null;
+    const connCount = storage.getLinks(db, terminalId, "both").length;
+    const score = computeScore(
+      mem,
+      DEFAULT_GRAPH_DISTANCE,
+      connCount,
+      maxConnections,
+      now,
+      { superseded: supersededRecent.has(terminalId) }
+    );
+    const effStr = effectiveStrength(mem.base_strength ?? 0.5, mem.last_accessed, now);
+    return { mem, score, effStr, connCount };
+  });
 
   const results = top.map((t) =>
     formatResult(t.mem, t.score, t.effStr, t.connCount)

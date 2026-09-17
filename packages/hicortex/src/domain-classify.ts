@@ -25,9 +25,10 @@
  * there is NO fallback category in the vocabulary and no configured domain is
  * ever auto-assigned on a no-fit. A genuine no-fit is the distinct result
  * `{tags: []}`; the CALLER then derives a weak primary from prototype cosines
- * (>= the weakPrimaryFloor) or, below the floor, applies accelerated decay
- * (see nofit.ts). If a user still configures a domain named "Unsorted", it is
- * just a normal domain with no special semantics.
+ * (>= the weak-primary floor, release-managed since #408) or, below the
+ * floor, applies accelerated decay (see nofit.ts). If a user still configures
+ * a domain named "Unsorted", it is just a normal domain with no special
+ * semantics.
  *
  * The `project` name is passed to the classifier as a HINT (content wins;
  * project only breaks ties). This rescues terse technical memories from

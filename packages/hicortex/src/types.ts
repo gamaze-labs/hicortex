@@ -43,6 +43,36 @@ export interface Memory {
    * kept as evidence and rollback reference).
    */
   status?: string | null;
+  /**
+   * Explicit owner corroboration count (#423 phase 3, migration v17). Each
+   * POST /enrich bumps it together with base_strength (+the calibration
+   * delta, capped at the importance ceiling) — EVIDENCE ABOUT IMPORTANCE,
+   * never access (access_count) nor index exposure (shown_count). Optional
+   * because rowToMemory is a cast over SELECT * rows; 0 (the column default)
+   * on all pre-v17 rows and until first enriched.
+   */
+  corroboration_count?: number;
+  /**
+   * Importance scored-at watermark (#425, migration v19). NULL = never
+   * scored (the nightly's unscored pool); a timestamp = this row's
+   * base_strength is settled under some rubric and the nightly will not
+   * re-roll it. Written by stageImportance, the enrich path (the owner's
+   * mark stands in for the first LLM score), and the rescore-importance
+   * backfill. Optional because rowToMemory is a cast over SELECT * rows;
+   * pre-v19 rows were stamped by the migration backfill (except sentinel
+   * rows, which stay NULL for exactly one scoring under the new rubric).
+   */
+  importance_scored_at?: string | null;
+  /**
+   * Promotion baseline (#448, migration v20): the access_count the nightly
+   * promotion stage (stagePromotion) last consumed — the delta
+   * access_count − promotion_last_count drives the per-use strength bump.
+   * Written by the stage, the migration backfill, and dedup merges (the
+   * baseline moves with the summed counter so a merge never replays the
+   * losers' lifetime accesses as fresh promotions). Optional because
+   * rowToMemory is a cast over SELECT * rows.
+   */
+  promotion_last_count?: number | null;
 }
 
 /** A link between two memories. */
@@ -100,6 +130,8 @@ export interface ResolutionBandStat {
   merge: number;
   corrects: number;
   supersedes: number;
+  /** #393 guard-C: verdicts that flagged a genuine conflict (link, both kept). */
+  conflicts: number;
   none: number;
   /** Merge verdicts below the confidence gate — both memories kept. */
   merge_below_gate: number;
@@ -110,13 +142,14 @@ export interface ResolutionBandStat {
 }
 
 /**
- * Report of the deterministic merge zone (#392) — the >= dedupAutoMergeThreshold
- * band, merged by the dedup core's union-find clustering with ZERO LLM calls.
+ * Report of the deterministic merge zone (#392) — the band at/above the merge
+ * ceiling (release-managed since #408; was the dedupAutoMergeThreshold config
+ * key), merged by the dedup core's union-find clustering with ZERO LLM calls.
  * Computed in dedup.ts (runDeterministicMergeZone); surfaced verbatim as
  * `stages.reconsolidation.merges`.
  */
 export interface DeterministicMergeZoneReport {
-  /** The cosine ceiling in force (config dedupAutoMergeThreshold; default 0.92). */
+  /** The cosine ceiling in force (release-managed calibration; default 0.92). */
   threshold: number;
   /** Every cluster found at the threshold (mergeable + mismatch-skipped). */
   clusters_found: number;
@@ -130,6 +163,12 @@ export interface DeterministicMergeZoneReport {
   links_repointed: number;
   /** Clusters skipped — members disagree on project / source_agent. */
   skipped_metadata_mismatch: number;
+  /**
+   * #393 guard-C: clusters skipped because a member pair holds a `conflicts`
+   * link — a judge-flagged genuine conflict is never blended, both records
+   * stay live.
+   */
+  skipped_conflict: number;
   /**
    * Mergeable clusters NOT attempted (pacing cap retired, #405): the run
    * deadline fired before them. Deferred clusters drain on the next run.
@@ -195,7 +234,8 @@ export interface ConsolidationReport {
       primaries_updated?: number;
       /**
        * No-fit path: memories that earned a WEAK primary (argmax prototype
-       * cosine >= weakPrimaryFloor) after the LLM found no fitting domain.
+       * cosine >= the weak-primary floor — release-managed since #408) after
+       * the LLM found no fitting domain.
        */
       weak_primary?: number;
       /**
@@ -204,10 +244,6 @@ export interface ConsolidationReport {
        */
       no_association_decayed?: number;
       reason?: string;
-    };
-    hub_boost?: {
-      hubs_found: number;
-      boosted: number;
     };
     links?: {
       auto_linked: number;
@@ -234,7 +270,8 @@ export interface ConsolidationReport {
      * Reconsolidation (#384) — runs after supersession, before decay/prune.
      * Since #392 this is THE unified resolution stage: its verdict also carries
      * a `merge` disposition, and the deterministic merge zone (pairs at/above
-     * `dedupAutoMergeThreshold`) runs inside it, LLM-free, before the scan.
+     * the merge ceiling — release-managed since #408) runs inside it,
+     * LLM-free, before the scan.
      */
     reconsolidation?: {
       /** Candidates examined this run (rowid > cursor; no shape filter). */
@@ -242,14 +279,17 @@ export interface ConsolidationReport {
       /** Pairs actually sent to the verdict LLM (detection + explicit-mark verification). */
       pairs_evaluated: number;
       /**
-       * #394: pairs the similarity floor discovered this run (KNN neighbors
-       * at/above correctionMinSimilarity), counted before any skip or
-       * judgment — the only sizing number a dry-run can show, where
-       * pairs_evaluated is always 0.
+       * #394: pairs the detection sources discovered this run, counted before
+       * any skip or judgment — the only sizing number a dry-run can show,
+       * where pairs_evaluated is always 0. #393 B: BOTH sources join this
+       * total (KNN neighbors at/above the correction floor + the scout's
+       * FTS hits on correction-shaped memories; see scout_candidates_found
+       * for the scout's share).
        */
       pairs_discovered: number;
       /** #394: discovered pairs with no resolution link yet — the actionable
-       * candidates (deterministic-zone work + would-be verdict calls). */
+       * candidates (deterministic-zone work + would-be verdict calls). #393 B:
+       * covers both detection sources. */
       pairs_discovered_unlinked: number;
       /** Targets rewritten in place this run (one history row each). */
       rewritten: number;
@@ -261,7 +301,7 @@ export interface ConsolidationReport {
       marked_superseded: number;
       /** Memories marked status 'retracted' (mark-only: below gate / non-fact / failed contract). */
       marked_retracted: number;
-      /** Verdicts that were `corrects` but below correctionRewriteMinConfidence. */
+      /** Verdicts that were `corrects` but below the rewrite confidence gate. */
       below_gate: number;
       /** Rewrite groups degraded to mark-only on a failed rewrite contract. */
       contract_failed: number;
@@ -276,6 +316,30 @@ export interface ConsolidationReport {
       /** reconsolidationCursor after this run (unchanged in dry-run). */
       cursor: number;
       /**
+       * #439: verdict calls on pairs whose candidate rowid was at/below the
+       * run-start scan high-water (state.reconsolidationScannedRowid) —
+       * re-judgments of work a prior run already judged but could not apply
+       * (the cursor held below it). Convergence evidence: this number must
+       * fall to 0 once the backlog drains. pairs_evaluated =
+       * pairs_reevaluated + pairs_new.
+       */
+      pairs_reevaluated: number;
+      /** #439: verdict calls on candidates ABOVE the high-water — first-time judgments. */
+      pairs_new: number;
+      /**
+       * #439: snapshot candidates skipped because a mid-scan absorb (a merge
+       * loser or rewrite trigger absorbed at an earlier candidate's boundary)
+       * had already absorbed them — the scan-stability guard.
+       */
+      skipped_absorbed: number;
+      /**
+       * #439: confirmed merge pairs still un-applied at run end — deadline
+       * deferrals at a boundary, a failed pre-merge backup, and lock-busy
+       * survivors of the final drain. Each holds the cursor below its
+       * candidate and re-detects next run.
+       */
+      merge_pairs_deferred: number;
+      /**
        * #392: the deterministic merge zone's own report (pairs >= the
        * ceiling, union-find merged, zero LLM). Present on every run —
        * including quiet-night skips (a stock install with a pre-upgrade
@@ -284,11 +348,13 @@ export interface ConsolidationReport {
       merges: DeterministicMergeZoneReport;
       /** #392: judged-zone pair merges applied this run (merge verdicts at/above the confidence gate). */
       merge_pairs_applied: number;
-      /** #392: merge verdicts below correctionRewriteMinConfidence — both memories kept. */
+      /** #392: merge verdicts below the rewrite confidence gate — both memories kept. */
       merge_below_gate: number;
       /**
        * #392: pairs the scan saw at/above the ceiling — owned by the
        * deterministic zone (or waiting for its cap), never LLM-judged.
+       * #393 B: similarity-source pairs only; the scout's FTS pairs are
+       * exempt (no similarity gate — cosine never blocks that source).
        */
       skipped_above_ceiling: number;
       /**
@@ -297,6 +363,34 @@ export interface ConsolidationReport {
        * the verdict was rendered, this is not an infra failure.
        */
       skipped_metadata_mismatch: number;
+      /**
+       * #393 guard-C: verdicts that flagged a genuine conflict — a `conflicts`
+       * link was written, both memories stay live (no status change, no
+       * rewrite, no merge queue).
+       */
+      conflict_flagged: number;
+      /**
+       * #393 guard-C: merges refused because the pair (deterministic-zone
+       * cluster or judged merge) holds a `conflicts` link — aggregates the
+       * judged-path refusals plus the zone's `skipped_conflict`. Both records
+       * kept live in every case.
+       */
+      conflict_skipped: number;
+      /**
+       * #393 B: memories given the scout's correction-shape call this run
+       * (ONE classify-tier call per scanned candidate; always 0 on dry-run —
+       * the shape call is LLM work, and dry-runs make zero LLM calls).
+       */
+      scout_scanned: number;
+      /** #393 B: shape verdicts that flagged a correction/retraction/supersession. */
+      scout_correction_shaped: number;
+      /**
+       * #393 B: FTS hits that became candidate pairs — the scout's share of
+       * pairs_discovered (after older-only/self filtering and dedup against
+       * the KNN neighbors; a pair found by both sources counts as
+       * similarity). Counted before the idempotency skip, the #394 discipline.
+       */
+      scout_candidates_found: number;
       /**
        * #392: per-run verdict statistics by cosine band ("0.75-0.8" …
        * ">=0.92"; labels derive from the live floor/ceiling). Calibration
@@ -309,6 +403,21 @@ export interface ConsolidationReport {
       candidates: number;
       pruned: number;
       failed: number;
+    };
+    /**
+     * Strength promotion (#448) — runs PRE-SKIP (quiet nights still promote
+     * the day's uses), BEFORE memory_cap eviction (a promoted row survives a
+     * cap it would otherwise lose). Zero LLM: it sits in the deterministic
+     * zone, before the BudgetTracker exists.
+     */
+    promotion?: {
+      /** Memories whose base_strength was bumped this run (delta iterations). */
+      promoted: number;
+      /**
+       * Demotion-set rows (superseded/retracted/absorbed + superseded_by-link
+       * sources) with a use delta — no bump, baseline advanced only.
+       */
+      demoted_skipped: number;
     };
     /** Capacity eviction (#245) — runs after decay_prune. When the corpus
      *  exceeds `memorySoftCap`, the lowest-effectiveStrength memories are
@@ -417,7 +526,7 @@ export interface HicortexConfig {
    * Server-mode `init` scaffolds a generic 5-domain default (Work, Personal,
    * People, Health, Finance — see GENERIC_DEFAULT_DOMAINS in init.ts) when
    * this key is absent, and NEVER touches an existing list. A power-user
-   * example (custom weakPrimaryFloor) ships as
+   * example (a wider life-sphere set) ships as
    * domains.example.json in the package root.
    *
    * NO fallback bucket is needed or special-cased (owner amendment 07.07):
@@ -479,14 +588,6 @@ export interface HicortexConfig {
    */
   updateChannel?: string;
   /**
-   * Minimum cosine(memory embedding, best domain prototype) for a no-fit
-   * memory to earn a WEAK primary instead of decaying (see nofit.ts).
-   * Number in (0, 1); default 0.45. Tune from the corpus weight distribution
-   * (the memory_tags.weight histogram of LLM-tagged rows — set the floor
-   * near its lower tail). See domains.example.json for a worked example.
-   */
-  weakPrimaryFloor?: number;
-  /**
    * Max output tokens for the ONE LLM model used by all phases — distillation,
    * reflection, classification, and scoring. Default 8192. An explicit value
    * overrides the default. A ceiling, not a target: generation stops at the
@@ -509,38 +610,6 @@ export interface HicortexConfig {
    * anthropic or claude-cli paths. See #220, #231.
    */
   enableThinking?: boolean;
-  /**
-   * Context window for ollama (the one model, all phases). Default 8192 — the point
-   * where context stops being the binding constraint for a sub-8B model on ollama
-   * (above it the SMALL_MODEL_MAX_CHUNK_CHARS speed cap binds instead, so extra
-   * context buys nothing). Also drives `detectChunkSize`'s chunk sizing
-   * (chunkChars ≤ numCtx × 0.6 × 4 chars), so numCtx is the single dial and the
-   * chunker/request agreement is enforced by construction (#228). For an ≥8B model
-   * on ollama the speed cap is 60,000 chars, needing numCtx ≈ 25000 to reach — raise
-   * it if running 8B+ locally. No effect for non-ollama providers.
-   */
-  numCtx?: number;
-  /**
-   * Flush ollama's accumulated memory every N LLM calls — workaround for
-   * ollama's per-request memory growth (the runner's RSS climbs ~171 MB/call and
-   * isn't freed between requests), which swap-thrashes RAM-constrained boxes
-   * during long consolidations. Default 0 (off). When >0, every Nth call
-   * (`complete()`, #405 — ALL phases count, not just scoring) triggers a
-   * `keep_alive:0` unload + an `ollamaFlushWaitMs` pause for the runner to
-   * exit + release, then the next call reloads fresh. N=15 caps a cycle at
-   * ~2.5 GB. Note: N counts **logical** calls, not raw HTTP requests —
-   * `complete()` retries once on timeout (#405), so under retry pressure the
-   * actual accumulation may be up to 2×N calls' worth. In practice the flush
-   * prevents the thrash that causes retries, keeping the count accurate.
-   */
-  ollamaFlushEvery?: number;
-  /**
-   * Milliseconds to wait after an ollama flush (`keep_alive:0`) for the runner
-   * to exit + release its accumulated memory before the next call reloads.
-   * Default 180000 (3 min — the runner takes >90 s to exit after keep_alive:0;
-   * doubled for margin). Only relevant when `ollamaFlushEvery` > 0.
-   */
-  ollamaFlushWaitMs?: number;
   /**
    * ONE per-attempt timeout ceiling (ms) for every LLM phase — distill,
    * reflect, classify, and scoring alike (#337). Default 900000 (15 min). The
@@ -585,8 +654,8 @@ export interface HicortexConfig {
   /**
    * Max memories per recall on the OpenClaw plugin's legacy /search fallback
    * (pre-0.14 servers, #316). Default 8. Does NOT size the pushed
-   * /recall-index — that is server config (`recallMaxItems`); the server
-   * accepts no client limit.
+   * /recall-index — that is sized by the server's release-managed calibration
+   * (#408); the server accepts no client limit.
    */
   recallLimit?: number;
   /**
@@ -681,36 +750,6 @@ export interface HicortexConfig {
   orgName?: string;
   /** Plan/tier label rendered as a small badge (e.g. "Cloud · Early bird"). */
   planLabel?: string;
-  /**
-   * Minimum cosine similarity for a reconsolidation candidate pair (#384):
-   * each new-since-cursor memory is paired with up to 5 older KNN neighbors
-   * at/above this bar before the verdict call. Default 0.75 — a touch wider
-   * than the supersession stage's 0.80 because a retraction often rides inside
-   * an otherwise unrelated memory; the verdict + confidence gate carry the
-   * precision. Number in (0, 1]; invalid/absent keeps the default.
-   */
-  correctionMinSimilarity?: number;
-  /**
-   * Minimum verdict confidence for the REWRITE fork of reconsolidation (#384):
-   * a `corrects` verdict at/above this bar on a fact-shaped target is rewritten
-   * in place; below it the pair degrades to mark-only (a weak mark is
-   * recoverable, a weak rewrite is corruption). Default 0.80. Number in
-   * (0, 1]; invalid/absent keeps the default. Since #392 this same gate also
-   * decides whether a `merge` verdict is applied (analogous reasoning: a weak
-   * merge keeps both memories, a confirmed merge hides one).
-   */
-  correctionRewriteMinConfidence?: number;
-  /**
-   * Deterministic merge ceiling for the unified resolution pass (#392): memory
-   * pairs at/above this cosine are merged by the dedup core's union-find
-   * clustering with ZERO LLM calls; pairs in [correctionMinSimilarity, this
-   * value) get the one unified verdict call (merge/corrects/supersedes/none).
-   * Default 0.92 (the #100/#191 calibration). The legacy `dedupMergeThreshold`
-   * key is honored as a fallback when this key is absent. Number in (0, 1];
-   * invalid/absent keeps the default. Also read by the manual `hicortex dedup`
-   * CLI (same precedence: --threshold > this key > legacy key > 0.92).
-   */
-  dedupAutoMergeThreshold?: number;
 }
 
 /** A config-owned life-sphere domain (see HicortexConfig.domains). */
@@ -777,6 +816,10 @@ export interface InsertMemoryOptions {
   sourceAgentId?: string | null;
   /** Client-declared topic/domain of the capturing agent. Provenance only. */
   sourceDomain?: string | null;
+  /** Machine the capture ran on (#421 machine × harness identity). Provenance
+   *  only — stamped by the nightly (config `machineName` ?? os.hostname()),
+   *  accepted optionally from /distill + /ingest. Null on pre-v15 rows. */
+  sourceMachine?: string | null;
   project?: string | null;
   /** 0.16.x: vestigial — stored but never filtered. null (or absent) when the
    *  caller doesn't declare one; an explicit value is honored as-is. */

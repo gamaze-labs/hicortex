@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { Memory, MemoryLink, InsertMemoryOptions } from "./types.js";
 import { derivePrimary, type WeightedTag } from "./schema-prototypes.js";
+import * as CALIBRATION from "./calibration.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -30,6 +31,18 @@ function rowToMemory(row: Record<string, unknown>): Memory {
 // ---------------------------------------------------------------------------
 // Single memory CRUD
 // ---------------------------------------------------------------------------
+
+/**
+ * #421 machine × harness identity: optional capture-machine provenance on
+ * /ingest + /distill. A string, trimmed, capped at 128 chars; anything else
+ * (absent, wrong type, blank) becomes NULL — a wrong machine name is worse
+ * than none. Never filtered; presentation grouping only.
+ */
+export function sanitizeSourceMachine(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t.length > 0 ? t.slice(0, 128) : null;
+}
 
 /**
  * Insert a memory and its vector embedding. Returns the memory's UUID.
@@ -56,8 +69,8 @@ export function insertMemory(
       `INSERT OR IGNORE INTO memories
        (id, content, base_strength, last_accessed, access_count,
         created_at, ingested_at, source_agent, source_agent_id, source_session,
-        source_domain, project, privacy, memory_type)
-       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        source_domain, project, privacy, memory_type, source_machine)
+       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -72,7 +85,8 @@ export function insertMemory(
       opts.sourceDomain ?? null,
       opts.project ?? null,
       opts.privacy ?? null,
-      opts.memoryType ?? "experience"
+      opts.memoryType ?? "experience",
+      opts.sourceMachine ?? null
     );
 
   if (result.changes > 0) {
@@ -147,6 +161,14 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   // reconsolidation stage, explicit ingest marks, and history rollback.
   // Code-defined vocabulary — see Memory.status.
   "status",
+  // Importance scored-at watermark (#425, migration v19): written by
+  // stageImportance, the enrich path, and the rescore-importance backfill —
+  // the moment a row's base_strength is settled under some rubric.
+  "importance_scored_at",
+  // Promotion baseline (#448, migration v20): written by the nightly
+  // promotion stage and dedup merges (which sum a cluster's counters onto
+  // the canonical — the baseline must move with the summed access_count).
+  "promotion_last_count",
 ]);
 
 /**
@@ -190,10 +212,61 @@ export function strengthenMemory(
 }
 
 /**
+ * Record an owner corroboration (#423 phase 3): one UPDATE that bumps
+ * corroboration_count, nudges base_strength up by the calibration delta
+ * (MIN-capped at the importance ceiling, #425; COALESCE keeps NULL bases
+ * honest — the unscored default), stamps the importance watermark, and
+ * refreshes last_accessed (the console's "last confirmed" cell reads it: an
+ * enrich IS a confirmation, and it keeps the stage fading gate honest).
+ * EVIDENCE ABOUT IMPORTANCE ONLY — never access_count (reserved for real
+ * recall use) nor shown_count (index exposure): faking either corrupts the
+ * uses-per-showing adoption metric.
+ *
+ * Nightly interaction: the importance pool keys on importance_scored_at IS
+ * NULL (#425), so the watermark stamp here keeps the pre-#425 contract — an
+ * enriched memory leaves the pool and the owner's mark stands in for (and is
+ * never stomped by) the first LLM score. Dedup merges take
+ * max(base_strength), so a merge never loses the mark. Returns the fresh row
+ * values (re-read after the update); null when the id matches nothing.
+ */
+export function enrichMemory(
+  db: Database.Database,
+  memoryId: string,
+  nowIsoStr: string
+): { corroborationCount: number; baseStrength: number } | null {
+  const result = db
+    .prepare(
+      `UPDATE memories
+       SET corroboration_count = corroboration_count + 1,
+           base_strength = MIN(?, COALESCE(base_strength, 0.5) + ?),
+           importance_scored_at = COALESCE(importance_scored_at, ?),
+           last_accessed = ?
+       WHERE id = ?`
+    )
+    .run(
+      CALIBRATION.IMPORTANCE_CEILING,
+      CALIBRATION.ENRICH_STRENGTH_DELTA,
+      nowIsoStr,
+      nowIsoStr,
+      memoryId
+    );
+  if (result.changes === 0) return null;
+  const row = db
+    .prepare("SELECT corroboration_count, base_strength FROM memories WHERE id = ?")
+    .get(memoryId) as
+    | { corroboration_count: number; base_strength: number }
+    | undefined;
+  return row
+    ? { corroborationCount: row.corroboration_count, baseStrength: row.base_strength }
+    : null;
+}
+
+/**
  * Record that memories appeared in a pushed recall index (#192): bump
  * shown_count and refresh last_accessed (a mild strengthen — the decay clock
  * resets so topically-live memories stop sinking) WITHOUT touching
- * access_count, which stays reserved for real use (hardening + prune shield).
+ * access_count, which stays reserved for real use (the promotion signal
+ * #448 + the prune shield).
  */
 export function touchMemoriesShown(
   db: Database.Database,
@@ -454,15 +527,15 @@ export function vectorSearch(
 // ---------------------------------------------------------------------------
 
 /**
- * BM25F field weights (config-driven via {@link configureBm25Fts}, called from
- * retrieval.configureScoring at boot). The order mirrors the FTS5 column
- * declaration in db.ts (content, project, domain) — `bm25(memories_fts, …)`
- * takes weights POSITIONALLY, so a new FTS column MUST be added here in the
- * same position or the weighting silently shifts. Defaults favor scope fields
- * (project/domain) over body so cross-scope noise that wins on raw token
- * frequency (the marine "battery" memory on a hardware query) is demoted
- * without excluding it — the same "graded, never binary" discipline as
- * computeScore's affinity terms.
+ * BM25F field weights (release-managed since #408 — the defaults resolve from
+ * calibration.ts; {@link configureBm25Fts} is the eval/test seam). The order
+ * mirrors the FTS5 column declaration in db.ts (content, project, domain) —
+ * `bm25(memories_fts, …)` takes weights POSITIONALLY, so a new FTS column
+ * MUST be added here in the same position or the weighting silently shifts.
+ * Defaults favor scope fields (project/domain) over body so cross-scope noise
+ * that wins on raw token frequency (the marine "battery" memory on a hardware
+ * query) is demoted without excluding it — the same "graded, never binary"
+ * discipline as computeScore's affinity terms.
  */
 export interface Bm25Weights {
   body: number;
@@ -471,30 +544,30 @@ export interface Bm25Weights {
 }
 
 const BM25_DEFAULTS: Bm25Weights = {
-  body: 1.0,
-  project: 2.0,
-  domain: 2.0,
+  body: CALIBRATION.BM25_WEIGHT_BODY,
+  project: CALIBRATION.BM25_WEIGHT_PROJECT,
+  domain: CALIBRATION.BM25_WEIGHT_DOMAIN,
 };
 
 let bm25Weights: Bm25Weights = { ...BM25_DEFAULTS };
 
 /**
- * Configure BM25F weights from config. Called by retrieval.configureScoring
- * (which itself is called at server + nightly boot) so storage and retrieval
- * rank identically. Invalid/out-of-range values keep the shipped default per
- * key. Range [0, ∞) — a 0 weight effectively drops that field from the score;
- * negative values are rejected (BM25F sign semantics break otherwise). Returns
- * the resolved set for logging/tests.
+ * Configure BM25F weights from RESOLVED overrides (the eval/test seam — #408;
+ * production calls it with no argument so storage and retrieval rank with the
+ * identical calibration defaults). Invalid/out-of-range values keep the
+ * shipped default per key. Range [0, ∞) — a 0 weight effectively drops that
+ * field from the score; negative values are rejected (BM25F sign semantics
+ * break otherwise). Returns the resolved set for logging/tests.
  */
-export function configureBm25Fts(config?: Record<string, unknown> | null): Bm25Weights {
-  const num = (key: string, dflt: number): number => {
-    const v = Number(config?.[key]);
-    return Number.isFinite(v) && v >= 0 ? v : dflt;
+export function configureBm25Fts(overrides?: Partial<Bm25Weights> | null): Bm25Weights {
+  const num = (v: unknown, dflt: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : dflt;
   };
   bm25Weights = {
-    body: num("bm25WeightBody", BM25_DEFAULTS.body),
-    project: num("bm25WeightProject", BM25_DEFAULTS.project),
-    domain: num("bm25WeightDomain", BM25_DEFAULTS.domain),
+    body: num(overrides?.body, BM25_DEFAULTS.body),
+    project: num(overrides?.project, BM25_DEFAULTS.project),
+    domain: num(overrides?.domain, BM25_DEFAULTS.domain),
   };
   return { ...bm25Weights };
 }
@@ -629,15 +702,21 @@ export function addLink(
   relationship: string,
   strength = 0.5
 ): void {
-  // Guard: superseded_by and corrected_by are the ranking-demotion /
-  // correction-resolution signals, so never let a different relationship
-  // clobber an existing one for the same pair — INSERT OR REPLACE would
-  // otherwise silently remove the resolution (corrected_by is protected
-  // exactly like superseded_by, #384 AC9).
-  if (relationship !== "superseded_by" && relationship !== "corrected_by") {
+  // Guard: superseded_by, corrected_by, and conflicts are the ranking-demotion /
+  // correction-resolution / conflict-preservation signals, so never let a
+  // different relationship clobber an existing one for the same pair — INSERT
+  // OR REPLACE would otherwise silently remove the resolution (corrected_by is
+  // protected exactly like superseded_by, #384 AC9; conflicts joins the set in
+  // #393 guard-C — a conflicts edge marks the pair as never-blendable, so it
+  // must survive arbitrary later link writes exactly the same way).
+  if (
+    relationship !== "superseded_by" &&
+    relationship !== "corrected_by" &&
+    relationship !== "conflicts"
+  ) {
     const protectedLink = db
       .prepare(
-        "SELECT 1 FROM memory_links WHERE source_id = ? AND target_id = ? AND relationship IN ('superseded_by', 'corrected_by') LIMIT 1"
+        "SELECT 1 FROM memory_links WHERE source_id = ? AND target_id = ? AND relationship IN ('superseded_by', 'corrected_by', 'conflicts') LIMIT 1"
       )
       .get(sourceId, targetId);
     if (protectedLink) return;
@@ -873,15 +952,18 @@ export function getAllLinkCounts(
 }
 
 /**
- * Get all memories with default base_strength (never scored).
- * Absorbed memories are excluded (#384): they are invisible to recall, so
+ * Get all never-scored memories — the nightly importance pool, keyed on the
+ * importance_scored_at watermark (#425, migration v19). The pre-v19 sentinel
+ * (`base_strength = 0.5`) re-rolled every row the model genuinely scored
+ * 0.5, every night; NULL watermark = never scored under ANY rubric. Absorbed
+ * memories are excluded (#384): they are invisible to recall, so
  * importance-scoring one would spend an LLM call on dead evidence.
  */
 export function getUnscoredMemories(db: Database.Database): Memory[] {
   const rows = db
     .prepare(
       `SELECT * FROM memories
-       WHERE base_strength = 0.5 AND COALESCE(status, '') != 'absorbed'
+       WHERE importance_scored_at IS NULL AND COALESCE(status, '') != 'absorbed'
        ORDER BY ingested_at ASC`
     )
     .all() as Array<Record<string, unknown>>;

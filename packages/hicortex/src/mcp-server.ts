@@ -31,10 +31,20 @@ import { embed, warmEmbedder } from "./embedder.js";
 import * as storage from "./storage.js";
 import { getNeighbors, shortestPath, detectHubs, exportGraph, EXPORT_DEFAULT_LIMIT } from "./graph.js";
 import { createAuthMiddleware, vizHandler, vizVendorHandler, identityUiHandler, dashboardHandler } from "./viz.js";
-import { dashboardDataHandler, accountHandler, accountTokenHandler } from "./dashboard.js";
+import {
+  dashboardDataHandler,
+  dashboardFieldHandler,
+  dashboardEventsHandler,
+  dashboardModelGetHandler,
+  dashboardModelPutHandler,
+  dashboardCapturePausePutHandler,
+  accountHandler,
+  accountTokenHandler,
+} from "./dashboard.js";
 import {
   handleIdentityGet,
   handleIdentityPut,
+  handleIdentityModePut,
   serveIdentityBody,
   resolveIdentityClientsConfig,
   resolveIdentityAgentsConfig,
@@ -42,9 +52,10 @@ import {
   type AgentMode,
 } from "./identity-store.js";
 import * as retrieval from "./retrieval.js";
+import * as CALIBRATION from "./calibration.js";
 import { SessionRecallRegistry } from "./recall-registry.js";
 import { isReservedSectionName, MEMORY_SECTION_NAME, resolveMcpInstructions } from "./memory-instructions.js";
-import { handleRecallIndex, handleMemoryGet, formatMemoryGetText, createRecallRetrieveFn, resolveNoveltyFloorSlots, type RecallIndexOptions } from "./recall-index.js";
+import { handleRecallIndex, handleMemoryGet, formatMemoryGetText, createRecallRetrieveFn, passesRelevanceGate, type RecallIndexOptions } from "./recall-index.js";
 import { labelForType, normalizeMemoryType, ACCEPTED_MEMORY_TYPES } from "./type-labels.js";
 import { publicHealthResponse, detailedHealthResponse, logAndSendInternalError } from "./health.js";
 import { injectSeedLesson } from "./seed-lesson.js";
@@ -57,7 +68,9 @@ import {
   type ExplicitMarkInput,
 } from "./reconsolidation.js";
 import { redact } from "./redact.js";
-import { ensureAndPersistAgentId, loadConfigStrict } from "./init.js";
+import { recordDistillActivity, type DistillOutcome } from "./capture-health.js";
+import { capturePauseKey, isCapturePaused } from "./capture-pause.js";
+import { ensureAndPersistAgentId, loadConfigStrict, persistConfigUpdates } from "./init.js";
 import type { MemorySearchResult } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -168,7 +181,7 @@ export function createMcpServer(): McpServer {
     "Search shared long-term memory (all agents, all sessions). CALL THIS BEFORE assuming, guessing, or asking the user about anything that may have come up before: prior decisions, preferences, project facts, people, hardware, past incidents. If you are about to write 'I don't have information about…', search first.",
     {
       query: z.string().describe("Search query text"),
-      limit: z.coerce.number().optional().describe("Max results (default: server config searchLimit)"),
+      limit: z.coerce.number().optional().describe("Max results (default: the server default)"),
       project: z.string().optional().describe("Filter by project name"),
     },
     async ({ query, limit, project }) => {
@@ -210,7 +223,7 @@ export function createMcpServer(): McpServer {
     "Get recent memories, optionally filtered by project. CALL THIS AT THE START of substantive work on a project to catch up on its latest state — cheaper than asking the user what happened.",
     {
       project: z.string().optional().describe("Filter by project name"),
-      limit: z.coerce.number().optional().describe("Max results (default: server config recentLimit)"),
+      limit: z.coerce.number().optional().describe("Max results (default: the server default)"),
     },
     async ({ project, limit }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
@@ -537,6 +550,24 @@ export function resolveBodyLimitMb(configVal: unknown, hostedMode: boolean): num
 }
 
 /**
+ * Resolve the OPTIONAL /search relevance floor (`minSimilarity` query param,
+ * #409 console polish). Pure — exported for tests. Absent/blank/invalid →
+ * undefined = NO gate (byte-identical to every pre-existing caller: agents,
+ * plugins, MCP tools never send the param). A finite number in [0, 1] → that
+ * floor, clamped into range so a hostile `?minSimilarity=42` cannot widen or
+ * invert the gate. Applied AFTER retrieve() with the exported recall gate
+ * (passesRelevanceGate: FTS/`both` hits pass regardless — a token match is
+ * real evidence; vector-only hits must clear the floor) — the same post-hoc
+ * shape /recall-index uses, so the two recall surfaces gate identically.
+ */
+export function resolveSearchSimilarityFloor(raw: unknown): number | undefined {
+  if (typeof raw !== "string" || raw.trim() === "") return undefined;
+  const v = Number(raw);
+  if (!Number.isFinite(v)) return undefined;
+  return Math.min(1, Math.max(0, v));
+}
+
+/**
  * Express error middleware (#7): translate express.json's default HTML 413
  * (entity.too.large) into a consistent JSON response. Catches body-parser
  * errors only — which express.json emits BEFORE any route runs — so by
@@ -721,9 +752,10 @@ export async function startServer(options: {
   }
 
   if (llmConfig) {
-    // Tuning (#220: maxTokens + enableThinking + numCtx + flush), validated +
-    // copied via the shared overlay (also applied in resolveSavedLlmConfig for
-    // the nightly). Wrong-typed values warn + drop.
+    // Tuning (#220: maxTokens + enableThinking; #408: the diagnostic env tier
+    // for numCtx + ollama flush), validated + resolved via the shared overlay
+    // (also applied in resolveSavedLlmConfig for the nightly — the ONE
+    // resolution point per process). Wrong-typed values warn + drop.
     applyTierTuningOverlay(llmConfig, savedConfig as Record<string, unknown> | null);
     llm = new LlmClient(llmConfig);
     console.log(`[hicortex] LLM (one model, all phases): ${llmConfig.provider}/${llmConfig.model}`);
@@ -815,17 +847,19 @@ export async function startServer(options: {
     );
   }
 
-  // #192 recall/decay alignment: decay speed + recall breadth + pushed-recall
-  // knobs, ALL from config (see retrieval.ts configureRecall for the key list)
-  // so calibration is a config edit + restart, never a release.
-  retrieval.configureDecay({ halfLifeDays: savedConfig?.decayHalfLifeDays });
-  const recallCfg = retrieval.configureRecall(savedConfig);
-  const scoringCfg = retrieval.configureScoring(savedConfig);
-  const sessionIntentCfg = retrieval.configureSessionIntent(savedConfig);
+  // #408: recall/decay calibration is RELEASE-MANAGED (calibration.ts) — no
+  // config keys are read here anymore. The plain configure*() calls pin this
+  // process to the shipped constants (they remain the eval/test seam; see
+  // retrieval.ts). The boot log still prints the active values — now sourced
+  // from the calibration constants via the configure*() returns.
+  retrieval.configureDecay();
+  const recallCfg = retrieval.configureRecall();
+  const scoringCfg = retrieval.configureScoring();
+  const sessionIntentCfg = retrieval.configureSessionIntent();
   console.log(
-    `[hicortex] Recall: k=${recallCfg.searchLimit}/recent=${recallCfg.recentLimit}` +
+    `[hicortex] Recall (release-managed calibration): k=${recallCfg.searchLimit}/recent=${recallCfg.recentLimit}` +
     `/window=${recallCfg.recentWindowDays}d/cold=${recallCfg.coldExposureSlots}` +
-    `/novelty=${resolveNoveltyFloorSlots(savedConfig?.noveltyFloorSlots, savedConfig?.recallMaxItems)}` +
+    `/novelty=${CALIBRATION.NOVELTY_FLOOR_SLOTS}` +
     ` · ` +
     `score sim=${scoringCfg.similarity}/str=${scoringCfg.strength}/conn=${scoringCfg.connections}` +
     `/rec=${scoringCfg.recency}, fresh=${scoringCfg.freshnessBoostWeight}@${scoringCfg.freshnessBoostDays}d, ` +
@@ -833,18 +867,11 @@ export async function startServer(options: {
     `, intent w=${sessionIntentCfg.weight}` +
     (sessionIntentCfg.weight === 0 ? " (disabled)" : "")
   );
-  recallRegistry = new SessionRecallRegistry({
-    reshowTurns: savedConfig?.recallReshowTurns as number | undefined,
-  });
-  recallIndexOptions = {
-    minSimilarity: savedConfig?.recallMinSimilarity as number | undefined,
-    maxItems: savedConfig?.recallMaxItems as number | undefined,
-    minPromptLength: savedConfig?.recallMinPromptChars as number | undefined,
-    titleChars: savedConfig?.recallTitleChars as number | undefined,
-    // #324 novelty floor: slots of recallMaxItems guaranteed to the
-    // pure-prompt (unblended) search's top passing hit(s). 0 disables.
-    noveltyFloorSlots: savedConfig?.noveltyFloorSlots as number | undefined,
-  };
+  // Defaults resolve inside recall-index.ts / recall-registry.ts from the
+  // calibration constants (#408) — the options objects stay as the seams the
+  // eval injects through.
+  recallRegistry = new SessionRecallRegistry();
+  recallIndexOptions = {};
   memoryInstructionsEnabled = savedConfig?.memoryInstructions !== false;
   if (resolvedAgents.dropped.length > 0) {
     console.warn(
@@ -998,7 +1025,7 @@ export async function startServer(options: {
   app.post("/ingest", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
 
-    const { content, source_agent, source_agent_id, source_domain, project, memory_type, privacy, source_session, session_date, corrects, supersedes } = req.body ?? {};
+    const { content, source_agent, source_agent_id, source_domain, source_machine, project, memory_type, privacy, source_session, session_date, corrects, supersedes } = req.body ?? {};
 
     if (!content || typeof content !== "string") {
       res.status(400).json({ error: "Missing or invalid 'content' field" });
@@ -1056,6 +1083,7 @@ export async function startServer(options: {
         // Attribution + provenance passthrough (0.16.x); null when absent.
         sourceAgentId: typeof source_agent_id === "string" ? source_agent_id : null,
         sourceDomain: typeof source_domain === "string" ? source_domain : null,
+        sourceMachine: storage.sanitizeSourceMachine(source_machine),
         sourceSession: source_session ?? undefined,
         project: project ?? undefined,
         memoryType: normalizedType ?? "experience",
@@ -1082,15 +1110,24 @@ export async function startServer(options: {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     const query = typeof req.query.query === "string" ? req.query.query.trim() : "";
     if (!query) { res.status(400).json({ error: "Missing 'query'" }); return; }
-    // No hardcoded default: absent limit → config-driven (searchLimit).
+    // No hardcoded default: absent limit → the release-managed calibration
+    // default (#408 — was the searchLimit config key).
     const limit = req.query.limit ? Number(req.query.limit) : undefined;
     const project = typeof req.query.project === "string" && req.query.project ? req.query.project : undefined;
     // 0.16.x: `privacy` query param is ACCEPTED for backward compat (old
     // clients/plugins still send it) but no longer read — retrieval ignores
     // privacy entirely (the column is vestigial, never filtered).
     warnDeprecatedPrivacyParamIfPresent(req.query as Record<string, unknown>, "search");
+    // #409 console polish: OPTIONAL relevance floor. Absent (every legacy
+    // caller) = ungated, byte-identical behavior. The console sends the
+    // recall floor (RECALL_MIN_SIMILARITY, via the /dashboard/field echo) so
+    // vector nearest-neighbor junk below it never renders as "results".
+    const minSimilarity = resolveSearchSimilarityFloor(req.query.minSimilarity);
     try {
-      const results = await retrieval.retrieve(db, embed, query, { limit, project });
+      let results = await retrieval.retrieve(db, embed, query, { limit, project });
+      if (minSimilarity !== undefined) {
+        results = results.filter((r) => passesRelevanceGate(r, minSimilarity));
+      }
       res.json({ results });
     } catch (err) {
       logAndSendInternalError(res, "search", err);
@@ -1149,7 +1186,8 @@ export async function startServer(options: {
   app.get("/recent", (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     const project = typeof req.query.project === "string" && req.query.project ? req.query.project : undefined;
-    // No hardcoded default: absent limit → config-driven (recentLimit).
+    // No hardcoded default: absent limit → the release-managed calibration
+    // default (#408 — was the recentLimit config key).
     // 0.16.x: `privacy` query param accepted but ignored (vestigial column).
     const limit = req.query.limit ? Number(req.query.limit) : undefined;
     warnDeprecatedPrivacyParamIfPresent(req.query as Record<string, unknown>, "recent");
@@ -1252,6 +1290,40 @@ export async function startServer(options: {
     }
   });
 
+  // PUT /identity/mode — switch ONE agent's identity scope (#423 phase 3).
+  // No /context/mode alias: this is a NEW endpoint with no legacy callers.
+  //
+  // Single-writer discipline: the daemon's boot-time identityAgents map is
+  // normally read-once-at-boot — THIS route is the one live writer. The
+  // adapter reads the FRESH config (not the boot snapshot) so two switches in
+  // a row can never drop each other's writes, then on success (1) persists
+  // the merged map as config `identityAgents` (survives restarts) and (2)
+  // sets the module-level map to the SAME map — the switch is live on the
+  // very next GET /identity?agent= (applies: "immediate"). Externally
+  // hand-edited config still needs a restart (pre-existing posture). Note
+  // the interplay: PUT /identity's black-hole guard 409s section writes while
+  // config forces off/global — switching to 'override' here first unblocks
+  // section editing. Bearer-only (standard auth middleware, no exemption).
+  app.put("/identity/mode", (req, res) => {
+    try {
+      const fresh = readConfigFile(stateDir) ?? {};
+      const r = handleIdentityModePut(
+        identityDir,
+        req.body ?? null,
+        req.query as Record<string, unknown>,
+        resolveIdentityAgentsConfig(fresh).agents,
+      );
+      if (r.status === 200 && r.agents) {
+        const merged = r.agents;
+        persistConfigUpdates(pathJoin(stateDir, "config.json"), { identityAgents: merged });
+        identityAgents = merged;
+      }
+      res.status(r.status).json(r.body);
+    } catch (err) {
+      logAndSendInternalError(res, "identity/mode", err);
+    }
+  });
+
   // REST /distill — canonical capture endpoint (0.9.0+).
   // Every machine (including the server itself) POSTs denoised session text here.
   // The server distills, embeds, stores. Body limit: see `distillBodyLimitMb`
@@ -1262,9 +1334,46 @@ export async function startServer(options: {
   // Uses cached detectChunkSize per endpoint so the probe runs once per boot.
   app.post("/distill", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
-    if (!llm || !llmConfig) { res.status(503).json({ error: "No LLM configured — run npx @gamaze/hicortex init. Session will be retried." }); return; }
 
-    const { text, messages, source_agent, source_agent_id, source_domain, project, session_id, segment_id, session_date, privacy } = req.body ?? {};
+    // #422: destructured ABOVE the no-LLM guard (it used to sit below) so the
+    // attribution fields exist at EVERY exit incl. the 503 — capture-health
+    // accounting records held posts there too. Nothing else reads them before
+    // the guard, so semantics are unchanged.
+    const { text, messages, source_agent, source_agent_id, source_domain, source_machine, project, session_id, segment_id, session_date, privacy } = req.body ?? {};
+
+    // #422 capture health: normalize the wire fields ONCE so every exit below
+    // records with a one-liner (recordDistillActivity re-sanitizes machine/
+    // agent — the builder only forwards + picks the byte count). bytes = the
+    // resolved (post-redaction) conversationText length, 0 while unresolved.
+    const capEntry = (bytes: number, outcome: DistillOutcome) => ({
+      machine: source_machine,
+      agent: source_agent,
+      sessionId: session_id,
+      segmentId: segment_id,
+      bytes,
+      outcome,
+    });
+
+    // #423 phase 3 (D3): operator capture pause — server-side 200-skip. The
+    // pause table is read per POST, so a pause takes effect on the very next
+    // /distill (no restart). Deliberately ABOVE the no-LLM guard: a paused
+    // bundle must skip regardless of LLM state — a 503 there would hold the
+    // client's cursor on a box that is deliberately not capturing. The 200 is
+    // the point: capture.ts treats every 200 as confirmed and advances its
+    // cursor, so paused sessions are deliberately NOT captured and never
+    // re-sent/backfilled. Zero client changes.
+    const pause = capturePauseKey(source_machine, source_agent);
+    if (isCapturePaused(db, pause.machine, pause.harness)) {
+      recordDistillActivity(db, capEntry(0, "paused"));
+      res.status(200).json({ skipped: true, paused: true, machine: pause.machine, harness: pause.harness });
+      return;
+    }
+
+    if (!llm || !llmConfig) {
+      recordDistillActivity(db, capEntry(0, "held"));
+      res.status(503).json({ error: "No LLM configured — run npx @gamaze/hicortex init. Session will be retried." });
+      return;
+    }
 
     // Resolve the conversation text from either the pre-denoised string or raw messages array.
     // `fromTextBranch` is captured once so the redaction gate below uses the SAME
@@ -1315,6 +1424,7 @@ export async function startServer(options: {
     if (session_id && segment_id) {
       const existingCount = countExistingSegment(db, session_id as string, segment_id as string);
       if (existingCount > 0) {
+        recordDistillActivity(db, capEntry(conversationText.length, "skipped"));
         res.status(200).json({ skipped: true, existing_count: existingCount });
         return;
       }
@@ -1327,6 +1437,7 @@ export async function startServer(options: {
     if (session_id && !segment_id) {
       const existingCount = countExistingSession(db, session_id as string);
       if (existingCount > 0) {
+        recordDistillActivity(db, capEntry(conversationText.length, "skipped"));
         res.status(200).json({ skipped: true, existing_count: existingCount });
         return;
       }
@@ -1339,6 +1450,7 @@ export async function startServer(options: {
     // diagnosis — the capture client treats non-201/200 as transient and holds
     // its cursor (capture.ts), so the segment is retried next run, never lost.
     if (!(await resolveDistillProbeGate(llm, llmConfig))) {
+      recordDistillActivity(db, capEntry(conversationText.length, "held"));
       res.status(503).json({ error: "LLM endpoint not generating — session will be retried" });
       return;
     }
@@ -1368,6 +1480,7 @@ export async function startServer(options: {
       // a skipped duplicate neither trips the gate nor consumes budget. The client
       // capture loop holds its cursor on 429 (dup-over-loss, capture.ts:303).
       if (isTokenBudgetExceeded(stateDir)) {
+        recordDistillActivity(db, capEntry(conversationText.length, "held"));
         res.status(429).json({ error: "token budget exceeded", retry: "next billing period" });
         return;
       }
@@ -1421,6 +1534,7 @@ export async function startServer(options: {
               // filtered. Default null for older clients that don't send them.
               sourceAgentId: typeof source_agent_id === "string" ? source_agent_id : null,
               sourceDomain: typeof source_domain === "string" ? source_domain : null,
+              sourceMachine: storage.sanitizeSourceMachine(source_machine),
               // Per-chunk key: "<session_id>[#<segment_id>]#<i>". The prefix
               // matches the dedup checks above, so a re-run is idempotent.
               sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
@@ -1441,6 +1555,7 @@ export async function startServer(options: {
       });
       const ids = insertAll();
 
+      recordDistillActivity(db, capEntry(conversationText.length, "ok"));
       res.status(201).json({
         ids,
         distilled: ids.length,
@@ -1453,6 +1568,7 @@ export async function startServer(options: {
         usage: distillUsage,
       });
     } catch (err) {
+      recordDistillActivity(db, capEntry(conversationText.length, "held"));
       res.status(500).json({ error: "Distillation failed" });
       console.error(`[hicortex] /distill: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
     } finally {
@@ -1534,6 +1650,52 @@ export async function startServer(options: {
     } catch (err) {
       res.status(500).json({ error: "Update failed" });
       console.error(`[hicortex] /update: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}`);
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // REST /enrich — owner corroboration (#423 phase 3).
+  //
+  // An enrich is EVIDENCE ABOUT IMPORTANCE: it bumps corroboration_count and
+  // base_strength (+the calibration delta, capped at 1.0) — the same anchor
+  // the nightly's LLM scoring writes. It must NOT touch
+  // access_count (reserved for real recall use) or shown_count (index
+  // exposure) — faking either corrupts the uses-per-showing adoption metric.
+  // Never a stage write: stages are derived presentation (the E-reframe).
+  // An absorbed memory is invisible evidence and cannot be corroborated
+  // (409, same posture as /update).
+  // -------------------------------------------------------------------------
+  app.post("/enrich", (req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    const { id } = req.body ?? {};
+    if (!id || typeof id !== "string") {
+      res.status(400).json({ error: "Missing or invalid 'id' field" });
+      return;
+    }
+
+    const fullId = resolveMemoryId(db, id);
+    if (!fullId) {
+      res.status(404).json({ error: "Memory not found" });
+      return;
+    }
+
+    // Same absorbed guard as /update: corroborating an invisible row would
+    // strengthen evidence the store deliberately folded into another memory.
+    const target = storage.getMemory(db, fullId);
+    if (target?.status === "absorbed") {
+      res.status(409).json({ error: "Memory is absorbed — invisible evidence cannot be corroborated" });
+      return;
+    }
+
+    try {
+      const r = storage.enrichMemory(db, fullId, new Date().toISOString());
+      if (!r) {
+        res.status(404).json({ error: "Memory not found" });
+        return;
+      }
+      res.status(200).json({ id: fullId, corroboration_count: r.corroborationCount, base_strength: r.baseStrength });
+    } catch (err) {
+      logAndSendInternalError(res, "enrich", err);
     }
   });
 
@@ -1754,6 +1916,59 @@ export async function startServer(options: {
     () => readConfigFile(stateDir),
   ));
 
+  // GET /dashboard/field — the console flight-field payload (#409/#421
+  // Phase 1): the whole live store as minimal fields (titles ≤100 via the
+  // production memoryTitle, derived stage + effective strength, no content
+  // bodies) plus every link edge {a, b, rel}. Bearer-only (auth middleware,
+  // no shell exemption — it carries data); localhost bypass applies. Handler
+  // + gzip adapter live in src/dashboard.ts next to its /data sibling; the
+  // field is one row per memory, so Accept-Encoding: gzip clients get the
+  // compressed wire form.
+  app.get("/dashboard/field", dashboardFieldHandler(
+    () => db!,
+  ));
+
+  // GET /dashboard/events?days=N — the console replay ledger (#409/#421
+  // Phase 1): night-resolution synthesis over existing tables (created_at /
+  // memory_history / dedup_log / memory_links; no schema change, no
+  // event-sourcing store). ids only. Bearer-only like /dashboard/field;
+  // localhost bypass applies.
+  app.get("/dashboard/events", dashboardEventsHandler(
+    () => db!,
+  ));
+
+  // GET/PUT /dashboard/model — the console's model-settings surface (#422
+  // Phase 2): the ONE scoped writer on the dashboard (view-only everywhere
+  // else). GET echoes the config's model knobs raw (null = unset) + the
+  // boot-resolved provider from the daemon's in-memory llmConfig; api_key_set
+  // carries ONLY the key's presence — no key material on the wire, ever. PUT
+  // validates an allowlisted subset (null clears a config key) and persists
+  // via init.ts persistConfigUpdates — strict load, so a malformed config.json
+  // throws → 500 with the file untouched. Bearer-only (auth middleware, no
+  // shell exemption — it carries install config); localhost bypass applies.
+  // Applies on restart: the daemon resolves config at boot (llmConfig is the
+  // boot snapshot; the card footnotes this).
+  app.get("/dashboard/model", dashboardModelGetHandler(
+    () => readConfigFile(stateDir),
+    () => llmConfig,
+  ));
+  app.put("/dashboard/model", dashboardModelPutHandler(
+    (updates) => persistConfigUpdates(pathJoin(stateDir, "config.json"), updates),
+    () => llmConfig,
+  ));
+
+  // PUT /dashboard/capture-pause — the console's pause/resume toggle (#423
+  // phase 3, D3). Body {machine?, harness, paused}: a pause makes /distill
+  // 200-skip the bundle's posts — deliberate NON-capture, the sessions are
+  // not backfilled (the client cursor advances on the 200, by design). The
+  // effect is IMMEDIATE — no restart — because the /distill handler reads the
+  // capture_pauses table on every post. Bearer-only like /dashboard/model
+  // (auth middleware, no shell exemption — it mutates operator state);
+  // localhost bypass applies. Handler + adapter live in src/dashboard.ts.
+  app.put("/dashboard/capture-pause", dashboardCapturePausePutHandler(
+    () => db!,
+  ));
+
   // GET /account — account identity for the console nav (name/org/plan from
   // config). The LIGHTWEIGHT twin of the account block inside /dashboard/data:
   // the /viz and /identity/ui pages need only this, not the metric payload;
@@ -1895,7 +2110,8 @@ function readConfigFile(stateDir: string): Record<string, unknown> | null {
   } catch (e) {
     console.warn(
       `[hicortex] ${configPath} exists but could not be parsed — server booting degraded ` +
-      `(config-driven LLM/decay/recall knobs and agentId self-heal will not apply). ` +
+      `(config-driven LLM knobs and agentId self-heal will not apply; decay/recall ` +
+      `calibration is release-managed and unaffected). ` +
       `Fix the JSON and restart. Cause: ${e instanceof Error ? e.message : String(e)}`
     );
     return null;
