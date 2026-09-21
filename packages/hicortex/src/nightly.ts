@@ -41,6 +41,7 @@ import { openCursorStore, pruneCursors } from "./capture-cursors.js";
 import { captureBatches, acquireCaptureLock, type PostFn, type PostResult, type DistillBody } from "./capture.js";
 import { createRunDeadline, resolveNightlyTimeBudgetMinutes, type RunDeadline } from "./run-deadline.js";
 import { writeSnapshot, backfillSnapshots } from "./dashboard.js";
+import { pruneRecallPrecision } from "./recall-precision.js";
 import { isTelemetryEnabled, getTelemetryId, sendTelemetry, TELEMETRY_PAYLOAD_VERSION } from "./telemetry.js";
 import { ensureAndPersistAgentId, loadConfigStrict } from "./init.js";
 import { createBackup, runBackupHook, newestBackupArtifactMs, DEFAULT_BACKUP_RETENTION } from "./backup.js";
@@ -1161,6 +1162,21 @@ export async function runNightly(options: {
         console.warn(
           `[hicortex] Dashboard snapshot write failed: ` +
           `${snapErr instanceof Error ? snapErr.message : String(snapErr)}`
+        );
+      }
+
+      // #476 — recall-precision retention prune (zero-LLM, full nightly only):
+      // both event tables drop rows outside the rolling window whose length IS
+      // the retention constant (the capture-health single-constant law — the
+      // Memory Precision card can never claim a window the store no longer
+      // holds rows for). Own try/catch like the snapshot writer: telemetry
+      // housekeeping must never fail the run.
+      try {
+        pruneRecallPrecision(db);
+      } catch (pruneErr) {
+        console.warn(
+          `[hicortex] Recall-precision retention prune failed: ` +
+          `${pruneErr instanceof Error ? pruneErr.message : String(pruneErr)}`
         );
       }
     }

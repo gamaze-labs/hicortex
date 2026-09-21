@@ -506,9 +506,14 @@ async function stageImportance(
   llm: LlmClient,
   budget: BudgetTracker,
   dryRun: boolean,
-  deadline?: RunDeadline
-): Promise<{ scored: number; failed: number; skipped_budget: number }> {
-  return scoreMemoriesImportance(db, memories, llm, { budget, deadline, dryRun });
+  deadline?: RunDeadline,
+  /** #478: pool candidates the paid-gain guard dropped at the stage
+   *  boundary — reported, not scored, so the run's evidence shows the
+   *  promotion/enrichment gains that survived the nightly. */
+  guardSkipped = 0,
+): Promise<{ scored: number; failed: number; skipped_budget: number; guard_skipped: number }> {
+  const r = await scoreMemoriesImportance(db, memories, llm, { budget, deadline, dryRun });
+  return { ...r, guard_skipped: guardSkipped };
 }
 
 // ---------------------------------------------------------------------------
@@ -744,13 +749,19 @@ async function stageContentDomains(
   //   - domain NOT IN the current vocabulary (a rename/removal re-files), OR
   //   - no memory_tags rows yet (single-domain memories from feat/content-domains
   //     that have a primary but no tag set — backfill them to multi-tag).
+  // #477: absorbed dedup losers are excluded — the merge clears their tags
+  // and nulls domain before absorbing, so without the predicate every dead
+  // loser re-enters this scope nightly (one classify call + a halving on
+  // evidence no recall can ever see). Conjoined OUTSIDE the parenthesized OR
+  // group so SQL precedence cannot let an OR arm absorb it.
   const placeholders = domains.map(() => "?").join(", ");
   const rows = db
     .prepare(
       `SELECT id, content, project FROM memories
-       WHERE domain IS NULL
-          OR domain NOT IN (${placeholders})
-          OR id NOT IN (SELECT DISTINCT memory_id FROM memory_tags)`,
+       WHERE COALESCE(status, '') != 'absorbed'
+         AND (domain IS NULL
+              OR domain NOT IN (${placeholders})
+              OR id NOT IN (SELECT DISTINCT memory_id FROM memory_tags))`,
     )
     .all(...domains.map((d) => d.name)) as Array<{
       id: string;
@@ -1674,6 +1685,7 @@ export function stagePromotion(
 
   let promoted = 0;
   let demotedSkipped = 0;
+  let totalGain = 0;
   const writes: Array<{ id: string; fields: Record<string, unknown> }> = [];
 
   for (const row of rows) {
@@ -1688,8 +1700,10 @@ export function stagePromotion(
     }
     // base_strength is NOT NULL after scoring; the `?? 0.5` mirrors
     // stageDecayPrune's defensive default for unscored rows (inserts at 0.5).
-    let strength = row.base_strength ?? 0.5;
+    const startStrength = row.base_strength ?? 0.5;
+    let strength = startStrength;
     for (let i = 0; i < row.delta; i++) strength = applyStrengthPromotion(strength);
+    totalGain += strength - startStrength;
     promoted++;
     writes.push({
       id: row.id,
@@ -1697,10 +1711,15 @@ export function stagePromotion(
     });
   }
 
+  // #459: the stage's one-line summary in the shared stage idiom (rows
+  // examined / promoted / total gain, like the supersession summary) — the
+  // stage writes its report in-memory only, so the log line is the soak-time
+  // health signal. Zero examined rows stay silent (the supersession gate).
   if (dryRun) {
     console.log(
-      `[hicortex] Strength promotion (dry-run): would promote ${promoted} memories ` +
-        `(${demotedSkipped} demotion-set rows advance their baseline only).`,
+      `[hicortex] Strength promotion (dry-run): ${rows.length} examined, would promote ` +
+        `${promoted} (+${totalGain.toFixed(3)} total strength, ` +
+        `${demotedSkipped} demotion-set rows advance their baseline only).`,
     );
     return { promoted, demoted_skipped: demotedSkipped };
   }
@@ -1714,8 +1733,9 @@ export function stagePromotion(
   tx();
 
   console.log(
-    `[hicortex] Strength promotion: promoted ${promoted} memories ` +
-      `(${demotedSkipped} demotion-set rows advance their baseline only).`,
+    `[hicortex] Strength promotion: ${rows.length} examined, promoted ${promoted} ` +
+      `(+${totalGain.toFixed(3)} total strength, ` +
+      `${demotedSkipped} demotion-set rows advance their baseline only).`,
   );
 
   return { promoted, demoted_skipped: demotedSkipped };
@@ -2044,12 +2064,32 @@ export async function runConsolidation(
   // Stage 1: Pre-check
   const precheck = stagePrecheck(db, stateDir);
 
-  // Also check for unscored memories
+  // #478: the importance pool is ROW-AGE bound — young (ingested within
+  // IMPORTANCE_SETTLE_WINDOW_DAYS) ∪ never-scored. The lastConsolidated
+  // watermark no longer defines any part of it: a deferred run's stuck
+  // watermark used to re-settle a growing cohort nightly, and every
+  // re-settle overwrites base_strength outright (erasing gains
+  // stagePromotion had already paid — 5/5 observed erasures). The watermark
+  // cohort (precheck.newMemories) STILL feeds reflection + links below —
+  // their work is batch retry by design; only importance's per-row settling
+  // was mis-bound to the batch marker.
+  const settleCutoff = new Date(
+    Date.now() - CALIBRATION.IMPORTANCE_SETTLE_WINDOW_DAYS * 86_400_000,
+  ).toISOString();
+  // getMemoriesSince keys on ingested_at only — absorbed rows (invisible to
+  // recall) are filtered here in the same vocabulary getUnscoredMemories
+  // uses in SQL: no LLM call on dead evidence.
+  const young = storage
+    .getMemoriesSince(db, settleCutoff)
+    .filter((m) => m.status !== "absorbed");
+  const youngIds = new Set(young.map((m) => m.id));
+
+  // Also check for unscored memories (#425 watermark pool) — first settle is
+  // age-independent, so a row used before its first score is never stranded.
   const unscored = storage.getUnscoredMemories(db);
-  const newIds = new Set(precheck.newMemories.map((m) => m.id));
   const scoreMemories = [
-    ...precheck.newMemories,
-    ...unscored.filter((m) => !newIds.has(m.id)),
+    ...young,
+    ...unscored.filter((m) => !youngIds.has(m.id)),
   ];
 
   // #194 no-fit scope: untagged rows (domain IS NULL) stay in the
@@ -2059,21 +2099,35 @@ export async function runConsolidation(
   // never caught because stagePrecheck used to read the AMBIENT (always
   // empty in the suite) state instead of the run's own watermark — threading
   // stateDir (#357) exposed the divergence between test and production.
+  // #477: absorbed dedup losers (tags cleared, domain NULLed by the merge)
+  // are dead evidence — they must not keep the no-fit scope (and the run)
+  // alive every night. Same predicate spelling as getUnscoredMemories.
   const nofitInScope = (
-    db.prepare("SELECT COUNT(*) AS n FROM memories WHERE domain IS NULL").get() as {
+    db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM memories WHERE domain IS NULL AND COALESCE(status, '') != 'absorbed'",
+      )
+      .get() as {
       n: number;
     }
   ).n;
 
-  const skip = scoreMemories.length === 0 && nofitInScope === 0;
+  // #478: the quiet-night gate is the UNION — watermark cohort OR young OR
+  // unscored OR no-fit scope. A stuck watermark alone must never silence
+  // reflection/links (their pool is the watermark cohort, and their retry
+  // semantics are the reason a deferred run holds the watermark at all).
+  const skip =
+    scoreMemories.length === 0 &&
+    precheck.newMemories.length === 0 &&
+    nofitInScope === 0;
 
   report.stages.precheck = {
     skip,
     reason: skip
       ? precheck.reason
-      : `${precheck.newMemories.length} new + ${scoreMemories.length - precheck.newMemories.length} unscored memories`,
+      : `${precheck.newMemories.length} new (watermark) + ${young.length} young + ${scoreMemories.length - young.length} unscored memories`,
     new_memory_count: precheck.newMemories.length,
-    unscored_count: scoreMemories.length - precheck.newMemories.length,
+    unscored_count: unscored.length,
   };
 
   // Strength promotion (#448) — runs in the pre-skip deterministic zone, in
@@ -2121,13 +2175,38 @@ export async function runConsolidation(
 
     // Stage 2: Importance Scoring
     if (!deadline?.hit("importance")) {
+      // #478 paid-gain guard — evaluated HERE, at the stage boundary, not at
+      // pool-build time: the pool above was built before this run's
+      // stagePromotion payment, so a row whose FIRST use lands this run
+      // passes a pool-build check and its just-paid gain is overwritten at
+      // the first re-settle. This read sits after promotion by construction
+      // and sees the advanced baseline. Already-scored rows carrying a paid
+      // gain (promotion baseline advanced OR owner corroboration) keep it —
+      // re-settling would stomp base_strength; `hicortex rescore-importance`
+      // remains the wholesale operator re-judge. Never-scored rows
+      // (importance_scored_at IS NULL) are NEVER skipped: first settle
+      // always happens, whatever their use history.
+      const paidGainIds = scoreMemories.length
+        ? new Set(
+            (db.prepare(
+              `SELECT id FROM memories
+                WHERE importance_scored_at IS NOT NULL
+                  AND (COALESCE(promotion_last_count, 0) > 0
+                       OR COALESCE(corroboration_count, 0) > 0)
+                  AND id IN (${scoreMemories.map(() => "?").join(", ")})`,
+            ).all(...scoreMemories.map((m) => m.id)) as Array<{ id: string }>)
+              .map((r) => r.id),
+          )
+        : new Set<string>();
+      const settleCandidates = scoreMemories.filter((m) => !paidGainIds.has(m.id));
       report.stages.importance = await stageImportance(
         db,
-        scoreMemories,
+        settleCandidates,
         llm,
         budget,
         dryRun,
         deadline,
+        scoreMemories.length - settleCandidates.length,
       );
     }
 

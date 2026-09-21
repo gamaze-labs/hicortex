@@ -213,6 +213,13 @@ export interface ConsolidationReport {
       scored: number;
       failed: number;
       skipped_budget: number;
+      /**
+       * #478: pool candidates dropped by the paid-gain guard at the stage
+       * boundary — already-scored rows whose promotion baseline advanced or
+       * that carry an owner corroboration. Their base_strength keeps the
+       * paid gain; the nightly re-settle leaves them alone.
+       */
+      guard_skipped?: number;
     };
     reflection?: {
       lessons_generated: number;

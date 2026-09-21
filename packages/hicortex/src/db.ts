@@ -703,6 +703,82 @@ const MIGRATIONS: Migration[] = [
       );
     },
   },
+  {
+    version: 21,
+    name: "memory_layout",
+    up: (db) => {
+      // #464 — the console field's server-computed placement. One row per
+      // placed memory at one epoch; the CURRENT epoch is MAX(epoch) and the
+      // payload (dashboard.ts handleDashboardField) LEFT JOINs on it. A full
+      // re-projection (`hicortex layout --reproject`) writes a NEW epoch and
+      // drops older ones in the SAME transaction (atomic swap — a mid-write
+      // failure leaves the previous epoch fully intact). Epochs exist so the
+      // whole store moves at once (one announced visual shift), never as a
+      // mix of projections. Idempotent: IF NOT EXISTS (the v18 pattern —
+      // plain CREATE, no ALTER).
+      // Kept after the #464/#475 field revert (#474): nothing reads or writes
+      // this table now — a dormant orphan. Rc databases already applied v21
+      // (user_version 21), so removing it would fork schema versions; it
+      // stays per the append-only migration discipline.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_layout (
+            memory_id TEXT PRIMARY KEY,
+            x REAL NOT NULL,
+            y REAL NOT NULL,
+            epoch INTEGER NOT NULL
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_memory_layout_epoch ON memory_layout(epoch)");
+    },
+  },
+  {
+    version: 22,
+    name: "recall_precision_events",
+    up: (db) => {
+      // #476 — the Memory Precision card's event store (Option A, owner
+      // decision 2026-09-19: per-push event rows incl. a ≤256-char prompt
+      // excerpt — the exact-window Level-1 measures + the judge follow-up's
+      // sample frame). Two sidecar tables, the v16 distill_activity pattern:
+      // OPERATIONS telemetry, no memories FK — recall_events.memory_id is
+      // DATA (absorbed memories' history stays queryable; rows outliving
+      // their memory are valid). recall_pushes: one row per NON-skipped
+      // /recall-index call (short-prompt skips and resets record nothing; a
+      // silent turn records its push row with zero events — the silence rate
+      // is computable). recall_events: one kind='shown' row per pushed line
+      // (similarity = cosine vs the PURE prompt embedding, redundancy = max
+      // cosine vs the standing-context basis — both RAW, verdicts computed at
+      // render so recalibration never rewrites history) + one kind='fetch'
+      // row per handleMemoryGet (push_id NULL). Pruned nightly at the
+      // retention horizon (= the longest window, the capture-health
+      // single-constant law). Idempotent: IF NOT EXISTS everywhere.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS recall_pushes (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          day TEXT NOT NULL,
+          session_id TEXT,
+          prompt_excerpt TEXT
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_recall_pushes_day ON recall_pushes(day)");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS recall_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          day TEXT NOT NULL,
+          push_id INTEGER,
+          memory_id TEXT NOT NULL,
+          similarity REAL,
+          redundancy REAL,
+          kind TEXT NOT NULL
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_recall_events_day ON recall_events(day)");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_recall_events_memory_kind ON recall_events(memory_id, kind)",
+      );
+    },
+  },
 ];
 
 /**

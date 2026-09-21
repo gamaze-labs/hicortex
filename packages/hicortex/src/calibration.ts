@@ -140,9 +140,53 @@ export const RECALL_USES_NORMAL_MAX = 0.25;
  *  keeps a visible span, not a measured bound. */
 export const RECALL_USES_AXIS_MAX = 0.30;
 
+// Memory-precision family (#476) — the console card's deterministic proxies.
+// All four are release-managed per this module's evolution contract: no config
+// keys, nothing hardcoded elsewhere. Values are stored THRESHOLD-FREE (raw
+// cosines in recall_events); the thresholds below are applied at RENDER time
+// only, so recalibrating them never rewrites history.
+
+/**
+ * Retention horizon for the recall_pushes/recall_events sidecar tables AND the
+ * longest window the Memory Precision card shows — ONE constant feeds both
+ * (the CAPTURE_HEALTH_WINDOW_DAYS single-constant law: the card can never
+ * claim a window the store no longer has rows for). 90 = the longest #452
+ * range option that the retention can honestly serve; 180d and all clamp to
+ * it server-side and the payload echoes the effective window_days.
+ */
+export const MEMORY_PRECISION_WINDOW_DAYS = 90;
+
+/**
+ * Cosine at/above which a pushed line reads "redundant" (restating the
+ * session's standing context — the top lessons + identity every session-start
+ * hook injects). Direction-only display guidance, never a gate. 0.80 mirrors
+ * SUPERSESSION_MIN_SIMILARITY: at/above it a pair reads as the same
+ * statement, below it as topical overlap — a reasonable first anchor until
+ * the judged-calibration follow-up measures the real distribution (the
+ * #426 provisional-anchor posture).
+ */
+export const MEMORY_PRECISION_REDUNDANT_ABOVE = 0.8;
+
+/**
+ * Window showings a live memory needs (with zero window fetches) to count as
+ * DIVERGING — the index keeps pushing it, nothing ever reads it. 5 is the
+ * spec's anchor (#476): enough showings that the silence is a pattern, not
+ * one prompt's turn-suppression.
+ */
+export const MEMORY_PRECISION_DIVERGENCE_MIN_SHOWN = 5;
+
+/**
+ * Cap on the prompt excerpt persisted per recall_pushes row (Option A,
+ * owner-blessed 2026-09-19: the first-ever server-side persistence of raw
+ * prompt text, bounded to 256 chars and pruned at the retention horizon —
+ * the same trust boundary as /distill's denoised conversation text).
+ */
+export const MEMORY_PRECISION_PROMPT_EXCERPT_CHARS = 256;
+
 // ---------------------------------------------------------------------------
-// Composite ranking weights (was: score*Weight, freshnessBoost*,
-// supersededDemotion, *AffinityWeight, rrf*)
+// Composite ranking weights (was: score*Weight, supersededDemotion,
+// *AffinityWeight, rrf*; the pre-#430 freshness bonus constants merged into
+// the RECENCY family below)
 // ---------------------------------------------------------------------------
 
 /** Semantic-similarity share of the composite score. 0.50 (raised from 0.40
@@ -158,28 +202,64 @@ export const SCORE_STRENGTH_WEIGHT = 0.20;
 /** Graph-centrality share of the composite score (was 0.20; see above). */
 export const SCORE_CONNECTIONS_WEIGHT = 0.15;
 
-/** Slow recency curve share of the composite score (was 0.10; see above). */
+/**
+ * Log-saturation degree K for the connections term (#449 PR E, items 1+3):
+ * the credit is min(1, log1p(k) / log1p(K)) × SCORE_CONNECTIONS_WEIGHT on
+ * the ABSOLUTE undirected-degree scale k — full at k = K, exactly +0 at
+ * k = 0 (unlinked rows score bit-identically to the linear term they
+ * replace). Provenance: p99 of the REAL undirected degree distribution
+ * (read-only audit 2026-09-17 of the canonical wave snapshot, 18,798
+ * memories / 14,600 linked: p50 = 4, p90 = 8, p95 = 9, p99 = 15, p99.9 =
+ * 28.4, max = 40; 135 memories ≥ 16 links = 0.92% of linked) — so the top
+ * ~1% of hubs tie at full credit and everything below differentiates
+ * modestly. Shape grounded in the #449 research base: ACT-R fan saturation
+ * (Anderson & Reder 1999 — activation falls with the LOG of fan), SAM's
+ * saturating returns, cue overload (Watkins & Watkins 1975). Replaces the
+ * candidate-set-relative normalization #449 deleted (k / the per-query max
+ * degree) — a row's score no longer depends on which other rows happened
+ * to match. Alternatives K = 8 (p90 — collapses all p90+ rows to
+ * full credit) and K = 32 (≈p99.9 — leaves the p99 hub at 0.12 of the
+ * term) were tabled in the #449 spec. RELEASE-MANAGED per this module's
+ * evolution contract — overridable only through the configureScoring seam.
+ */
+export const CONNECTIONS_SATURATION_DEGREE = 16;
+
+/** Time-curve share of the composite score — the merged curve's blend weight
+ *  AND slow-region amplitude (was 0.10; see above). The four blend weights
+ *  still sum to 1.0; the head amplitude below is a documented overshoot, NOT
+ *  a fifth blend weight (#430). Zero (via the seam) disables the whole term. */
 export const SCORE_RECENCY_WEIGHT = 0.15;
 
-/** Fresh-memory window: the additive bonus fades linearly to 0 over this
- *  many days. 7 — nightly capture means 1 day is the floor of "fresh"
- *  (#191 Phase B). */
-export const FRESHNESS_BOOST_DAYS = 7;
+/** Hourly decay of the merged curve's slow region (#430) — promoted from the
+ *  inline literal computeScore carried; half-life ≈ 57.7 days. At and beyond
+ *  RECENCY_HEAD_DAYS the curve is bit-identical to the pre-#430 slow term
+ *  (SCORE_RECENCY_WEIGHT × RECENCY_HOURLY_DECAY^hours). */
+export const RECENCY_HOURLY_DECAY = 0.9995;
 
-/** Fresh-memory bonus size at age 0 (#191 Phase B; 0 = disabled via seam). */
-export const FRESHNESS_BOOST_WEIGHT = 0.15;
+/** Merged time-curve head amplitude at age 0 (#430) — the pre-#430 slow
+ *  weight 0.15 + fresh bonus 0.15: the freshness job is now the early steep
+ *  part of ONE curve. The head joins value-continuously onto the slow region
+ *  at RECENCY_HEAD_DAYS; its rate is DERIVED from that continuity, never a
+ *  free constant. */
+export const RECENCY_HEAD_WEIGHT = 0.30;
+
+/** Join age in days of the merged time curve (#430) — the head window edge,
+ *  carried over from the pre-#430 freshness window. Nightly capture means
+ *  1 day is the floor of "fresh" (#191 Phase B). */
+export const RECENCY_HEAD_DAYS = 7;
 
 /** Score multiplier for a memory a later decision superseded (0.15.2; the
  *  belief walk (#393 D) is the primary mechanism — this is the safety net
  *  for rows the walk does not reach). */
 export const SUPERSEDED_DEMOTION = 0.50;
 
-/** #203 soft boost on exact project match. ADDITIVE, zero-boost neutral,
- *  never a penalty — a foreign memory ranks equal, not lower. */
-export const PROJECT_AFFINITY_WEIGHT = 0.15;
-
-/** #203 soft boost multiplier on max overlapping domain-tag weight. */
-export const DOMAIN_AFFINITY_WEIGHT = 0.15;
+/** #430 merged scope affinity — ONE term replacing #203's two boosts (the
+ *  project-affinity and domain-affinity constants) at their shared value.
+ *  Boost = max(project-match indicator (1 on exact match), max overlapping
+ *  domain-tag weight) × this weight: the strongest single scope signal counts
+ *  once, never stacked. ADDITIVE, zero-boost neutral, never a penalty — an
+ *  absent scope adds exactly 0; a foreign memory ranks equal, not lower. */
+export const SCOPE_AFFINITY_WEIGHT = 0.15;
 
 /** #205 RRF k parameter (1/(k+rank+1)) — matches the pre-#205 hardcoded 60
  *  so the no-config path was byte-identical to 0.15.3. */
@@ -255,6 +335,19 @@ export const BM25_WEIGHT_DOMAIN = 2.0;
  * base-1.0 rows decay again.
  */
 export const IMPORTANCE_CEILING = 0.95;
+
+/**
+ * How many days a memory stays in the nightly importance-settle pool after
+ * ingest (#478): a row's importance re-settles nightly while young — keyed
+ * on PER-ROW age (ingested_at), never the global lastConsolidated
+ * watermark, which sticks whenever a run defers and used to drag a growing
+ * cohort back through re-scoring (each re-settle overwrites base_strength,
+ * erasing promotion gains). Rows leave the pool after the window; promoted
+ * or enriched rows leave earlier via the paid-gain guard. Release-managed
+ * (#408 discipline): moving it is a release decision with soak evidence,
+ * not a config knob.
+ */
+export const IMPORTANCE_SETTLE_WINDOW_DAYS = 3;
 
 /** Deterministic merge ceiling of the unified resolution pass (#392): pairs
  *  at/above this cosine merge LLM-free; [CORRECTION_MIN_SIMILARITY, this)
