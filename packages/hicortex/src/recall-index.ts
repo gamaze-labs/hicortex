@@ -59,6 +59,9 @@ import {
   recallQueryVector,
 } from "./retrieval.js";
 import * as CALIBRATION from "./calibration.js";
+// Type-only (no runtime cycle: recall-precision imports formatIndexLine from
+// here; this side only needs the recorder's entry shape).
+import type { RecallPushEntry, RecallFetchRecorder } from "./recall-precision.js";
 
 export interface RecallIndexOptions {
   /** Minimum measured cosine for vector-only candidates (release-managed
@@ -249,6 +252,17 @@ export type RecallRetrieveFn = (
   purePrompt?: boolean
 ) => Promise<MemorySearchResult[]>;
 
+/** What createRecallRetrieveFn returns (#476): the search closure PLUS the
+ *  per-request prompt-embed memo it already maintained — exposed so the
+ *  precision recorder reuses the SAME embedding (zero extra embeds) instead
+ *  of re-embedding the prompt to measure per-line similarity. */
+export interface RecallRetrieveFactory {
+  retrieveFn: RecallRetrieveFn;
+  /** The single-entry embed memo (keyed on the query text; the factory is
+   *  built per request, so the memo never outlives it). */
+  embedPrompt: (query: string) => Promise<Float32Array>;
+}
+
 export interface RecallIndexDeps {
   db: Database.Database;
   registry: SessionRecallRegistry;
@@ -264,6 +278,35 @@ export interface RecallIndexDeps {
    *  no breakage. */
   retrieveFn: RecallRetrieveFn;
   options?: RecallIndexOptions;
+  /** #476 Memory Precision seams — OPTIONAL so existing callers (tests,
+   *  library use) keep their exact no-recording behavior. Absent → no event
+   *  rows, the plain exposure write runs as before. mcp-server wires the
+   *  production set (the real recorder, the request-memoized prompt embed,
+   *  the 24h-TTL standing-context basis). Recording is FAIL-SOFT: any error
+   *  is caught here and the recall response (200 + block) is never affected;
+   *  on failure the exposure touch re-runs standalone so shown_count never
+   *  depends on telemetry. */
+  precision?: RecallPrecisionDeps;
+}
+
+/** The #476 precision-recording seams (see RecallIndexDeps.precision). All
+ *  three are injectable; tests force failures through them. */
+export interface RecallPrecisionDeps {
+  /** The request's memoized pure-prompt embed (createRecallRetrieveFn's
+   *  embedPrompt) — the recorder computes per-line cosines with ZERO extra
+   *  embeds (the perf law). */
+  promptEmbed: (prompt: string) => Promise<Float32Array>;
+  /** Standing-context basis vectors (recall-precision.ts's 24h-TTL cached
+   *  provider; empty array → redundancy NULL, unmeasured). */
+  basis: (db: Database.Database) => Promise<Float32Array[]>;
+  /** The recorder (recall-precision.ts recordRecallPush). Throws on failure —
+   *  this handler catches (fail-soft) and falls back to the plain exposure
+   *  write. */
+  recorder: (
+    db: Database.Database,
+    entry: RecallPushEntry,
+    basis?: Float32Array[]
+  ) => void;
 }
 
 /**
@@ -298,7 +341,7 @@ export function createRecallRetrieveFn(deps: {
   embedFn: (text: string) => Promise<Float32Array>;
   /** FTS resolution override (tests). Defaults to storage.searchFts. */
   ftsFn?: typeof storage.searchFts;
-}): RecallRetrieveFn {
+}): RecallRetrieveFactory {
   let embMemo: { query: string; p: Promise<Float32Array> } | null = null;
   const embedOnce = (query: string): Promise<Float32Array> => {
     if (!embMemo || embMemo.query !== query) {
@@ -327,27 +370,34 @@ export function createRecallRetrieveFn(deps: {
     }
     return ftsMemo.rows;
   };
-  return async (query, limit, filters, sessionId, purePrompt) => {
-    const { weight, alpha } = getSessionIntent();
-    const promptEmb = await embedOnce(query);
-    const queryVec = recallQueryVector(deps.registry, sessionId, promptEmb, {
-      weight,
-      alpha,
-      purePrompt,
-    });
-    return retrieve(deps.db, deps.embedFn, query, {
-      limit,
-      noStrengthen: true,
-      // #203: project + mission_domains are SOFT affinity (zero-boost
-      // neutral), threaded into computeScore.
-      project: filters?.project,
-      missionDomains: filters?.mission_domains,
-      queryEmbedding: queryVec,
-      // #329: shared per-request FTS list. The recall path never passes
-      // sourceAgent, so the memo is keyed on (query, fetchLimit) only —
-      // exactly the two things retrieve() would pass to searchFts.
-      ftsCandidates: (fetchLimit) => ftsOnce(query, fetchLimit),
-    });
+  return {
+    retrieveFn: async (query, limit, filters, sessionId, purePrompt) => {
+      const { weight, alpha } = getSessionIntent();
+      const promptEmb = await embedOnce(query);
+      const queryVec = recallQueryVector(deps.registry, sessionId, promptEmb, {
+        weight,
+        alpha,
+        purePrompt,
+      });
+      return retrieve(deps.db, deps.embedFn, query, {
+        limit,
+        noStrengthen: true,
+        // #203: project + mission_domains are SOFT affinity (zero-boost
+        // neutral), threaded into computeScore.
+        project: filters?.project,
+        missionDomains: filters?.mission_domains,
+        queryEmbedding: queryVec,
+        // #329: shared per-request FTS list. The recall path never passes
+        // sourceAgent, so the memo is keyed on (query, fetchLimit) only —
+        // exactly the two things retrieve() would pass to searchFts.
+        ftsCandidates: (fetchLimit) => ftsOnce(query, fetchLimit),
+      });
+    },
+    // #476: the memoized prompt embed, EXPOSED so the precision recorder
+    // computes per-line cosines with ZERO additional embeds (the perf law —
+    // the memo semantics are unchanged: one embed per distinct query string
+    // per factory instance).
+    embedPrompt: embedOnce,
   };
 }
 
@@ -530,13 +580,55 @@ export async function handleRecallIndex(
   }
 
   if (picked.length === 0) {
+    // #476: a silent turn (searches ran, no line passed the gates) still
+    // records its PUSH row — the silence rate is computable later and the
+    // judge's population stays complete. Zero event rows, no exposure touch.
+    // Fail-soft like every recording site.
+    if (deps.precision) {
+      try {
+        deps.precision.recorder(deps.db, { sessionId, prompt, ids: [] });
+      } catch (err) {
+        console.warn(
+          `[hicortex] recall-precision push recording failed (fail-soft): ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     return { status: 200, body: { block: null, shown: [], turn } };
   }
 
   const ids = picked.map((r) => r.id);
   deps.registry.markShown(sessionId, ids);
-  // Exposure signal: shown_count + last_accessed refresh, NOT access_count.
-  storage.touchMemoriesShown(deps.db, ids, new Date().toISOString());
+  const nowIso = new Date().toISOString();
+  // #476 Memory Precision: record the push + per-line events IN THE SAME
+  // TRANSACTION as the exposure write (the recorder owns the unit — it calls
+  // touchMemoriesShown inside its own transaction). FAIL-SOFT: on any error
+  // (or when the seams are absent — library callers, test doubles) the plain
+  // exposure write runs instead, so shown_count NEVER depends on telemetry.
+  let exposureWritten = false;
+  if (deps.precision) {
+    try {
+      const [promptEmb, basis] = await Promise.all([
+        deps.precision.promptEmbed(prompt),
+        deps.precision.basis(deps.db),
+      ]);
+      deps.precision.recorder(
+        deps.db,
+        { ts: nowIso, sessionId, prompt, ids, promptEmbedding: promptEmb },
+        basis
+      );
+      exposureWritten = true;
+    } catch (err) {
+      console.warn(
+        `[hicortex] recall-precision recording failed (fail-soft): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  if (!exposureWritten) {
+    // Exposure signal: shown_count + last_accessed refresh, NOT access_count.
+    storage.touchMemoriesShown(deps.db, ids, nowIso);
+  }
 
   const lines = picked.map((r) => formatIndexLine(r, titleChars));
   const block = [
@@ -556,6 +648,15 @@ export async function handleRecallIndex(
   return { status: 200, body: { block, shown: ids, turn } };
 }
 
+/** Optional #476 deps for handleMemoryGet: the fetch-event recorder. Absent
+ *  (old callers, tests) → no recording, byte-identical behavior. mcp-server
+ *  wires recordRecallFetch so BOTH fetch paths (REST GET /memory, MCP
+ *  hicortex_get via formatMemoryGetText) record exactly once — this is the
+ *  ONE funnel. Fail-soft: a recorder error is caught here, never surfaced. */
+export interface MemoryGetDeps {
+  recordFetch: RecallFetchRecorder;
+}
+
 /**
  * Handle a GET /memory request (lazy-load counterpart of the recall index for
  * REST clients). Thin Express adapter in mcp-server.ts; behavior lives here so
@@ -571,7 +672,8 @@ export async function handleRecallIndex(
  */
 export function handleMemoryGet(
   db: Database.Database,
-  query: { id?: unknown }
+  query: { id?: unknown },
+  deps?: MemoryGetDeps
 ): RecallIndexResult {
   const id = typeof query.id === "string" ? query.id : "";
   if (!id) return { status: 400, body: { error: "Missing 'id'" } };
@@ -586,6 +688,19 @@ export function handleMemoryGet(
   if (!mem) return notFound;
 
   storage.strengthenMemory(db, fullId, new Date().toISOString());
+  // #476: one kind='fetch' precision event per successful fetch (the use
+  // signal for Level 2 / divergence). Fail-soft — the fetch result is never
+  // affected by a recording failure.
+  if (deps?.recordFetch) {
+    try {
+      deps.recordFetch(db, fullId, new Date().toISOString());
+    } catch (err) {
+      console.warn(
+        `[hicortex] recall-precision fetch recording failed (fail-soft): ` +
+          `${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
   // `citation` is server-rendered so every plugin surfaces the same built-in
   // provenance norm (owner directive 27.07) — see #193.
   const date = (mem.created_at ?? "").slice(0, 10);
@@ -616,9 +731,12 @@ export function handleMemoryGet(
  */
 export function formatMemoryGetText(
   db: Database.Database,
-  query: { id?: unknown }
+  query: { id?: unknown },
+  deps?: MemoryGetDeps
 ): { status: number; text: string } {
-  const r = handleMemoryGet(db, query);
+  // deps (the #476 fetch recorder) forwards so the MCP path records exactly
+  // like the REST path — one funnel, one event per fetch.
+  const r = handleMemoryGet(db, query, deps);
   if (r.status !== 200) {
     return { status: r.status, text: String(r.body.error ?? `No memory with id ${query.id ?? ""}`) };
   }

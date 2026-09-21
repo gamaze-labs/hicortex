@@ -39,7 +39,7 @@
     - Overview: the counter/bar/headroom key off LIVE memories (absorbed
       rows show as an "absorbed (kept as evidence)" note); the counter is
       STATIC (no replay tracking — owner ruling 2026-09-13).
-    - Recall card: the RAW uses-per-showing ratio + a 7v7-nights trend, NO
+    - Recall card: the RAW uses-per-showing ratio, NO
       grade verdict (#426 owner semantics ruling: recall depends on the
       conversation, higher is not a target).
     - Rail header: "Fleet".
@@ -89,7 +89,7 @@
       default, which used to degrade the corner to a standalone Upgrade
       button. The upgrade CTA is a MENU ITEM (same plan-unset eligibility
       the shipped #365 code used); no standalone upgrade button remains.
-    - RECALL CARD: below the band at most ONE subtle line (trend glyph +
+    - RECALL CARD: below the band at most ONE subtle line (zone word +
       muted "provisional"; pill chrome dropped); the zone word rides the
       marker, the zone-label row is gone — the card stops setting the row
       height.
@@ -135,7 +135,7 @@
       DOWN into the siblings' chart slot (header → big → band → foot).
       "provisional" is hover-only now — a tooltip on the band (the card
       stays marked; the visible word failed to communicate). Vocabulary
-      amendment: Low / HEALTHY / Overfetching. Marker + trend stay.
+      amendment: Low / HEALTHY / Overfetching. Marker + zone word stay.
 
   REPLAY + RANGE (#452, owner directives 2026-09-16):
     - 30-DAY DEFAULT FOR ALL VIEWS: the replay ledger, the band and the
@@ -397,10 +397,6 @@
   .big .n.noconf{ font-size:14.5px; font-weight:520; letter-spacing:0; color:var(--dim); }
   html:not([data-theme="light"]) .big .n.noconf{ text-shadow:none; }
   .big .l{ font-size:10px; color:var(--faint); text-transform:uppercase; letter-spacing:.13em; }
-  .trend{ font-size:12px; line-height:1; flex:none; }
-  .trend.up{ color:var(--green-mid); }
-  .trend.down{ color:var(--red); }
-  .trend.flat{ color:var(--dim); }
   /* THE card sub-line — one text type */
   .csub{ font-size:11px; color:var(--dim); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .csub b{ color:var(--green-mid); font-weight:600; }
@@ -419,7 +415,7 @@
      row). The visible "provisional" word is GONE — the marking is hover-only
      now, a tooltip on the band (the visible word failed to communicate).
      Vocabulary (owner 2026-09-14): Low / Healthy / Overfetching. The raw
-     number stays tooltip-only on the marker; the trend glyph stays (mock
+     number stays tooltip-only on the marker (mock
      family). Colors: the band + word carry concrete per-theme colors from
      the JS stop table (setTheme re-renders), the dot rides theme tokens. */
   .rec-word.none{ color:var(--dim); }
@@ -427,6 +423,24 @@
   .rec-band{ position:absolute; inset:0; border-radius:4px; }
   .rec-dot{ position:absolute; top:50%; transform:translate(-50%,-50%); width:11px; height:11px; border-radius:50%; background:var(--text); border:2px solid var(--panel); box-shadow:0 0 0 1px color-mix(in srgb, var(--text) 40%, transparent), 0 0 8px color-mix(in srgb, var(--text) 30%, transparent); }
   .rec-foot{ display:flex; align-items:center; gap:7px; }
+  /* Memory Precision Level 1 (#476) — the pushed-index row: a compact
+     second line in the .csub scale (the sibling-rhythm ruling 2026-09-14:
+     the card keeps the shared .bseg gap rhythm, header → big → band →
+     index row → foot). Direction-only coloring: green at/above the echoed
+     recall floor, muted below (the index bar reads conservative); the
+     floor tick is amber like the pace marker. Theme tokens only — both
+     themes render from their own table, no JS colors here. */
+  .rec-l1{ display:block; font-size:10.5px; color:var(--dim); min-width:0; line-height:1.6; }
+  .rec-l1 .l1row{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rec-l1 .lbl{ display:none; }  /* #476 rename: the three-bucket text is self-labeled */
+  .rec-l1 .l1bar{ position:relative; flex:1 1 46px; height:5px; border-radius:3px; background:var(--tbar-bg); min-width:36px; }
+  .rec-l1 .l1bar .l1-fill{ position:absolute; left:0; top:0; bottom:0; border-radius:3px; background:color-mix(in srgb, var(--green) 65%, transparent); }
+  .rec-l1.below .l1bar .l1-fill{ background:color-mix(in srgb, var(--dim) 55%, transparent); }
+  .rec-l1 .l1bar .l1-floor{ position:absolute; top:-2px; bottom:-2px; width:1px; background:var(--amber); }
+  .rec-l1 .l1txt{ color:var(--dim); overflow:hidden; text-overflow:ellipsis; font-size:10.5px; letter-spacing:-.01em; }
+  .rec-l1 b{ color:var(--green-mid); font-weight:600; }
+  .rec-l1.below b{ color:var(--dim); }
+  #rec-div{ color:var(--amber); overflow:hidden; text-overflow:ellipsis; }
   .b-health{ display:flex; align-items:center; gap:7px; font-size:11px; color:var(--dim); white-space:nowrap; }
   .dot{ width:6px; height:6px; border-radius:50%; background:var(--green); box-shadow:0 0 10px color-mix(in srgb, var(--green) 70%, transparent); animation:breathe 3.2s ease-in-out infinite; flex:none; }
   .dot.blue{ background:var(--blue); box-shadow:0 0 10px color-mix(in srgb, var(--blue) 70%, transparent); }
@@ -1159,21 +1173,32 @@
         <div class="csub" id="tok-sub">&nbsp;</div>
         <div id="tok-nights" aria-label="LLM tokens per nightly run this billing period"></div>
       </div>
-      <!-- Recall level — the designed U-band (#426 final ruling 2026-09-13).
-           Title/subtitle hierarchy is the mock of record; the raw ratio is
-           tooltip-only (relative value, not user-facing); zone edges arrive
-           from the /dashboard/field thresholds echo (never hardcoded here).
-           #409 fix round 3 (owner, verbatim intent): the zone word is the
-           card's BIG element (the .big .n slot, colored by sampling the band
-           gradient at the marker); the band sits in the siblings' chart slot
-           (header → big → band → foot — same child order as the limitbar
-           cards); "provisional" is hover-only (band tooltip); the marker
-           keeps the raw-value tooltip; the trend glyph stays (mock family). -->
+      <!-- Memory Precision (#476, owner retitle) — ONE card, two context
+           levels. Level 2 (recall depth) keeps the #426 U-band + zone word +
+           provisional-hover semantics; the marker/tooltip read the WINDOW
+           ratio off D.memory_precision.level2 (a pre-#476 server has no block
+           → the headline ratio — today's rendering exactly). Level 1 (pushed
+           index) is a compact second row: mean similarity of pushed lines to
+           their prompt, with a floor marker at the echoed
+           recall_min_similarity and muted below it (the index's bar reads
+           conservative — its noise costs compound per prompt) + the
+           redundancy share; direction-only coloring, NO verdict words (the
+           #426 semantics ruling extended: similarity is
+           conversation-dependent). Divergence count on the FACE, the ≤3
+           titles hover-only (no memory lists on the main page — owner ruling
+           2026-09-12; the header search panel is the list surface). The
+           window rides the #452 selector via the echoed window_days — never
+           hardcoded, never a second range control. -->
       <div class="bseg" id="lim-rec">
-        <div class="gh"><span class="t">Recall level</span><span class="sub">uses per showing</span></div>
+        <div class="gh"><span class="t">Memory Precision</span><span class="sub" id="rec-sub">uses per showing</span></div>
         <div class="big"><b class="n rec-word" id="rec-zone">—</b></div>
         <div class="rec-bandrow" id="rec-bandrow"><div class="rec-band" id="rec-band"></div><i class="rec-dot" id="rec-dot" hidden></i></div>
-        <div class="csub rec-foot"><span class="trend flat" id="rec-trend" title="last 7 nights vs the prior 7">&#9644;</span></div>
+        <div class="rec-l1" id="rec-l1" hidden style="display:block">
+          <div class="l1row" id="l1-rel">&nbsp;</div>
+          <div class="l1row" id="l1-rep">&nbsp;</div>
+          <div class="l1row" id="l1-off">&nbsp;</div>
+        </div>
+        <div class="csub rec-foot"><span id="rec-div" hidden></span></div>
       </div>
     </div>
     <!-- row 2 · ops & maturity — capture health · 30 nights · maturity split · model -->
@@ -1391,9 +1416,15 @@ function fmtTokens(n){
   return String(n);
 }
 /* deterministic per-id randomness — the same memory always lands in the
-   same place across reloads (positions are content of the field, not noise) */
+   same place across reloads (positions are content of the field, not noise).
+   #465: the salt hashes at the FRONT (hash32(salt+':'+s)) — FNV-1a does not
+   diffuse a trailing-byte difference, and salts 1/2/3 differ only in their
+   last character, so the old trailing form coupled angle to radius at
+   Pearson r=0.953 (four spiral arms per domain). Salt-first measures
+   r=0.019 (noise). Positions shift once (hash-derived content), then
+   re-stabilize. */
 function hash32(s){ let h=2166136261; for(let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619);} return h>>>0; }
-function rand01(s,salt){ return hash32(s+':'+salt)/4294967296; }
+function rand01(s,salt){ return hash32(salt+':'+s)/4294967296; }
 
 /* ---------- token handling (harvested verbatim from the 0.20.4 console:
    ?token= handoff stripped from the URL, localStorage persistence, 401 →
@@ -1482,8 +1513,11 @@ const DEPTH_BANDS = { truth:[.9,1.05], belief:[1.05,1.3], forming:[1.3,1.55], fa
    post-backfill store still shows a visible gradient and the inflated
    pre-#425 store shows no monsters. Robust by construction: the mapping is
    absolute (no min/max over the live distribution), so it cannot explode on
-   a skewed store. Pure functions — the ratio is behaviorally tested. */
-function bubbleRadius(s){ return 6 + Math.sqrt(clamp(s??0,0,1))*3; }
+   a skewed store. Pure functions — the ratio is behaviorally tested.
+   #474 graph final (owner 2026-09-19): the balls at 30% — 1.8→2.7, exactly
+   0.30× of the 6→9 law; the depth divisor and the ruled ratio band are
+   scale-invariant and unchanged. */
+function bubbleRadius(s){ return 1.8 + Math.sqrt(clamp(s??0,0,1))*0.9; }
 function depthSizeDivisor(dz){ return Math.pow(Math.max(.14,dz),0.35); }
 
 /* ---------- live-data state ---------- */
@@ -1500,7 +1534,7 @@ let TOTAL=0, removedNow=0;
    clock (owner ruling 2026-09-13; only the boot reveal counts up) */
 
 /* =====================================================================
-   WORLD — domains, memories (every one), the interactive sample, real
+   WORLD — domains, memories, the dateline window (the visible set), real
    links, the replay ledger. All positions derive from id hashes → stable
    across reloads and across the refreshes after Update/Remove.
    ===================================================================== */
@@ -1509,8 +1543,14 @@ const PORT = [ [.50,.20,.15],[.28,.38,.12],[.74,.40,.12],[.50,.62,.13],[.25,.68,
 let DOMAINS = [];                 // {name,count,land,port,cx,cy,cr}
 const mems = new Map();           // id -> memory object (live + replay ghosts)
 const links = [];                 // real link edges, engine-decorated
-const bubbles = [];               // the ~120-mem interactive importance sample
 let crowdByStage = {};            // stage -> [mem refs] (EVERY memory paints)
+const bubbles = [];               // the latest-N-by-dateline visible set (#474
+                                  // return; owned by refreshWindow, rebuilt on T)
+const FIELD_WINDOW_N = 1000;       // #474 graph final (owner 2026-09-19): the field shows the latest N memories by dateline
+let WIN_ORDER = [];               // every mem (live + ghosts), effCreated DESC, id ASC
+let winSet = new Set();           // ids in the window at the current T
+let winCount = [];                // per-domain window counts (labels + tip)
+let winT = -1;
 let byAgentCounts = {};           // source_agent -> count
 let CONTEXTS = [];                // [{id,name,machine,count}] — #421 machine × harness grouping
 let adj = new Map();              // id -> [neighbor ids] (real links)
@@ -1518,6 +1558,13 @@ let EVENTS = [];                  // flattened replay ledger, sorted by t
 let learnedL = [], mergedL = [], enrichedL = [];
 let NIGHTS = [];                  // the events payload's night list
 let WINDOW = 1, NOW_T = .999, REPLAY_OK = false;
+
+/* Replay pacing (owner 2026-09-19: 2x faster default). Event-driven cruise:
+   each ledger event lands every REPLAY_TICK_MS; a heralded (birth/merge)
+   event holds the clock REPLAY_HERALD_MS then applies; boundary beats rest
+   REPLAY_REST_MS. Halve all three to run 2x; the constants are the only
+   pacing surface. */
+const REPLAY_TICK_MS=205, REPLAY_HERALD_MS=108, REPLAY_REST_MS=800;
 
 function domIndex(domain){ const i = DOMAINS.findIndex(d=>d.name===domain); return i<0?0:i; }
 function titleOf(id){ const m=mems.get(id); return m?m.title:'(absorbed)'; }
@@ -1582,6 +1629,10 @@ function buildWorld(){
     const m = mems.get(id);
     if(!m.ghost && !keep.has(id)) mems.delete(id);
   }
+
+  // the crowd: EVERY memory, bucketed by stage for one fillStyle per pass
+  crowdByStage = { forming:[], belief:[], truth:[], fading:[] };
+  for(const m of mems.values()) (crowdByStage[m.stage]||crowdByStage.forming).push(m);
 
   // replay metadata from the events ledger: in-window births + merge-outs
   // (absorbed losers get ghost entries so their merge animation has a
@@ -1651,34 +1702,12 @@ function buildWorld(){
     }
   }
 
-  // the crowd: EVERY memory, bucketed by stage for one fillStyle per pass
-  crowdByStage = { forming:[], belief:[], truth:[], fading:[] };
-  for(const m of mems.values()) (crowdByStage[m.stage]||crowdByStage.forming).push(m);
-
-  // the interactive sample (#422 live review, "all dots green"): STRATIFIED
-  // by stage — quota proportional to each stage's share of live memories
-  // (largest-remainder to the fixed total, minimum 1 each), each quota filled
-  // by that stage's OWN strength→access ranking with an id-ASC tie-break —
-  // fully deterministic, no Math.random. The old global top-120-by-strength
-  // sample was 100% truth BY CONSTRUCTION (truth IS the top strength band),
-  // so every touchable dot read green and the 1–2px crowd was visually
-  // negligible; on an even store this yields ~30/30/30/30.
-  bubbles.length = 0;
-  {
-    const BUBBLE_N=120;
-    const stageArrs=STAGE_KEYS.map(k=>crowdByStage[k].filter(m=>!m.ghost)
-      .sort((a,b)=> b.strength-a.strength || b.access-a.access || (a.id<b.id?-1:a.id>b.id?1:0)));
-    const liveCount=stageArrs.reduce((n,a)=>n+a.length,0);
-    if(liveCount>0){
-      const exact=stageArrs.map(a=>a.length/liveCount*BUBBLE_N);
-      const quota=exact.map(Math.floor);
-      for(let i=0;i<quota.length;i++) if(quota[i]===0&&stageArrs[i].length>0) quota[i]=1;
-      let left=BUBBLE_N-quota.reduce((n,q)=>n+q,0);
-      const order=exact.map((_,i)=>i).sort((a,b)=>(exact[b]%1)-(exact[a]%1)); // remainder DESC, stage order tie
-      for(let oi=0; left>0; oi++, left--) quota[order[oi%order.length]]++;
-      stageArrs.forEach((a,i)=>{ bubbles.push(...a.slice(0,Math.min(quota[i],a.length))); });
-    }
-  }
+  // #474 return: the visible set is the dateline WINDOW, not a sample —
+  // WIN_ORDER walks every mem (live + ghosts) newest-first (effCreated DESC,
+  // id ASC tie-break; ghosts sort via their birth night's date), and
+  // refreshWindow (draw) slices the latest FIELD_WINDOW_N alive-at-T rows
+  // out of it each time T moves.
+  WIN_ORDER = Array.from(mems.values()).sort(winCmp);
 
   // contexts (source_agent values) with their machine stamps (#421 machine ×
   // harness): the rail + capture card group on (machine ?? legacy) × harness.
@@ -1740,6 +1769,31 @@ function aliveAt(b,t){
   return true;
 }
 function dateAt(t){ const i=clamp(Math.floor(t),0,NIGHTS.length-1); return NIGHTS[i]?NIGHTS[i].date:''; }
+/* #474 return: the visible set is a DATELINE WINDOW — at replay clock T the
+   field draws the latest FIELD_WINDOW_N memories by effective created date
+   (created_at; ghosts via their birth night), not a sample and not the whole
+   store. Pure helpers (behaviorally tested). */
+function effCreated(m){ return m.created || (m.born>=0 ? dateAt(m.born) : ''); }
+function windowPick(order, t, n, dl, isNow){
+  const out=[];
+  for(const m of order){
+    if(out.length>=n) break;
+    if(!aliveAt(m,t)) continue;
+    if(!isNow && m.born<0 && effCreated(m)>dl) continue;  // untracked + newer than the dateline
+    out.push(m);
+  }
+  return out;
+}
+function winCmp(a,b){ return effCreated(b)<effCreated(a)?-1: effCreated(b)>effCreated(a)?1: a.id<b.id?-1:1; }
+function refreshWindow(t){
+  if(t===winT) return;
+  winT=t;
+  const picked = windowPick(WIN_ORDER, t, FIELD_WINDOW_N, dateAt(t), t>=NOW_T);
+  winSet = new Set(picked.map(m=>m.id));
+  winCount = new Array(DOMAINS.length).fill(0);
+  for(const m of picked) winCount[m.dom]++;
+  bubbles.length=0; bubbles.push(...picked);
+}
 
 /* =====================================================================
    THEME — one engine, two palettes. Dark (the brand night: glow) is the
@@ -1897,22 +1951,16 @@ function sprite(stage, r){
   const st = PAL.stages[stage] || PAL.stages.forming;
   const rgb = st.rgb;
   if(PAL.name==='dark'){
+    /* #474 final polish (owner 2026-09-20): plain dot — no glow halo, no
+       white core gradient. A filled circle with a slightly brighter edge;
+       the maturity color carries the reading, the size stays small. */
     const S = Math.ceil(rad*PAL.sprK), c2 = document.createElement('canvas');
     c2.width=S; c2.height=S;
     const g = c2.getContext('2d'), cxp=S/2;
-    let gr = g.createRadialGradient(cxp,cxp,rad*.2, cxp,cxp,rad*2.3);
-    gr.addColorStop(0, rgba(rgb,.5*st.glow));
-    gr.addColorStop(.45, rgba(rgb,.16*st.glow));
-    gr.addColorStop(1, rgba(rgb,0));
-    g.fillStyle=gr; g.fillRect(0,0,S,S);
-    gr = g.createRadialGradient(cxp-rad*.28,cxp-rad*.32,rad*.1, cxp,cxp,rad);
-    gr.addColorStop(0,'rgba(255,255,255,'+(.5*st.alpha)+')');
-    gr.addColorStop(.35, rgba(rgb,.55*st.alpha));
-    gr.addColorStop(.82, rgba(rgb,.22*st.alpha));
-    gr.addColorStop(1, rgba(rgb,.04));
-    g.fillStyle=gr; g.beginPath(); g.arc(cxp,cxp,rad,0,7); g.fill();
-    g.strokeStyle=rgba(rgb,.34*st.alpha); g.lineWidth=1;
-    g.beginPath(); g.arc(cxp,cxp,rad-.5,0,7); g.stroke();
+    g.fillStyle=rgba(rgb,.88*st.alpha);
+    g.beginPath(); g.arc(cxp,cxp,rad*.82,0,7); g.fill();
+    g.strokeStyle=rgba(rgb,.45*st.alpha); g.lineWidth=1;
+    g.beginPath(); g.arc(cxp,cxp,rad*.82,0,7); g.stroke();
     /* #422 round 2: fading's DISTINCT outer ring — the rim stage's fill runs
        at low alpha by design; without its own edge treatment the dots were
        illegible against the night ground */
@@ -1995,7 +2043,7 @@ function buildPaths(){
   }
 }
 function pathAlive(p,t){
-  for(const id of p.nodes){ const b=mems.get(id); if(!b||!aliveAt(b,t)) return false; }
+  for(const id of p.nodes){ const b=mems.get(id); if(!b||!aliveAt(b,t)||!winSet.has(id)) return false; }
   return t>=p.born;
 }
 function spawnSignal(showcase){
@@ -2054,8 +2102,10 @@ function advanceSignals(now, dt){
 }
 
 /* =====================================================================
-   THE FRAME — theme-aware; crowd first (micro-stars), then synapses,
-   signals, bubbles (painter-sorted far→near), waymarkers, furniture.
+   THE FRAME — theme-aware; synapses, signals, bubbles (painter-sorted
+   far→near), waymarkers, furniture. #474 return: the ONLY dots drawn are
+   the dateline window (latest FIELD_WINDOW_N by effective created date at
+   the replay clock — see refreshWindow); no crowd pass, no sample.
    ===================================================================== */
 let labelRects=[];
 /* emergence queue (#422 live review): a night's births/links become VISIBLE
@@ -2099,6 +2149,7 @@ function processEmergence(t){
 }
 function draw(now, dt){
   const t=T;
+  refreshWindow(t);   // #474: the visible set = latest-N by dateline at this T (bubbles, winSet, winCount)
   const dark = PAL.name==='dark';
   const ADD = dark ? 'lighter' : 'source-over';
   ctx.clearRect(0,0,view.w,view.h);
@@ -2164,6 +2215,12 @@ function draw(now, dt){
   }
   ctx.globalAlpha=1;
 
+  /* emergence flags resolve FIRST (once per frame) — the visible set and
+     the link pass below read them; dots still queued (_emerged===false)
+     stay invisible until their frame budget comes up. (#474: the old
+     every-memory crowd pass is gone — the window IS the field.) */
+  processEmergence(t);
+
   /* THE CROWD — every memory in the store as maturity-colored micro-stars
      behind the touchable sample (no sampling: the dot count IS the store).
      One fillStyle per stage pass. The emergence queue is resolved FIRST
@@ -2181,7 +2238,7 @@ function draw(now, dt){
       if(fog<.15) continue;
       const [sx,sy]=proj3(m.nx||.5,m.ny||.5,dz);
       if(sx<-2||sy<-2||sx>view.w+2||sy>view.h+2) continue;
-      ctx.globalAlpha=fog*.5;
+      ctx.globalAlpha=fog*.5*(focusDom!=null&&m.dom!==focusDom?.15:1);
       const px=Math.max(1,Math.round((rand01(m.id,9)<.85?1:1.8)/dz*1.4));
       ctx.fillRect(sx,sy,px,px);
     }
@@ -2235,6 +2292,7 @@ function draw(now, dt){
     if(L.rk>=lodK) continue;                             // zoom LOD (lines only)
     const a=mems.get(L.a), b=mems.get(L.b);
     if(!a||!b||!aliveAt(a,t)||!aliveAt(b,t)) continue;
+    /* #474 final polish: the both-endpoints-in-window gate killed the mesh — links draw between ANY placed memories (bedrock parity: the full LOD-tamed mesh), endpoints carry positions regardless of window membership */
     if(a._emerged===false||b._emerged===false) continue; // thread waits for both endpoints
     const [ax,ay]=bpos(a,now,t), [bx,by]=bpos(b,now,t);
     const ctrl=segCtrlN(ax,ay,bx,by,(L.use>18?1:-1));
@@ -2249,6 +2307,9 @@ function draw(now, dt){
     const prog = L.forming ? clamp((t-(L._emergeT!==undefined?L._emergeT:L.born))/1.4,0,1) : 1;
     const drawP=Math.min(prog,linkBoot);
     if(drawP<=0) continue;
+    /* #474 final polish: domain focus — a thread stays lit only if an
+       endpoint belongs to the focused domain (owner 2026-09-20) */
+    const focusDim = (focusDom!=null && a.dom!==focusDom && b.dom!==focusDom) ? .15 : 1;
     const len=Math.hypot(x2-x1,y2-y1)*1.15;
     const superFam = L.rel==='superseded_by'||L.rel==='corrected_by';
     /* fix-round-3 weights: settled alphas roughly halved (both themes) so the
@@ -2256,7 +2317,7 @@ function draw(now, dt){
     const bright=(a.stage==='truth'||b.stage==='truth') ? (dark?.07:.11) : (dark?.035:.06);
     const baseW=.34+useF*.55+heat*.5;
     /* the SETTLED stroke is always the base */
-    ctx.strokeStyle=rgba(PAL.thread,(bright*(superFam?.45:1)+useF*(dark?.05:.07)+heat*.28)*linkBoot*tfog);
+    ctx.strokeStyle=rgba(PAL.thread,(bright*(superFam?.45:1)+useF*(dark?.05:.07)+heat*.28)*linkBoot*tfog*focusDim);
     ctx.lineWidth=baseW;
     ctx.setLineDash(superFam?[4,4]:[len*drawP,1e5]);
     ctx.beginPath(); ctx.moveTo(x1,y1); ctx.quadraticCurveTo(cx1,cy1,x2,y2); ctx.stroke();
@@ -2265,7 +2326,7 @@ function draw(now, dt){
          in the same proportion as the settled stroke) */
       const settle=1-prog;
       const baseA=(dark? .07 : .09)+((dark?.15:.17)-(dark?.07:.09))*drawP;
-      ctx.strokeStyle=rgba(PAL.threadHot,(baseA+.14*heat)*tfog*(superFam?.5:1)*settle);
+      ctx.strokeStyle=rgba(PAL.threadHot,(baseA+.14*heat)*tfog*(superFam?.5:1)*settle*focusDim);
       ctx.lineWidth=baseW+(.18+drawP*.3)*settle;
       ctx.setLineDash(superFam?[4,4]:[len*drawP,1e5]);
       ctx.beginPath(); ctx.moveTo(x1,y1); ctx.quadraticCurveTo(cx1,cy1,x2,y2); ctx.stroke();
@@ -2340,8 +2401,9 @@ function draw(now, dt){
        dark-blue-on-near-black at ~4px read invisible to a vision model);
        the projection factor is known here, and far-stage bubbles (rim depth
        / small viewports) were collapsing to ~1-2px. Every stage stays a
-       legible glimmer; ordering untouched. */
-    r=Math.max(r,5);
+       legible glimmer; ordering untouched. #474 graph final: floor 1.5 —
+       0.30× of 5, proportional with the 30% balls. */
+    r=Math.max(r,1.5);
     let remA=1;
     if(b.removing){ const p=clamp((now-b.removing)/700,0,1); remA=1-p; if(p>=1){ b.removed=true; b.removing=undefined; } }
     const ex=b._ex||0;
@@ -2441,8 +2503,11 @@ function draw(now, dt){
     ctx.font=(9.5*k).toFixed(1)+'px '+FF;
     try{ ctx.letterSpacing=(1*k).toFixed(1)+'px'; }catch(e){}
     ctx.fillStyle= dark? 'rgba(90,90,90,'+(.85*dimming*lp)+')' : hexA(PAL.labelCount,dimming*lp);
-    ctx.fillText(fmt(d.count), sx+w+9*k, sy);
-    const bw=w+9*k+ctx.measureText(fmt(d.count)).width;
+    /* #474: the label count is the WINDOW count (what is drawn at this T),
+       not the store total — honest with the dateline view. */
+    const cnt=fmt(winCount[i]||0);
+    ctx.fillText(cnt, sx+w+9*k, sy);
+    const bw=w+9*k+ctx.measureText(cnt).width;
     ctx.strokeStyle= active? rgba(PAL.stages.truth.rgb,.55*lp) : (dark? 'rgba(120,130,140,'+(.4*dimming*lp)+')' : 'rgba(96,92,78,'+(.5*dimming*lp)+')');
     ctx.lineWidth=1;
     const bx=sx-9*k, by=sy-11*k, bxx=bx+bw+9*k, byy=by+15*k, tk=4*k;
@@ -2607,18 +2672,18 @@ function autoTick(now){
   if(T>=NOW_T-.001){
     /* a beat at "now": re-kick to the range start ONLY before the first
        full playback; after it, REST here — plays once, never loops (#452) */
-    if(played){ autoPlay=false; autoNextAt=now+3200; return; }
-    autoEvIdx=0; autoNextAt=now+3200; seek(.001); return;
+    if(played){ autoPlay=false; autoNextAt=now+REPLAY_REST_MS; return; }
+    autoEvIdx=0; autoNextAt=now+REPLAY_REST_MS; seek(.001); return;
   }
   while(autoEvIdx<EVENTS.length && EVENTS[autoEvIdx].t<=T+.0001) autoEvIdx++;
   if(autoEvIdx>=EVENTS.length){
     /* ledger exhausted: arrive at today and complete the playback (the
        flags go BEFORE the seek so onTChanged's control swap sees them) */
-    autoNextAt=now+3200; played=true; autoPlay=false; seek(WINDOW); return;
+    autoNextAt=now+REPLAY_REST_MS; played=true; autoPlay=false; seek(WINDOW); return;
   }
   const ev=EVENTS[autoEvIdx++];
-  if(ev.id && signals.length<8){ heraldTo(ev.id); pendingApply={t:ev.t+.001, at:now+430}; }
-  else { seek(ev.t+.001); autoNextAt=now+820; }
+  if(ev.id && signals.length<8){ heraldTo(ev.id); pendingApply={t:ev.t+.001, at:now+REPLAY_HERALD_MS}; }
+  else { seek(ev.t+.001); autoNextAt=now+REPLAY_TICK_MS; }
 }
 track.addEventListener('pointerdown',e=>{ if(!REPLAY_OK) return; scrubbing=true; manualTake(); track.setPointerCapture(e.pointerId); seek(trackFrac(e)*WINDOW); });
 track.addEventListener('pointermove',e=>{ if(scrubbing) seek(trackFrac(e)*WINDOW); });
@@ -2835,7 +2900,8 @@ cv.addEventListener('pointermove',e=>{
     tip.style.display='block';
     tip.style.left=Math.min(e.clientX+14,window.innerWidth-300)+'px';
     tip.style.top=(e.clientY+16)+'px';
-    tip.innerHTML='<b>'+esc(d.name)+'</b><span style="color:var(--dim)">'+fmt(d.count)+' memories</span>';
+    /* #474: the window count at this T — honest with what is drawn */
+    tip.innerHTML='<b>'+esc(d.name)+'</b><span style="color:var(--dim)">'+fmt(winCount[lb]||0)+' in view</span>';
   }else tip.style.display='none';
   dirty=true;
 });
@@ -3108,23 +3174,6 @@ function buildTokNights(used, cap, periodStart){
   }
 }
 
-/* trend = mean of the last 7 nights vs the prior 7 (a DEFINED window — the
-   old first-vs-last-over-the-range comparison had no window at all). Titles
-   state the window so the arrow is never mysterious. */
-function recallTrend(){
-  const flat={cls:'flat',sym:'&#9644;'};
-  if(!D||!D.series) return Object.assign(flat,{title:'no snapshot data'});
-  const vals=D.series.map(s=>s.metrics&&s.metrics.adoption?s.metrics.adoption.uses_per_showing:null).filter(v=>typeof v==='number');
-  const last7=vals.slice(-7), prior7=vals.slice(-14,-7);
-  const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
-  const a=mean(prior7), b=mean(last7);
-  if(a===null||b===null) return Object.assign(flat,{title:'trend needs 7+ nights of history'});
-  const d=b-a;
-  if(d>0.005) return {cls:'up',sym:'&#8599;',title:'up — mean of the last 7 nights vs the prior 7 ('+b.toFixed(3)+' vs '+a.toFixed(3)+')'};
-  if(d<-0.005) return {cls:'down',sym:'&#8600;',title:'down — mean of the last 7 nights vs the prior 7 ('+b.toFixed(3)+' vs '+a.toFixed(3)+')'};
-  return Object.assign(flat,{title:'flat — mean of the last 7 nights vs the prior 7 ('+b.toFixed(3)+' vs '+a.toFixed(3)+')'});
-}
-
 /* ---------- Recall level — the designed U-band (#426 final ruling
    2026-09-13). A continuous red→green→red gradient spans the PROVISIONAL
    zone edges (echoed by /dashboard/field as thresholds.recall_uses — the
@@ -3174,7 +3223,14 @@ function recallGradAt(frac,z,theme){
 }
 let lastRecUses=null;   /* setTheme's re-render carries the last value */
 function renderRecBand(ups){
+  /* #476: the marker/tooltip read the WINDOW ratio when the memory_precision
+     block is present; a pre-#476 server (no block) degrades to the headline
+     ratio — today's rendering exactly (the capture card's block-absence
+     guard pattern). A null window value honestly renders "—" below. */
+  const mp=D&&D.memory_precision?D.memory_precision:null;
+  if(mp&&mp.level2) ups=mp.level2.uses_per_showing;
   lastRecUses=ups;
+  renderRecL1(mp);
   const z=F&&F.thresholds?F.thresholds.recall_uses:null;
   const axis=z&&typeof z.axis_max==='number'&&z.axis_max>0?z.axis_max:null;
   const row=el('rec-bandrow'), band=el('rec-band'), dot=el('rec-dot'), word=el('rec-zone');
@@ -3198,7 +3254,7 @@ function renderRecBand(ups){
   if(zk){
     dot.hidden=false;
     dot.style.left=pct(ups)+'%';
-    dot.title=ups.toFixed(3)+' uses per showing — last 30 nights';
+    dot.title=ups.toFixed(3)+' uses per showing — last '+(mp&&mp.window_days?mp.window_days:30)+' days';
     word.textContent=RECALL_ZONE_WORD[zk];
     word.className='n rec-word';
     /* the big word's color = the gradient sampled AT the marker — the word
@@ -3214,16 +3270,67 @@ function renderRecBand(ups){
     word.style.color=''; word.style.textShadow='none';
     word.title='no showings yet';
   }
-  /* trend arrow — the mock family's 7v7 window, unchanged */
-  if(typeof ups==='number'){
-    const tr=recallTrend();
-    el('rec-trend').className='trend '+tr.cls;
-    el('rec-trend').innerHTML=tr.sym;
-    el('rec-trend').title=tr.title;
-  }else{
-    el('rec-trend').className='trend flat'; el('rec-trend').innerHTML='&#9644;';
-    el('rec-trend').title='no showings yet';
+  /* No trend arrow (owner 2026-09-20: removed — unclear). Its renderer and
+     the element writes are removed WITH it: a leftover write to a removed
+     element is a boot-killing TypeError whenever the recall band carries
+     real data (bedrock 0.22.2: "0 memories" — boot died before the counter
+     was ever seeded). */
+}
+
+/* ---------- Memory Precision — Level 1, the pushed index (#476). A compact
+   second row beside Level 2's U-band: mean similarity of pushed lines to
+   their prompt (a 0..1 bar with a floor tick at the /dashboard/field echo of
+   recall_min_similarity — the server's own recall floor, never a page
+   literal), muted below the floor (the index row reads conservative: its
+   noise lands on every prompt), plus the redundancy share (lines restating
+   the session's standing context at/above the echoed cosine). Direction-only
+   coloring, NO verdict words — the #426 semantics ruling extended.
+   Divergence: the COUNT on the card face, the ≤3 titles hover-only (no
+   memory lists on the main page, owner 2026-09-12 — the search panel is the
+   list surface). Absent block (pre-#476 server) → the whole row hides and
+   the sub keeps the old label — today's rendering exactly. */
+function renderRecL1(mp){
+  const row=el('rec-l1'), sub=el('rec-sub'), dv=el('rec-div');
+  if(!mp||!mp.level1||!mp.level2){
+    row.hidden=true; dv.hidden=true; dv.title='';
+    if(sub) sub.textContent='uses per showing';
+    return;
   }
+  if(sub) sub.textContent='last '+(mp.window_days||90)+' days';
+  const l1=mp.level1;
+  const floor=(F&&F.thresholds&&typeof F.thresholds.recall_min_similarity==='number')?F.thresholds.recall_min_similarity:null;
+  const ra=(l1.thresholds&&typeof l1.thresholds.redundant_above==='number')?l1.thresholds.redundant_above:null;
+  const mins=(l1.thresholds&&typeof l1.thresholds.divergence_min_shown==='number')?l1.thresholds.divergence_min_shown:5;
+  const sim=(typeof l1.mean_similarity==='number'&&isFinite(l1.mean_similarity))?l1.mean_similarity:null;
+  const red=(typeof l1.redundant_share==='number'&&isFinite(l1.redundant_share))?l1.redundant_share:null;
+  if(sim===null){
+    row.hidden=true;   /* nothing measured in the window — the row degrades away */
+  }else{
+    row.hidden=false;
+    row.classList.toggle('below',floor!==null&&sim<floor);
+    /* numbers only on the face — direction carries the meaning, no verdict words */
+    /* #476 owner rename (2026-09-20): the three buckets as named — Relevant /
+       Repeated known / Off-target. Relevant = the mean relevance; Repeated =
+       the redundant share; Off-target = the remainder (pushed lines that were
+       neither relevant nor new). Numbers, no verdict words (#426). */
+    const relPct=Math.round(clamp(sim,0,1)*100);
+    const repPct=red!==null?Math.round(clamp(red,0,1)*100):0;
+    const offPct=Math.max(0,100-relPct-repPct);
+    const dv=mp.divergence, nUsed=(dv&&typeof dv.count==='number')?dv.count:0;
+    el('l1-rel').innerHTML='<b>Relevant: '+relPct+'%</b>';
+    el('l1-rep').textContent='Repeated known: '+repPct+'%';
+    el('l1-off').textContent='Off-target: '+offPct+'%'+(nUsed>0?' ('+nUsed+' never used)':'');
+    row.title='pushed index, last '+(mp.window_days||90)+' days — mean similarity of pushed lines to their prompt (tick at the recall floor '+
+      (floor!==null?floor.toFixed(2):'—')+'; muted below it)'+
+      (ra!==null?'; redundant = share of lines at ≥'+ra.toFixed(2)+' cosine vs the session\'s standing context (lessons + identity)':'')+
+      ' · '+fmt(l1.pushes)+' pushes, '+fmt(l1.lines)+' lines';
+  }
+  /* divergence — the face count is amber; the ≤3 lines ride the native
+     tooltip ONLY (text via .title, never face content) */
+  /* #476 owner bundling (2026-09-20): the never-used count rides inside
+     Off-target; the separate face element stays hidden (titles on hover) */
+  const dEl=el('rec-div');
+  if(dEl){ dEl.hidden=true; }
 }
 
 let MODEL_LABEL='';

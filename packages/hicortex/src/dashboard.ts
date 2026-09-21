@@ -29,6 +29,7 @@ import { formatIndexLine, memoryTitle } from "./recall-index.js";
 import { readPositiveConfig, readNonNegativeConfig, readAccount } from "./config-read.js";
 import { resolveMemorySoftCap } from "./consolidate.js";
 import { readCaptureHealth, readCaptureHealthWindow, type CaptureHealthRow } from "./capture-health.js";
+import { readMemoryPrecision, type MemoryPrecision } from "./recall-precision.js";
 import { listCapturePauses, readFleetLastSeen, setCapturePause } from "./capture-pause.js";
 import { loadState } from "./state.js";
 import { effectiveStrength } from "./retrieval.js";
@@ -257,6 +258,16 @@ export interface DashboardData {
     pauses: Array<{ machine: string; harness: string; paused_at: string }>;
     last_seen: Array<{ machine: string; harness: string; last_seen: string; last_outcome: string }>;
   };
+  /**
+   * #476 — the Memory Precision card: Level 1 (pushed-index precision
+   * proxies over the recall_pushes/recall_events window) beside Level 2
+   * (recall depth = the uses-per-showing ratio over the SAME window, from
+   * snapshot deltas) + the divergence list. ALWAYS present; edges echoed
+   * like every threshold (the page never hardcodes), and the block measures
+   * ≤ 2 KB against the live 30-day payload. The page degrades to the
+   * pre-#476 recall-card rendering when the block is absent.
+   */
+  memory_precision: MemoryPrecision;
   digest: {
     date: string | null;
     run_at: string | null;
@@ -1043,6 +1054,14 @@ export function handleDashboardData(
         by_source_machine: live.by_source_machine,
       },
       capture_health: { ...readCaptureHealth(db), ...readCaptureHealthWindow(db) },
+      // #476 Memory Precision: the window aggregation over the precision
+      // event tables + snapshot deltas. Level 2's "latest" is the SAME live
+      // adoption this handler already computed (one definition of corpus
+      // shape — computeDashboardMetrics); readMemoryPrecision owns the rest.
+      memory_precision: readMemoryPrecision(db, rangeParam, {
+        shown_sum: live.adoption?.shown_sum ?? 0,
+        used_sum: live.adoption?.used_sum ?? 0,
+      }),
       // #423 phase 3: pauses + presence in one block — one source of truth
       // for the rail's dots, toggles and the capture card's PAUSED badges.
       fleet: {

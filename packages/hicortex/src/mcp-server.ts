@@ -69,6 +69,11 @@ import {
 } from "./reconsolidation.js";
 import { redact } from "./redact.js";
 import { recordDistillActivity, type DistillOutcome } from "./capture-health.js";
+import {
+  recordRecallPush,
+  recordRecallFetch,
+  createStandingContextBasis,
+} from "./recall-precision.js";
 import { capturePauseKey, isCapturePaused } from "./capture-pause.js";
 import { ensureAndPersistAgentId, loadConfigStrict, persistConfigUpdates } from "./init.js";
 import type { MemorySearchResult } from "./types.js";
@@ -208,8 +213,10 @@ export function createMcpServer(): McpServer {
       // (incl. the #204 FETCHED marker) is built in ONE place shared with the
       // REST GET /memory path. CC reaches Hicortex through THIS MCP tool;
       // before #207's fix it got a marker-less citation built inline here.
+      // #476: the fetch recorder forwards through the same funnel — exactly
+      // one precision event per fetch, whichever path served it.
       try {
-        const r = formatMemoryGetText(db, { id });
+        const r = formatMemoryGetText(db, { id }, { recordFetch: recordRecallFetch });
         return { content: [{ type: "text" as const, text: r.text }], isError: r.status !== 200 };
       } catch (err) {
         return { content: [{ type: "text" as const, text: `Get failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
@@ -862,7 +869,8 @@ export async function startServer(options: {
     `/novelty=${CALIBRATION.NOVELTY_FLOOR_SLOTS}` +
     ` · ` +
     `score sim=${scoringCfg.similarity}/str=${scoringCfg.strength}/conn=${scoringCfg.connections}` +
-    `/rec=${scoringCfg.recency}, fresh=${scoringCfg.freshnessBoostWeight}@${scoringCfg.freshnessBoostDays}d, ` +
+    `/K=${scoringCfg.connectionsSaturation}` +
+    `/rec=${scoringCfg.recency}, head=${scoringCfg.recencyHead}@${scoringCfg.recencyHeadDays}d, ` +
     `superseded×${scoringCfg.supersededDemotion}` +
     `, intent w=${sessionIntentCfg.weight}` +
     (sessionIntentCfg.weight === 0 ? " (disabled)" : "")
@@ -1140,6 +1148,22 @@ export async function startServer(options: {
   // last_accessed, NOT access_count (that stays reserved for hicortex_get /
   // GET /memory — real use). {reset: true} clears the session's dedup state
   // (SessionStart/compaction).
+  //
+  // #476 Memory Precision: the route also wires the precision seams — the
+  // factory's exposed embedPrompt (the per-request memo: the recorder
+  // measures per-line similarity with ZERO extra embeds), the 24h-TTL
+  // standing-context basis (lessons in /learnings order + identity only when
+  // every known client is served — the redundancy reference), and the
+  // fail-soft recorder. handleRecallIndex owns the fail-soft law: a
+  // recording failure never touches the response.
+  const standingContextBasis = createStandingContextBasis({
+    // Lazy getters: identityClients is resolved at boot and stateDir is
+    // assigned before the routes serve, but both land AFTER this provider is
+    // created — read per cache rebuild (a config restart applies at the next
+    // TTL), never captured once.
+    clients: () => identityClients,
+    identityDir: () => pathJoin(stateDir, "identity"),
+  });
   app.post("/recall-index", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     // Client-pushed project/privacy scoping (F1) rides through to retrieval,
@@ -1151,16 +1175,22 @@ export async function startServer(options: {
     // that searches unblended and touches no centroid state. Extracted so the
     // exact behavior is unit-testable without HTTP (blendQueryVector
     // precedent); this adapter stays thin.
+    const factory = createRecallRetrieveFn({
+      db,
+      registry: recallRegistry,
+      embedFn: embed,
+    });
     const r = await handleRecallIndex(
       {
         db,
         registry: recallRegistry,
-        retrieveFn: createRecallRetrieveFn({
-          db,
-          registry: recallRegistry,
-          embedFn: embed,
-        }),
+        retrieveFn: factory.retrieveFn,
         options: recallIndexOptions,
+        precision: {
+          promptEmbed: factory.embedPrompt,
+          basis: standingContextBasis,
+          recorder: recordRecallPush,
+        },
       },
       req.body
     );
@@ -1170,12 +1200,14 @@ export async function startServer(options: {
   // REST /memory?id= — fetch one memory's full content (lazy-load counterpart
   // of /recall-index for REST clients: Hermes/OC plugins). Marks it as used.
   // Prefix ids resolve. 0.16.x: the `privacy` query param is accepted but
-  // ignored (column is vestigial, never filtered). Logic in handleMemoryGet.
+  // ignored (column is vestigial, never filtered). Logic in handleMemoryGet;
+  // the #476 fetch recorder rides the same funnel (exactly one event per
+  // fetch, shared with the MCP hicortex_get path).
   app.get("/memory", (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     warnDeprecatedPrivacyParamIfPresent(req.query as Record<string, unknown>, "memory");
     try {
-      const r = handleMemoryGet(db, { id: req.query.id });
+      const r = handleMemoryGet(db, { id: req.query.id }, { recordFetch: recordRecallFetch });
       res.status(r.status).json(r.body);
     } catch (err) {
       logAndSendInternalError(res, "memory", err);

@@ -245,10 +245,15 @@ export async function runClassifyDomains(
     const { prototypes } = await computeDomainPrototypes(db, domains, getEmbedFn);
 
     // Scope filter: default = NULL / not-in-set / no tags yet; --all = everything.
+    // #477: absorbed dedup losers are excluded from the default scope (dead
+    // evidence — the merge already cleared their tags and nulled domain);
+    // conjoined OUTSIDE the parenthesized OR group, same as the nightly
+    // stageContentDomains twin. --all stays a wholesale operator re-judge.
     const placeholders = domains.map(() => "?").join(", ");
     const scopeSql = all
       ? "rowid > ?"
-      : `rowid > ? AND (domain IS NULL OR domain NOT IN (${placeholders}) ` +
+      : `rowid > ? AND COALESCE(status, '') != 'absorbed' ` +
+        `AND (domain IS NULL OR domain NOT IN (${placeholders}) ` +
         `OR id NOT IN (SELECT DISTINCT memory_id FROM memory_tags))`;
     const batchStmt = db.prepare(
       `SELECT rowid AS __rowid, id, content, project, domain FROM memories

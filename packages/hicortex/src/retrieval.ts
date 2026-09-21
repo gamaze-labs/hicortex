@@ -108,13 +108,33 @@ export function configureRecall(overrides?: Partial<RecallDefaults> | null): Rec
 // configureScoring is the eval/test seam only:
 //   similarity              0.50  semantic match (was 0.40 — see below)
 //   strength                0.20  effective strength (was 0.30)
-//   connections             0.15  graph centrality (was 0.20)
-//   recency                 0.15  slow recency curve (was 0.10)
-//   freshnessBoostDays        7   fresh-memory window length
-//   freshnessBoostWeight    0.15  additive bonus at age 0, linear to 0 at edge
+//   connections             0.15  graph centrality — LOG-SATURATING in the
+//                                row's absolute undirected degree k (#449):
+//                                the term is min(1, log1p(k)/log1p(K)) ×
+//                                this weight, K = CONNECTIONS_
+//                                SATURATION_DEGREE (16, the p99 of the real
+//                                degree distribution — the top ~1% of hubs
+//                                tie at full credit, k = 0 is exactly +0).
+//                                Was a linear share of the candidate-set
+//                                max (the set-relative normalization #449
+//                                deleted: a row's score used to depend on
+//                                which OTHER rows matched)
+//   connectionsSaturation    16   the K above (a count, not a weight — the
+//                                rrfK seam precedent; validated ≥ 1)
+//   recency                 0.15  time curve — slow-region share/blend weight
+//                                (was 0.10); 0 disables the WHOLE term
+//   recencyHead             0.30  time curve — head amplitude at age 0 (the
+//                                merged freshness job). A deliberate overshoot
+//                                (max total 1.15 pre-clamp), NOT a fifth blend
+//                                weight — the four blend weights above still
+//                                sum to 1.0
+//   recencyHeadDays           7   time curve — head window / join age in days
 //   supersededDemotion      0.50  multiplier for reversed decisions
-//   projectAffinity         0.15  #203 soft boost on exact project match
-//   domainAffinity          0.15  #203 soft boost on domain-tag overlap
+//   scopeAffinity           0.15  #430 merged scope boost — max() of the
+//                                project-match signal (1 on exact match) and
+//                                the max overlapping domain-tag weight (the
+//                                two #203 boosts at their shared value, never
+//                                stacked); 0 disables the WHOLE term
 //
 //   #205 fusion-retune knobs (RRF side; the BM25F field weights live in
 //   storage.ts next to the FTS column declaration they mirror):
@@ -129,10 +149,11 @@ export function configureRecall(overrides?: Partial<RecallDefaults> | null): Rec
 // memory outranked the on-topic 0.50-strength one for its own topic.
 // Similarity now dominates; strength still breaks ties and rewards real use.
 //
-// #203 affinity weights are ADDITIVE, zero-boost neutral, and NEVER a penalty:
-// absent scope ⇒ both terms are 0 (byte-identical to pre-#203); a foreign
-// memory adds 0 (ranks equal, not lower — a penalty would re-introduce the
-// soft-exclusion the owner rejected: "no hard filters in brains").
+// The #430 scope-affinity term (born from #203's two boosts) is ADDITIVE,
+// zero-boost neutral, and NEVER a penalty: absent scope ⇒ the term is 0
+// (byte-identical to pre-#203); a foreign memory adds 0 (ranks equal, not
+// lower — a penalty would re-introduce the soft-exclusion the owner rejected:
+// "no hard filters in brains").
 //
 // #205 RRF retune nudges toward vector (FTS was winning cross-scope collisions
 // on raw token overlap — the marine "battery" memory beating the hardware one
@@ -146,14 +167,26 @@ export interface ScoringWeights {
   similarity: number;
   strength: number;
   connections: number;
+  /**
+   * #449 log-saturation degree K for the connections term: the credit is
+   * min(1, log1p(k)/log1p(K)) — full at k = K, exactly +0 at k = 0. A count,
+   * not a weight: validated ≥ 1 (the rrfK non-weight seam precedent); no
+   * upper bound (the eval sweep widens K past the planted fixture degrees).
+   */
+  connectionsSaturation: number;
   recency: number;
-  freshnessBoostDays: number;
-  freshnessBoostWeight: number;
+  /** #430 merged time curve: head amplitude at age 0 — the merged freshness
+   *  job. A deliberate overshoot (max total 1.15 pre-clamp), NOT a fifth
+   *  blend weight; the four blend weights still sum to 1.0. */
+  recencyHead: number;
+  /** #430 merged time curve: head window / join age in days. */
+  recencyHeadDays: number;
   supersededDemotion: number;
-  /** #203 soft affinity boost on exact project match. */
-  projectAffinity: number;
-  /** #203 soft affinity boost multiplier on max overlapping domain-tag weight. */
-  domainAffinity: number;
+  /** #430 merged scope affinity: ONE term — max() of the project-match
+   *  indicator (1 on exact match) and the max overlapping domain-tag weight,
+   *  × this weight (born from #203's two additive boosts at their shared
+   *  value). 0 (via the seam) disables the whole term. */
+  scopeAffinity: number;
   /** #205 RRF k parameter (1/(k+rank+1)). Larger ⇒ shallower rank curve. */
   rrfK: number;
   /** #205 composite-score share of the final blend (RRF gets the remainder). */
@@ -170,12 +203,14 @@ const SCORING_DEFAULTS: ScoringWeights = {
   similarity: CALIBRATION.SCORE_SIMILARITY_WEIGHT,
   strength: CALIBRATION.SCORE_STRENGTH_WEIGHT,
   connections: CALIBRATION.SCORE_CONNECTIONS_WEIGHT,
+  // #449: the p99 of the real undirected degree distribution (see
+  // calibration.ts provenance) — saturates the top ~1% of linked memories.
+  connectionsSaturation: CALIBRATION.CONNECTIONS_SATURATION_DEGREE,
   recency: CALIBRATION.SCORE_RECENCY_WEIGHT,
-  freshnessBoostDays: CALIBRATION.FRESHNESS_BOOST_DAYS,
-  freshnessBoostWeight: CALIBRATION.FRESHNESS_BOOST_WEIGHT,
+  recencyHead: CALIBRATION.RECENCY_HEAD_WEIGHT,
+  recencyHeadDays: CALIBRATION.RECENCY_HEAD_DAYS,
   supersededDemotion: CALIBRATION.SUPERSEDED_DEMOTION,
-  projectAffinity: CALIBRATION.PROJECT_AFFINITY_WEIGHT,
-  domainAffinity: CALIBRATION.DOMAIN_AFFINITY_WEIGHT,
+  scopeAffinity: CALIBRATION.SCOPE_AFFINITY_WEIGHT,
   // #205 (calibration.ts): rrfK + rrfCompositeWeight match the pre-#205
   // hardcoded values (60 and 0.8); the FTS per-list weight (1.0 → 0.5) is the
   // one deliberate nudge toward vector — the bisection point where BM25F +
@@ -213,22 +248,39 @@ export function configureScoring(overrides?: Partial<ScoringWeights> | null): Sc
     const n = Number(v);
     return Number.isFinite(n) && n >= 0 ? n : dflt;
   };
+  // #449: the connections saturation degree is a COUNT ≥ 1 (log1p(K) must
+  // not divide by zero; K < 1 would saturate every k > 0 instantly). No
+  // upper bound — the rrfK non-weight precedent.
+  const numMin1 = (v: unknown, dflt: number): number => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 1 ? n : dflt;
+  };
   scoringWeights = {
     similarity: num(overrides?.similarity, SCORING_DEFAULTS.similarity, 0, 1),
     strength: num(overrides?.strength, SCORING_DEFAULTS.strength, 0, 1),
     connections: num(overrides?.connections, SCORING_DEFAULTS.connections, 0, 1),
+    connectionsSaturation: numMin1(overrides?.connectionsSaturation, SCORING_DEFAULTS.connectionsSaturation),
     recency: num(overrides?.recency, SCORING_DEFAULTS.recency, 0, 1),
-    freshnessBoostDays: num(overrides?.freshnessBoostDays, SCORING_DEFAULTS.freshnessBoostDays, 0, 365),
-    freshnessBoostWeight: num(overrides?.freshnessBoostWeight, SCORING_DEFAULTS.freshnessBoostWeight, 0, 1),
+    recencyHead: num(overrides?.recencyHead, SCORING_DEFAULTS.recencyHead, 0, 1),
+    recencyHeadDays: num(overrides?.recencyHeadDays, SCORING_DEFAULTS.recencyHeadDays, 0, 365),
     supersededDemotion: num(overrides?.supersededDemotion, SCORING_DEFAULTS.supersededDemotion, 0, 1),
-    projectAffinity: num(overrides?.projectAffinity, SCORING_DEFAULTS.projectAffinity, 0, 1),
-    domainAffinity: num(overrides?.domainAffinity, SCORING_DEFAULTS.domainAffinity, 0, 1),
+    scopeAffinity: num(overrides?.scopeAffinity, SCORING_DEFAULTS.scopeAffinity, 0, 1),
     rrfK: numW(overrides?.rrfK, SCORING_DEFAULTS.rrfK),
     rrfCompositeWeight: num(overrides?.rrfCompositeWeight, SCORING_DEFAULTS.rrfCompositeWeight, 0, 1),
     rrfFtsWeight: numW(overrides?.rrfFtsWeight, SCORING_DEFAULTS.rrfFtsWeight),
     rrfVectorWeight: numW(overrides?.rrfVectorWeight, SCORING_DEFAULTS.rrfVectorWeight),
     bothChannelBoost: num(overrides?.bothChannelBoost, SCORING_DEFAULTS.bothChannelBoost, 0, 1),
   };
+  // #430: a head weaker than the slow weight it must join is nonsensical (the
+  // head curve would dive below the tail inside the window). Floor it at the
+  // resolved slow weight, defaulting to the shipped amplitude — the normal
+  // invalid case falls back to 0.30 rather than degrading the curve silently.
+  if (scoringWeights.recencyHead < scoringWeights.recency) {
+    scoringWeights.recencyHead = Math.max(
+      SCORING_DEFAULTS.recencyHead,
+      scoringWeights.recency
+    );
+  }
   return { ...scoringWeights };
 }
 
@@ -641,15 +693,65 @@ export function effectiveStrength(
 }
 
 /**
+ * #430 merged time curve — ONE additive score term, two timescales. The
+ * pre-#430 pair (slow recency blend + linear fresh-memory bonus) is now a
+ * single piecewise exponential: a steep head with amplitude `recencyHead` at
+ * age 0, joined value-continuously onto the unchanged slow curve at
+ * `recencyHeadDays`. The head rate is DERIVED from value-continuity at the
+ * join (never a free constant), so the join cannot be mis-tuned and the eval
+ * seam retunes it automatically.
+ *
+ * A memory is born highly available and settles into the normal ranking over
+ * the head window. Age is measured from created_at, which the nightly sets
+ * from the session's own date — so a session captured last night ranks as
+ * ~1 day old (not 0), and backfilled older content correctly gets no head.
+ * The slow tail alone (≈58-day half-life at weight 0.15) could never lift a
+ * day-old memory past an old high-strength one — measured case: an
+ * exact-match 1-day-old memory (strength 0.50) lost to an unrelated memory
+ * at strength 0.80. That job is now the head's, so ranking among memories
+ * that are all old (at or beyond the join) is untouched.
+ */
+function timeScore(hoursSinceCreated: number, hasCreatedAt: boolean): number {
+  const w = scoringWeights;
+  // Zero slow weight disables the WHOLE term (the term-isolation semantics
+  // the tests rely on). Also the NaN guard: with w.recency = 0 the derived
+  // head rate is ln(0)/join = −Inf and exp(−Inf · 0) = NaN at age 0.
+  if (w.recency === 0) return 0;
+  // Absent created_at keeps the pre-#430 behavior exactly: the slow term at
+  // its age-0 value, no head. The guard is TRUTHINESS (the pre-#430 freshness
+  // guard was `memory.created_at && …`), so an empty string counts as absent
+  // too — and parseTimestamp("") falls back to now just like null (hours 0 →
+  // pow(·, 0) = 1 → exactly the slow weight).
+  if (!hasCreatedAt) return w.recency;
+  const joinHours = w.recencyHeadDays * 24;
+  // The boundary belongs to the slow branch — at and beyond the join the
+  // expression is bit-identical to the pre-#430 slow term (IEEE754
+  // multiplication is commutative, so the operand order vs the old
+  // `recency * w.recency` is float-identical).
+  if (joinHours <= 0 || hoursSinceCreated >= joinHours) {
+    return w.recency * Math.pow(CALIBRATION.RECENCY_HOURLY_DECAY, hoursSinceCreated);
+  }
+  // Head branch (created_at present, 0 ≤ hours < joinHours): amplitude
+  // w.recencyHead decaying at the continuity-derived rate (≈ −0.004626/h —
+  // head half-life ≈ 6.24 d at the shipped constants).
+  const headRate =
+    Math.log(
+      (w.recency * Math.pow(CALIBRATION.RECENCY_HOURLY_DECAY, joinHours)) / w.recencyHead
+    ) / joinHours;
+  return w.recencyHead * Math.exp(headRate * hoursSinceCreated);
+}
+
+/**
  * Return a composite relevance score in [0, 1] for a candidate memory.
  * Exported for exact-value tests of the similarity component (#145).
  *
- * #203 soft affinity (options.scope + options.tagWeights): two additive,
- * graded, zero-boost-neutral terms — project affinity (exact project match)
- * and domain affinity (max overlapping memory_tags.weight × scope). Both are
- * 0 when the scope is absent (byte-identical to pre-#203) and NEVER negative
- * (a foreign memory adds 0, never a penalty — penalties re-introduce
- * soft-exclusion). See `AffinityScope`.
+ * Scope affinity (options.scope + options.tagWeights; #203, merged #430):
+ * ONE additive, graded, zero-boost-neutral term — max() of the project-match
+ * indicator (exact match ⇒ 1) and the max overlapping memory_tags.weight,
+ * × the scopeAffinity weight. It is 0 when the scope is absent
+ * (byte-identical to pre-#203) and NEVER negative (a foreign memory adds 0,
+ * never a penalty — penalties re-introduce soft-exclusion). See
+ * `AffinityScope`.
  */
 export interface AffinityScope {
   /** Exact-match project from the client (CC/OC cwd-derived; /search project). */
@@ -663,14 +765,14 @@ export function computeScore(
   memory: Memory,
   distance: number,
   connectionCount: number,
-  maxConnections: number,
   now: Date,
   options?: {
     superseded?: boolean;
-    /** #203: when present, project/domain affinity boosts are applied. */
+    /** #203/#430: when present, the scope-affinity boost is applied. */
     scope?: AffinityScope;
     /** Candidate's graded domain tags (memory_tags rows). Loaded batched for
-     *  the whole candidate set in retrieve(); used for domain affinity. */
+     *  the whole candidate set in retrieve(); used for the scope-affinity
+     *  term's domain signal. */
     tagWeights?: Array<{ tag: string; weight: number | null }>;
     /** #425: the candidate was matched by BOTH retrieval channels (vector
      *  KNN AND BM25 FTS) — the genuine-match signature. Adds the
@@ -700,64 +802,66 @@ export function computeScore(
       importance: memory.base_strength ?? 0.5,
     }
   );
-  const connScore =
-    maxConnections > 0 ? connectionCount / maxConnections : 0;
   const hoursSinceCreated = Math.max(
     (now.getTime() - parseTimestamp(memory.created_at).getTime()) / 3_600_000,
     0
   );
-  const recency = Math.pow(0.9995, hoursSinceCreated);
 
   const w = scoringWeights;
+  // #449 (PR E, items 1+3): LOG-SATURATING connection credit on the
+  // ABSOLUTE degree scale — min(1, log1p(k)/log1p(K)), K = the resolved
+  // connectionsSaturation (default 16, the p99 of the real undirected
+  // degree distribution; calibration.ts carries the provenance). Shape per
+  // the #449 research base: ACT-R fan saturation (Anderson & Reder 1999 —
+  // activation falls with the LOG of fan, not linearly), SAM's saturating
+  // returns, cue overload (Watkins & Watkins 1975) — returns per
+  // additional link compress, and the top ~1% of hubs tie at full credit.
+  // This REPLACED the pre-#449 candidate-set normalization
+  // (connectionCount / maxConnections), which is deleted from this
+  // signature and every call site: a row's score no longer depends on
+  // which OTHER rows happened to match (set-relative scores were not
+  // reproducible, and the ~40-degree global hubs sat in nearly every
+  // 2-hop neighborhood — per-query max p50 = 36 — so the median linked
+  // candidate earned only k/36 of the term). k = 0 contributes exactly +0
+  // (log1p(0) = 0): unlinked rows score bit-identically to pre-#449.
+  const connScore = Math.min(
+    1,
+    Math.log1p(connectionCount) / Math.log1p(w.connectionsSaturation)
+  );
   let score =
     similarity * w.similarity +
     effStrength * w.strength +
     connScore * w.connections +
-    recency * w.recency;
+    timeScore(hoursSinceCreated, Boolean(memory.created_at));
 
-  // Fresh-memory window (#191 Phase B): a memory is born highly available and
-  // settles into the normal ranking over `freshnessBoostDays`. Age is measured
-  // from created_at, which the nightly sets from the session's own date — so a
-  // session captured last night ranks as ~1 day old (not 0), and backfilled
-  // older content correctly gets no boost. The slow
-  // `recency` term above (≈58-day half-life at weight 0.15) could never lift a
-  // day-old memory past an old high-strength one — measured case: an
-  // exact-match 1-day-old memory (strength 0.50) lost to an unrelated memory
-  // at strength 0.80. This is an ADDITIVE bonus that decays linearly to zero
-  // at the window edge, so it cannot distort ranking among memories that are
-  // all old.
-  const ageDays = hoursSinceCreated / 24;
-  if (memory.created_at && ageDays < scoringWeights.freshnessBoostDays) {
-    const freshness = 1 - ageDays / scoringWeights.freshnessBoostDays;
-    score += freshness * scoringWeights.freshnessBoostWeight;
-  }
-
-  // #203 soft affinity (retrieval scoping). Two graded, additive terms — both
-  // ZERO when the scope is absent (byte-identical ranking) and ZERO for a
-  // non-matching memory (never a penalty). Project affinity is a flat boost on
-  // exact project match; domain affinity is max(overlapping tag weight) × the
-  // domain weight. NULL tag weights (not yet computed by the nightly
-  // reconsolidation) count as 0 — we never invent a boost from missing
-  // association strength. Affinity rides the 0.8 composite side only (the RRF
-  // 0.2 side is #205 territory and untouched here).
+  // #430 scope affinity (retrieval scoping; born from #203's two boosts).
+  // ONE graded, additive term — max() of the strongest single scope signal:
+  // the project-match indicator (exact project match ⇒ 1) and the max
+  // overlapping domain-tag weight. ZERO when the scope is absent
+  // (byte-identical ranking) and ZERO for a non-matching memory (never a
+  // penalty). The signals are never stacked — they are largely the same
+  // evidence and the domain one is the weaker, so the strongest counts once
+  // (single-signal scopes reproduce #203's exact floats). NULL tag weights
+  // (not yet computed by the nightly reconsolidation) count as 0 — we never
+  // invent a boost from missing association strength. Affinity rides the 0.8
+  // composite side only (the RRF 0.2 side is #205 territory and untouched
+  // here).
   const scope = options?.scope;
   if (scope) {
-    if (scope.project && memory.project === scope.project) {
-      score += scoringWeights.projectAffinity;
-    }
+    const projectMatch = scope.project && memory.project === scope.project;
+    let maxOverlapTagWeight = 0;
     const domains = scope.missionDomains;
     if (domains && domains.length > 0 && options.tagWeights && options.tagWeights.length > 0) {
       const domainSet = domains.length === 1 ? null : new Set(domains);
-      let maxWeight = 0;
       for (const tw of options.tagWeights) {
         const overlaps = domainSet ? domainSet.has(tw.tag) : tw.tag === domains[0];
         if (overlaps) {
           const w = tw.weight ?? 0;
-          if (w > maxWeight) maxWeight = w;
+          if (w > maxOverlapTagWeight) maxOverlapTagWeight = w;
         }
       }
-      if (maxWeight > 0) score += maxWeight * scoringWeights.domainAffinity;
     }
+    score += Math.max(projectMatch ? 1 : 0, maxOverlapTagWeight) * scoringWeights.scopeAffinity;
   }
 
   // #425 both-channel boost: vector KNN and BM25 FTS AGREEING on a candidate
@@ -765,7 +869,7 @@ export function computeScore(
   // exists — the field failure this fixes: 0.90/0.95-strength domain-adjacent
   // memories outranked the best-similarity exact-token match). ADDITIVE,
   // zero-boost neutral, never a penalty; rides the composite side only (like
-  // projectAffinity — the RRF side is #205 territory); applied BEFORE the
+  // scopeAffinity — the RRF side is #205 territory); applied BEFORE the
   // superseded multiplier so a superseded both-channel row still demotes.
   if (options?.bothChannel) score += scoringWeights.bothChannelBoost;
 
@@ -783,6 +887,19 @@ export function computeScore(
 // Graph traversal
 // ---------------------------------------------------------------------------
 
+/**
+ * #466 — truth-management relationships that never pay connection credit.
+ * A superseded/corrected memory remains part of its knowledge neighborhood
+ * as EVIDENCE, but the administrative edge itself is not a semantic
+ * connection: "this memory was replaced" must not add ranking credit to the
+ * memory it replaced. Scoped to exactly the #463 audit's administrative set
+ * (`superseded_by`, `corrected_by`); every semantic edge — `extends`,
+ * `relates_to`, and the legacy vocabulary — still counts. Graph traversal
+ * (frontier expansion below, the belief walk, /graph queries) is untouched:
+ * those are discovery mechanisms, and only the credit stops.
+ */
+const ADMIN_RELATIONSHIPS = new Set(["superseded_by", "corrected_by"]);
+
 function collectLinks(
   db: Database.Database,
   seedIds: string[],
@@ -796,7 +913,11 @@ function collectLinks(
     const nextFrontier = new Set<string>();
     for (const mid of frontier) {
       const links = storage.getLinks(db, mid, "both");
-      const count = links.length;
+      // #466: the degree feeding computeScore's connections term counts
+      // semantic edges only — administrative edges do not pay credit.
+      const count = links.filter(
+        (l) => !ADMIN_RELATIONSHIPS.has(l.relationship)
+      ).length;
       connectionCounts.set(
         mid,
         (connectionCounts.get(mid) ?? 0) + count
@@ -818,7 +939,9 @@ function collectLinks(
   for (const mid of visited) {
     if (!connectionCounts.has(mid)) {
       const links = storage.getLinks(db, mid, "both");
-      connectionCounts.set(mid, links.length);
+      connectionCounts.set(mid, links.filter(
+        (l) => !ADMIN_RELATIONSHIPS.has(l.relationship)
+      ).length);
     }
   }
 
@@ -963,13 +1086,18 @@ export async function retrieve(
       fetchLimit: number,
       sourceAgent?: string
     ) => Array<Memory & { rank: number }>;
+    /** #458 eval clock pin — the instant the decay/recency terms score
+     *  against. Eval-only: no production caller passes it, and unset means
+     *  the live clock (byte-identical to pre-#458). Mirrors the
+     *  injectable-clock idiom of run-deadline.ts; see eval/eval-clock.ts. */
+    now?: Date;
   }
 ): Promise<MemorySearchResult[]> {
   const limit = options?.limit ?? recallDefaults.searchLimit;
   const project = options?.project;
   const sourceAgent = options?.sourceAgent;
   const missionDomains = options?.missionDomains;
-  const now = new Date();
+  const now = options?.now ?? new Date();
 
   // #203 affinity scope — passed to computeScore for every candidate. Built
   // once; absent fields yield no boost (zero-boost neutral).
@@ -1072,13 +1200,9 @@ export async function retrieve(
     candidateMap.set(gid, { mem, distance: DEFAULT_GRAPH_DISTANCE, source: "graph" });
   }
 
-  // 5. Compute composite scores
-  const maxConnections = Math.max(
-    ...([...connectionCounts.values()].length > 0
-      ? [...connectionCounts.values()]
-      : [0])
-  );
-
+  // 5. Compute composite scores (the connections term reads each row's own
+  // degree only — #449 deleted the candidate-set-max normalization: a
+  // row's score no longer depends on which other rows matched).
   const scored: Array<{
     mem: Memory;
     finalScore: number;
@@ -1109,7 +1233,7 @@ export async function retrieve(
 
   for (const [mid, { mem, distance, source }] of candidateMap) {
     const connCount = connectionCounts.get(mid) ?? 0;
-    const composite = computeScore(mem, distance, connCount, maxConnections, now, {
+    const composite = computeScore(mem, distance, connCount, now, {
       superseded: supersededIds.has(mid),
       scope,
       tagWeights: tagWeightsByMemory?.get(mid),
@@ -1187,7 +1311,6 @@ export async function retrieve(
       mem,
       DEFAULT_GRAPH_DISTANCE,
       connCount,
-      maxConnections,
       now,
       { superseded: supersededIds.has(terminalId) }
     );
@@ -1240,11 +1363,6 @@ export function searchRecent(
 
   const allIds = candidates.map((c) => c.id);
   const connectionCounts = collectLinks(db, allIds, 1);
-  const maxConnections = Math.max(
-    ...([...connectionCounts.values()].length > 0
-      ? [...connectionCounts.values()]
-      : [0])
-  );
 
   const scored: Array<{
     mem: Memory;
@@ -1259,7 +1377,7 @@ export function searchRecent(
 
   for (const mem of candidates) {
     const connCount = connectionCounts.get(mem.id) ?? 0;
-    const score = computeScore(mem, DEFAULT_GRAPH_DISTANCE, connCount, maxConnections, now, {
+    const score = computeScore(mem, DEFAULT_GRAPH_DISTANCE, connCount, now, {
       superseded: supersededRecent.has(mem.id),
     });
     const effStr = effectiveStrength(mem.base_strength ?? 0.5, mem.last_accessed, now);
@@ -1291,7 +1409,6 @@ export function searchRecent(
       mem,
       DEFAULT_GRAPH_DISTANCE,
       connCount,
-      maxConnections,
       now,
       { superseded: supersededRecent.has(terminalId) }
     );
