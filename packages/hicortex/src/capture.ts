@@ -463,7 +463,10 @@ export async function captureBatches(
         if (advancesBoundary) lastConfirmedEnd = seg.segEnd;
         console.log(`[hicortex]     → ${result.distilled ?? 0} memories (segment ${body.segment_id})`);
         for (const d of result.dropped ?? []) {
-          console.log(`[hicortex]     Substance gate: dropped "${d}"`);
+          // #489: the response array carries BOTH gate kinds (substance +
+          // volatility) — the server's own log names the exact gate; this
+          // client-side line is the same #156 trail, labeled generically.
+          console.log(`[hicortex]     Distill gate: dropped "${d}"`);
         }
       } else if (result.status === 200) {
         // Already ingested (segment-exact or legacy session dedup) — treat as

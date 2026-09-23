@@ -16,6 +16,9 @@
  *              dedup --apply           Execute the merge (default: dry run);
  *                                      losers are absorbed (kept as evidence,
  *                                      hidden from recall), not deleted
+ *   sweep-volatile  One-shot sweep of volatile GH-status/version rows (#489)
+ *              sweep-volatile --apply  Demote matches via absorb (default:
+ *                                      dry run; backup first, audit trail)
  *   history    Show a memory's rewrite history, or roll one back (issue #384)
  *              history --rollback <row>  Undo one rewrite + un-absorb triggers
  *   status     Show config, DB stats, adapter status
@@ -303,6 +306,29 @@ switch (command) {
     import("./dedup.js").then(({ runDedup }) => {
       runDedup(dedupOptions).catch((err) => {
         console.error(err instanceof Error ? err.message : `[hicortex] dedup failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
+  case "sweep-volatile": {
+    // One-shot store sweep of volatile GH-status/version rows (#489,
+    // deliverable iii): reuses the distill path's deterministic gate over the
+    // stored corpus. Mirrors `dedup`: dry-run default, --apply explicit
+    // (backup first, absorb — never delete, volatile_sweep_log audit trail).
+    const args = process.argv.slice(3);
+    let dbPath: string | undefined;
+    try {
+      dbPath = readValueFlag(args, "--db");
+    } catch {
+      console.error("[hicortex] sweep-volatile: --db requires a path value");
+      process.exit(1);
+    }
+    const sweepOptions = { apply: args.includes("--apply"), dbPath };
+    import("./sweep-volatile.js").then(({ runSweepVolatile }) => {
+      runSweepVolatile(sweepOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] sweep-volatile failed: ${err}`);
         process.exit(1);
       });
     });

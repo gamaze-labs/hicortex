@@ -5,6 +5,18 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-09-22
+
+### Changed — duplicates retire deterministically; junk stops at the door (#206, #489)
+- **Cross-agent duplicates merge.** The dedup guard no longer refuses near-identical memories (≥0.92 similarity) just because different agents captured them — attribution is preserved on the retained row. The project rail stays. Skip reporting now separates the reason (`project_mismatch`), so a dry run sizes the remaining project-rail refusals.
+- **Newest-wins canonical.** When a cluster merges, the surviving row is the most-used copy, tie-broken to the NEWEST wording (was oldest) — the freshest restatement is the memory of record.
+- **The standalone supersession stage is retired** (−937 lines). True-update detection is the unified resolution pass's job (its `supersedes` verdict, confidence-gated, now also marks status); the old stage's whole-corpus backfill is complete, its cursor becomes a documented tombstone, and near-duplicate pairs stop being permanently masked from the merge verdict by mislabeled links. Existing links and retrieval demotion semantics are unchanged.
+- **Recall skips harness plumbing** (task-notification / agent-message / command wrappers): wrapper-only prompts produce no recall push, no turn burn, no shown-count bump, no decay-clock refresh — client hook and server both, sharing one detector. Wrappers carrying real prose recall as before.
+
+### Added
+- **Volatile-content gate** (distill side): GitHub ticket/workflow statuses, version bumps, and commit-state entries are dropped before embedding and storage — deterministically, with durability escapes (a decision like "switched from X to Y" stays), riding the existing dropped-entries audit trail. Release-managed kill-switch constant.
+- **`hicortex sweep-volatile`**: one-shot cleanup command reusing the same gate over the stored corpus — dry-run by default; `--apply` takes a backup, demotes matches to absorbed-evidence (never deletes), and writes an audit log (migration v23).
+
 ## [0.22.3] — 2026-09-21
 
 ### Fixed

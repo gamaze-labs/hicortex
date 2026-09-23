@@ -2,7 +2,7 @@
  * Reconsolidation (#384, #392) — the store resolves its own corrections, and
  * THE unified resolution stage.
  *
- * Nightly consolidation stage (runs as Stage 3.8, after supersession, before
+ * Nightly consolidation stage (runs as Stage 3.8, after links, before
  * decay/prune) that detects memories which correct, retract, supersede, or
  * DUPLICATE older ones; REWRITES corrected facts in place (absorbing
  * transition-only trigger memories), MERGES confirmed duplicates via the
@@ -44,8 +44,9 @@
  * planDedup and the judged mergeMemoryIds) refuse to blend a conflicts-linked
  * pair, counted as conflict_skipped. The zone therefore runs AFTER the scan —
  * with the zone first, a >=0.92 conflict pair was blended
- * before the judge ever saw it (the planted-eval harm: canonical=older, the
- * newer truth erased); running it last means verdicts/marks/binds land first
+ * before the judge ever saw it (the planted-eval harm: an unjudged blend —
+ * whichever row lost the canonical pick, its wording was simply erased);
+ * running it last means verdicts/marks/binds land first
  * and the zone merges only what no verdict claimed — a conflicts bind set by
  * this run's scan guards the SAME run's zone.
  *
@@ -113,10 +114,14 @@ export const RECONSOLIDATION_STAGE_LABEL = "reconsolidation";
 /**
  * Default minimum COSINE similarity for a correction candidate pair —
  * RELEASE-MANAGED since #408 (calibration.ts CORRECTION_MIN_SIMILARITY;
- * provenance there). Lower than the supersession stage's 0.80 on purpose: a
- * retraction often rides inside an otherwise unrelated memory (the field
- * failure that opened this issue), so the neighborhood gate must be a touch
- * wider while the LLM verdict + confidence gate carry the precision load.
+ * provenance there). Deliberately wide: a retraction often rides inside an
+ * otherwise unrelated memory (the field failure that opened this issue), so
+ * the neighborhood gate must be a touch wider while the LLM verdict +
+ * confidence gate carry the precision load. Since #206-B (owner decision 6)
+ * this floor also subsumes the retired Stage 3.7 supersession scan's 0.80:
+ * 3.8 is the ONLY true-update detector, scanning every new memory — no
+ * shape gate, wider floor — with `corrects`/`supersedes` partitioning what
+ * 3.7's binary prompt called a supersession.
  */
 export const DEFAULT_CORRECTION_MIN_SIMILARITY = CALIBRATION.CORRECTION_MIN_SIMILARITY;
 
@@ -128,11 +133,12 @@ export const DEFAULT_CORRECTION_MIN_SIMILARITY = CALIBRATION.CORRECTION_MIN_SIMI
  */
 export const DEFAULT_CORRECTION_REWRITE_MIN_CONFIDENCE = CALIBRATION.CORRECTION_REWRITE_MIN_CONFIDENCE;
 
-/** Neighbor pool size before older/similarity filtering narrows to top 5 (supersession mirror). */
+/** Neighbor pool size before older/similarity filtering narrows to top 5
+ *  (formerly the supersession stage's constants — 3.8 inherited the shape). */
 const CORRECTION_NEIGHBOR_POOL = 15;
-/** Older-neighbor pairs kept per candidate after filtering (supersession mirror). */
+/** Older-neighbor pairs kept per candidate after filtering. */
 const CORRECTION_NEIGHBOR_TOP_K = 5;
-/** Content truncation for prompts (classify-tier cost profile; supersession precedent). */
+/** Content truncation for prompts (classify-tier cost profile). */
 const PROMPT_TRUNCATE_CHARS = 1500;
 /** Head of the old content quoted in the provenance footer. */
 export const FOOTER_HEAD_MAX_CHARS = 160;
@@ -269,7 +275,7 @@ export interface ScoutShape {
 
 /**
  * Build the constrained correction-shape prompt (classify-tier cost profile:
- * 1500-char truncation, supersession/verdict precedent). The wording asks for
+ *  1500-char truncation, verdict-prompt precedent). The wording asks for
  * the OLD claim's distinctive terms — the field-failure mechanism is that a
  * correction CONTAINS the words of what it corrects, even when the surrounding
  * topics (and therefore the embedding cosine) are unrelated. Guard-C extends
@@ -295,7 +301,8 @@ export function buildScoutShapePrompt(content: string): string {
 /**
  * Parse the scout shape reply. Null on unparseable JSON, a missing/non-boolean
  * `correction`, or a missing/out-of-range `confidence` — the caller counts
- * skipped_infra and moves on (parseSupersessionReply discipline: never
+ * skipped_infra and moves on (the retired supersession stage's parse
+ * discipline, kept: never
  * mis-detect on ambiguity). `references` is lenient (missing/non-string → "")
  * because an empty string simply yields no FTS hits — a harmless miss, not a
  * mis-judgment.
@@ -318,7 +325,7 @@ export function parseScoutShape(reply: string): ScoutShape | null {
   return { correction: obj.correction, references: references.trim(), confidence };
 }
 
-/** Build the constrained pair-verdict prompt (1500-char truncation, supersession precedent). */
+/** Build the constrained pair-verdict prompt (1500-char truncation). */
 export function buildCorrectionVerdictPrompt(oldContent: string, newContent: string): string {
   const trunc = (s: string) => (s.length > PROMPT_TRUNCATE_CHARS ? `${s.slice(0, PROMPT_TRUNCATE_CHARS)}…` : s);
   return (
@@ -349,7 +356,7 @@ export interface CorrectionVerdict {
 /**
  * Parse the pair verdict. Null on anything unparseable, unknown action, or an
  * out-of-range/missing confidence — the caller counts skipped_infra and moves
- * on (same discipline as parseSupersessionReply: never mis-judge on ambiguity).
+ * on (the same never-mis-judge-on-ambiguity discipline).
  */
 export function parseCorrectionVerdict(reply: string): CorrectionVerdict | null {
   if (!reply) return null;
@@ -707,8 +714,8 @@ function accumulateBandStat(cumulative: ResolutionBandStat, run: ResolutionBandS
   cumulative.none += run.none;
   cumulative.merge_below_gate += run.merge_below_gate;
   cumulative.conf_sum += run.conf_sum;
-  if (run.metadata_skipped !== undefined) {
-    cumulative.metadata_skipped = (cumulative.metadata_skipped ?? 0) + run.metadata_skipped;
+  if (run.project_skipped !== undefined) {
+    cumulative.project_skipped = (cumulative.project_skipped ?? 0) + run.project_skipped;
   }
 }
 
@@ -945,7 +952,9 @@ export async function stageReconsolidation(
   // re-detect). Once the backlog drains, pairs_reevaluated reads 0.
   const prevScannedRowid = loadState(stateDir).reconsolidationScannedRowid ?? startCursor;
   let scannedRowidHighwater = startCursor;
-  // NO shape filter (AC2) — unlike stageSupersession. Absorbed rows are
+  // NO shape filter (AC2) — also why 3.8 subsumes the retired Stage 3.7
+  // supersession scan (its shape gate would miss exactly these pairs).
+  // Absorbed rows are
   // excluded: they are invisible to recall and must not re-enter judgment.
   const rows = db
     .prepare(
@@ -972,7 +981,7 @@ export async function stageReconsolidation(
   let explicitDivergent = 0;
   let mergeBelowGate = 0;
   let skippedAboveCeiling = 0;
-  let skippedMetadataMismatch = 0;
+  let skippedProjectMismatch = 0;
   let mergePairsApplied = 0;
   // #393 guard-C: conflicts verdicts rendered (link written, both live) and
   // judged-path merge refusals on a conflicts-linked pair.
@@ -1491,11 +1500,11 @@ export async function stageReconsolidation(
                       `[hicortex] Reconsolidation: merged ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
                         `into canonical ${result.canonicalId.slice(0, 8)} (${result.linksRepointed} link(s) re-pointed)`,
                     );
-                  } else if (result.reason === "metadata_mismatch") {
-                    skippedMetadataMismatch++;
+                  } else if (result.reason === "project_mismatch") {
+                    skippedProjectMismatch++;
                     console.log(
                       `[hicortex] Reconsolidation: merge of ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
-                        `skipped (metadata mismatch) — both kept`,
+                        `skipped (project mismatch) — both kept`,
                     );
                   } else if (result.reason === "conflict_linked") {
                     // #393 guard-C: the pair is conflicts-linked (operator-planted
@@ -1714,11 +1723,11 @@ export async function stageReconsolidation(
                   `[hicortex] Reconsolidation: merged ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
                     `into canonical ${result.canonicalId.slice(0, 8)} (${result.linksRepointed} link(s) re-pointed)`,
                 );
-              } else if (result.reason === "metadata_mismatch") {
-                skippedMetadataMismatch++;
+              } else if (result.reason === "project_mismatch") {
+                skippedProjectMismatch++;
                 console.log(
                   `[hicortex] Reconsolidation: merge of ${pair.oldId.slice(0, 8)} + ${pair.newId.slice(0, 8)} ` +
-                    `skipped (metadata mismatch) — both kept`,
+                    `skipped (project mismatch) — both kept`,
                 );
               } else if (result.reason === "conflict_linked") {
                 conflictSkippedJudged++;
@@ -1744,7 +1753,8 @@ export async function stageReconsolidation(
   // deterministic sweep: verdicts, marks, and binds land first, and the zone
   // merges only what no verdict claimed. With the zone first, a >=0.92
   // genuine-conflict pair was blended before the judge ever saw it
-  // (canonical = oldest, the newer truth erased — the planted-eval harm);
+  // (an unjudged blend — the canonical-pick loser's wording erased —
+  // the planted-eval harm);
   // running it last means a `conflicts` bind set by THIS run's scan guards
   // the SAME run's zone. LLM-free and budget-free — an LLM-less night still
   // drains duplicates (a deadline-deferred cluster re-detects next run at
@@ -1771,8 +1781,8 @@ export async function stageReconsolidation(
     det.pairs = merges.losers_merged;
     det.merge = merges.losers_merged;
     det.conf_sum = merges.losers_merged;
-    if (merges.skipped_metadata_mismatch > 0) {
-      det.metadata_skipped = merges.skipped_metadata_mismatch;
+    if (merges.skipped_project_mismatch > 0) {
+      det.project_skipped = merges.skipped_project_mismatch;
     }
     bandStats[`>=${autoMergeThreshold}`] = det;
   }
@@ -1845,7 +1855,7 @@ export async function stageReconsolidation(
     merge_pairs_applied: mergePairsApplied,
     merge_below_gate: mergeBelowGate,
     skipped_above_ceiling: skippedAboveCeiling,
-    skipped_metadata_mismatch: skippedMetadataMismatch,
+    skipped_project_mismatch: skippedProjectMismatch,
     conflict_flagged: conflictFlagged,
     conflict_skipped: conflictSkippedJudged + merges.skipped_conflict,
     scout_scanned: scoutScanned,

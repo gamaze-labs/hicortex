@@ -14,6 +14,7 @@
  */
 
 import { resolveConfig } from "./learnings-identity.js";
+import { isPureWrapperPrompt } from "./wrapper-prompt.js";
 import { basename } from "node:path";
 
 const FETCH_TIMEOUT_MS = 1000;
@@ -55,6 +56,14 @@ export function buildHookRequest(
 
   const prompt = typeof payload.prompt === "string" ? payload.prompt : "";
   if (!prompt) return null;
+  // #489: a pure plumbing payload (task-notification without a report result,
+  // command envelope, caveat, stdout echo, bare system-reminder) produces NO
+  // request at all — no HTTP call, so the 1000 ms hook budget is spent on
+  // real prompts only. A wrapper CARRYING prose (agent-message hand-back,
+  // report <result>, user text around the wrapper) recalls on the full text
+  // (owner decision 4) — the shared classifier, same function the server
+  // guards with (wrapper-prompt.ts).
+  if (isPureWrapperPrompt(prompt)) return null;
   // #203 scope: derive project from the session cwd so retrieval can apply a
   // soft project-affinity boost. basename(cwd) matches capture's
   // decodeProjectDirName for non-hyphenated dirs (the common case); a hyphen
