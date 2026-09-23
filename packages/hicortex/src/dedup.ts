@@ -20,8 +20,9 @@
  *    consolidate.ts) so one stage report covers all resolution work.
  *
  * Per cluster (shared `planDedup`/`mergeCluster` core — no forks):
- *   - Canonical = highest access_count (tie: oldest created_at, then
- *     lexicographically smallest id — fully deterministic for audit).
+ *   - Canonical = highest access_count (tie: NEWEST created_at — newest-wins,
+ *     #206 decision 3 — then lexicographically smallest id, fully
+ *     deterministic for audit).
  *   - Losers' links are re-pointed onto the canonical (a link that would
  *     become a self-link, or one whose (canonical, target) ordered pair
  *     ALREADY holds an edge, is skipped rather than overwritten — see
@@ -44,8 +45,11 @@
  *     dedup_log (loser_id → canonical_id) + the retained loser row is the
  *     record.
  *
- * A cluster whose members disagree on project or source_agent is SKIPPED
- * entirely and listed for manual review — no --force in this release.
+ * A cluster whose members disagree on project is SKIPPED entirely and listed
+ * for manual review (reason `project_mismatch`) — no --force in this release.
+ * The source_agent rail was REMOVED (#206 decision 2, 2026-09-21): cross-agent
+ * clusters merge — attribution is preserved on the retained evidence row and
+ * no recall path filters by agent.
  *
  * Safety rails when applying (CLI and zone alike):
  *   - A full DB backup (SQLite backup API) is taken FIRST, to
@@ -242,11 +246,13 @@ function loadMembers(db: Database.Database, ids: string[]): DedupMemberRow[] {
     .all(...ids) as DedupMemberRow[];
 }
 
-/** Canonical = highest access_count; ties broken by oldest created_at, then lexicographically smallest id. */
+/** Canonical = highest access_count; ties broken by NEWEST created_at (newest-wins,
+ *  #206 decision 3 — most-used still wins first, newest is the tie-break), then
+ *  lexicographically smallest id. */
 function pickCanonical(members: DedupMemberRow[]): { canonical: DedupMemberRow; losers: DedupMemberRow[] } {
   const sorted = [...members].sort((a, b) => {
     if (b.access_count !== a.access_count) return b.access_count - a.access_count;
-    if (a.created_at !== b.created_at) return a.created_at.localeCompare(b.created_at);
+    if (a.created_at !== b.created_at) return b.created_at.localeCompare(a.created_at);
     return a.id.localeCompare(b.id);
   });
   const [canonical, ...losers] = sorted;
@@ -415,7 +421,9 @@ export function planDedup(db: Database.Database, threshold: number): PlanDedupRe
     }
 
     const mismatch = clusterMetadataMismatch(members);
-    if (mismatch.projectMismatch || mismatch.sourceAgentMismatch) {
+    // #206 decision 2: project is the ONLY rail — the source_agent rail was
+    // removed (cross-agent clusters merge; the skip reason is project_mismatch).
+    if (mismatch.projectMismatch) {
       mismatchSkipped.push({ size: members.length, memberIds: members.map((m) => m.id), mismatch });
       continue;
     }
@@ -532,16 +540,17 @@ function mergeCluster(
 
 export type MergeMemoryIdsResult =
   | { ok: true; canonicalId: string; loserIds: string[]; linksRepointed: number }
-  | { ok: false; reason: "metadata_mismatch" | "conflict_linked" | "no_members" };
+  | { ok: false; reason: "project_mismatch" | "conflict_linked" | "no_members" };
 
 /**
  * Merge an explicit set of memories (the judged-pair phase of #392: the
  * reconsolidation stage queues verdict-confirmed pairs and applies them
  * through THIS function so the merge math stays single-definition). Loads the
  * LIVE rows at apply time — members that vanished or were absorbed between
- * verdict and apply are dropped defensively; a metadata disagreement refuses
- * the merge (both memories stay live); a conflicts-linked pair refuses it
- * exactly the same way (#393 guard-C). One transaction for the whole set.
+ * verdict and apply are dropped defensively; a project disagreement refuses
+ * the merge (both memories stay live — the only metadata rail left, #206
+ * decision 2); a conflicts-linked pair refuses it exactly the same way
+ * (#393 guard-C). One transaction for the whole set.
  */
 export function mergeMemoryIds(db: Database.Database, ids: string[]): MergeMemoryIdsResult {
   const unique = [...new Set(ids)];
@@ -549,15 +558,15 @@ export function mergeMemoryIds(db: Database.Database, ids: string[]): MergeMemor
   if (members.length < 2) return { ok: false, reason: "no_members" };
 
   // #393 guard-C: a conflicts-linked pair is never blended — the mirror of the
-  // metadata rails (both memories stay live; the caller's verdict was still
+  // project rail (both memories stay live; the caller's verdict was still
   // rendered, so its cursor advances).
   if (clusterHasConflictLink(db, members.map((m) => m.id))) {
     return { ok: false, reason: "conflict_linked" };
   }
 
   const mismatch = clusterMetadataMismatch(members);
-  if (mismatch.projectMismatch || mismatch.sourceAgentMismatch) {
-    return { ok: false, reason: "metadata_mismatch" };
+  if (mismatch.projectMismatch) {
+    return { ok: false, reason: "project_mismatch" };
   }
 
   const { canonical, losers } = pickCanonical(members);
@@ -629,7 +638,7 @@ export interface DeterministicMergeZoneOptions {
  *
  * Also persists the deterministic band's cumulative statistics to state.json
  * `resolutionBandStats` (label `>=threshold`; losers count as merge verdicts
- * at confidence 1.0, mismatch clusters as metadata_skipped) — skipped
+ * at confidence 1.0, mismatch clusters as project_skipped) — skipped
  * entirely on dry-run. Called from the reconsolidation stage (main path) and
  * from runConsolidation's quiet-night skip path — exactly one of the two per
  * run.
@@ -655,7 +664,7 @@ export async function runDeterministicMergeZone(
       merged_clusters: 0,
       losers_merged: 0,
       links_repointed: 0,
-      skipped_metadata_mismatch: plan.mismatchSkipped.length,
+      skipped_project_mismatch: plan.mismatchSkipped.length,
       skipped_conflict: plan.conflictSkipped.length,
       capped: 0,
       failed: 0,
@@ -675,7 +684,7 @@ export async function runDeterministicMergeZone(
     // Cumulative deterministic-band stats (state.json) — one write at zone
     // end, on every apply-path exit, never when there is nothing to record.
     const persistBand = (): void => {
-      if (report.losers_merged === 0 && report.skipped_metadata_mismatch === 0) return;
+      if (report.losers_merged === 0 && report.skipped_project_mismatch === 0) return;
       updateState((s) => {
         const label = `>=${threshold}`;
         const bands = s.resolutionBandStats ?? {};
@@ -690,7 +699,7 @@ export async function runDeterministicMergeZone(
           // Deterministic merges carry no verdict — model confidence 1.0 each
           // (the calibration line: measured ~100% same-memory at the ceiling).
           conf_sum: b.conf_sum + report.losers_merged,
-          metadata_skipped: (b.metadata_skipped ?? 0) + report.skipped_metadata_mismatch,
+          project_skipped: (b.project_skipped ?? 0) + report.skipped_project_mismatch,
         } satisfies ResolutionBandStat;
         s.resolutionBandStats = bands;
       }, stateDir);
@@ -773,7 +782,7 @@ export async function runDeterministicMergeZone(
       console.log(
         `[hicortex] deterministic-merge zone (>= ${threshold}): ${report.merged_clusters}/${plan.mergePlans.length} ` +
           `cluster(s) merged, ${report.losers_merged} loser(s) absorbed, ` +
-          `${report.skipped_metadata_mismatch} skipped (metadata mismatch), ` +
+          `${report.skipped_project_mismatch} skipped (project mismatch), ` +
           `${report.skipped_conflict} skipped (conflict-flagged)` +
           (report.capped > 0 ? `, ${report.capped} deferred (run deadline)` : "") +
           (report.failed > 0 ? `, ${report.failed} FAILED` : ""),
@@ -794,7 +803,7 @@ export async function runDeterministicMergeZone(
     return {
       threshold, clusters_found: 0, mergeable_clusters: 0,
       merged_clusters: 0, losers_merged: 0, links_repointed: 0,
-      skipped_metadata_mismatch: 0, skipped_conflict: 0, capped: 0, failed: 0,
+      skipped_project_mismatch: 0, skipped_conflict: 0, capped: 0, failed: 0,
     };
   }
 }
@@ -873,7 +882,7 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
 
     console.log(
       `[hicortex] dedup: ${plan.clusterCount} cluster(s) found, ${mergeable.length} mergeable ` +
-        `(${plannedMerges} row(s) would be absorbed), ${plan.mismatchSkipped.length} skipped (metadata mismatch), ` +
+        `(${plannedMerges} row(s) would be absorbed), ${plan.mismatchSkipped.length} skipped (project mismatch), ` +
         `${plan.conflictSkipped.length} skipped (conflict-flagged), ` +
         `${linksSkippedExistingPreview} link(s) would be skipped (existing edge on the canonical)`,
     );
@@ -888,12 +897,11 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
         );
       }
       for (const c of plan.mismatchSkipped) {
-        const reasons = Object.entries(c.mismatch)
-          .filter(([, v]) => v)
-          .map(([k]) => k)
-          .join(", ");
+        // #206 decision 2: project_mismatch is the only skip reason left on
+        // this rail (the source_agent rail was removed) — the bedrock dry run
+        // sizes the project rail alone off this line.
         console.log(
-          `[hicortex]   SKIPPED (${reasons}): ${c.memberIds.map((id) => id.slice(0, 8)).join(", ")}`,
+          `[hicortex]   SKIPPED (project_mismatch): ${c.memberIds.map((id) => id.slice(0, 8)).join(", ")}`,
         );
       }
       // #393 guard-C: listed for review like the mismatch clusters — a

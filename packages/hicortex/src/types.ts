@@ -38,9 +38,13 @@ export interface Memory {
    * never config: NULL/absent = active (the default, and every pre-v14 row);
    * 'superseded'/'retracted' = marked stale or wrong (demoted in ranking);
    * 'corrected' = rewritten in place (does NOT demote — demoting it would
-   * bury the correction); 'absorbed' = invisible to recall (trigger memory
-   * folded into a corrected target — no vector/FTS row, plain row + link
-   * kept as evidence and rollback reference).
+   * bury the correction); 'absorbed' = invisible to recall (no vector/FTS
+   * row, plain row + links kept as evidence and rollback reference). Writers
+   * of 'absorbed': the reconsolidation rewrite path (trigger folded into a
+   * corrected target), dedup merge losers (#392), and the one-shot
+   * `sweep-volatile` demotion (#489 — volatile rows retire through the SAME
+   * primitive, so no new status vocabulary exists to thread through read
+   * paths; recovery is the pre-sweep backup).
    */
   status?: string | null;
   /**
@@ -137,8 +141,13 @@ export interface ResolutionBandStat {
   merge_below_gate: number;
   /** Sum of verdict confidences (divide by `pairs` for the mean). Deterministic merges count 1.0 each. */
   conf_sum: number;
-  /** Deterministic band only: clusters refused by the metadata rails. */
-  metadata_skipped?: number;
+  /**
+   * Deterministic band only: clusters refused by the project rail. #206
+   * decision 2 renamed this from `metadata_skipped` when the source_agent
+   * rail was removed — pre-rename cumulative values stay on disk unread
+   * (their semantics conflated both rails).
+   */
+  project_skipped?: number;
 }
 
 /**
@@ -161,8 +170,8 @@ export interface DeterministicMergeZoneReport {
   losers_merged: number;
   /** Loser links re-pointed onto canonicals this run. */
   links_repointed: number;
-  /** Clusters skipped — members disagree on project / source_agent. */
-  skipped_metadata_mismatch: number;
+  /** Clusters skipped — members disagree on project (#206 decision 2: the source_agent rail is removed). */
+  skipped_project_mismatch: number;
   /**
    * #393 guard-C: clusters skipped because a member pair holds a `conflicts`
    * link — a judge-flagged genuine conflict is never blended, both records
@@ -258,27 +267,15 @@ export interface ConsolidationReport {
       heuristic_fallback?: number;
       failed: number;
     };
-    /** Supersession detection (#191 Phase B) — runs after linking, before decay/prune. */
-    supersession?: {
-      /** Decision/correction-shaped candidates examined this run. */
-      scanned: number;
-      /** Older-neighbor pairs actually sent to the classify-tier LLM. */
-      evaluated: number;
-      /** Pairs the LLM judged superseded — a `superseded_by` link was created. */
-      superseded: number;
-      /** Pairs skipped on a parse/infra error (retried naturally next night). */
-      skipped_infra: number;
-      /** Pairs skipped because a superseded_by link already existed (either direction). */
-      skipped_idempotent: number;
-      /** supersessionCursor after this run (unchanged in dry-run). */
-      cursor: number;
-    };
     /**
-     * Reconsolidation (#384) — runs after supersession, before decay/prune.
+     * Reconsolidation (#384) — runs after linking, before decay/prune.
      * Since #392 this is THE unified resolution stage: its verdict also carries
      * a `merge` disposition, and the deterministic merge zone (pairs at/above
      * the merge ceiling — release-managed since #408) runs inside it,
-     * LLM-free, before the scan.
+     * LLM-free, before the scan. Since #206-B (owner decision 6) it is also
+     * the ONLY true-update detector — the standalone supersession stage
+     * (3.7, #191 Phase B) is retired into its `supersedes` verdict action,
+     * and its former `supersession` report slot no longer exists.
      */
     reconsolidation?: {
       /** Candidates examined this run (rowid > cursor; no shape filter). */
@@ -365,11 +362,12 @@ export interface ConsolidationReport {
        */
       skipped_above_ceiling: number;
       /**
-       * #392: judged merge pairs refused by the metadata rails (project /
-       * source_agent disagreement). Both memories kept; the cursor advances —
-       * the verdict was rendered, this is not an infra failure.
+       * #392: judged merge pairs refused by the project rail (project
+       * disagreement — the only metadata rail, #206 decision 2). Both
+       * memories kept; the cursor advances — the verdict was rendered, this
+       * is not an infra failure.
        */
-      skipped_metadata_mismatch: number;
+      skipped_project_mismatch: number;
       /**
        * #393 guard-C: verdicts that flagged a genuine conflict — a `conflicts`
        * link was written, both memories stay live (no status change, no

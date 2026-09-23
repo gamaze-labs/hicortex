@@ -52,6 +52,7 @@ import type Database from "better-sqlite3";
 import type { MemorySearchResult, Memory } from "./types.js";
 import * as storage from "./storage.js";
 import { SessionRecallRegistry } from "./recall-registry.js";
+import { isPureWrapperPrompt } from "./wrapper-prompt.js";
 import { labelForType } from "./type-labels.js";
 import {
   retrieve,
@@ -447,6 +448,17 @@ export async function handleRecallIndex(
   }
 
   const prompt = typeof req.prompt === "string" ? req.prompt.trim() : "";
+  // #489 wrapper guard — the short-prompt gate's slot, BEFORE beginTurn and
+  // before any precision recording, so a pure plumbing payload (CC delivers
+  // task-notifications/command envelopes as user-role messages; any client
+  // could POST one) gets {block: null} with NO recall_pushes row, NO turn
+  // burn, NO shown_count bump, NO last_accessed refresh. The SAME shared
+  // classifier the hook client guards with (wrapper-prompt.ts) — defense in
+  // depth. A wrapper carrying real payload prose falls through and recalls on
+  // the full text, exactly today's behavior (owner decision 4).
+  if (isPureWrapperPrompt(prompt)) {
+    return { status: 200, body: { block: null, skipped: "wrapper-prompt" } };
+  }
   const minPromptLength = deps.options?.minPromptLength ?? DEFAULT_MIN_PROMPT_LENGTH;
   if (prompt.length < minPromptLength) {
     return { status: 200, body: { block: null, skipped: "short-prompt" } };

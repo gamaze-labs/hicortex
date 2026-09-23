@@ -396,8 +396,9 @@ export function recallQueryVector(
 
 /**
  * Ids among `candidateIds` that have been superseded by a later memory — i.e.
- * they are the SOURCE of a `superseded_by` link (stageSupersession links
- * old → new). One query, not per-candidate.
+ * they are the SOURCE of a `superseded_by` link (the resolution pass links
+ * old → new; formerly also the retired Stage 3.7 supersession scan). One
+ * query, not per-candidate.
  */
 export function findSupersededIds(
   db: Database.Database,
@@ -416,8 +417,8 @@ export function findSupersededIds(
 
 /**
  * The full ranking-demotion set among `candidateIds` (#384): the UNION of
- * (a) sources of a `superseded_by` link (legacy + stageSupersession — link
- * driven, works on pre-v14 rows with NULL status) and (b) rows whose
+ * (a) sources of a `superseded_by` link (legacy + retired-3.7 + resolution
+ * verdicts — link driven, works on pre-v14 rows with NULL status) and (b) rows whose
  * `memories.status` is 'superseded' or 'retracted' (reconsolidation marks +
  * explicit ingest marks). `corrected` is deliberately NOT demoting — a
  * rewritten memory carries the CORRECTION, and demoting it would bury the

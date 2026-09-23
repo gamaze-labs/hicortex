@@ -779,6 +779,27 @@ const MIGRATIONS: Migration[] = [
       );
     },
   },
+  {
+    version: 23,
+    name: "volatile_sweep_log",
+    up: (db) => {
+      // #489 — `hicortex sweep-volatile` audit trail (owner decision 3:
+      // one-shot store sweep, mark-not-delete). Every swept memory gets a row
+      // here as it is absorbed: the sweep is inspectable forever, never
+      // silent. The dedup_log precedent (a sidecar audit table, no memories
+      // FK), but with no runtime consumer — the CAPTURE-side volatility gate
+      // is the re-ingest safety net, so nothing consults this table; it is
+      // purely the durable record of what --apply retired and when.
+      // Idempotent: IF NOT EXISTS.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS volatile_sweep_log (
+          memory_id TEXT PRIMARY KEY,
+          swept_at TEXT NOT NULL,
+          preview TEXT
+        )
+      `);
+    },
+  },
 ];
 
 /**

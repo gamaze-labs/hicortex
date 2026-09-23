@@ -68,19 +68,19 @@ export interface HicortexState {
    */
   domainCursor?: number;
   /**
-   * Resume cursor for the nightly's supersession-detection stage (#191 Phase
-   * B) — highest memories.rowid whose decision/correction candidates have
-   * been evaluated (or infra-skipped) this run. Absent/0 = never run. Unlike
-   * relinkCursor/domainCursor (separate resumable CLI commands), this cursor
-   * advances within the shared nightly LLM call budget as part of the regular
-   * nightly — the corpus is back-processed gradually over many nights.
+   * #206-B: the retired supersession stage's cursor key
+   * (`supersessionCursor`) is deliberately NOT modeled here anymore. The
+   * stage (3.7, #191 Phase B) is retired into the reconsolidation pass, the
+   * whole-corpus backfill was complete before retirement, and nothing reads
+   * the key — pre-#206-B installs keep their stale value on disk, left to
+   * rot unread (no migration, no deletion). Do not repurpose the name.
    */
-  supersessionCursor?: number;
   /**
    * Resume cursor for the nightly's reconsolidation stage (#384) — highest
    * memories.rowid whose candidates have been evaluated (or infra-skipped)
    * with all their CONFIRMED work applied. Absent/0 = never run. Same
-   * advance-past-considered-candidates discipline as supersessionCursor,
+   * advance-past-considered-candidates discipline (formerly the retired
+   * supersessionCursor's),
    * with one addition (#439): confirmed merges and rewrite groups apply at
    * the candidate boundary — the END of the iteration that confirmed them —
    * and the cursor advances past a candidate only when that apply landed.

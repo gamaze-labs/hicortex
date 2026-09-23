@@ -159,11 +159,11 @@ export const MEMORY_PRECISION_WINDOW_DAYS = 90;
 /**
  * Cosine at/above which a pushed line reads "redundant" (restating the
  * session's standing context — the top lessons + identity every session-start
- * hook injects). Direction-only display guidance, never a gate. 0.80 mirrors
- * SUPERSESSION_MIN_SIMILARITY: at/above it a pair reads as the same
- * statement, below it as topical overlap — a reasonable first anchor until
- * the judged-calibration follow-up measures the real distribution (the
- * #426 provisional-anchor posture).
+ * hook injects). Direction-only display guidance, never a gate. 0.80 — the
+ * anchor it was seeded from (the retired supersession stage's floor, #206-B)
+ * at/above which a pair reads as the same statement, below it as topical
+ * overlap — a reasonable first anchor until the judged-calibration follow-up
+ * measures the real distribution (the #426 provisional-anchor posture).
  */
 export const MEMORY_PRECISION_REDUNDANT_ABOVE = 0.8;
 
@@ -182,6 +182,31 @@ export const MEMORY_PRECISION_DIVERGENCE_MIN_SHOWN = 5;
  * the same trust boundary as /distill's denoised conversation text).
  */
 export const MEMORY_PRECISION_PROMPT_EXCERPT_CHARS = 256;
+
+// ---------------------------------------------------------------------------
+// Volatility gate (#489) — deterministic drop of GH-ticket-status /
+// version-bump / commit-state entries at the distill gate, and the one-shot
+// store sweep that reuses the same gate.
+// ---------------------------------------------------------------------------
+
+/**
+ * Kill-switch for the deterministic volatility gate (#489, owner decision 5):
+ * false disables isVolatileStatusEntry's use in the distill path (entries
+ * keep flowing as before) AND the sweep's candidacy rule — one release-managed
+ * constant, no config knob (#408 discipline: moving it is a release decision,
+ * never a runtime one).
+ */
+export const VOLATILE_STATUS_FILTER = true;
+
+/**
+ * Max entry length the volatility gate will classify as volatile (#489) — the
+ * operationalization of the spec's "DOMINANT content matches": distiller
+ * bullets are one-liners, so a status shape in a SHORT entry dominates it,
+ * while the same clause riding inside long mixed prose does not (kept — the
+ * substance gate's precision-over-recall bias, applied to a second gate).
+ * 300 chars ≈ 3× the longest shape in the #489 KEEP/DROP corpus.
+ */
+export const VOLATILE_GATE_MAX_CHARS = 300;
 
 // ---------------------------------------------------------------------------
 // Composite ranking weights (was: score*Weight, supersededDemotion,
@@ -355,14 +380,11 @@ export const IMPORTANCE_SETTLE_WINDOW_DAYS = 3;
  *  corpus (89 clusters / 110 excess rows; data/audit-20260729). */
 export const DEDUP_AUTO_MERGE_THRESHOLD = 0.92;
 
-/** Minimum cosine for a nightly supersession candidate pair (#100 stage,
- *  0.15.0): one classify-tier call per pair above the bar. */
-export const SUPERSESSION_MIN_SIMILARITY = 0.80;
-
 /** Minimum cosine for a reconsolidation correction pair (#384). Deliberately
- *  wider than supersession's 0.80: a retraction often rides inside an
- *  otherwise unrelated memory; the verdict + confidence gate carry the
- *  precision. */
+ *  wide: a retraction often rides inside an otherwise unrelated memory; the
+ *  verdict + confidence gate carry the precision. (The retired Stage 3.7
+ *  supersession scan's 0.80 floor — #206-B, owner decision 6 — is subsumed:
+ *  3.8 scans all shapes from this wider floor.) */
 export const CORRECTION_MIN_SIMILARITY = 0.75;
 
 /** Minimum verdict confidence for the REWRITE (and #392 merge-apply) fork

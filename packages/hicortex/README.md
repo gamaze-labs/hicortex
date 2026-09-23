@@ -91,8 +91,8 @@ Bare top-level keys (`"serverUrl": …` at the root of `openclaw.json`) still wo
 | When | What | How |
 |------|------|-----|
 | Agent start | Standing identity (`## Identity`) + recent lessons fetched fresh and injected | CC SessionStart hook (calls `hicortex learnings-identity`; `lessons-context` kept as an alias so existing installed hooks don't break) / Hermes plugin `system_prompt_block` / OC `before_agent_start` hook |
-| Every prompt (0.14) | A compact **recall index** of relevant memories is injected — one line per memory; the agent lazy-loads full content with `hicortex_get` only when needed | All five harnesses call server `POST /recall-index` per turn: CC UserPromptSubmit hook (`hicortex recall-hook`), Hermes plugin `prefetch` (0.7.0; falls back to `/search` injection against a pre-0.14 server), OC `before_agent_start` hook (fires per inbound message), Pi extension `before_agent_start` (0.20), opencode plugin messages-transform hook (0.21). Turn-based dedup per session; resets on new session/compaction. Fail-soft |
-| Nightly | Denoise sessions → POST /distill → server distills + embeds + stores → consolidate (score, reflect, link, decay) | Automatic pipeline — no manual steps |
+| Every prompt (0.14) | A compact **recall index** of relevant memories is injected — one line per memory; the agent lazy-loads full content with `hicortex_get` only when needed | All five harnesses call server `POST /recall-index` per turn: CC UserPromptSubmit hook (`hicortex recall-hook`), Hermes plugin `prefetch` (0.7.0; falls back to `/search` injection against a pre-0.14 server), OC `before_agent_start` hook (fires per inbound message), Pi extension `before_agent_start` (0.20), opencode plugin messages-transform hook (0.21). Turn-based dedup per session; resets on new session/compaction. Fail-soft. Harness plumbing (task-notifications, command envelopes) is skipped deterministically at BOTH the hook and the server — a wrapper carrying real prose still recalls on the full text |
+| Nightly | Denoise sessions → POST /distill → server distills + embeds + stores → consolidate (score, reflect, link, decay) | Automatic pipeline — no manual steps. Volatile status entries (GitHub ticket states, version bumps, commit/push states) are dropped at a deterministic entry gate beside the substance gate — every drop rides the `/distill` response's `dropped` audit trail; decision/policy wording ("switched from X to Y", "never relicense…") always escapes the gate |
 
 **Exposure vs use (0.14):** appearing in the recall index only marks a memory as *shown* (it stops decaying while topically active); fetching it with `hicortex_get` marks it as *used* (durable strengthening). Memory importance is driven by what agents actually use, not by what was pushed at them.
 
@@ -216,6 +216,8 @@ npx @gamaze/hicortex classify-domains          # Backfill domain tags over the c
 npx @gamaze/hicortex classify-types            # Reclassify memory types (episode/fact/decision)
 npx @gamaze/hicortex dedup                     # Preview near-duplicate memory clusters (dry run, no changes)
 npx @gamaze/hicortex dedup --apply             # Merge near-duplicate clusters (backs up the DB first)
+npx @gamaze/hicortex sweep-volatile            # Preview volatile GitHub-status/version rows the gate would retire (dry run)
+npx @gamaze/hicortex sweep-volatile --apply    # Retire them via absorb (backs up the DB first; audit trail; never deletes)
 npx @gamaze/hicortex identity show [name]       # Print the standing identity layer (see Identity Layer)
 npx @gamaze/hicortex identity edit <name>       # Edit an identity section in $EDITOR
 npx @gamaze/hicortex identity show --agent <id> # Show a specific agent's resolved identity (0.13)

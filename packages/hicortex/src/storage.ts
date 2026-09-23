@@ -466,8 +466,8 @@ export function getMemoryTagsWeightedBatched(
  * Read the stored embedding for a memory from memory_vectors.
  * Returns null when the row is missing (caller falls back to re-embedding).
  *
- * Shared by `hicortex relink` and the nightly's supersession stage
- * (consolidate.ts) — lives here (not in relink.ts) so consolidate.ts can use
+ * Shared by `hicortex relink` and the nightly's resolution stages
+ * (reconsolidation.ts, consolidate.ts) — lives here (not in relink.ts) so they can use
  * it without importing from relink.ts, which itself imports from
  * consolidate.ts (BudgetTracker, discoverLinkCandidates).
  */

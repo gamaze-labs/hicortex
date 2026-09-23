@@ -846,13 +846,11 @@ export async function runNightly(options: {
               // #408: weakPrimaryFloor is a release-managed calibration
               // constant now — no config threading; the Options field stays
               // as the eval/test seam.
-            }, {
-              // #405: no supersessionMaxCalls — the ONE run budget is the
-              // only call cap. #408: minSimilarity defaults to the
-              // calibration constant (seam only).
             },
               // #405: the ONE per-run LLM-call ceiling (default 5000;
               // consolidateMaxLlmCalls honored as a deprecated alias).
+              // (#206-B: the retired supersession stage's options slot sat
+              // here — removed with the stage; true-update detection is 3.8's.)
               resolveNightlyLlmCallBudget(savedConfig),
               // #245: soft cap on the corpus (default 10000; 0 disables eviction).
               memorySoftCapResolved,

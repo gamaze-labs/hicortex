@@ -7,6 +7,7 @@
 import type { LlmClient, LlmUsage } from "./llm.js";
 import { distillation } from "./prompts.js";
 import { redact, type RedactionConfig } from "./redact.js";
+import { VOLATILE_STATUS_FILTER, VOLATILE_GATE_MAX_CHARS } from "./calibration.js";
 
 const MAX_TRANSCRIPT_CHARS = 80_000;
 const MIN_CONVERSATION_CHARS = 200;
@@ -472,22 +473,35 @@ async function distillChunk(
   }
 
   const entries: DistilledEntry[] = [];
-  const dropped: string[] = [];
+  const substanceDropped: string[] = [];
+  const volatileDropped: string[] = [];
   for (const entry of parsed) {
-    if (hasMinimalSubstance(entry.content)) {
-      entries.push(entry);
-    } else {
-      dropped.push(entry.content);
+    if (!hasMinimalSubstance(entry.content)) {
+      substanceDropped.push(entry.content);
+      continue;
     }
+    // #489 volatility gate (owner decision 2: entry-level, deterministic,
+    // beside the substance gate — cleanMessageContent untouched): GH-ticket /
+    // version-bump / commit-state status shapes drop into the SAME #156
+    // trail (owner decision 1: mark-and-skip, never silent). Kill-switch =
+    // the release-managed calibration constant (owner decision 5).
+    if (VOLATILE_STATUS_FILTER && isVolatileStatusEntry(entry.content)) {
+      volatileDropped.push(entry.content);
+      continue;
+    }
+    entries.push(entry);
   }
-  if (dropped.length > 0) {
-    for (const d of dropped) {
+  const dropped = [...substanceDropped, ...volatileDropped];
+  for (const [label, list] of [
+    ["Substance gate", substanceDropped],
+    ["Volatility gate", volatileDropped],
+  ] as const) {
+    if (list.length === 0) continue;
+    for (const d of list) {
       const preview = d.length > 120 ? `${d.slice(0, 120)}…` : d;
-      console.log(`[hicortex]     Substance gate: dropped "${preview}"`);
+      console.log(`[hicortex]     ${label}: dropped "${preview}"`);
     }
-    console.log(
-      `[hicortex]     Substance gate: dropped ${dropped.length}/${parsed.length} content-free fragment(s)`
-    );
+    console.log(`[hicortex]     ${label}: dropped ${list.length}/${parsed.length} entr(ies)`);
   }
   // Parsed-zero bypass (#339 CR finding 2): a non-empty response with no
   // NO_EXTRACT token that still parses to zero bullets is the silent twin of
@@ -581,6 +595,86 @@ export function hasMinimalSubstance(entry: string): boolean {
   // e.g. "[decision]: [reasoning]".
   if (/^(?:\[[^\]]{0,80}\]|[\s:.,;–-])+$/.test(body)) return false;
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Volatility gate (#489) — deterministic, entry-level, beside the substance
+// gate. Owner directive (gold-set A adjudication): GitHub ticket/workflow
+// states and version numbers churn faster than nightly consolidation retires
+// them — they arrive as supersession noise and inflate the store with
+// same-subject rows. The ephemera PROMPT already names these categories and
+// demonstrably under-fires (a month of it running, gold A still full of
+// GH-status/version rows) — so the filter is deterministic, catching entries
+// synthesized from ANY source prose.
+// ---------------------------------------------------------------------------
+
+/**
+ * Durability escapes — decision/policy predicates that OVERRIDE every
+ * volatility trigger (#489 spec): "switched from X to Y" is a durable model
+ * choice even though it names two versions; a version boundary is a policy
+ * even though it cites one. Whole-word, case-insensitive. Version numbers
+ * never trigger alone — version + STATUS-verb triggers; version +
+ * DECISION-verb escapes.
+ */
+const VOLATILE_ESCAPES: RegExp =
+  /\b(?:switch(?:ed)?\s+from|adopt(?:ed)?|standardi[sz]ed|deprecated|polic(?:y|ies)|rule|boundary|convention|must|never|always|only\s+when)\b/i;
+
+/** T1 — GH ticket/workflow status: a #number ticket + a status predicate, or
+ *  a workflow-run shape (checks/CI outcome, test-count status). */
+const TICKET_REF = /(?:^|[\s(#])(?:pr|issue|epic)?\s*#\d+/i;
+const TICKET_STATUS =
+  /\b(?:merged?|closed?|reopened?|opened?|approved?|blocked?|failing|pass(?:ed|ing)?|green|red|ready|draft)\b/i;
+const WORKFLOW_STATUS =
+  /\b(?:checks?\s+(?:passed|failed|green|red)|ci\s+(?:green|red)|\d+\s+tests?\s+(?:pass(?:ed|ing)?|fail(?:ed|ing)?))\b/i;
+
+/** T2 — version-bump status: a semver-ish number + a release verb, or a
+ *  version→version transition. The `\b` boundary keeps "Qwen3.6" (no
+ *  boundary between n and 3) from matching — model names are not versions. */
+const SEMVERISH = /\bv?\d+\.\d+(?:\.\d+)?\b/;
+const RELEASE_VERB =
+  /\b(?:released?|deployed?|promoted?|published?|tagged?|bumped?|cut|shipped?|rolled?\s+out|dist-tags?)\b/i;
+const VERSION_TRANSITION =
+  /\bv?\d+\.\d+(?:\.\d+)?\b[^.\d]{0,20}(?:→|->|to)\s*v?\d+\.\d+(?:\.\d+)?\b/i;
+
+/** T3 — branch/commit state: a short sha (7-40 hex, word-bounded) + a
+ *  vcs-motion verb. The SHA is the discriminator, so the verb list is bare
+ *  ("rebased feature branch onto 4f9c1ab" must fire); a durable narrative
+ *  carrying a sha + verb rides the escape list or the length cap. */
+const SHORT_SHA = /\b[0-9a-f]{7,40}\b/;
+const VCS_STATE =
+  /\b(?:pushed?|merged?|rebased?|force-?pushed?|updated?)\b/i;
+
+/**
+ * True when the entry is a VOLATILE STATUS SHAPE — GH-ticket/workflow status,
+ * version-bump status, or branch/commit state — and carries no durability
+ * escape (#489, owner decisions 1+2). Runs in distillChunk's gate zone beside
+ * hasMinimalSubstance; drops ride the SAME #156 dropped[] trail. Also reused
+ * verbatim by `hicortex sweep-volatile` over the stored corpus — ONE gate,
+ * one meaning.
+ *
+ * PRECISION OVER RECALL (the substance gate's law, inherited): escapes are
+ * checked FIRST and override every trigger; entries longer than
+ * VOLATILE_GATE_MAX_CHARS are treated as mixed prose whose status clause is
+ * not the DOMINANT content (kept). Accepted false-positive mode, stated
+ * plainly: an entry pairing a status clause with a distinct durable clause
+ * and no escape word drops, losing the durable half — unless the distiller
+ * emitted that half as its own entry, which is exactly what the ephemera
+ * prompt tells it to do. Every drop is auditable via the trail.
+ */
+export function isVolatileStatusEntry(entry: string): boolean {
+  const raw = entry.trim();
+  if (!raw || raw.length > VOLATILE_GATE_MAX_CHARS) return false;
+  if (VOLATILE_ESCAPES.test(raw)) return false;
+
+  const ticketStatus = TICKET_REF.test(raw) && TICKET_STATUS.test(raw);
+  const workflowStatus = WORKFLOW_STATUS.test(raw);
+  // A version number + release verb, OR a bare version→version transition
+  // (the transition fires without a verb — "0.22.2 → 0.22.3 on rc" is a
+  // version-bump status; the escape list carries the durable flips).
+  const versionBump =
+    (SEMVERISH.test(raw) && RELEASE_VERB.test(raw)) || VERSION_TRANSITION.test(raw);
+  const commitState = SHORT_SHA.test(raw) && VCS_STATE.test(raw);
+  return ticketStatus || workflowStatus || versionBump || commitState;
 }
 
 /**

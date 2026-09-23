@@ -129,8 +129,8 @@ function loadExistingPairs(db: Database.Database): Set<string> {
 /**
  * Read the stored embedding for a memory from memory_vectors.
  * Returns null when the row is missing (caller falls back to re-embedding).
- * @deprecated moved to storage.ts (shared with consolidate.ts's supersession
- * stage); re-exported here so existing importers of relink.ts keep working.
+ * @deprecated moved to storage.ts (shared with the resolution stages);
+ * re-exported here so existing importers of relink.ts keep working.
  */
 export { getStoredEmbedding } from "./storage.js";
 

@@ -80,8 +80,12 @@ export function clusterExcess(clusters: string[][]): number {
 // Metadata-mismatch guard (shared by the #191 audit dump and `hicortex dedup`)
 // ---------------------------------------------------------------------------
 
-/** Metadata fields a merge candidate cluster must agree on. `privacy` is on the row (the
- *  column still exists) but is NOT a merge-safety field — vestigial since 0.16.2. */
+/** Metadata row shape for the merge-safety check. `privacy` and `source_agent`
+ *  are on the row (the columns still exist) but are NOT merge-safety fields:
+ *  privacy is vestigial since 0.16.2, and the agent rail was REMOVED by owner
+ *  decision (#206 decision 2, 2026-09-21) — cross-agent clusters merge, because
+ *  attribution survives on the retained absorbed-loser row and no recall path
+ *  filters by source_agent. Project is the only rail. */
 export interface ClusterMetaRow {
   project: string | null;
   privacy: string | null;
@@ -90,18 +94,13 @@ export interface ClusterMetaRow {
 
 export interface ClusterMetadataMismatch {
   projectMismatch: boolean;
-  sourceAgentMismatch: boolean;
 }
 
-/** Do cluster members disagree on project / source_agent? (merge-safety input for #100).
- *  Privacy is intentionally NOT checked — it is vestigial since 0.16.2. */
+/** Do cluster members disagree on project? (merge-safety input for #100/#206.)
+ *  Privacy and source_agent are intentionally NOT checked — see ClusterMetaRow. */
 export function clusterMetadataMismatch(members: ClusterMetaRow[]): ClusterMetadataMismatch {
   const projects = new Set(members.map((m) => m.project ?? "\u0000null"));
-  const agents = new Set(members.map((m) => m.source_agent));
-  return {
-    projectMismatch: projects.size > 1,
-    sourceAgentMismatch: agents.size > 1,
-  };
+  return { projectMismatch: projects.size > 1 };
 }
 
 // ---------------------------------------------------------------------------
