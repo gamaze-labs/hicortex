@@ -14,3 +14,9 @@ packages/hicortex/opencode-plugin/
 
 # distill-ab-check harness outputs (scripts/distill-ab-check README)
 distill-ab-out-*/
+
+# Local prototypes, previews and test homes (owner decision 2026-09-25): never committed
+scratchpad/
+
+# Local Claude state (review scratch) — settings.json above stays tracked
+.claude/issue/

@@ -345,9 +345,8 @@
   }
   .acct-btn:hover{ border-color:var(--green-mid); color:var(--green-mid); }
   .acct-btn:disabled{ opacity:0.5; cursor:default; }
-  .acct-menu details{ border-top:1px solid var(--line); margin-top:10px; padding-top:8px; }
-  .acct-menu summary{ cursor:pointer; color:var(--dim); font-size:13px; }
-  .acct-menu summary:hover{ color:var(--green-mid); }
+  /* the acct-* snippet classes are shared by the account menu's token row
+     and the connect overlay's snippet blocks (#506 — one idiom, two hosts) */
   .acct-snippet{ margin-bottom:8px; }
   .acct-snippet pre{
     background:var(--panel); border:1px solid var(--line2); border-radius:7px;
@@ -363,12 +362,40 @@
   }
   .acct-link:hover{ background:var(--panel); }
   .acct-link.acct-danger:hover{ color:var(--red); }
-  /* the upgrade CTA as a MENU ITEM (#409 fix round 2, owner ruling
-     2026-09-14: the corner is the account chip; upgrade lives INSIDE the
-     menu — no standalone header button). Accent row in the #365 link style. */
-  .acct-link.acct-upgrade{ color:var(--green-mid); font-weight:640; }
-  .acct-link.acct-upgrade:hover{ background:color-mix(in srgb, var(--green) 8%, transparent); }
-  .acct-link.acct-upgrade:disabled{ opacity:.5; cursor:default; }
+  /* the Subscription entry's upgrade pill (#371 round 3, owner: the menu's
+     two billing entries merge into ONE "Subscription" item — "it can have
+     an upgrade pill/label after it before any subscription is active").
+     The ENTRY always renders; the PILL is what the plan-unset eligibility
+     gates. Accent badge in the trigger's chip idiom. */
+  .acct-link .acct-pill{
+    margin-left:8px; font-size:9px; font-weight:640; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--green-mid); border:1px solid color-mix(in srgb, var(--green) 35%, transparent);
+    background:color-mix(in srgb, var(--green) 8%, transparent);
+    border-radius:999px; padding:1px 7px; vertical-align:1px;
+  }
+
+  /* ============ billing-return banner (#371) — the one-line acknowledgment
+     for ?billing=success|cancelled (the URLs the router stamps on every
+     checkout). A page-level element under the header, deliberately NOT a
+     toast: the returning buyer must still find it when they look back at
+     the page. Shown once — the param is stripped on show, so neither
+     dismissal nor a plain reload can re-show it. Theme tokens only. */
+  #billing-banner{
+    display:flex; align-items:center; justify-content:center; gap:10px;
+    margin:8px 16px 0; padding:7px 12px; border-radius:10px;
+    border:1px solid var(--line2); background:var(--panel);
+    font-size:12px; color:var(--dim); flex:none;
+  }
+  /* author display beats the UA's [hidden]{display:none} — without the
+     override the "hidden" banner rendered an EMPTY strip under the header
+     on every plain load (found live in preview). The #model-modal idiom. */
+  #billing-banner[hidden]{ display:none; }
+  #billing-banner[data-kind="success"]{
+    color:var(--green-mid);
+    border-color:color-mix(in srgb, var(--green) 30%, var(--line2));
+  }
+  #billing-banner button{ color:var(--faint); font-size:11px; padding:2px 4px; }
+  #billing-banner button:hover{ color:var(--text); }
 
   /* ============ the stats band — a WRAPPING CARD GRID ============
      Cards come in TWO widths only — the row is a positional grid
@@ -503,8 +530,9 @@
 
   .cap-of{ font-size:10.5px; color:var(--faint); font-variant-numeric:tabular-nums; }
   .bseg.warn .csub{ color:var(--amber); }
-  /* Agents card: a faded amber Connect pill, bottom-right — opens the rail's
-     connect drawer (the phase-1 stand-in for the seats CTA: no cap exists) */
+  /* Agents card: a faded amber Connect pill, bottom-right — opens the
+     full-cover connect overlay (#506; the phase-1 rail drawer stand-in for
+     the seats CTA is retired: no cap exists) */
   #lim-ag .limit-cta{
     display:inline-block; align-self:flex-end;
     color:var(--amber); border-color:color-mix(in srgb, var(--amber) 45%, transparent);
@@ -766,24 +794,6 @@
   .ctx-detail .ctx-head{ display:flex; align-items:center; gap:8px; margin-bottom:4px; min-width:0; }
   .ctx-detail .ctx-head b{ font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .ctx-detail .ctx-head small{ color:var(--faint); font-family:var(--mono); font-size:9px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #connect{ flex:none; border-top:1px solid var(--line); padding:8px; }
-  #connect-btn{
-    display:flex; align-items:center; gap:7px; width:100%; justify-content:center;
-    color:var(--green-mid); border:1px dashed color-mix(in srgb, var(--green) 35%, transparent); border-radius:10px;
-    padding:7px 10px; font-size:11.5px; transition:box-shadow .15s, background .15s;
-  }
-  html:not([data-theme="light"]) #connect-btn:hover{ box-shadow:0 0 12px rgba(61,255,122,.18); }
-  html[data-theme="light"] #connect-btn:hover{ background:color-mix(in srgb, var(--green) 5%, transparent); }
-  #connect-btn .plus{ font-size:14px; line-height:1; }
-  #connect-x{ display:none; margin-top:8px; background:var(--elev); border:1px solid var(--line2); border-radius:10px; padding:10px 11px; }
-  #connect-x.open{ display:block; }
-  #connect-x p{ font-size:10.5px; color:var(--dim); line-height:1.5; margin-bottom:7px; }
-  #connect-x .snip{
-    font-family:var(--mono); font-size:10px; color:var(--green-mid); background:var(--panel);
-    border:1px solid var(--line2); border-radius:7px; padding:7px 9px;
-    white-space:nowrap; overflow-x:auto; margin-bottom:7px;
-  }
-  #connect-x .row{ display:flex; justify-content:flex-end; gap:6px; }
 
   /* ---- shared kv rows (band detail groups + memory detail internals) ---- */
   .kv{ display:flex; justify-content:space-between; gap:12px; font-size:11.5px; padding:2.5px 0; min-width:0; }
@@ -975,9 +985,9 @@
   /* toasts + tooltip */
   #toasts{ position:fixed; left:50%; bottom:20px; transform:translateX(-50%); z-index:95; display:flex; flex-direction:column; gap:8px; align-items:center; pointer-events:none; }
 
-  /* model-settings modal (#422) — the #panel/#connect-x visual language as a
-     centered overlay; every color rides the theme vars (zero theme-specific
-     rules, both themes work) */
+  /* model-settings modal (#422) — the #panel visual language as a centered
+     overlay; every color rides the theme vars (zero theme-specific rules,
+     both themes work) */
   #model-modal{ position:fixed; inset:0; z-index:90; display:grid; place-items:center; }
   #model-modal[hidden]{ display:none; }
   #model-modal .mm-backdrop{ position:absolute; inset:0; background:rgba(0,0,0,.55); }
@@ -994,6 +1004,61 @@
   .mm-check small{ color:var(--faint); }
   #model-modal .mm-note{ padding:4px 14px 8px; font-size:10px; color:var(--faint); font-style:italic; }
   #model-modal .mm-foot{ display:flex; justify-content:flex-end; gap:7px; padding:10px 14px; border-top:1px solid var(--line); }
+
+  /* plan & billing overlay (#371, owner amendment 2 2026-09-23: the under-
+     graph section was rejected — the upgrade surface must COVER the dash).
+     The #model-modal idiom, widened for two side-by-side option cards; the
+     cover is OPAQUE (var(--bg), not a scrim) — the dash is fully hidden
+     behind it, not dimmed-partial. The [hidden] override is mandatory
+     (author display beats the UA rule — the banner lesson, pinned by tests). */
+  #plan-overlay{ position:fixed; inset:0; z-index:92; display:grid; place-items:center; }
+  #plan-overlay[hidden]{ display:none; }
+  #plan-overlay .po-cover{ position:absolute; inset:0; background:var(--bg); }
+  #plan-overlay .po-card{
+    position:relative; width:min(860px, calc(100vw - 32px)); max-height:calc(100vh - 48px);
+    overflow-y:auto; background:var(--elev); border:1px solid var(--line2); border-radius:14px;
+    box-shadow:var(--shadow-pop);
+  }
+  #plan-overlay .po-head{ display:flex; align-items:center; justify-content:space-between; padding:14px 16px 10px; border-bottom:1px solid var(--line); }
+  #plan-overlay .po-head b{ font-family:var(--serif); font-weight:500; font-size:17px; letter-spacing:.06em; text-transform:uppercase; }
+  #plan-overlay .po-body{ padding:14px 16px 16px; display:flex; flex-direction:column; gap:10px; }
+  #plan-overlay .po-current{ font-size:12.5px; color:var(--dim); }
+  .po-opts{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  #acct-options[hidden]{ display:none; }   /* author grid beats [hidden] (renderPlanOverlay hides it when a plan is set) */
+  .po-opt{ background:var(--panel); border:1px solid var(--line2); border-radius:12px; padding:14px 16px 13px; display:flex; flex-direction:column; gap:5px; min-width:0; }
+  .po-opt .po-name{ font-size:10px; color:var(--faint); text-transform:uppercase; letter-spacing:.13em; }
+  .po-opt .po-price{ font-size:26px; font-weight:640; font-variant-numeric:tabular-nums; letter-spacing:.01em; color:var(--green); }
+  html:not([data-theme="light"]) .po-opt .po-price{ text-shadow:0 0 12px rgba(61,255,122,.35); }
+  .po-opt .po-note{ font-size:11px; color:var(--dim); }
+  /* what's included (round 3, owner: "NO info on what is included in the
+     plan") — the marketing site's Cloud feature lines, verbatim, per card. */
+  .po-opt .po-feat{ list-style:none; margin-top:7px; display:flex; flex-direction:column; gap:3px; }
+  .po-opt .po-feat li{ font-size:11px; color:var(--dim); display:flex; gap:7px; align-items:baseline; }
+  .po-opt .po-feat li::before{ content:"✓"; color:var(--green-mid); font-size:10px; }
+  .po-choose{
+    align-self:flex-start; margin-top:8px;
+    color:var(--green-mid); border:1px solid color-mix(in srgb, var(--green) 35%, transparent);
+    border-radius:999px; padding:4px 15px; font-size:11.5px; font-weight:600; white-space:nowrap;
+  }
+  .po-choose:hover{ border-color:var(--green-mid); }
+  .po-choose:disabled{ opacity:.5; cursor:default; }
+  @media (max-width:720px){ .po-opts{ grid-template-columns:1fr; } }
+
+  /* connect overlay (#506) — ONE full-cover surface for every "Connect an
+     agent" entry (the #plan-overlay idiom, owner 2026-09-24: the fleet
+     rail's inline drawer is REMOVED, not kept; the account-menu entry and
+     the Agents-detected pill both open THIS). The cover is OPAQUE
+     (var(--bg), not a scrim) and the [hidden] override is MANDATORY
+     (author display beats the UA rule — the banner lesson, pinned by
+     tests). The snippet blocks reuse the acct-* classes. */
+  #connect-overlay{ position:fixed; inset:0; z-index:92; display:grid; place-items:center; }
+  #connect-overlay[hidden]{ display:none; }
+  #connect-overlay .co-cover{ position:absolute; inset:0; background:var(--bg); }
+  #connect-overlay .co-card{ position:relative; width:min(640px, calc(100vw - 32px)); max-height:calc(100vh - 48px); overflow-y:auto; background:var(--elev); border:1px solid var(--line2); border-radius:14px; box-shadow:var(--shadow-pop); }
+  #connect-overlay .co-head{ display:flex; align-items:center; justify-content:space-between; padding:14px 16px 10px; border-bottom:1px solid var(--line); }
+  #connect-overlay .co-head b{ font-family:var(--serif); font-weight:500; font-size:17px; letter-spacing:.06em; text-transform:uppercase; }
+  #connect-overlay .co-body{ padding:14px 16px 16px; display:flex; flex-direction:column; gap:10px; }
+  #connect-overlay .co-intro{ font-size:12px; color:var(--dim); line-height:1.5; }
   .toast{
     background:var(--elev); border:1px solid var(--line2); border-radius:999px; padding:8px 17px;
     font-size:12px; color:var(--text); box-shadow:var(--shadow-pop);
@@ -1146,6 +1211,11 @@
   </div>
 </header>
 
+<!-- billing-return banner (#371) — filled by wireBillingBanner() when the
+     URL carries ?billing=success|cancelled (the checkout return URLs the
+     router stamps). Dismiss removes it; the param is stripped on show. -->
+<div id="billing-banner" role="status" aria-live="polite" hidden></div>
+
 <!-- ============ the stats band — card grid (two rows of four) ============ -->
 <section id="measures" aria-label="Vitals, operator data, and account limits">
   <div class="band" id="strip">
@@ -1164,8 +1234,10 @@
         <div class="csub" id="ag-sub-band">found on their own</div>
         <button class="limit-cta" id="ag-cta">Connect Agent</button>
       </div>
-      <!-- #plan-billing: the account menu's "Plan & billing" target — the
-           token/cap usage card is this page's billing-adjacent surface -->
+      <!-- #plan-billing: the token/cap usage card — this page's
+           billing-adjacent surface. The account-menu item that scrolled
+           here was consolidated into the Subscription entry (#371 round 3);
+           the anchor id stays (diagnostics + tests pin it). -->
       <div class="bseg c-red" id="plan-billing">
         <div class="gh"><span class="t">Token usage</span></div>
         <div class="big"><span class="n" id="tok-n">—</span><span class="l">used</span><span class="cap-of" id="tok-of" hidden></span></div>
@@ -1284,17 +1356,9 @@
   <aside id="agentscol" aria-label="Connected agents">
     <div class="col-head"><span class="t">Fleet</span><small id="ag-sub">0 &middot; auto-detected</small></div>
     <div id="ag-list"></div>
-    <div id="connect">
-      <button id="connect-btn"><span class="plus">+</span> connect an agent</button>
-      <div id="connect-x">
-        <p>Run this on the machine that hosts the agent. It appears here the moment it first talks to the server.</p>
-        <div class="snip" id="connect-snip"></div>
-        <div class="row">
-          <button class="btn sm" id="connect-copy">Copy command</button>
-          <button class="btn sm save" id="connect-close">Done</button>
-        </div>
-      </div>
-    </div>
+    <!-- #506: the fleet rail's + connect-an-agent drawer lived here — REMOVED
+         (owner 2026-09-24). Both surviving connect entries (the account-menu
+         entry + the Agents-detected pill) open the #connect-overlay. -->
   </aside>
 </main>
 
@@ -1335,6 +1399,64 @@
     <div class="mm-foot">
       <button class="btn" id="mm-cancel">Cancel</button>
       <button class="btn save" id="mm-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ the PLAN & BILLING overlay (#371, owner amendment 2
+     2026-09-23: the under-graph section was rejected after the live look —
+     "the plan and billing needs to open up as overlay, not under the
+     graph, it could not even find it first. needs to cover the normal dash
+     or be a separate tab or view"; the owner picked the full overlay).
+     Opens from the account menu's Subscription entry (round 3: the two
+     billing entries merged into one); the opaque .po-cover fully hides
+     the dash (not dimmed-partial). × / cover-click / ESC close and return
+     where the user was. The option cards are GENERATED from the
+     PLAN_OPTIONS data array (round 3: N-driven — a future plan is a data
+     entry + a router price id, not a page rework); prices and the
+     included-features bullets are display constants aligned with the
+     marketing site (lockstep-pinned by tests). The router deliberately
+     knows only Stripe price ids, so there is no server-side amount to
+     read; the Stripe Checkout page shows the authoritative amount before
+     payment. ============ -->
+<div id="plan-overlay" hidden>
+  <div class="po-cover" id="po-cover"></div>
+  <div class="po-card" role="dialog" aria-modal="true" aria-labelledby="po-title">
+    <div class="po-head"><b id="po-title">Plan &amp; billing</b><button class="pm-close" id="po-close" aria-label="Close">&#10005;</button></div>
+    <div class="po-body">
+      <div class="po-current" id="po-current"></div>
+      <div class="po-opts" id="acct-options"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ the CONNECT overlay (#506) — ONE full-cover surface for
+     every "Connect an agent" entry. Before this there were two shapes: the
+     account menu's inline expandable snippets and the fleet rail's +
+     drawer. Owner 2026-09-24: the rail entry is REMOVED, not kept; the
+     account-menu entry and the Agents-detected pill both open THIS
+     (#plan-overlay idiom: opaque cover, × / cover-click / ESC). The
+     snippet <pre>s and copy buttons keep the acct-* ids so
+     renderAcctToken keeps driving them (token-gated: disabled until
+     /account/token answers); the wiring is STATIC so the overlay works
+     even when /account failed and the menu never rendered. The overlay
+     itself lazily fetches the token on open (idempotent). ============ -->
+<div id="connect-overlay" hidden>
+  <div class="co-cover" id="co-cover"></div>
+  <div class="co-card" role="dialog" aria-modal="true" aria-labelledby="co-title">
+    <div class="co-head"><b id="co-title">Connect an agent</b><button class="pm-close" id="co-close" aria-label="Close">&#10005;</button></div>
+    <div class="co-body">
+      <p class="co-intro">Run this on the machine that hosts the agent. It appears here the moment it first talks to the server.</p>
+      <div class="acct-label">CLI</div>
+      <div class="acct-snippet">
+        <pre id="acct-cli"></pre>
+        <button id="acct-copy-cli" type="button" class="acct-btn" disabled>Copy</button>
+      </div>
+      <div class="acct-label">MCP — ~/.claude.json</div>
+      <div class="acct-snippet">
+        <pre id="acct-mcp"></pre>
+        <button id="acct-copy-mcp" type="button" class="acct-btn" disabled>Copy</button>
+      </div>
     </div>
   </div>
 </div>
@@ -2966,9 +3088,12 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='ArrowRight'){ manualTake(); seek(T+1); }
   else if(e.key==='t'||e.key==='T'){ setTheme(document.documentElement.dataset.theme==='dark'?'light':'dark'); }
   else if(e.key==='Escape'){
-    if(document.getElementById('acct-menu') && document.getElementById('acct-menu').classList.contains('open')) closeAcctMenu();
+    const po=el('plan-overlay');
+    const co=el('connect-overlay');
+    if(po && !po.hidden) closePlanOverlay();   /* the full-cover overlay is topmost — it closes first (#371) */
+    else if(co && !co.hidden) closeConnectOverlay();   /* #506 — same tier: the connect overlay */
+    else if(document.getElementById('acct-menu') && document.getElementById('acct-menu').classList.contains('open')) closeAcctMenu();
     else if(panel.classList.contains('open')) closePanel();
-    else if(el('connect-x').classList.contains('open')) el('connect-x').classList.remove('open');
     else if(focusDom!=null) setFocus(null);
   }
   wake();
@@ -3784,7 +3909,9 @@ function lastNightByAgent(){
 function buildAgents(){
   const listEl=el('ag-list'); listEl.innerHTML='';
   const gs=contextGroups();
-  if(!gs.length){ listEl.innerHTML='<div class="pm-empty" style="padding:10px 6px;">no contexts yet — connect an agent below</div>'; return; }
+  /* #506: the "below" target (the rail drawer) is gone — the empty state
+     points at the one remaining connect surface, the account menu */
+  if(!gs.length){ listEl.innerHTML='<div class="pm-empty" style="padding:10px 6px;">no contexts yet — connect an agent from the account menu (top right)</div>'; return; }
   const lastNight=lastNightByAgent();
   /* #423 phase 3: presence + pauses ride D.fleet — ABSENT on a pre-phase-3
      server → no dots, no toggles, no paused state (phase-2 rendering) */
@@ -4022,8 +4149,6 @@ async function refreshFleet(){
     renderBand();
   }catch(e){ toast('Refresh failed: '+e.message); }
 }
-el('connect-btn').onclick=()=>{ el('connect-x').classList.toggle('open'); wake(); };
-
 /* model-settings modal wiring (#422) */
 el('model-cfg').onclick=()=>{ openModelModal(); wake(); };
 el('mm-close').onclick=closeModelModal;
@@ -4031,14 +4156,10 @@ el('mm-cancel').onclick=closeModelModal;
 el('mm-backdrop').onclick=closeModelModal;
 el('mm-save').onclick=()=>{ saveModelSettings(); wake(); };
 el('mm-think').addEventListener('change',()=>{ mmThinkTouched=true; });
-el('ag-cta').onclick=()=>{ el('connect-x').classList.add('open');
-  el('connect-btn').scrollIntoView({block:'nearest',behavior:'smooth'}); wake(); };
-el('connect-close').onclick=()=>el('connect-x').classList.remove('open');
-el('connect-snip').textContent='npx @gamaze/hicortex init --server '+location.origin;
-el('connect-copy').onclick=()=>{
-  copyToClipboard('npx @gamaze/hicortex init --server '+location.origin, el('connect-copy'));
-  wake();
-};
+/* #506: the Agents-detected pill opens the full-cover connect overlay —
+   the rail drawer (+ button, open/scroll mechanics) it used to target is
+   REMOVED (owner 2026-09-24) */
+el('ag-cta').onclick=()=>{ openConnectOverlay(); wake(); };
 
 /* ---------- the memory browser — dropdown under the search pill ---------- */
 const panel=el('panel');
@@ -4416,8 +4537,9 @@ async function refreshAfterWrite(){
 
 /* =====================================================================
    ACCOUNT MENU — harvested from the 0.20.4 console (#365): authoritative
-   token via lazy GET /account/token, connect snippets, plan & billing,
-   sign-out (client-side only — dropping the stored tokens IS the sign-out).
+   token via lazy GET /account/token, connect overlay entry (#506 — the
+   snippets moved to the full-cover overlay), plan & billing, sign-out
+   (client-side only — dropping the stored tokens IS the sign-out).
    ===================================================================== */
 const $ = el;   // the harvested block below uses the $ shorthand
 /* Pure decision — what the corner renders for an /account payload (#409 fix
@@ -4441,6 +4563,58 @@ function acctMenuPlan(a) {
     avatar: ((typeof a.name === "string" && a.name) ? a.name : "?").slice(0, 2).toUpperCase(),
   };
 }
+/* Pure decision (#371) — the purchasable periods. Decided pricing (owner
+   2026-08-19): ONE price, TWO periods — €12/mo and €108/yr. ANNUAL FIRST:
+   annual is the stated product default; its note is the numeric savings
+   sub-line (round-4 addendum 2026-09-24: it replaces the retired
+   words-only annual tagline — same fact, numbers not words; effective
+   monthly 108/12 = €9, discount (144−108)/144 = 25%, derived-pinned by
+   tests so a price change forces the sub-line update). Prices are
+   display constants — the
+   router deliberately knows only Stripe price ids (no server-side amount
+   exists to read), and the Stripe Checkout page shows the authoritative
+   amount before payment. Round 3: a PURE DATA ARRAY and the single source
+   of truth — the overlay cards are GENERATED from it (renderPlanCards)
+   and the wiring loops it (wireSubscription); no two-plan hardcoding
+   anywhere. The bullets are the marketing site's Cloud feature lines,
+   verbatim (lockstep-pinned against web/index.html) — the seven
+   owner-decided lines (amendment 4, 2026-09-24: copy-first ruling; the
+   agent-cap enforcement rides its own issue); both periods are the same
+   Cloud product, so both carry the same seven. */
+const PLAN_OPTIONS = [
+  { id: "annual", posts: "annual", name: "Annual", price: "€108/year", note: "€9/mo · 25% off", cta: "Choose annual", bullets: ["Fully managed — no API keys needed", "Claude Code, Hermes, OpenClaw, Pi, OpenCode", "10,000 memories included", "Up to 10 agents", "Learnings & nightly reflection", "Semantic search + knowledge graph", "Multi-machine support"] },
+  { id: "monthly", posts: "monthly", name: "Monthly", price: "€12/mo", note: "", cta: "Choose monthly", bullets: ["Fully managed — no API keys needed", "Claude Code, Hermes, OpenClaw, Pi, OpenCode", "10,000 memories included", "Up to 10 agents", "Learnings & nightly reflection", "Semantic search + knowledge graph", "Multi-machine support"] },
+];
+/* Pure decision (#371) — the Stripe return parameter (?billing=…, the
+   success_url/cancel_url the router stamps on every checkout) → the
+   acknowledgment banner spec, or null when there is nothing to acknowledge
+   (unknown or absent → the page shows nothing, never a guess). */
+function billingBanner(value) {
+  if (value === "success")
+    return { kind: "success", text: "payment received — activation completes within a minute" };
+  if (value === "cancelled")
+    return { kind: "cancelled", text: "checkout cancelled — nothing was charged" };
+  return null;
+}
+/* Pure decision (#371, amendment 2) — the overlay's current-plan line.
+   HONEST by construction: /account provides name/org/plan only, so the
+   line shows the plan label verbatim when set, and when unset the
+   documented meaning of a null label (the same eligibility the Upgrade
+   entry uses) — never invented tiers or numbers. */
+function acctPlanLine(p) {
+  return p.plan
+    ? "Current plan — " + p.plan
+    : "Current plan — none yet (hosted trial, or self-hosted install)";
+}
+/* Pure decision (#371 round 3) — the Subscription entry's Upgrade pill.
+   The menu's two billing entries (Upgrade + Plan & billing) merged into
+   ONE always-rendered "Subscription" item; the PILL is what the old
+   plan-unset eligibility gates (owner: "it can have an upgrade pill/label
+   after it before any subscription is active"). Returns the pill markup
+   or "" — interpolated into the entry's label. */
+function acctPill(p) {
+  return p.upgrade ? '<span class="acct-pill">Upgrade</span>' : "";
+}
 function renderAccount(a) {
   const host = $("nav-account");
   const p = acctMenuPlan(a);
@@ -4449,9 +4623,7 @@ function renderAccount(a) {
   const plan = p.plan
     ? `<span class="mini" style="font-size:10.5px;border:1px solid var(--line2);border-radius:999px;padding:2px 9px;color:var(--dim)">${esc(p.plan)}</span>`
     : "";
-  const upgrade = p.upgrade
-    ? '<button id="acct-upgrade" type="button" class="acct-link acct-upgrade">Upgrade</button>'
-    : "";
+  const pill = acctPill(p);   // #371 round 3: the entry always renders; the PILL is eligibility-gated
   host.innerHTML = `
     <button id="acct-trigger" type="button" class="acct-trigger" aria-haspopup="menu" aria-expanded="false">
       <span class="avatar">${esc(p.avatar)}</span>${who?'<span class="who">'+who+'</span> ':''}${plan}<span class="acct-caret" aria-hidden="true">&#9660;</span>
@@ -4463,55 +4635,182 @@ function renderAccount(a) {
         <button id="acct-reveal" type="button" class="acct-btn" disabled>Reveal</button>
         <button id="acct-copy-token" type="button" class="acct-btn" disabled>Copy</button>
       </div>
-      <details id="acct-connect">
-        <summary>Connect an agent</summary>
-        <div class="acct-label">CLI</div>
-        <div class="acct-snippet">
-          <pre id="acct-cli"></pre>
-          <button id="acct-copy-cli" type="button" class="acct-btn" disabled>Copy</button>
-        </div>
-        <div class="acct-label">MCP — ~/.claude.json</div>
-        <div class="acct-snippet">
-          <pre id="acct-mcp"></pre>
-          <button id="acct-copy-mcp" type="button" class="acct-btn" disabled>Copy</button>
-        </div>
-      </details>
-      ${upgrade}
-      <button id="acct-plan" type="button" class="acct-link">Plan &amp; billing</button>
+      <button id="acct-connect-entry" type="button" class="acct-link">Connect an agent</button>
+      <button id="acct-subscription" type="button" class="acct-link">Subscription${pill}</button>
       <button id="acct-signout" type="button" class="acct-link acct-danger">Sign out</button>
     </div>`;
   wireAcctMenu();
-  if (upgrade) wireUpgrade();
+  renderPlanOverlay(p);
+  wireSubscription();
+  wireConnectEntry();
 }
-function wireUpgrade() {
-  const btn = $("acct-upgrade");
+/* The overlay's content (#371, amendment 2): the honest current-plan line
+   from the pure decision, and the purchase options under the SAME
+   plan-label-unset eligibility as the menu entry (a second checkout for an
+   active subscriber would mint a second Stripe subscription — checkout
+   passes customer_email, not a subscription update; switching is Phase 3).
+   /account failed (p null) → nothing fills (fail-soft, like the empty
+   corner); the overlay itself opens only from the menu entry anyway. */
+function renderPlanOverlay(p) {
+  if (!p) return;
+  const cur = $("po-current");
+  if (cur) cur.textContent = acctPlanLine(p);
+  const opts = $("acct-options");
+  if (opts) opts.hidden = !p.upgrade;
+}
+function openPlanOverlay() {
+  const ov = $("plan-overlay");
+  if (!ov || !ov.hidden) return;
+  ov.hidden = false;
+  const close = $("po-close");
+  if (close) close.focus();   // keyboard users land on the primary exit (the modal focus idiom)
+}
+function closePlanOverlay() {
+  const ov = $("plan-overlay");
+  if (ov) ov.hidden = true;
+}
+/* #506 — the connect overlay: ONE full-cover surface for every "Connect an
+   agent" entry (the #plan-overlay idiom). Opening lazily fetches the token
+   (idempotent) because the overlay is reachable WITHOUT the account menu
+   (the Agents-detected pill) — the menu path would otherwise be the only
+   thing seeding the snippets. */
+function openConnectOverlay() {
+  const ov = $("connect-overlay");
+  if (!ov || !ov.hidden) return;
+  ov.hidden = false;
+  fetchAcctToken();   // lazy + idempotent — one attempt per page load
+  const close = $("co-close");
+  if (close) close.focus();   // keyboard users land on the primary exit (the modal focus idiom)
+}
+function closeConnectOverlay() {
+  const ov = $("connect-overlay");
+  if (ov) ov.hidden = true;
+}
+/* N-driven card render (#371 round 3): the option cards are GENERATED from
+   PLAN_OPTIONS — N entries, N cards, no per-plan literals anywhere in the
+   markup or this template (a future plan is a data entry + a router price
+   id, not a page rework). Runs once at script init; account data only
+   toggles visibility (renderPlanOverlay). */
+function renderPlanCards() {
+  const host = $("acct-options");
+  if (!host) return;
+  host.innerHTML = PLAN_OPTIONS.map((o) => `
+    <div class="po-opt" id="acct-opt-${o.id}">
+      <div class="po-name">${esc(o.name)}</div>
+      <div class="po-price">${esc(o.price)}</div>
+      ${o.note ? `<div class="po-note">${esc(o.note)}</div>` : ""}
+      <ul class="po-feat">${o.bullets.map((b) => `<li>${esc(b)}</li>`).join("")}</ul>
+      <button id="acct-buy-${o.id}" type="button" class="po-choose">${esc(o.cta)}</button>
+    </div>`).join("");
+}
+renderPlanCards();
+function wireSubscription() {
+  const btn = $("acct-subscription");
   if (!btn) return;
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    try {
-      const resp = await fetch("/stripe/checkout", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ plan: "annual" }),
-      });
-      if (resp.status === 401) {
-        // Never hard-redirect to Google on a daemon (dead end / loop) — only
-        // where the probe says OAuth exists; else surface the expired session.
-        if (await probeGoogleAuth()) { location.href = "/auth/google/start"; return; }
-        alert("Session expired — reload the page to sign in again.");
-        btn.disabled = false;
-        return;
-      }
-      const body = await resp.json().catch(() => ({}));
-      if (resp.ok && body.url) { location.href = body.url; return; }
-      alert("Checkout unavailable (" + resp.status + ") — try again later.");
-      btn.disabled = false;
-    } catch {
-      alert("Checkout unreachable — try again later.");
-      btn.disabled = false;
-    }
+  // #371 round 3: the ONE Subscription entry (Upgrade + Plan & billing
+  // merged, owner) opens the FULL-COVER plan & billing overlay; the entry
+  // always renders — the Upgrade pill alone marks the plan-unset state.
+  // Menu closes first; × / cover-click / ESC return.
+  btn.addEventListener("click", () => {
+    closeAcctMenu();
+    openPlanOverlay();
+  });
+  for (const o of PLAN_OPTIONS) {
+    const buy = $("acct-buy-" + o.id);
+    if (!buy) continue;
+    buy.addEventListener("click", () => { startCheckout(o.posts, buy); });
+  }
+}
+/* #506: the menu's Connect-an-agent entry opens the full-cover connect
+   overlay — the same launch idiom as wireSubscription (#371): the menu
+   closes first; × / cover-click / ESC close and return where the user
+   was. The inline expandable snippets this entry used to reveal are gone;
+   the overlay owns connecting. */
+function wireConnectEntry() {
+  const btn = $("acct-connect-entry");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    closeAcctMenu();
+    openConnectOverlay();
   });
 }
+/** POST /stripe/checkout for ONE plan, then navigate to the returned Stripe
+ *  URL (#371 — each period's action posts its own plan; the hardcoded
+ *  annual-only body was the defect). The failure seams are the shipped
+ *  checkout-handler contract, kept verbatim for EVERY action: 401 → Google
+ *  re-auth where the probe says OAuth exists, else the expired-session
+ *  alert; non-ok → the unavailable alert; network error → the unreachable
+ *  alert. Each button is disabled independently while its own request is in
+ *  flight. */
+async function startCheckout(plan, btn) {
+  btn.disabled = true;
+  try {
+    const resp = await fetch("/stripe/checkout", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ plan }),
+    });
+    if (resp.status === 401) {
+      // Never hard-redirect to Google on a daemon (dead end / loop) — only
+      // where the probe says OAuth exists; else surface the expired session.
+      if (await probeGoogleAuth()) { location.href = "/auth/google/start"; return; }
+      alert("Session expired — reload the page to sign in again.");
+      btn.disabled = false;
+      return;
+    }
+    const body = await resp.json().catch(() => ({}));
+    if (resp.ok && body.url) { location.href = body.url; return; }
+    alert("Checkout unavailable (" + resp.status + ") — try again later.");
+    btn.disabled = false;
+  } catch {
+    alert("Checkout unreachable — try again later.");
+    btn.disabled = false;
+  }
+}
+/* The return acknowledgment (#371): read ?billing= once on load and show
+   the one-line banner. The param is STRIPPED via history.replaceState the
+   moment the banner shows — neither dismissal nor a plain reload can
+   re-show it (a reload re-reads a URL that no longer carries the param).
+   Runs at script init, before boot: the acknowledgment must not depend on
+   the data fetches succeeding. */
+function wireBillingBanner() {
+  const host = $("billing-banner");
+  if (!host) return;
+  const params = new URLSearchParams(location.search);
+  const spec = billingBanner(params.get("billing"));
+  if (!spec) return;
+  params.delete("billing");
+  const qs = params.toString();
+  history.replaceState(null, "", location.pathname + (qs ? "?" + qs : "") + location.hash);
+  host.dataset.kind = spec.kind;
+  host.innerHTML =
+    "<span>" + esc(spec.text) + "</span>" +
+    '<button id="billing-banner-dismiss" type="button" aria-label="Dismiss">&#10005;</button>';
+  host.hidden = false;
+  $("billing-banner-dismiss").addEventListener("click", () => { host.remove(); });
+}
+wireBillingBanner();
+/* the plan & billing overlay's close affordances (the #model-modal wiring
+   idiom): the × button and a click on the opaque cover both return to the
+   dash; ESC lives in the shared keyboard handler below. */
+$("po-close").addEventListener("click", closePlanOverlay);
+$("po-cover").addEventListener("click", closePlanOverlay);
+/* the connect overlay's close + copy affordances (#506) — the same static
+   wiring idiom. The copy buttons are STATIC overlay elements, wired at
+   script init so they work even when /account failed and the menu never
+   rendered; the payloads are the same byte-for-byte commands the old
+   handlers copied. Token-gated exactly like the menu's buttons: a copy
+   without the token would paste a command that cannot authenticate. */
+$("co-close").addEventListener("click", closeConnectOverlay);
+$("co-cover").addEventListener("click", closeConnectOverlay);
+const copyCliBtn = $("acct-copy-cli");
+copyCliBtn.addEventListener("click", () => {
+  if (acctTokenState === "ok") copyToClipboard("npx @gamaze/hicortex init --server " + location.origin, copyCliBtn);
+});
+const copyMcpBtn = $("acct-copy-mcp");
+copyMcpBtn.addEventListener("click", () => {
+  if (acctTokenState === "ok") copyToClipboard(acctMcpText(), copyMcpBtn);
+});
 let acctToken = null;             // token from /account/token (server truth)
 let acctTokenState = "unfetched"; // "unfetched" | "ok" | "unavailable"
 let acctTokenFetched = false;     // one lazy fetch attempt per page load
@@ -4539,30 +4838,33 @@ function acctMcpText() {
   }, null, 2);
 }
 function renderAcctToken() {
+  /* #506: per-element guards instead of the old bail-early `if (!val)
+     return` — the snippet <pre>s + copy buttons now live in the STATIC
+     connect overlay, so token state must render even when /account failed
+     and the menu (val/reveal/copy-token) never rendered. Gating semantics
+     are unchanged: everything disabled unless ok, "token unavailable"
+     text otherwise, "…" while unfetched, revealed text only in the ok
+     path. */
+  const ok = acctTokenState === "ok";
   const val = $("acct-token-val");
-  if (!val) return; // menu not rendered (/account failed — the corner stays empty)
   const revealBtn = $("acct-reveal");
   const copyToken = $("acct-copy-token");
   const copyCli = $("acct-copy-cli");
   const copyMcp = $("acct-copy-mcp");
-  if (acctTokenState !== "ok") {
-    val.textContent = acctTokenState === "unfetched" ? "…" : "token unavailable";
-    revealBtn.disabled = true;
-    copyToken.disabled = true;
-    copyCli.disabled = true;
-    copyMcp.disabled = true;
-    $("acct-cli").textContent = acctTokenState === "unfetched" ? "" : "token unavailable";
-    $("acct-mcp").textContent = acctTokenState === "unfetched" ? "" : "token unavailable";
-    return;
+  if (revealBtn) revealBtn.disabled = !ok;
+  if (copyToken) copyToken.disabled = !ok;
+  if (copyCli) copyCli.disabled = !ok;
+  if (copyMcp) copyMcp.disabled = !ok;
+  if (val) {
+    if (!ok) val.textContent = acctTokenState === "unfetched" ? "…" : "token unavailable";
+    else val.textContent = acctRevealed ? acctToken : maskToken(acctToken);
   }
-  revealBtn.disabled = false;
-  copyToken.disabled = false;
-  copyCli.disabled = false;
-  copyMcp.disabled = false;
-  val.textContent = acctRevealed ? acctToken : maskToken(acctToken);
-  revealBtn.textContent = acctRevealed ? "Hide" : "Reveal";
-  $("acct-cli").textContent = acctCliText();
-  $("acct-mcp").textContent = acctMcpText();
+  if (revealBtn && ok) revealBtn.textContent = acctRevealed ? "Hide" : "Reveal";
+  const cli = $("acct-cli");   // the connect overlay's snippets (#506) — render regardless of menu presence
+  const mcp = $("acct-mcp");
+  const degraded = acctTokenState === "unfetched" ? "" : "token unavailable";
+  if (cli) cli.textContent = ok ? acctCliText() : degraded;
+  if (mcp) mcp.textContent = ok ? acctMcpText() : degraded;
 }
 async function fetchAcctToken() {
   if (acctTokenFetched) return;
@@ -4588,8 +4890,6 @@ function closeAcctMenu() {
   const trigger = document.getElementById("acct-trigger");
   if (trigger) trigger.setAttribute("aria-expanded", "false");
   acctRevealed = false;
-  const details = document.getElementById("acct-connect");
-  if (details) details.removeAttribute("open");
   renderAcctToken();
 }
 function openAcctMenu() {
@@ -4652,21 +4952,11 @@ function wireAcctMenu() {
   copyToken.addEventListener("click", () => {
     if (acctTokenState === "ok") copyToClipboard(acctConnectLine(), copyToken);
   });
-  const copyCli = $("acct-copy-cli");
-  copyCli.addEventListener("click", () => {
-    if (acctTokenState === "ok") {
-      copyToClipboard("npx @gamaze/hicortex init --server " + location.origin, copyCli);
-    }
-  });
-  const copyMcp = $("acct-copy-mcp");
-  copyMcp.addEventListener("click", () => {
-    if (acctTokenState === "ok") copyToClipboard(acctMcpText(), copyMcp);
-  });
-  $("acct-plan").addEventListener("click", () => {
-    closeAcctMenu();
-    const t = document.getElementById("plan-billing");
-    if (t) t.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  });
+  // #506: the copy-cli/copy-mcp wiring moved to the STATIC init block by
+  // the connect overlay — those buttons live in the overlay now, not here.
+  // #371 round 3: the old "Plan & billing" scroll item is gone — its
+  // target tile (#plan-billing) stays in the measures band as the
+  // billing-adjacent surface; the Subscription entry owns the route now.
   $("acct-signout").addEventListener("click", signOut);
   renderAcctToken();
 }

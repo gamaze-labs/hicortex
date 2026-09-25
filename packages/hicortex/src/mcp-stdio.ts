@@ -42,6 +42,27 @@
  * port: explicit error, never a spawn. A remote target that is down is
  * likewise an explicit error — we never spawn for remote URLs.
  *
+ * Startup retry (#501): a REMOTE target that is unreachable at launch is
+ * TRANSIENT, not fatal — the product case is a client (e.g. Claude Desktop
+ * auto-launched at login) starting before the VPN/DNS that carries the
+ * server URL is up (ENOTFOUND/EAI_AGAIN/ECONNREFUSED/timeouts). The bridge
+ * then keeps the stdio side ALIVE and answers `initialize` IMMEDIATELY
+ * (design B), retrying the upstream connect with backoff (1s→2s→4s… capped
+ * 10s) for a 60s window. Why answer immediately: MCP clients cancel a
+ * pending `initialize` at ~60s (TS SDK DEFAULT_REQUEST_TIMEOUT_MSEC;
+ * Claude Desktop observed cancelling at ~60s in the wild) — a delayed
+ * initialize would lose the session the retry window is meant to save, and
+ * the first tools/list request carries the same ~60s client budget, so the
+ * window deliberately stays at the BOTTOM of the 60–90s range the issue
+ * proposed (evidence + decision: issue #501 design-note comment). The
+ * daemon's initialize-result `instructions` are unknowable while it is down
+ * and are therefore omitted on this path (the pre-#383 shape); tools
+ * handlers await upstream readiness. NEVER retried: 401/403 (auth is not
+ * transient — existing HICORTEX_AUTH_TOKEN hint) and a reachable-but-not-
+ * healthy endpoint (foreign service). Local targets keep the autostart poll
+ * (which already waits 30s). Mid-session SSE reconnect after an established
+ * connection drops is OUT OF SCOPE (#501 follow-up).
+ *
  * STDIO DISCIPLINE: stdout carries ONLY the MCP protocol. Every diagnostic
  * goes to stderr; fatal errors are a one-liner on stderr + non-zero exit
  * (thrown to cli.ts's catch). Cancellation downstream→upstream rides the
@@ -84,6 +105,14 @@ const DEFAULT_BRIDGE_PORT = 8787;
 const HEALTH_PROBE_TIMEOUT_MS = 2000;
 const AUTOSTART_POLL_INTERVAL_MS = 250;
 const AUTOSTART_POLL_TOTAL_MS = 30_000;
+// #501 startup-retry window. 60s — the bottom of the issue's 60–90s proposal,
+// deliberately: the client's own request timeout (TS SDK default, and Claude
+// Desktop's observed initialize cancel) is 60s, and under design B the FIRST
+// tools/list inherits that same budget, so a longer window would only answer
+// requests the client has already abandoned.
+const REMOTE_RETRY_WINDOW_MS = 60_000;
+const REMOTE_RETRY_BASE_DELAY_MS = 1_000;
+const REMOTE_RETRY_MAX_DELAY_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // Target + token resolution (pure helpers, exported for unit tests)
@@ -196,6 +225,16 @@ export type AutostartDecision =
   | { action: "spawn" }
   | { action: "fail"; reason: string };
 
+/** The clear unreachable message — shared by the fail-fast path and the #501
+ *  retry-window expiry, so both ends of the window say the same thing. */
+function remoteUnreachableMessage(target: BridgeTarget): string {
+  return (
+    `Cannot reach the Hicortex server at ${target.url}. Start it on the server machine ` +
+    `(check with \`hicortex status\`, start with \`npx @gamaze/hicortex server\`) or fix HICORTEX_SERVER_URL. ` +
+    `If it answers 401 once up, set HICORTEX_AUTH_TOKEN to the server's auth token.`
+  );
+}
+
 /**
  * Pure decision from one health probe: healthy → bridge; refused + loopback
  * → spawn a local daemon; refused + remote → fail with an actionable message
@@ -213,15 +252,7 @@ export function decideAutostart(probe: HealthProbe, target: BridgeTarget): Autos
         `then either free the port or point HICORTEX_SERVER_URL at the real Hicortex server.`,
     };
   }
-  if (!target.local) {
-    return {
-      action: "fail",
-      reason:
-        `Cannot reach the Hicortex server at ${target.url}. Start it on the server machine ` +
-        `(check with \`hicortex status\`, start with \`npx @gamaze/hicortex server\`) or fix HICORTEX_SERVER_URL. ` +
-        `If it answers 401 once up, set HICORTEX_AUTH_TOKEN to the server's auth token.`,
-    };
-  }
+  if (!target.local) return { action: "fail", reason: remoteUnreachableMessage(target) };
   return { action: "spawn" };
 }
 
@@ -292,6 +323,84 @@ export async function ensureDaemonReady(target: BridgeTarget, options: EnsureDae
 }
 
 // ---------------------------------------------------------------------------
+// Startup-failure classification + retry pacing (#501, pure, unit-tested)
+// ---------------------------------------------------------------------------
+
+export type StartupFailureKind = "auth" | "foreign" | "transient" | "fatal";
+
+/** Node/undici errno codes a "network not up yet" boot race produces. */
+const TRANSIENT_ERRNO_RE =
+  /\b(?:ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|UND_ERR_CONNECT_TIMEOUT)\b/;
+
+/** SseError carries the HTTP status on .code (SDK client/sse.js). */
+function isAuthRejection(err: unknown): boolean {
+  const code = (err as { code?: unknown } | undefined)?.code;
+  return code === 401 || code === 403 || code === "401" || code === "403";
+}
+
+/**
+ * A network-level failure that a retry window can plausibly outlive: walk the
+ * error + its cause chain for a transient errno, a fetch/undici timeout name,
+ * or errno text embedded in the message (SseError has no `cause` — the SDK
+ * puts the underlying text straight into `SSE error: getaddrinfo ENOTFOUND …`).
+ */
+function isTransientNetworkError(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current instanceof Error; depth += 1) {
+    const code = (current as NodeJS.ErrnoException).code;
+    if (typeof code === "string" && TRANSIENT_ERRNO_RE.test(code)) return true;
+    if (current.name === "TimeoutError" || current.name === "AbortError") return true;
+    if (TRANSIENT_ERRNO_RE.test(current.message)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * Classify a startup failure of the upstream connect sequence. Only a REMOTE
+ * target's network-level failure is transient (#501); auth rejections and a
+ * reachable-but-unhealthy endpoint are fatal immediately, and local targets
+ * keep their own autostart-poll semantics.
+ */
+export function classifyStartupFailure(err: unknown, target: BridgeTarget): StartupFailureKind {
+  if (isAuthRejection(err)) return "auth";
+  const message = err instanceof Error ? err.message : String(err);
+  if (/not a healthy Hicortex/i.test(message)) return "foreign";
+  if (target.local) return "fatal";
+  // decideAutostart's remote-unreachable reason is the probe-level shape of
+  // every refused/DNS-failed/timeout probe (probeHealthOnce collapses them).
+  if (message.startsWith("Cannot reach the Hicortex server")) return "transient";
+  return isTransientNetworkError(err) ? "transient" : "fatal";
+}
+
+/** Backoff step N (0-based): base·2^N, capped — 1s, 2s, 4s, 8s, then the cap. */
+export function nextRetryDelayMs(attempt: number, baseMs: number, maxMs: number): number {
+  return Math.min(baseMs * 2 ** attempt, maxMs);
+}
+
+/** One-line reason for the stderr retry log — never the full fail message. */
+function summarizeStartupFailure(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  const errno = TRANSIENT_ERRNO_RE.exec(message)?.[0];
+  if (errno) return errno;
+  if (message.startsWith("Cannot reach the Hicortex server")) return "unreachable";
+  return message.length > 80 ? `${message.slice(0, 77)}…` : message;
+}
+
+/** The friendly fatal form: auth rejections get the token hint, the rest pass
+ *  through unchanged (their messages are already the actionable ones). */
+function toStartupError(err: unknown, target: BridgeTarget): Error {
+  if (isAuthRejection(err)) {
+    const status = (err as { code?: unknown }).code;
+    return new Error(
+      `The Hicortex server at ${target.url} rejected the connection (${status}). ` +
+      `Set HICORTEX_AUTH_TOKEN to the server's auth token — it is printed by \`hicortex status\` on the server box.`,
+    );
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+// ---------------------------------------------------------------------------
 // The bridge itself
 // ---------------------------------------------------------------------------
 
@@ -302,21 +411,30 @@ export interface McpStdioOptions extends EnsureDaemonOptions {
   authToken?: string;
   /** Injectable downstream transport (test seam; default: real stdio). */
   downstream?: Transport;
+  /** Injectable upstream connect (test seam; default: real SSE transport). */
+  connectUpstream?: (target: BridgeTarget, token: string | undefined) => Promise<Client>;
+  /** Retry pacing for the #501 transient-unreachable window (test seams). */
+  retryWindowMs?: number;
+  retryBaseDelayMs?: number;
+  retryMaxDelayMs?: number;
 }
 
 /**
- * Run the stdio MCP bridge. Resolves only after the downstream transport
- * closes (the lifecycle handlers then exit the process); every setup failure
- * throws for cli.ts to report on stderr and exit 1.
+ * Connect the upstream Client to the daemon's SSE MCP endpoint. requestInit
+ * headers ride BOTH the GET /sse and the POST /messages (SDK 1.28
+ * _commonHeaders/send). Raw errors propagate — classification happens at the
+ * call site. Exported for the ghost-reconnect unit test.
+ *
+ * On failure the transport is closed EXPLICITLY: the SDK's Client.connect
+ * closes only when the initialize REQUEST fails after a successful start —
+ * a failed transport.start() (refused/DNS) propagates out of Protocol.connect
+ * with no cleanup, and the still-open EventSource keeps eventsource's ~3s
+ * reconnect loop alive. Every retry attempt would leak one ghost that, once
+ * the server appears, opens a REAL authed SSE session on the daemon and is
+ * never closed (proven empirically on SDK 1.28.0 / eventsource 3.0.7, PR
+ * review round 1 — pinned by the ghost-reconnect unit test).
  */
-export async function runMcpStdio(options: McpStdioOptions = {}): Promise<void> {
-  const target = resolveBridgeTarget(options.serverUrl);
-  const token = resolveBridgeToken(options.authToken);
-
-  await ensureDaemonReady(target, options);
-
-  // Upstream: the daemon's SSE MCP endpoint. requestInit headers ride BOTH
-  // the GET /sse and the POST /messages (SDK 1.28 _commonHeaders/send).
+export async function defaultConnectUpstream(target: BridgeTarget, token: string | undefined): Promise<Client> {
   const upstream = new SSEClientTransport(
     new URL(`${target.url}/sse`),
     token !== undefined ? { requestInit: { headers: { Authorization: `Bearer ${token}` } } } : {},
@@ -325,44 +443,47 @@ export async function runMcpStdio(options: McpStdioOptions = {}): Promise<void> 
   try {
     await client.connect(upstream);
   } catch (err) {
-    // 401 from the daemon's auth middleware (remote connections; loopback is
-    // exempt). SseError carries the HTTP status as .code.
-    if ((err as { code?: unknown }).code === 401) {
-      throw new Error(
-        `The Hicortex server at ${target.url} rejected the connection (401). ` +
-        `Set HICORTEX_AUTH_TOKEN to the server's auth token — it is printed by \`hicortex status\` on the server box.`,
-      );
-    }
-    throw err instanceof Error ? err : new Error(String(err));
+    await client.close().catch(() => {});
+    throw err;
   }
+  return client;
+}
 
-  // Downstream: a low-level Server over stdio advertising exactly what the
-  // daemon offers (tools). Ping is auto-answered by the Protocol base.
-  // #383: forward the DAEMON's initialize-result instructions verbatim — the
-  // daemon owns the text and the memoryInstructions gate, so the two surfaces
-  // cannot diverge and no config read is duplicated in the bridge (a
-  // pre-#383 remote daemon simply has none to forward; undefined omits the
-  // field from the bridge's own initialize result).
+/**
+ * The downstream Server: a low-level Server over stdio advertising exactly
+ * what the daemon offers (tools). Ping is auto-answered by the Protocol
+ * base. #383: `instructions` is the DAEMON's initialize-result text,
+ * forwarded verbatim — undefined (pre-#383 daemon, memoryInstructions off,
+ * or the #501 slow path where the daemon has not answered yet) omits the
+ * field. `awaitClient` yields the upstream Client a tools request should
+ * use — already-resolved on the fast path, a readiness promise on the slow
+ * path, so tools requests queue until the server exists.
+ */
+function createBridgeServer(instructions: string | undefined, awaitClient: () => Promise<Client>): Server {
   const server = new Server(
     { name: "hicortex", version: VERSION },
-    { capabilities: { tools: {} }, instructions: client.getInstructions() },
+    instructions !== undefined ? { capabilities: { tools: {} }, instructions } : { capabilities: { tools: {} } },
   );
-
   // The proxy core — the SDK's documented proxy pattern. Forward the two
   // tools requests and pass extra.signal through so a downstream
   // notifications/cancelled aborts the upstream call (which emits the
   // correctly-id'd cancellation to the daemon). Nothing else is forwarded
   // request-wise: the daemon is tools-only and the base class answers ping.
-  server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) =>
-    (await client.listTools(undefined, { signal: extra.signal })) as unknown as ListToolsResult,
-  );
-  server.setRequestHandler(CallToolRequestSchema, async (request, extra) =>
-    (await client.callTool(request.params, undefined, { signal: extra.signal })) as unknown as CallToolResult,
-  );
+  server.setRequestHandler(ListToolsRequestSchema, async (_request, extra) => {
+    const client = await awaitClient();
+    return (await client.listTools(undefined, { signal: extra.signal })) as unknown as ListToolsResult;
+  });
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+    const client = await awaitClient();
+    return (await client.callTool(request.params, undefined, { signal: extra.signal })) as unknown as CallToolResult;
+  });
+  return server;
+}
 
-  // Upstream → downstream notifications, best-effort: the daemon's tool-list
-  // changes or log messages reach the client; a closed far end must not kill
-  // the bridge from inside a notification handler.
+/** Upstream → downstream notifications, best-effort: the daemon's tool-list
+ *  changes or log messages reach the client; a closed far end must not kill
+ *  the bridge from inside a notification handler. */
+function forwardNotifications(client: Client, server: Server): void {
   client.fallbackNotificationHandler = async (notification) => {
     try {
       await server.notification(notification as unknown as ServerNotification);
@@ -370,31 +491,136 @@ export async function runMcpStdio(options: McpStdioOptions = {}): Promise<void> 
       // Best-effort by design.
     }
   };
+}
 
-  // Lifecycle: whichever side ends first tears down the other. The `exiting`
-  // guard keeps our OWN client.close() (graceful path) from being read as an
-  // upstream loss.
+/**
+ * Lifecycle: whichever side ends first tears down the other. The `exiting`
+ * guard keeps our OWN client.close() (graceful path) from being read as an
+ * upstream loss. The upstream attaches late on the #501 slow path, hence
+ * attachUpstream() instead of a constructor argument.
+ */
+function wireBridgeLifecycle(server: Server): { shutdown: (code: number) => void; attachUpstream: (client: Client) => void } {
   let exiting = false;
+  let upstream: Client | undefined;
   const shutdown = (code: number) => {
     if (exiting) return;
     exiting = true;
-    void Promise.allSettled([server.close(), client.close()]).then(() => process.exit(code));
+    const closing = [server.close()];
+    if (upstream) closing.push(upstream.close());
+    void Promise.allSettled(closing).then(() => process.exit(code));
   };
-
   // Downstream closed (the MCP client went away) → close upstream → exit 0.
   server.onclose = () => shutdown(0);
-  // Upstream transport died → the bridge cannot serve anything → exit 1.
-  client.onclose = () => {
-    if (exiting) return;
-    console.error("[hicortex] mcp: lost the connection to the Hicortex server");
-    shutdown(1);
-  };
   process.once("SIGINT", () => shutdown(0));
   process.once("SIGTERM", () => shutdown(0));
+  return {
+    shutdown,
+    attachUpstream(client: Client) {
+      upstream = client;
+      // Upstream transport died → the bridge cannot serve anything → exit 1.
+      client.onclose = () => {
+        if (exiting) return;
+        console.error("[hicortex] mcp: lost the connection to the Hicortex server");
+        shutdown(1);
+      };
+    },
+  };
+}
 
-  const downstream = options.downstream ?? new StdioServerTransport();
-  await server.connect(downstream);
+/**
+ * Run the stdio MCP bridge. Fast path (daemon reachable now): connect
+ * upstream first, then serve stdio with the daemon's forwarded instructions
+ * — exactly the pre-#501 sequence. Slow path (REMOTE target, transient
+ * network failure — the boot race): serve stdio IMMEDIATELY (design B,
+ * initialize answered at once) and retry the upstream connect with backoff
+ * for the retry window. Resolves once bridging is established; every setup
+ * failure throws for cli.ts to report on stderr and exit 1.
+ */
+export async function runMcpStdio(options: McpStdioOptions = {}): Promise<void> {
+  const target = resolveBridgeTarget(options.serverUrl);
+  const token = resolveBridgeToken(options.authToken);
+  const connect = options.connectUpstream ?? defaultConnectUpstream;
 
-  // Diagnostics NEVER touch stdout (the MCP wire) — stderr only.
+  // ---- Fast path: the daemon answers now. ----
+  let firstFailure: unknown;
+  let upstream: Client | undefined;
+  try {
+    await ensureDaemonReady(target, options);
+    upstream = await connect(target, token);
+  } catch (err) {
+    if (classifyStartupFailure(err, target) !== "transient") throw toStartupError(err, target);
+    firstFailure = err;
+  }
+
+  if (upstream) {
+    const server = createBridgeServer(upstream.getInstructions(), async () => upstream!);
+    const lifecycle = wireBridgeLifecycle(server);
+    lifecycle.attachUpstream(upstream);
+    forwardNotifications(upstream, server);
+    await server.connect(options.downstream ?? new StdioServerTransport());
+    // Diagnostics NEVER touch stdout (the MCP wire) — stderr only.
+    console.error(`[hicortex] mcp: bridging stdio <-> ${target.url}/sse (target: ${target.source})`);
+    return;
+  }
+
+  // ---- Slow path (#501): remote + transient — answer initialize now,
+  // retry the upstream in the background, keep stdio alive throughout. ----
+  const windowMs = options.retryWindowMs ?? REMOTE_RETRY_WINDOW_MS;
+  const baseDelayMs = options.retryBaseDelayMs ?? REMOTE_RETRY_BASE_DELAY_MS;
+  const maxDelayMs = options.retryMaxDelayMs ?? REMOTE_RETRY_MAX_DELAY_MS;
+
+  let resolveReady!: (client: Client) => void;
+  let rejectReady!: (err: Error) => void;
+  const upstreamReady = new Promise<Client>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+  // Mark handled: if the window expires before any tools request arrived,
+  // rejecting an un-awaited promise would crash the process as an unhandled
+  // rejection.
+  upstreamReady.catch(() => {});
+
+  const server = createBridgeServer(undefined, () => upstreamReady);
+  const lifecycle = wireBridgeLifecycle(server);
+  await server.connect(options.downstream ?? new StdioServerTransport());
+
   console.error(`[hicortex] mcp: bridging stdio <-> ${target.url}/sse (target: ${target.source})`);
+  console.error(
+    `[hicortex] mcp: Hicortex server at ${target.url} unreachable at startup ` +
+    `(${summarizeStartupFailure(firstFailure)}) — retrying for up to ${Math.round(windowMs / 1000)}s ` +
+    `while the network comes up; the connection stays open and tools wait for the server`,
+  );
+
+  const deadline = Date.now() + windowMs;
+  let attempt = 0;
+  let lastFailure = firstFailure;
+  for (;;) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      rejectReady(new Error(remoteUnreachableMessage(target)));
+      throw new Error(remoteUnreachableMessage(target));
+    }
+    const delayMs = Math.min(nextRetryDelayMs(attempt, baseDelayMs, maxDelayMs), remainingMs);
+    console.error(
+      `[hicortex] mcp: retrying ${target.url} in ${delayMs}ms ` +
+      `(attempt ${attempt + 1}, ${Math.ceil(remainingMs / 1000)}s of window left) after: ${summarizeStartupFailure(lastFailure)}`,
+    );
+    await sleep(delayMs);
+    attempt += 1;
+    try {
+      await ensureDaemonReady(target, { probeHealth: options.probeHealth });
+      const client = await connect(target, token);
+      // Established — from here the lifecycle is exactly the fast path's.
+      lifecycle.attachUpstream(client);
+      forwardNotifications(client, server);
+      resolveReady(client);
+      console.error(`[hicortex] mcp: server reachable after ${attempt} retry${attempt === 1 ? "" : "ies"} — serving tools`);
+      return;
+    } catch (err) {
+      const kind = classifyStartupFailure(err, target);
+      if (kind === "auth") throw toStartupError(err, target);
+      if (kind !== "transient") throw err;
+      lastFailure = err;
+    }
+  }
 }
