@@ -717,8 +717,19 @@ export class LlmClient {
   }
 
   /**
-   * Claude CLI: shell out to `claude -p` for subscription users.
+   * Claude CLI: invoke `claude -p` for subscription users.
    * No API key needed — uses CC's authenticated session.
+   *
+   * Invocation contract (#512): the binary is called with a plain argument
+   * array and NO shell; the prompt travels on the child's stdin (execFileSync
+   * pipes stdin when `input` is set — the `< /dev/null` of the old shell
+   * command line is gone with the shell). The prompt is transcript-derived
+   * data, so it must reach the binary as bytes, never as command-line text
+   * an intermediary could interpret; argv stays exactly the fixed flag set.
+   * Side effects: stdin delivery lifts the per-argument exec limit on long
+   * transcripts, and a claudePath containing spaces works (one argv element,
+   * never re-parsed). cwd is left unset on purpose — the child inherits
+   * process.cwd() like every other phase of the daemon.
    *
    * Token usage (#246): the claude CLI JSON output does not carry a token
    * usage field, so this path returns `usage: undefined`. The CLI is billed
@@ -731,13 +742,14 @@ export class LlmClient {
     prompt: string,
     timeoutMs: number
   ): Promise<LlmResult> {
-    const { execSync } = require("node:child_process") as typeof import("node:child_process");
+    const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
     const claudePath = this.config.baseUrl; // baseUrl stores the claude binary path
 
     try {
-      const raw = execSync(
-        `${claudePath} -p ${JSON.stringify(prompt)} --model ${model} --max-turns 1 --output-format json --no-session-persistence < /dev/null`,
-        { encoding: "utf-8", timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024 }
+      const raw = execFileSync(
+        claudePath,
+        ["-p", "--model", model, "--max-turns", "1", "--output-format", "json", "--no-session-persistence"],
+        { encoding: "utf-8", timeout: timeoutMs, maxBuffer: 10 * 1024 * 1024, input: prompt }
       );
       const data = JSON.parse(raw) as { result?: string; is_error?: boolean };
       if (data.is_error) {

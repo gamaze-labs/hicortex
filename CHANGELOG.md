@@ -5,6 +5,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.23.1] — 2026-09-25
+
+### Fixed — claude-cli LLM backend (npm package)
+- **The claude-cli backend now invokes the claude binary with an argument array (no shell) and delivers the prompt on stdin (#512).** Prompts longer than the per-argument exec limit go through, and a claude binary path containing spaces works.
+
+### Added — hosted pending-state page (not in the npm package)
+- **A fresh signup's browser wait is a page, not raw JSON (#369): the router serves a pending-state page on browser navigations (GET/HEAD carrying a text/html Accept) wherever it used to answer `{"error":"account pending"}` — a ~3 s same-URL poll that auto-transitions the instant provisioning commits (the next request after the commit proxies to the real console), a distinct at-capacity copy keyed off the 403's detail marker that makes no timing promise, a taking-longer note after two minutes, and waking / suspended / no-tenant / map-unavailable states getting their own pages (waking keeps its Retry-After).** API clients — no Accept, application/json, every write verb — keep the byte-identical JSON denies, pinned by exact-string tests. Hosted router only; no change to the npm package.
+
+### Added — hosted funnel analytics, server-side (not in the npm package)
+- **The hosted stack emits the four frozen funnel events to the self-hosted Umami instance (#311): `signup_completed {provider:"google"}` when an OIDC first login creates a user row, `tenant_provisioned {plan:"trial"}` when the provisioner lands a provision job, `checkout_started {plan}` when a Stripe Checkout session is created, and `subscription_activated {plan}` when a webhook activation commits (the trial/dormant→active flip).** Emission is fire-and-forget and fail-soft (2.5 s timeout, errors swallowed after one log line) — analytics can never fail a login, checkout, or webhook; the POST carries a browser-like User-Agent because Umami silently bot-filters custom ones (verified live against the trap); no PII rides any event (provider/plan labels only). `UMAMI_WEBSITE_ID` is the feature switch (unset = off, silent); the provisioner fires its event from a lockstep copy of the same helper. Hosted router + provisioner only; no change to the npm package.
+
+### Fixed — hosted router (not in the npm package)
+- **Failed Google sign-ins land on a router-served static error page (#315): the failure code explained in plain language, a single sign-in-again action, and no automatic retry — the page carries no script and no meta refresh, so an automatic navigation is structurally impossible and the login-loop class (a persistent client-side cause, e.g. a browser extension stripping the session cookie, as on 2026-08-20) is dead; the router answers the landing before session resolution and proxying, whatever else is configured.** Hosted router only; no change to the npm package.
+
+### Changed — one Connect dialog for every connect entry in the console (#506)
+- **Every "Connect an agent" entry in the console opens one full-cover connect dialog (the account menu entry and the agents-detected card's pill), carrying the CLI install command, the MCP configuration, and copy buttons — all token-gated, so a copy never pastes a command that cannot authenticate.** The account menu no longer expands an inline snippet block, and the fleet rail's inline connect drawer is removed; the dialog closes via ×, a cover click, or ESC, and the agents list's empty state points at the account menu instead of the removed rail entry.
+
+### Changed — the console sells both cloud periods (#371)
+- **The dashboard's plan & billing overlay presents both cloud periods side by side — €12/month and €108/year (effective €9/mo, 25% off) — each with its own checkout action and the cloud plan's included features.** The account menu's Subscription entry (an Upgrade pill marks the pre-subscription state) opens a full-cover overlay over the dashboard, closed via ×, a cover click, or ESC, instead of sending every buyer down the annual path; returning from Stripe Checkout is acknowledged with a one-line banner (payment received, activation completes shortly / checkout cancelled, nothing charged) that is dismissible and shown once.
+- **The hosted billing path's plan vocabulary is exactly the two decided periods.** A retired email-gated third price variant is removed end to end (checkout gate, activation queues, deploy wiring, docs); the checkout endpoint keeps its shape and accepts the same two plans, and the webhook's unknown-plan fallback remains the safety net for events minted before the removal.
+
 ## [0.23.0] — 2026-09-22
 
 ### Changed — duplicates retire deterministically; junk stops at the door (#206, #489)
