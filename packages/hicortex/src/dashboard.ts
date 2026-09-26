@@ -1705,6 +1705,12 @@ export function dashboardEventsHandler(
 // SECURITY: no key material on the wire, ever. GET reports only `api_key_set`
 // (a boolean); PUT accepts a NEW key (write-only). The GET/PUT handlers are
 // pure; the express adapters follow the dashboardDataHandler convention.
+//
+// #514: in HOSTED mode the PUT additionally rejects backend/base_url/api_key
+// — the hosting service owns the endpoint and the credentials there, so a
+// tenant may only steer model/max_tokens/enable_thinking. GET then echoes
+// managed:true so the console can disable those inputs. Self-hosted behavior
+// is byte-identical (the gate is invisible outside hosted mode).
 // ---------------------------------------------------------------------------
 
 /** The GET /dashboard/model + PUT-success response shape (snake_case wire). */
@@ -1730,6 +1736,8 @@ export interface DashboardModelSettings {
   /** Constant true — the daemon resolves config at boot, so every write
    *  lands on restart. The modal footnotes it. */
   applies_on_restart: true;
+  /** Present ONLY in hosted mode — the console uses it to disable the managed inputs (#514). */
+  managed?: true;
 }
 
 /** A config value echoed as a non-blank string, else null. */
@@ -1740,11 +1748,14 @@ function configString(v: unknown): string | null {
 /**
  * The pure GET handler: echo the CONFIG values raw (null when unset — the UI
  * shows defaults as placeholders, so this never resolves them) + the runtime
- * provider from the daemon's in-memory llmConfig.
+ * provider from the daemon's in-memory llmConfig. `hostedMode` (#514) only
+ * adds `managed: true` to the body — self-hosted responses never carry the
+ * key at all (byte-identical wire).
  */
 export function handleDashboardModelGet(
   config: Record<string, unknown> | null | undefined,
   llmConfig: { provider: string } | null,
+  hostedMode = false,
 ): { status: 200; body: DashboardModelSettings } {
   const cfg = config ?? {};
   return {
@@ -1760,6 +1771,7 @@ export function handleDashboardModelGet(
       enable_thinking: typeof cfg.enableThinking === "boolean" ? cfg.enableThinking : null,
       api_key_set: Boolean(configString(cfg.llmApiKey)),
       applies_on_restart: true,
+      ...(hostedMode ? { managed: true as const } : {}),
     },
   };
 }
@@ -1774,6 +1786,13 @@ const MODEL_PUT_KEYS: Record<string, string> = {
   enable_thinking: "enableThinking",
 };
 
+/** #514 — hosted mode: these model-settings fields are controlled by the
+ *  hosting service (it owns the endpoint and the credentials), so the PUT
+ *  rejects them wholesale. Key PRESENCE in the body is the trigger — the
+ *  value is never inspected (null or nested garbage is a change attempt like
+ *  any other). Self-hosted installs never hit this gate. */
+const HOSTED_MANAGED_MODEL_KEYS = ["backend", "base_url", "api_key"] as const;
+
 /** The backends init ever writes (absence of llmBackend + baseUrl+apiKey =
  *  the openai-compat path). "" clears (the modal's "auto" option). */
 const MODEL_BACKEND_VALUES = new Set(["", "ollama", "claude-cli"]);
@@ -1783,16 +1802,38 @@ const MODEL_BACKEND_VALUES = new Set(["", "ollama", "claude-cli"]);
  * injected writer (which THROWS on a malformed config — the adapter maps that
  * to a 500 and the file stays untouched), answer with the fresh GET shape
  * built from the post-write config. `null` REMOVES a config key.
+ *
+ * `hostedMode` (#514): the managed fields (see HOSTED_MANAGED_MODEL_KEYS) are
+ * rejected BEFORE any validation or persistence — a refused PUT writes
+ * nothing, not even the allowed keys that rode the same body.
  */
 export function handleDashboardModelPut(
   body: unknown,
   persist: (updates: Record<string, unknown>) => Record<string, unknown>,
   getLlmConfig: () => { provider: string } | null,
+  hostedMode = false,
 ): { status: number; body: DashboardModelSettings | { error: string } } {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return { status: 400, body: { error: "Body must be a JSON object of model settings" } };
   }
   const input = body as Record<string, unknown>;
+
+  // #514 hosted-mode gate: the hosting service owns the endpoint and the
+  // credentials, so a tenant PUT may not touch them. Key PRESENCE is the
+  // trigger; the rejection precedes validation AND persistence, so nothing
+  // is written on a refused PUT (atomicity for mixed allowed+blocked bodies).
+  if (hostedMode) {
+    const attempted = HOSTED_MANAGED_MODEL_KEYS.filter((k) => k in input);
+    if (attempted.length > 0) {
+      const named = attempted.map((k) => `'${k}'`).join(", ");
+      return {
+        status: 403,
+        body: {
+          error: `${named} ${attempted.length === 1 ? "is" : "are"} managed by the hosting service and cannot be changed here (managed fields: ${HOSTED_MANAGED_MODEL_KEYS.join(", ")})`,
+        },
+      };
+    }
+  }
 
   const updates: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
@@ -1875,21 +1916,24 @@ export function handleDashboardModelPut(
   // persist THROWS on a malformed config (strict load) — propagated to the
   // adapter → 500, file untouched. On success it returns the fresh config.
   const fresh = persist(updates);
-  return handleDashboardModelGet(fresh, getLlmConfig());
+  return handleDashboardModelGet(fresh, getLlmConfig(), hostedMode);
 }
 
 /**
  * Express adapter for GET /dashboard/model. Bearer-only by construction
  * (mounted after createAuthMiddleware — NO exemption, unlike the page shells:
- * this carries install config). Failures surface as a 500 {error}.
+ * this carries install config). Failures surface as a 500 {error}. The
+ * boot-resolved `hostedMode` flag (#514) threads straight through to the pure
+ * handler — it is a boot constant, not a per-request value.
  */
 export function dashboardModelGetHandler(
   getConfig: () => Record<string, unknown> | null | undefined,
   getLlmConfig: () => { provider: string } | null,
+  hostedMode = false,
 ): express.RequestHandler {
   return (_req, res) => {
     try {
-      const { status, body } = handleDashboardModelGet(getConfig(), getLlmConfig());
+      const { status, body } = handleDashboardModelGet(getConfig(), getLlmConfig(), hostedMode);
       res.status(status).json(body);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -1902,15 +1946,17 @@ export function dashboardModelGetHandler(
  * The injected persist closure owns the config path (the server passes
  * init.ts persistConfigUpdates over stateDir/config.json); its load/persist
  * failures (malformed config, unwritable file) map to a 500 {error} with the
- * file left untouched — never a silent partial write.
+ * file left untouched — never a silent partial write. `hostedMode` (#514)
+ * threads to the pure handler's managed-field gate.
  */
 export function dashboardModelPutHandler(
   persist: (updates: Record<string, unknown>) => Record<string, unknown>,
   getLlmConfig: () => { provider: string } | null,
+  hostedMode = false,
 ): express.RequestHandler {
   return (req, res) => {
     try {
-      const { status, body } = handleDashboardModelPut(req.body ?? null, persist, getLlmConfig);
+      const { status, body } = handleDashboardModelPut(req.body ?? null, persist, getLlmConfig, hostedMode);
       res.status(status).json(body);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

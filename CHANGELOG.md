@@ -5,6 +5,17 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+## [0.23.2] — 2026-09-26
+
+### Fixed — managed-mode model settings (npm package)
+- **In managed/hosted mode the model-settings endpoint no longer accepts endpoint or credential changes (`backend`, `base_url`, `api_key`); the console marks them as managed.** Self-hosted behavior is unchanged.
+
+### Changed — trust framing on injected lesson blocks (#516)
+- Injected lesson blocks (CC hook, OpenClaw/Hermes/Pi/opencode plugins) are now delimited and carry a standing framing line plus provenance headers, marking them as recalled reference data rather than instructions.
+
+### Changed — npm package (#518)
+- **The published package no longer ships development eval tooling, and the release pipeline enforces it.** The npm tarball excludes the eval build output (`npm run eval` is unchanged from a source checkout — the build still compiles it, the scripts stay), a release-time pack-list gate fails the publish if a development-only path reappears in the tarball, and the public-mirror sync now materializes tracked files only, so local ignored state cannot reach the mirror.
+
 ## [0.23.1] — 2026-09-25
 
 ### Fixed — claude-cli LLM backend (npm package)

@@ -898,8 +898,8 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
       }
       for (const c of plan.mismatchSkipped) {
         // #206 decision 2: project_mismatch is the only skip reason left on
-        // this rail (the source_agent rail was removed) — the bedrock dry run
-        // sizes the project rail alone off this line.
+        // this rail (the source_agent rail was removed) — the reference dry
+        // run sizes the project rail alone off this line.
         console.log(
           `[hicortex]   SKIPPED (project_mismatch): ${c.memberIds.map((id) => id.slice(0, 8)).join(", ")}`,
         );

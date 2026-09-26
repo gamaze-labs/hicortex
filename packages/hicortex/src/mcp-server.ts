@@ -1980,13 +1980,19 @@ export async function startServer(options: {
   // shell exemption — it carries install config); localhost bypass applies.
   // Applies on restart: the daemon resolves config at boot (llmConfig is the
   // boot snapshot; the card footnotes this).
+  // #514: hosted mode additionally rejects backend/base_url/api_key on the
+  // PUT (the hosting service owns the endpoint and credentials) and the GET
+  // echoes managed:true; the boot-resolved hostedMode threads to BOTH
+  // handlers. Self-hosted behavior is unchanged.
   app.get("/dashboard/model", dashboardModelGetHandler(
     () => readConfigFile(stateDir),
     () => llmConfig,
+    hostedMode,
   ));
   app.put("/dashboard/model", dashboardModelPutHandler(
     (updates) => persistConfigUpdates(pathJoin(stateDir, "config.json"), updates),
     () => llmConfig,
+    hostedMode,
   ));
 
   // PUT /dashboard/capture-pause — the console's pause/resume toggle (#423
