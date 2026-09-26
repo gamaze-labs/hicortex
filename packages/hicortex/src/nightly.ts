@@ -1281,7 +1281,7 @@ async function runClientNightly(
   for (let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS; attempt++) {
     try {
       // PUBLIC /health probe — liveness only, no auth required. Client-mode
-      // preflight runs against a REMOTE server over Tailscale, and the client
+      // preflight runs against a REMOTE server across the network, and the client
       // has NO bearer token to hand on this path (the auth token is the
       // server's, not the client's; /distill uses the configured authToken
       // but the liveness check must work even before that resolves). The

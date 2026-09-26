@@ -76,7 +76,7 @@
       badged "best match" (server composite order kept — ranking is #425).
       All-below-floor renders "no matches for '<q>'" — NN junk never shows.
     - ONE-SCREEN LAYOUT: header + band + field fit the first viewport at
-      ~1440×900 (MBP5 reference; 1280×800 verified). Band compacted; the
+      ~1440×900 (reference resolution; 1280×800 verified). Band compacted; the
       field takes the viewport remainder (clamp with a measured offset —
       see the #brainwrap CSS note). Scroll stays available as overflow.
 
@@ -574,7 +574,7 @@
 
   /* ---- the brain-field ---- */
   /* ONE-SCREEN AT-REST LAYOUT (#409 polish, owner ruling 2026-09-13): header
-     + stats band + field fit the first viewport at ~1440×900 (MBP5 is the
+     + stats band + field fit the first viewport at ~1440×900 (that is the
      reference; 1280×800 verified too). The field takes the viewport REMAINDER
      — the subtracted constant is the MEASURED header+band+paddings total on
      the reference store (Chrome 152, headless): 412px at the 4-column width,
@@ -1395,7 +1395,7 @@
       </label>
       <label class="mm-check"><input type="checkbox" id="mm-think"> enable thinking <small>(local endpoints only)</small></label>
     </div>
-    <div class="mm-note">applies on server restart</div>
+    <div class="mm-note" id="mm-note">applies on server restart</div>
     <div class="mm-foot">
       <button class="btn" id="mm-cancel">Cancel</button>
       <button class="btn save" id="mm-save">Save</button>
@@ -2414,7 +2414,7 @@ function draw(now, dt){
     if(L.rk>=lodK) continue;                             // zoom LOD (lines only)
     const a=mems.get(L.a), b=mems.get(L.b);
     if(!a||!b||!aliveAt(a,t)||!aliveAt(b,t)) continue;
-    /* #474 final polish: the both-endpoints-in-window gate killed the mesh — links draw between ANY placed memories (bedrock parity: the full LOD-tamed mesh), endpoints carry positions regardless of window membership */
+    /* #474 final polish: the both-endpoints-in-window gate killed the mesh — links draw between ANY placed memories (reference parity: the full LOD-tamed mesh), endpoints carry positions regardless of window membership */
     if(a._emerged===false||b._emerged===false) continue; // thread waits for both endpoints
     const [ax,ay]=bpos(a,now,t), [bx,by]=bpos(b,now,t);
     const ctrl=segCtrlN(ax,ay,bx,by,(L.use>18?1:-1));
@@ -3398,8 +3398,8 @@ function renderRecBand(ups){
   /* No trend arrow (owner 2026-09-20: removed — unclear). Its renderer and
      the element writes are removed WITH it: a leftover write to a removed
      element is a boot-killing TypeError whenever the recall band carries
-     real data (bedrock 0.22.2: "0 memories" — boot died before the counter
-     was ever seeded). */
+     real data (a production instance on 0.22.2: "0 memories" — boot died
+     before the counter was ever seeded). */
 }
 
 /* ---------- Memory Precision — Level 1, the pushed index (#476). A compact
@@ -3509,32 +3509,44 @@ function renderModelCard(){
    only as api_key_set), writes PUT with the subset the user touched. The
    api-key input is WRITE-ONLY: prefilled with nothing, sent only when
    non-empty ("leave blank to keep"). enable_thinking is sent only when the
-   user toggles the checkbox (tri-state not needed). ---------- */
+   user toggles the checkbox (tri-state not needed).
+   Hosted mode (#514): the GET carries managed:true — the hosting service
+   owns the endpoint + credentials, so their inputs are disabled and never
+   ride the PUT body (a save cannot hit the server's managed-field 403). */
 let mmThinkTouched=false;
 function openModelModal(){
   if(!M) return;               // no settings payload → no dialog (degrade)
   const mdl=el('model-modal');
+  const managed=!!M.managed;
   el('mm-backend').value=M.backend||'';   // '' = auto / OpenAI-compatible
   el('mm-baseurl').value=M.base_url||'';
   el('mm-model').value=M.model||'';
   const ak=el('mm-apikey'); ak.value='';
-  ak.placeholder=M.api_key_set?'configured — leave blank to keep':'api key (optional for local endpoints)';
+  ak.placeholder=managed?'managed by the hosting service'
+    :(M.api_key_set?'configured — leave blank to keep':'api key (optional for local endpoints)');
   el('mm-maxtok').value=M.max_tokens!=null?String(M.max_tokens):'';
   el('mm-think').checked=!!M.enable_thinking;
   mmThinkTouched=false;
+  for(const id of ['mm-backend','mm-baseurl','mm-apikey']) el(id).disabled=managed;
+  el('mm-note').textContent=managed
+    ?'endpoint and credentials are managed by the hosting service — applies on server restart'
+    :'applies on server restart';
   mdl.hidden=false;
-  el('mm-baseurl').focus();
+  (managed?el('mm-model'):el('mm-baseurl')).focus();
 }
 function closeModelModal(){ el('model-modal').hidden=true; }
 async function saveModelSettings(){
   /* Build the PUT body from CURRENT field state: empty base_url/model/max
      tokens = clear (null server-side); backend '' clears the named-backend
-     key; api_key only rides when typed; enable_thinking only when toggled. */
+     key; api_key only rides when typed; enable_thinking only when toggled.
+     Managed (hosted) mode: backend/base_url/api_key never ride the body. */
   const body={};
-  body.backend=el('mm-backend').value;
-  const bu=el('mm-baseurl').value.trim(); body.base_url=bu?bu:null;
+  if(!M.managed){
+    body.backend=el('mm-backend').value;
+    const bu=el('mm-baseurl').value.trim(); body.base_url=bu?bu:null;
+    const ak=el('mm-apikey').value; if(ak) body.api_key=ak;
+  }
   const mo=el('mm-model').value.trim(); body.model=mo?mo:null;
-  const ak=el('mm-apikey').value; if(ak) body.api_key=ak;
   const mt=el('mm-maxtok').value.trim(); body.max_tokens=mt?Number(mt):null;
   if(mmThinkTouched) body.enable_thinking=el('mm-think').checked;
   try{
