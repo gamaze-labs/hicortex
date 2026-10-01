@@ -24,6 +24,12 @@ Email **security@gamaze.com** with:
 You'll get an acknowledgement within 72 hours. We'll work with you on a fix
 and a coordinated disclosure timeline.
 
+**Credit:** reports that lead to a fix are credited in the published GitHub
+Security Advisory (with your handle linked, if you'd like). Our first external
+report — a command-injection finding in the claude-cli backend, fixed in
+0.23.1 — was responsibly disclosed and credited:
+[GHSA-rxh9-32xw-qcfg](https://github.com/gamaze-labs/hicortex/security/advisories/GHSA-rxh9-32xw-qcfg).
+
 ## Scope
 
 In scope:
