@@ -2,11 +2,18 @@
 
 > **Install:** `hermes plugins install gamaze-labs/hicortex-hermes-plugin` → `hermes memory setup hicortex` → restart your gateway.
 >
-> The [gamaze-labs/hicortex-hermes-plugin](https://github.com/gamaze-labs/hicortex-hermes-plugin) repo is a **generated read-only mirror** of `hermes-plugin/hicortex/` in the main Hicortex repo — do not open PRs there. Requires a running [Hicortex server](https://hicortex.gamaze.com/docs/installation.html) (local or remote) for recall; capture of Hermes sessions is handled by the server machine's nightly job.
+> The [gamaze-labs/hicortex-hermes-plugin](https://github.com/gamaze-labs/hicortex-hermes-plugin) repo is a **generated read-only mirror** of `hermes-plugin/hicortex/` in the main Hicortex repo — do not open PRs there. Requires a running [Hicortex server](https://hicortex.gamaze.com/docs/installation.html) (local or remote) for recall; capture of Hermes sessions is the nightly job's, not this plugin's (see [Data flow](#data-flow)).
 
-Gives [Hermes](https://github.com/nousresearch/hermes-agent) agents self-learning memory backed by a [Hicortex](https://hicortex.gamaze.com/) server: their experience is distilled into lessons overnight, and they wake up wiser. **Recall-only:** the plugin retrieves relevant memories on every turn and injects distilled lessons into the system prompt. It has **no local LLM, no capture, no cron** — it is a thin recall shim.
+Gives [Hermes](https://github.com/nousresearch/hermes-agent) agents self-learning memory backed by a [Hicortex](https://hicortex.gamaze.com/) server: their experience is distilled into lessons overnight, and they wake up wiser. **Recall-only:** each turn the plugin sends the user's message to the configured server and injects the returned recall index, plus distilled lessons into the system prompt. It has **no local LLM, no capture, no cron** — it is a thin recall shim.
 
-**Capture happens centrally.** A nightly reader on the Hicortex server distills each agent's own session store (Hermes keeps full history in `~/.hermes/profiles/<agent>/state.db`), so nothing needs to be captured in real time. See `specs/2026-07-01-memory-capture-architecture.md` in the main repo.
+## Data flow
+
+Both directions of the wire, stated plainly:
+
+- **Recall — every turn.** Each user message is sent to your configured Hicortex server for recall (`POST /recall-index`, or `GET /search` on pre-0.14 servers), and session distillation runs on the server. The server therefore sees prompt text as it arrives — point `hicortex_url` at a server you trust (default `http://localhost:8787`).
+- **Capture — nightly.** Session logs are read locally from each machine's own Hermes store (Hermes keeps full history in `~/.hermes/profiles/<agent>/state.db`); the nightly ships only denoised text to the server, and the server stores distilled memories — raw session logs stay on the capturing machine. Nothing is captured in real time.
+
+The plugin warns once at startup when `hicortex_url` is plain `http://` on a non-loopback host while an auth token is set — credentials and prompts then cross the network in cleartext. Use `https://`, or keep the server on a trusted private network (plain http over a private/overlay network is a legitimate setup; the warning is advisory, not a rejection). The HTTP client also strips the `Authorization` header on any redirect that leaves the original host.
 
 ## How it works
 
@@ -26,9 +33,9 @@ Instead of injecting full memory content every turn, `prefetch` sends the user's
 
 ### Per-agent standing context (0.13)
 
-`system_prompt_block()` also injects the hand-edited **standing context layer** (`## Context`, above the lessons block) — "who you are + how to work", distinct from episodic memory. The server resolves it **per agent**: this profile's own sections override the global set (`override`), or it can be `global` or `off`. See the main repo's `/context` layer docs.
+`system_prompt_block()` also injects the hand-edited **standing context layer** (`## Identity`, above the lessons block) — "who you are + how to work", distinct from episodic memory. The server resolves it **per agent**: this profile's own sections override the global set (`override`), or it can be `global` or `off`. See the main repo's `/context` layer docs.
 
-> **Note (#264 rename):** the server-side layer was renamed Context → Identity in 0.18. The `/context` endpoint remains as an alias so this plugin keeps working unchanged; the heading is still rendered as `## Context` here and will switch to `## Identity` in a follow-up plugin release. No action needed.
+> **Note (#264 rename):** the server-side layer was renamed Context → Identity in 0.18. The `/context` endpoint remains as an alias so this plugin keeps working unchanged, and the injected heading renders as `## Identity`. No action needed.
 
 The plugin sends its **profile name** as `?agent=`, resolved in this order:
 
@@ -91,7 +98,7 @@ Env overrides: `HICORTEX_URL`, `HICORTEX_AUTH_TOKEN`.
 ## Topology
 
 - **Server host:** runs Hicortex. Set `hicortex_url: http://localhost:8787` (localhost bypasses auth).
-- **Other Hermes boxes:** set `hicortex_url` to the server's hostname (e.g. `http://memory-server:8787`) and `HICORTEX_AUTH_TOKEN` to the server's token. Each box recalls from the same shared brain.
+- **Other Hermes boxes:** set `hicortex_url` to the server's hostname (e.g. `http://memory-server:8787`) and `HICORTEX_AUTH_TOKEN` to the server's token. Each box recalls from the same shared brain — and every user message travels to that server each turn (see [Data flow](#data-flow)). Over plain `http://` the token and prompts cross the network in cleartext (one startup warning); prefer `https://` or a trusted private network.
 
 ## Notes
 

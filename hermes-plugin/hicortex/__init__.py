@@ -16,3 +16,10 @@ from agent.memory_provider import MemoryProvider  # noqa: F401  (loader scans fo
 from .provider import HicortexProvider
 
 __all__ = ["HicortexProvider"]
+
+
+def register(ctx) -> None:
+    """Hermes plugin entry point (memory-provider guide convention): hand this
+    provider to the host. Complements the direct import path — the loader
+    scans for ``MemoryProvider`` subclasses either way."""
+    ctx.register_memory_provider(HicortexProvider())

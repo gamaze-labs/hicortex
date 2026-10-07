@@ -800,6 +800,53 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 24,
+    name: "distill_queue",
+    up: (db) => {
+      // #529 — the durable distill inbox. POST /distill in queue mode stores
+      // the REDACTED segment here and answers 201 immediately (no LLM call);
+      // the nightly drain distills rows oldest-first and deletes each row in
+      // the same transaction as its memory inserts. One table in the shared
+      // SQLite DB — one store, same backup and tooling as the corpus (owner
+      // decision; not files). The row carries every /distill wire field needed
+      // to re-distill later (attribution, project, session_date, privacy) so
+      // the drain reproduces the sync path's insert exactly.
+      //
+      // UNIQUE(session_id, segment_id) is the delivery-time idempotency key: a
+      // queued-but-undistilled segment re-POST answers 200 skipped (the
+      // handler's prechecks consult this table), and a failed drain attempt
+      // never duplicates on retry. Legacy no-segment posts normalize
+      // segment_id ''. session_id stays NULL for posts that carry no session
+      // key — SQLite unique indexes treat NULLs as distinct, so those rows
+      // (which have no dedup key by construction, same as the sync path's
+      // sourceSession-undefined inserts) each enqueue separately.
+      // Idempotent: IF NOT EXISTS (the v18/v21 pattern — plain CREATE).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS distill_queue (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_id TEXT,
+          segment_id TEXT NOT NULL DEFAULT '',
+          source_agent TEXT,
+          source_agent_id TEXT,
+          source_domain TEXT,
+          source_machine TEXT,
+          project TEXT,
+          session_date TEXT,
+          privacy TEXT,
+          text TEXT NOT NULL,
+          arrived_at TEXT NOT NULL
+        )
+      `);
+      db.exec(`
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_distill_queue_session_segment
+          ON distill_queue(session_id, segment_id)
+      `);
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_distill_queue_arrived ON distill_queue(arrived_at)",
+      );
+    },
+  },
 ];
 
 /**

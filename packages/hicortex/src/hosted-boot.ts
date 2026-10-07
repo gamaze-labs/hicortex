@@ -13,7 +13,7 @@
  *     no bypass; a tenant dir provisioned from a restored tar could otherwise
  *     ship with the bypass active).
  *
- * Spec: specs/2026-07-27-hosted-service.md §1-§2 (Phase 0B, issue #271).
+ * Phase 0B, issue #271.
  */
 export interface HostedBootInput {
   /** Resolved hostedMode flag from config (absent/false → self-hosted). */

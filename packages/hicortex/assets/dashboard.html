@@ -865,6 +865,15 @@
   /* #423 phase 3: the capture-pause badge — the same amber family as the
      held badge (an operator state, not an error) */
   .cap-paused{ color:var(--amber); margin-left:5px; font-size:9px; letter-spacing:.08em; }
+  /* #530 follow-up: the distill-inbox row — stale badge + bar fill in the
+     amber family once the oldest queued item passes the payload's ECHOED warn
+     age. [hidden] must win over .cap-row2's flex (author display beats the
+     UA's hidden — the #billing-banner idiom) so a pre-#529 server shows
+     nothing, theme tokens only */
+  .cap-qrow[hidden]{ display:none; }
+  .cap-stale{ color:var(--amber); margin-left:5px; }
+  .cap-qrow .fill.warn{ background:var(--amber); }
+  .cap-qrow.stale .cap-dot{ background:var(--amber); }
 
   /* ================= the memory dropdown — opens UNDER the left search ================= */
   #panel{
@@ -1277,6 +1286,11 @@
     <div class="brow">
       <div class="bseg" id="g-capture">
         <div class="gh"><span class="t">Capture health</span><span class="sub" id="cap-sub">memory counts</span></div>
+        <!-- #530 follow-up: the distill inbox — the drain-side counterpart of
+             this card's delivery-side health. Pinned above the scrollable
+             #cap-rows; hidden until buildCapture's payload guard unhides it
+             (pre-#529 servers omit the block). -->
+        <div class="cap-row2 cap-qrow" id="cap-queue" hidden></div>
         <div id="cap-rows"></div>
       </div>
       <div class="bseg" id="g-roll">
@@ -3766,6 +3780,31 @@ function agoLabel(iso){
 function buildCapture(){
   const host=el('cap-rows');
   host.innerHTML='';
+  /* #530 follow-up: the distill-inbox row — rendered FIRST because every
+     render branch below returns early (a call after them would only run in
+     the degrade). The absent-block guard keeps it hidden on a pre-#529
+     server; the warn threshold is always the payload's echo (#476
+     degrade-literal precedent), never a page literal. */
+  const qrow=el('cap-queue');
+  qrow.innerHTML='';
+  qrow.className='cap-row2 cap-qrow';
+  const q=D&&D.distill_queue?D.distill_queue:null;
+  qrow.hidden=!q;
+  if(q){
+    const thr=q.warn_age_hours||24;
+    const oldest=(typeof q.oldest_age_hours==='number')?q.oldest_age_hours:null;
+    const stale=oldest!==null&&oldest>thr;
+    if(stale) qrow.classList.add('stale');
+    qrow.title='Distill inbox — deliveries are stored durably at POST time and distilled by the scheduled nightly run before consolidation'
+      +(stale?' — the oldest item is '+oldest+' h old (warn age '+thr+' h): the scheduled drain is behind':'');
+    qrow.innerHTML='<span class="cap-dot"></span>'
+      +'<span class="hn">Distill inbox</span>'
+      +'<span class="cap-bar"><span class="fill'+(stale?' warn':'')+'" style="width:'+(oldest===null?0:Math.min(1,oldest/thr)*100)+'%"></span></span>'
+      +'<span class="st"><b>'+fmt(q.depth||0)+'</b> queued'
+      +(oldest===null?' · inbox empty':' · oldest '+(oldest>=48?(oldest/24).toFixed(1)+'d':oldest.toFixed(1)+'h'))
+      +(stale?'<span class="cap-stale" title="oldest queued item past the '+thr+' h warn age — the scheduled drain is behind">&#9888; stale</span>':'')
+      +'</span>';
+  }
   const sub=el('cap-sub');
   const ch=D&&D.capture_health?D.capture_health:null;
   /* fix round 7: the rolling-window view — the card shows the normal 30 day

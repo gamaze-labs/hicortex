@@ -12,6 +12,8 @@ import { getValidatedLicense } from "./features.js";
 import { describeLastNightly } from "./state.js";
 import { resolveAgentIdentity } from "./identity-store.js";
 import { labelForType } from "./type-labels.js";
+import { readQueueStats } from "./distill-queue.js";
+import { DRAIN_QUEUE_WARN_AGE_HOURS } from "./calibration.js";
 
 const HICORTEX_HOME = hicortexHome();
 const CC_SETTINGS = join(homedir(), ".claude", "settings.json");
@@ -50,6 +52,29 @@ export function formatTypeBreakdown(byType: Record<string, number>): string {
     .join(", ");
 }
 
+/**
+ * The distill-inbox lines for `hicortex status` (#529). Pure on the
+ * {@link readQueueStats} shape so the rendering (incl. the 24 h stale-item
+ * warning, DRAIN_QUEUE_WARN_AGE_HOURS) is unit-testable without the full
+ * status printer. An empty inbox prints nothing — depth 0 is the healthy
+ * steady state, not worth a line.
+ */
+export function formatDistillQueueLines(stats: {
+  depth: number;
+  oldest_age_hours: number | null;
+}): string[] {
+  if (stats.depth === 0) return [];
+  const age = stats.oldest_age_hours ?? 0;
+  const lines = [`Distill queue: ${stats.depth} pending (oldest ${age.toFixed(1)}h)`];
+  if (age >= DRAIN_QUEUE_WARN_AGE_HOURS) {
+    lines.push(
+      `  ⚠ Distill inbox oldest item is ${age.toFixed(1)}h old (>${DRAIN_QUEUE_WARN_AGE_HOURS}h) — ` +
+        `check the drain outcome in the last nightly log`,
+    );
+  }
+  return lines;
+}
+
 export async function runStatus(): Promise<void> {
   console.log("Hicortex Status");
   console.log("─".repeat(40));
@@ -68,6 +93,10 @@ export async function runStatus(): Promise<void> {
       console.log(`Memories:     ${stats.memories} (${typeStr || "none"})`);
       console.log(`Links:        ${stats.links}`);
       console.log(`DB size:      ${(stats.db_size_bytes / 1024).toFixed(1)} KB`);
+      // #529: inbox visibility — depth + oldest-item age, warn above 24 h.
+      for (const line of formatDistillQueueLines(readQueueStats(db))) {
+        console.log(line);
+      }
       // 0.21 migration detection (#425): pre-0.21 stores have inflated importance
       // scores (median ~0.80 vs the honest ~0.40). If the live median is high,
       // recommend the one-shot rescore.

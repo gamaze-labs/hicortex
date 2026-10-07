@@ -1,6 +1,6 @@
 /**
  * No-fit lifecycle — weak-primary floor + no-association decay
- * (owner amendment 07.07 to specs/2026-07-07-graded-schema-memory-tags.md).
+ * (owner amendment 07.07).
  *
  * THE MODEL
  * ---------

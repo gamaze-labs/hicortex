@@ -6,10 +6,55 @@ Stdlib-only (no pip dependencies) so the plugin installs with zero friction.
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# One-shot-per-process guard for the cleartext-transport warning. Clients are
+# rebuilt per provider/config read; warning per construction would spam the
+# gateway log on every rebuild.
+_cleartext_warned = False
+
+
+def _origin(url: str) -> Tuple[Optional[str], Optional[int]]:
+    """(host, port) origin of a URL, default-port-normalized (http→80,
+    https→443) and lower-cased — the identity a redirect must preserve for the
+    Authorization header to be safe to keep. Unparseable URLs never compare
+    equal, so they fail CLOSED (token stripped)."""
+    try:
+        parsed = urllib.parse.urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return (parsed.hostname or "").lower(), port
+    except ValueError:
+        return (url, None)
+
+
+class _AuthStrippingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strip ``Authorization`` on any redirect that leaves the original origin.
+
+    urllib's default redirect handler forwards the request's headers to the
+    redirect target (only content headers — length/type/encoding — are
+    dropped), so a cross-host 302 hands the bearer token to whoever answers
+    the redirect. Same-origin redirects (path changes, trailing-slash fixes)
+    keep authenticating as before."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None and _origin(req.full_url) != _origin(newurl):
+            # Request headers are Capitalized by add_header ("Authorization").
+            new_req.headers.pop("Authorization", None)
+            new_req.unredirected_hdrs.pop("Authorization", None)
+        return new_req
+
+
+# Shared opener: urllib's defaults plus the auth-stripping redirect handler.
+# `urlopen` cannot be used for this — it goes through the process-global
+# default opener, which we must not reconfigure from inside a plugin.
+_OPENER = urllib.request.build_opener(_AuthStrippingRedirectHandler)
 
 
 class HicortexClient:
@@ -31,6 +76,23 @@ class HicortexClient:
             if host in ("127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1")
             else auth_token
         )
+        # Cleartext transport warning (catalog review 130093): a plain http://
+        # URL to a non-loopback host while a token is set means the token AND
+        # every prompt sent for recall cross the network unencrypted. WARN,
+        # never reject — plain http on a trusted private network (overlay
+        # networks, private overlay meshes) is a legitimate setup.
+        if self.auth_token and urllib.parse.urlparse(self.base_url).scheme != "https":
+            global _cleartext_warned
+            if not _cleartext_warned:
+                _cleartext_warned = True
+                logger.warning(
+                    "hicortex: %s uses plain http:// on a non-loopback host "
+                    "while an auth token is set — the token and every prompt "
+                    "sent for recall cross the network in cleartext. Use "
+                    "https://, or keep the server on a trusted private "
+                    "network. (This warning fires once per process.)",
+                    self.base_url,
+                )
         self.timeout = timeout
 
     def _headers(self) -> dict[str, str]:
@@ -69,7 +131,7 @@ class HicortexClient:
         errors converted to statuses (never raised)."""
         req = urllib.request.Request(url, data=data, headers=self._headers(), method=method)
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            with _OPENER.open(req, timeout=timeout or self.timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             return e.code, self._parse_http_error(e)

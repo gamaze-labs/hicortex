@@ -21,8 +21,8 @@ let VERSION = "0.0.0";
 try { VERSION = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "utf-8")).version; } catch {}
 
 import { initDb, resolveDbPath } from "./db.js";
-import { readNonNegativeConfig, readPositiveConfig, warnIgnoredConfigKeys } from "./config-read.js";
-import { DEFAULT_FIRST_RUN_LOOKBACK_DAYS } from "./calibration.js";
+import { readNonNegativeConfig, readPositiveConfig, readStringConfig, warnIgnoredConfigKeys } from "./config-read.js";
+import { DEFAULT_FIRST_RUN_LOOKBACK_DAYS, DRAIN_YIELD_PROBE_TIMEOUT_MS } from "./calibration.js";
 import { resolveSavedLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
@@ -39,6 +39,8 @@ import { loadState, updateState, migrateLegacyState } from "./state.js";
 import { migrateIdentityDir } from "./identity-store.js";
 import { openCursorStore, pruneCursors } from "./capture-cursors.js";
 import { captureBatches, acquireCaptureLock, type PostFn, type PostResult, type DistillBody } from "./capture.js";
+import { drainDistillQueue, type YieldStatus } from "./distill-queue.js";
+import { isTokenBudgetExceeded, recordDistillUsage } from "./token-budget.js";
 import { createRunDeadline, resolveNightlyTimeBudgetMinutes, type RunDeadline } from "./run-deadline.js";
 import { writeSnapshot, backfillSnapshots } from "./dashboard.js";
 import { pruneRecallPrecision } from "./recall-precision.js";
@@ -203,6 +205,43 @@ function makeRemotePost(serverUrl: string, authToken?: string, deadline?: RunDea
 }
 
 /**
+ * #529: the REAL yield-signal probe (the drain's is injected so the stage is
+ * unit-testable without HTTP). GETs the configured URL with a short timeout
+ * and classifies: busy = 2xx AND (a JSON body with a truthy `busy` field OR
+ * the plain body "busy"); a non-2xx answer means the endpoint ANSWERED and is
+ * simply not reporting busy → idle; a network error/timeout → unreachable
+ * (the drain proceeds fail-open and warns once). The URL lives in the nightly
+ * (not distill-queue.ts) so the drain module stays fetch-free.
+ */
+function makeDrainYieldProbe(): (url: string) => Promise<YieldStatus> {
+  return async (url: string): Promise<YieldStatus> => {
+    try {
+      const resp = await fetch(url, {
+        signal: AbortSignal.timeout(DRAIN_YIELD_PROBE_TIMEOUT_MS),
+      });
+      if (!resp.ok) return "idle";
+      const body = (await resp.text()).trim();
+      try {
+        const parsed = JSON.parse(body) as unknown;
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          "busy" in parsed &&
+          Boolean((parsed as Record<string, unknown>).busy)
+        ) {
+          return "busy";
+        }
+      } catch {
+        // Not JSON — the plain-body form below is the whole remaining check.
+      }
+      return body.toLowerCase() === "busy" ? "busy" : "idle";
+    } catch {
+      return "unreachable";
+    }
+  };
+}
+
+/**
  * Per-POST timeout: 20 min (synchronous distillation of a large segment can
  * take minutes), clamped to the run deadline's remaining time when one is in
  * force (#405) — a POST launched near expiry never outlives the deadline.
@@ -218,6 +257,7 @@ async function normalizePostResult(resp: Response): Promise<PostResult> {
       distilled?: number;
       dropped?: string[];
       usage?: unknown;
+      queued?: unknown;
     };
     // #287: the daemon reports the segment's metered usage. Shape-validated
     // so a partial payload can't NaN the run's totals; a pre-#287 daemon
@@ -227,6 +267,9 @@ async function normalizePostResult(resp: Response): Promise<PostResult> {
       status: 201,
       distilled: data.distilled ?? 0,
       dropped: data.dropped ?? [],
+      // #529: a queue-mode server confirms durable storage, not distillation
+      // — the client only swaps its log line on this flag.
+      queued: data.queued === true,
       ...(usage ? { usage } : {}),
     };
   }
@@ -723,6 +766,54 @@ export async function runNightly(options: {
       }
     }
     } // end capture block (consolidateOnly else)
+
+    // Step 2.5 (#529): drain the distill inbox — distill everything the
+    // daemon queued since the last run, BEFORE consolidation so drained
+    // memories are scored/linked/reflected in the SAME run. Full AND
+    // consolidate-only runs drain (the same gate as consolidation — hosted
+    // tenants deliver through their daemon too); capture-only/watchdog and
+    // dry-run never do (compute stays scheduled; capture-only keeps its
+    // no-LLM contract). All LLM goes through the one LlmClient (ladder,
+    // breaker, single-flight, dispatcher); token gate + run deadline are
+    // checked between items; the optional yield signal (drainYieldUrl) waits
+    // out interactive use of the endpoint. Runs even when capture above was
+    // skipped (lock wait / consolidate-only) — the inbox is independent of
+    // this machine's capture.
+    if (!dryRun && !captureOnly) {
+      const drainReport = await drainDistillQueue(db, {
+        llm,
+        llmConfig,
+        embed,
+        budgetExceeded: () => isTokenBudgetExceeded(stateDir),
+        deadline,
+        yieldUrl: readStringConfig(savedConfig ?? {}, "drainYieldUrl") ?? undefined,
+        probeBusy: makeDrainYieldProbe(),
+      });
+      // #5 metering, same as the daemon's sync path: record tokens against
+      // the monthly budget (incl. a failed item's partial usage) and fold
+      // them into the snapshot's distill share so new_this_run.tokens stays
+      // the run's TRUE total.
+      if (drainReport.usage.total > 0) {
+        recordDistillUsage(stateDir, drainReport.usage);
+        distillUsage = distillUsage
+          ? {
+              prompt: distillUsage.prompt + drainReport.usage.prompt,
+              completion: distillUsage.completion + drainReport.usage.completion,
+              total: distillUsage.total + drainReport.usage.total,
+            }
+          : drainReport.usage;
+      }
+      if (drainReport.outcome !== "empty" && drainReport.outcome !== "completed") {
+        // A non-clean drain is a health signal, not a run failure: processed
+        // items are durable and the rest retries next scheduled run. Make it
+        // visible next to the capture-complete line so the queue-depth/age
+        // warning in status has a log-side counterpart.
+        console.warn(
+          `[hicortex] Distill drain ${drainReport.outcome}: ` +
+            `${drainReport.processed} processed, ${drainReport.remaining} still queued`,
+        );
+      }
+    }
 
     // Step 3: Consolidation — skipped in capture-only mode, dry-run, or no LLM.
     // Runs even if capture had transient failures (opens DB directly, independent

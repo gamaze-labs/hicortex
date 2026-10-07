@@ -643,6 +643,26 @@ export interface HicortexConfig {
    */
   llmProbeTtlMs?: number;
   /**
+   * #529 kill switch for the durable distill inbox. Default TRUE (queue
+   * mode): POST /distill stores the redacted segment durably and answers the
+   * SAME 201 shape with zeroed counts + `queued: true` — no LLM call — and
+   * the nightly's drain stage distills the inbox before consolidation, so
+   * all distill LLM traffic happens inside the scheduled runs. `false`
+   * restores synchronous distill-on-POST byte-for-byte (every delivery
+   * lands in the sync flow). Read through readStrictBoolean — a non-boolean
+   * value is ignored (warned), never coerced.
+   */
+  distillQueue?: boolean;
+  /**
+   * #529 optional interactive-yield signal: a URL the drain polls BETWEEN
+   * items. A 2xx answer whose body is JSON with a truthy `busy` field — or
+   * the plain text `busy` — makes the drain wait and re-check (bounded by
+   * the run deadline and a per-item cap); unset or unreachable proceeds
+   * fail-open (one warn per run). Seam only for now — the drain side ships
+   * with this contract, endpoints can adopt it whenever.
+   */
+  drainYieldUrl?: string;
+  /**
    * Max lessons injected into an agent's session-start context (default 10).
    * Lessons are ranked per-session by project/domain affinity + recency +
    * strength + access, so each session sees its most-relevant slice. Lower =
