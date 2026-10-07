@@ -888,5 +888,231 @@ def test_get_config_redacts_token(monkeypatch, tmp_path):
     assert cfg["hicortex_auth_token"] == "***"
 
 
+# --------------------------------------------------------------------------- #
+# Catalog review round (130093) — register(ctx) entry point, cleartext
+# warning, Authorization strip on cross-origin redirects
+# --------------------------------------------------------------------------- #
+def test_register_entry_point_registers_provider():
+    """register(ctx) is the documented Hermes entry point: it hands exactly one
+    HicortexProvider to the host's register_memory_provider. __all__ keeps the
+    direct-import path (HicortexProvider) intact."""
+    import hicortex
+
+    recorded = []
+
+    class Ctx:
+        def register_memory_provider(self, p):
+            recorded.append(p)
+
+    hicortex.register(Ctx())
+    assert len(recorded) == 1
+    assert isinstance(recorded[0], provider_mod.HicortexProvider)
+    assert hicortex.__all__ == ["HicortexProvider"]
+
+
+@pytest.fixture
+def reset_cleartext_warn():
+    """The cleartext warning is one-shot per process (a per-client warning would
+    spam the gateway log on every client rebuild). Reset for test isolation."""
+    from hicortex import client as client_mod
+
+    client_mod._cleartext_warned = False
+    yield
+    client_mod._cleartext_warned = False
+
+
+def _warning_records(caplog, logger_name):
+    return [r for r in caplog.records if r.levelno == logging.WARNING
+            and r.name == logger_name]
+
+
+def test_cleartext_http_remote_plus_token_warns_once(caplog, reset_cleartext_warn):
+    """http:// + non-loopback host + bearer token set → exactly ONE startup
+    warning naming the URL, mentioning cleartext + https — and NEVER echoing
+    the token value."""
+    from hicortex import client as client_mod
+    from hicortex.client import HicortexClient
+
+    with caplog.at_level(logging.WARNING, logger=client_mod.__name__):
+        HicortexClient("http://memory-server:8787", auth_token="hctx-secret")
+        HicortexClient("http://another-host:8787", auth_token="hctx-secret")  # once/process
+
+    warns = _warning_records(caplog, client_mod.__name__)
+    assert len(warns) == 1
+    msg = warns[0].getMessage()
+    assert "memory-server" in msg            # actionable: names the URL
+    assert "cleartext" in msg.lower()
+    assert "https" in msg
+    assert "hctx-secret" not in msg          # the token itself is never logged
+
+
+def test_cleartext_warning_silent_when_any_condition_missing(caplog, reset_cleartext_warn):
+    """No warning for the three legitimate shapes: loopback http (token or
+    not), https remote with a token, and tokenless remote http."""
+    from hicortex import client as client_mod
+    from hicortex.client import HicortexClient
+
+    with caplog.at_level(logging.WARNING, logger=client_mod.__name__):
+        HicortexClient("http://localhost:8787", auth_token="hctx-secret")  # loopback
+        HicortexClient("http://127.0.0.1:8787", auth_token="hctx-secret")  # loopback
+        HicortexClient("https://memory-server:8787", auth_token="hctx-secret")  # encrypted
+        HicortexClient("http://memory-server:8787")  # no token to leak
+
+    assert _warning_records(caplog, client_mod.__name__) == []
+
+
+def _redirect(url: str, location: str):
+    """Run urllib's redirect machinery by hand: build a GET request carrying an
+    Authorization header, then ask the handler what the follow-up request is."""
+    import email.message
+    import urllib.request
+    from hicortex.client import _AuthStrippingRedirectHandler
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": "Bearer hctx-secret",
+            "Accept": "application/json",
+        },
+    )
+    return _AuthStrippingRedirectHandler().redirect_request(
+        req, None, 302, "Found", email.message.Message(), location
+    )
+
+
+def test_redirect_strips_authorization_cross_host():
+    """A redirect to a DIFFERENT origin must not carry the bearer token
+    (urllib's default handler forwards it — only content headers are dropped)."""
+    new_req = _redirect(
+        "http://memory-server:8787/search", "https://evil.example/steal"
+    )
+    assert new_req is not None
+    assert new_req.full_url == "https://evil.example/steal"
+    assert "Authorization" not in new_req.headers
+    assert "Authorization" not in new_req.unredirected_hdrs
+    assert new_req.headers.get("Accept") == "application/json"  # other headers survive
+
+
+def test_redirect_keeps_authorization_same_origin():
+    """Same origin (host + port, default-port-normalized) keeps the token —
+    routine same-server redirects (path changes, trailing slash) must still
+    authenticate."""
+    new_req = _redirect(
+        "http://memory-server:8787/search", "http://memory-server:8787/search?q=x"
+    )
+    assert new_req is not None
+    assert new_req.headers.get("Authorization") == "Bearer hctx-secret"
+
+
+def test_redirect_cross_port_treated_as_cross_origin():
+    """A different port on the same host is a different listener — strip."""
+    new_req = _redirect(
+        "http://memory-server:8787/search", "http://memory-server:9999/x"
+    )
+    assert new_req is not None
+    assert "Authorization" not in new_req.headers
+
+
+def test_redirect_default_port_normalization_is_not_a_strip():
+    """Explicit :80 on an http URL and its port-less form are the SAME origin."""
+    new_req = _redirect(
+        "http://memory-server:80/search", "http://memory-server/search"
+    )
+    assert new_req is not None
+    assert new_req.headers.get("Authorization") == "Bearer hctx-secret"
+
+
+def test_client_end_to_end_strips_auth_on_cross_origin_redirect():
+    """The client's HTTP path must actually USE the stripping handler (not plain
+    urlopen): through a real redirect chain (A:302 → B, different port =
+    different origin) the token reaches A but never B."""
+    import http.server
+    import threading
+    from hicortex.client import HicortexClient
+
+    seen = {}
+
+    class _Base(http.server.BaseHTTPRequestHandler):
+        def _json(self, status: int) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"results": []}')
+
+        def log_message(self, *a):
+            pass
+
+    class B(_Base):
+        def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler API
+            seen["b"] = self.headers.get("Authorization")
+            self._json(200)
+
+    sb = http.server.HTTPServer(("127.0.0.1", 0), B)
+    port_b = sb.server_address[1]
+
+    class A(_Base):
+        def do_GET(self):  # noqa: N802
+            seen["a"] = self.headers.get("Authorization")
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{port_b}/landed")
+            self.end_headers()
+
+    sa = http.server.HTTPServer(("127.0.0.1", 0), A)
+    for s in (sa, sb):
+        threading.Thread(target=s.serve_forever, daemon=True).start()
+    try:
+        c = HicortexClient(f"http://127.0.0.1:{sa.server_address[1]}", timeout=5.0)
+        # Simulate a non-loopback config (the constructor nulls the token on
+        # loopback hosts): inject it post-construction so the header is on the
+        # wire — the thing a redirect could leak.
+        c.auth_token = "hctx-integration"
+        c.search("q")
+    finally:
+        for s in (sa, sb):
+            s.shutdown()
+            s.server_close()
+
+    assert seen["a"] == "Bearer hctx-integration"   # reached the origin
+    assert seen["b"] is None                        # never forwarded onward
+
+
+def test_client_end_to_end_keeps_auth_on_same_origin_redirect():
+    """The legitimate case still authenticates: a same-server redirect (path
+    change) carries the token on the follow-up request."""
+    import http.server
+    import threading
+    from hicortex.client import HicortexClient
+
+    seen = {}
+
+    class S(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — BaseHTTPRequestHandler API
+            if self.path == "/start":
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{self.server.server_address[1]}/search")
+                self.end_headers()
+                return
+            seen["landed"] = self.headers.get("Authorization")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"results": []}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), S)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        c = HicortexClient(f"http://127.0.0.1:{srv.server_address[1]}", timeout=5.0)
+        c.auth_token = "hctx-integration"
+        c.search("q")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    assert seen["landed"] == "Bearer hctx-integration"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

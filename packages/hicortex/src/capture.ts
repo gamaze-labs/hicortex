@@ -106,6 +106,13 @@ export interface PostResult {
    * pre-#287 daemon (or any non-201) — callers must treat absent as zero.
    */
   usage?: { prompt: number; completion: number; total: number };
+  /**
+   * #529: the 201 confirmed durable QUEUEING, not distillation — a queue-mode
+   * server stores the segment and the nightly's drain distills it in the
+   * scheduled run. Contract-wise identical to any other 201 (the cursor
+   * advances); the capture loop only swaps its log line on it.
+   */
+  queued?: boolean;
 }
 
 export type PostFn = (body: DistillBody) => Promise<PostResult>;
@@ -461,7 +468,15 @@ export async function captureBatches(
           distillUsage.total += result.usage.total;
         }
         if (advancesBoundary) lastConfirmedEnd = seg.segEnd;
-        console.log(`[hicortex]     → ${result.distilled ?? 0} memories (segment ${body.segment_id})`);
+        // #529: a queue-mode 201 means "durably stored, distilled on the
+        // server's next scheduled run" — same confirmation, different log
+        // line, so a nightly log never reads "0 memories" as a failure when
+        // the server simply queued the segment.
+        if (result.queued) {
+          console.log(`[hicortex]     Queued on server (segment ${body.segment_id}) — distilled on the next scheduled run`);
+        } else {
+          console.log(`[hicortex]     → ${result.distilled ?? 0} memories (segment ${body.segment_id})`);
+        }
         for (const d of result.dropped ?? []) {
           // #489: the response array carries BOTH gate kinds (substance +
           // volatility) — the server's own log names the exact gate; this

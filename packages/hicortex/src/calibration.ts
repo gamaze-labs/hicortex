@@ -580,3 +580,45 @@ export function resolveOllamaFlushWaitMs(): number {
   );
   return OLLAMA_FLUSH_WAIT_MS;
 }
+
+// ---------------------------------------------------------------------------
+// Distill inbox / drain family (#529) — delivery-compute separation. Delivery
+// (cheap, must never lose data) stores segments durably; compute (expensive,
+// scheduled) happens only inside the nightly's drain stage. These constants
+// shape the drain's interactive-yield seam and the inbox's visibility signal.
+// ---------------------------------------------------------------------------
+
+/**
+ * Re-check interval (ms) while the drain's yield signal reports the LLM
+ * endpoint busy (#529 owner ruling 05.10.2026: interactive use always
+ * yields). The drain waits one interval between probe re-checks instead of
+ * polling in a tight loop; 30 s is short enough that the run resumes within
+ * half a minute of the owner going idle, long enough not to hammer the
+ * signal endpoint while a long interactive session runs.
+ */
+export const DRAIN_YIELD_POLL_MS = 30_000;
+
+/**
+ * Per-item cap (ms) on yield waits (#529). The run deadline is the primary
+ * bound; this cap is the fail-open backstop so a misconfigured signal that
+ * always answers "busy" cannot stall one item past half an hour — the item
+ * proceeds and the next between-items checks decide again. 30 min matches
+ * the order of a long local-model generation, the longest legitimate busy.
+ */
+export const DRAIN_YIELD_WAIT_CAP_MS = 30 * 60_000;
+
+/**
+ * Timeout (ms) for ONE yield-probe GET (#529). Deliberately short: the probe
+ * sits between drain items, and an endpoint that answers busy-signals at all
+ * answers them fast — anything slower reads as unreachable (fail-open).
+ */
+export const DRAIN_YIELD_PROBE_TIMEOUT_MS = 3_000;
+
+/**
+ * Oldest-item age (hours) above which the distill inbox warns in
+ * `hicortex status` and on the dashboard (#529). 24 h ≈ two missed scheduled
+ * runs on the default 2×/day consolidation grid — items older than that are
+ * not "waiting for tonight" anymore, they are stuck, and the operator should
+ * look at the drain's last outcome.
+ */
+export const DRAIN_QUEUE_WARN_AGE_HOURS = 24;

@@ -11,7 +11,7 @@
  *    bearer-token auth middleware (localhost bypasses as usual) so an
  *    operator running `hicortex status` on the server box, or a co-located
  *    nightly preflight, still gets them — but a remote/anonymous caller does
- *    not. Spec: `specs/2026-07-27-hosted-service.md` §6, Phase 0a item 5a/b.
+ *    not. Phase 0a item 5a/b.
  *
  * 2. REST `res.status(500).json({error: err.message})` sites were echoing
  *    internal detail (LLM upstream URLs, hostnames, stack frames) to the HTTP
@@ -36,6 +36,10 @@ export function publicHealthResponse(): { status: "ok" } {
  * standard auth middleware (localhost bypasses auth, so co-located tooling
  * — `hicortex status`, nightly preflight, `init` detect — sees it without a
  * token; a remote caller needs the bearer token).
+ *
+ * `distillQueue` (#529) is the inbox visibility signal: depth + oldest-item
+ * age in hours (null = empty inbox). Optional so the helper stays usable
+ * without a DB handle (tests) — the route always passes it.
  */
 export function detailedHealthResponse(opts: {
   memories: number;
@@ -43,6 +47,7 @@ export function detailedHealthResponse(opts: {
   dbSizeBytes: number;
   version: string;
   llmLabel: string;
+  distillQueue?: { depth: number; oldest_age_hours: number | null };
 }): {
   status: "ok";
   version: string;
@@ -50,6 +55,7 @@ export function detailedHealthResponse(opts: {
   links: number;
   db_size_kb: number;
   llm: string;
+  distill_queue?: { depth: number; oldest_age_hours: number | null };
 } {
   return {
     status: "ok",
@@ -58,6 +64,7 @@ export function detailedHealthResponse(opts: {
     links: opts.links,
     db_size_kb: Math.round(opts.dbSizeBytes / 1024),
     llm: opts.llmLabel,
+    ...(opts.distillQueue !== undefined ? { distill_queue: opts.distillQueue } : {}),
   };
 }
 

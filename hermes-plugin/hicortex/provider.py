@@ -26,7 +26,7 @@ Recall:   prefetch()          -> POST /recall-index (pushed recall index, 0.14 â
 
 Capture is NOT the plugin's job. A nightly reader on the Hicortex server
 distills each agent's own session store (Hermes: ~/.hermes/profiles/<agent>/
-state.db) centrally â€” see specs/2026-07-01-memory-capture-architecture.md. This
+state.db) centrally. This
 plugin has no local LLM, no spool, no timer, and no capture path.
 """
 

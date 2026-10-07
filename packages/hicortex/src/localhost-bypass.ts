@@ -32,7 +32,7 @@ export const LOCALHOST_BYPASS_MARKER_CONTENT =
   "# Written by `hicortex init` (self-hosted). Opt-in to the localhost auth\n" +
   "# bypass. DELETE this file to require the bearer token on localhost too\n" +
   "# (fail-closed). Hosted-mode (hostedMode:true) refuses to start with this\n" +
-  "# marker present — see specs/2026-07-27-hosted-service.md §2.\n";
+  "# See the hosted-mode boot assertions for the refusal logic.\n";
 
 /**
  * Resolve the marker file path for a given home dir. Defaults to the canonical

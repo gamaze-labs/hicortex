@@ -1,6 +1,6 @@
 /**
  * Graded schema membership — domain prototypes + per-tag association weights
- * (spec: specs/2026-07-07-graded-schema-memory-tags.md).
+ *.
  *
  * MODEL (cognitive grounding → mechanism)
  * ---------------------------------------

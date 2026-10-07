@@ -63,6 +63,13 @@ import { buildIdentityToolResult } from "./learnings-identity.js";
 import { extractConversationText, distillSession, detectChunkSize } from "./distiller.js";
 import { countExistingSegment, countExistingSession } from "./dedup.js";
 import {
+  enqueueDistill,
+  countQueuedSegment,
+  countQueuedSession,
+  resolveQueueMode,
+  readQueueStats,
+} from "./distill-queue.js";
+import {
   checkExplicitMarkTarget,
   applyExplicitMark,
   type ExplicitMarkInput,
@@ -720,6 +727,11 @@ export async function startServer(options: {
   // env (provider-set, tenant-immutable) which takes precedence. Initialised here
   // (after stateDir + savedConfig are known) so the warn-dedup can seed from state.
   initTokenBudget(stateDir, savedConfig?.llmTokensPerMonth);
+  // #529: the distill-inbox kill switch. Default ON (queue mode) — read once
+  // at boot via readStrictBoolean (the llmSingleFlight kill-switch pattern,
+  // llm.ts): never coerced ("false" the STRING is invalid + ignored), applied
+  // on restart like every other boot-resolved knob.
+  const distillQueueEnabled = readStrictBoolean(savedConfig ?? {}, "distillQueue") !== false;
   // #7: request body-size limit. Env (HICORTEX_DISTILL_BODY_LIMIT_MB) wins;
   // else the config key; else 5 MB hosted / 25 MB self-hosted (the prior
   // fixed value → no regression). Guards the OOM vector (the body is fully
@@ -984,6 +996,12 @@ export async function startServer(options: {
         dbSizeBytes: s.db_size_bytes,
         version: VERSION,
         llmLabel: llmConfig ? `${llmConfig.provider}/${llmConfig.model}` : "not configured",
+        // #529: inbox visibility — queue depth + oldest-item age (null when
+        // empty). The 24 h warning threshold itself is applied at render
+        // (status/dashboard), not here.
+        distillQueue: db
+          ? readQueueStats(db)
+          : { depth: 0, oldest_age_hours: null },
       }),
     );
   });
@@ -1401,10 +1419,25 @@ export async function startServer(options: {
       return;
     }
 
+    // #529 queue mode: the ONE branch condition into the sync flow. Queue
+    // mode = the kill switch is ON (default) AND this is not a fresh brain
+    // (empty memories + empty inbox distills synchronously — the bootstrap
+    // carve-out keeps first-ever memories immediate). Computed once, used at
+    // the no-LLM guard below (queue mode needs no LLM to accept a delivery —
+    // the drain defers when none is configured) and at the queue branch after
+    // the dedup prechecks. `distillQueue: false` lands here as false ALWAYS →
+    // the sync flow below runs byte-identically to pre-#529.
+    const queueMode = resolveQueueMode(db, distillQueueEnabled);
+
     if (!llm || !llmConfig) {
-      recordDistillActivity(db, capEntry(0, "held"));
-      res.status(503).json({ error: "No LLM configured — run npx @gamaze/hicortex init. Session will be retried." });
-      return;
+      if (!queueMode) {
+        recordDistillActivity(db, capEntry(0, "held"));
+        res.status(503).json({ error: "No LLM configured — run npx @gamaze/hicortex init. Session will be retried." });
+        return;
+      }
+      // Queue mode with no LLM: fall through — the queue branch below stores
+      // the delivery without any LLM call and the nightly drain defers until
+      // an LLM is configured.
     }
 
     // Resolve the conversation text from either the pre-denoised string or raw messages array.
@@ -1453,8 +1486,15 @@ export async function startServer(options: {
     // marker survives there after the `memories` row is deleted, so a
     // `hicortex dedup --apply` merge can't be undone by a retried/recaptured
     // segment silently re-ingesting the same content.
+    // #529: ALSO consults the distill inbox — a QUEUED-but-undistilled
+    // segment re-POST answers 200 skipped (same client contract as a stored
+    // duplicate: the cursor advances, the segment is never queued twice). In
+    // sync mode the inbox is empty by construction, so behavior there is
+    // unchanged.
     if (session_id && segment_id) {
-      const existingCount = countExistingSegment(db, session_id as string, segment_id as string);
+      const existingCount =
+        countExistingSegment(db, session_id as string, segment_id as string) +
+        countQueuedSegment(db, session_id as string, segment_id as string);
       if (existingCount > 0) {
         recordDistillActivity(db, capEntry(conversationText.length, "skipped"));
         res.status(200).json({ skipped: true, existing_count: existingCount });
@@ -1465,14 +1505,66 @@ export async function startServer(options: {
     // Session-level dedup: when session_id is present and this is a whole-session
     // POST (no segment_id — legacy ≤0.13.1 clients), skip if any chunk of this
     // session is already stored (memories OR dedup_log — see above).
+    // #529: the inbox is mirrored here too (any queued row of the session).
     // Unchanged: legacy clients keep exact behaviour.
     if (session_id && !segment_id) {
-      const existingCount = countExistingSession(db, session_id as string);
+      const existingCount =
+        countExistingSession(db, session_id as string) +
+        countQueuedSession(db, session_id as string);
       if (existingCount > 0) {
         recordDistillActivity(db, capEntry(conversationText.length, "skipped"));
         res.status(200).json({ skipped: true, existing_count: existingCount });
         return;
       }
+    }
+
+    // #529 queue branch: store the redacted segment durably and answer the
+    // SAME 201 shape with zeroed counts + `queued: true` — the client
+    // contract (cursor advances on 201) is untouched; capture.ts only swaps
+    // its log line when `queued` is present. NO LLM call: the probe gate,
+    // chunk-size detection, and the token gate all live in the nightly's
+    // drain now. Redaction already happened above, so the inbox never holds
+    // unredacted text (owner ruling 05.10.2026: same protection as the DB).
+    // The enqueue's UNIQUE(session_id, segment_id) insert is idempotent — a
+    // duplicate (only reachable via a racing identical POST; the prechecks
+    // above already answered the sequential re-POST) returns the same
+    // 200-skip contract.
+    if (queueMode) {
+      const { duplicate } = enqueueDistill(db, {
+        text: conversationText,
+        source_agent,
+        source_agent_id,
+        source_domain,
+        source_machine,
+        project,
+        session_id,
+        segment_id,
+        session_date,
+        privacy,
+      });
+      recordDistillActivity(db, capEntry(conversationText.length, duplicate ? "skipped" : "ok"));
+      if (duplicate) {
+        res.status(200).json({ skipped: true, existing_count: 0 });
+        return;
+      }
+      res.status(201).json({
+        ids: [],
+        distilled: 0,
+        dropped: [],
+        // #287 shape kept (zeros — no LLM ran) so pre-#529 clients parse the
+        // body unchanged; `queued: true` is the new signal.
+        usage: { prompt: 0, completion: 0, total: 0 },
+        queued: true,
+      });
+      return;
+    }
+
+    // #529: from here on queueMode is false, so the no-LLM guard above has
+    // already answered 503 in every path that reaches this line. Restated so
+    // the sync flow keeps its non-null llm/llmConfig typing unchanged.
+    if (!llm || !llmConfig) {
+      res.status(503).json({ error: "No LLM configured — run npx @gamaze/hicortex init. Session will be retried." });
+      return;
     }
 
     // #337: readiness gate — cached minimal generation probe BEFORE

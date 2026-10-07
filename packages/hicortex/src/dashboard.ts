@@ -30,6 +30,7 @@ import { readPositiveConfig, readNonNegativeConfig, readAccount } from "./config
 import { resolveMemorySoftCap } from "./consolidate.js";
 import { readCaptureHealth, readCaptureHealthWindow, type CaptureHealthRow } from "./capture-health.js";
 import { readMemoryPrecision, type MemoryPrecision } from "./recall-precision.js";
+import { readQueueStats } from "./distill-queue.js";
 import { listCapturePauses, readFleetLastSeen, setCapturePause } from "./capture-pause.js";
 import { loadState } from "./state.js";
 import { effectiveStrength } from "./retrieval.js";
@@ -44,6 +45,7 @@ import {
   STAGE_FADING_STRENGTH,
   STAGE_BELIEF_STRENGTH,
   STAGE_TRUTH_STRENGTH,
+  DRAIN_QUEUE_WARN_AGE_HOURS,
 } from "./calibration.js";
 
 // ---------------------------------------------------------------------------
@@ -268,6 +270,20 @@ export interface DashboardData {
    * pre-#476 recall-card rendering when the block is absent.
    */
   memory_precision: MemoryPrecision;
+  /**
+   * #529 — the distill inbox: live queue depth + oldest-item age (the
+   * drain-side health signal; delivery-side health is capture_health
+   * above). ALWAYS present; `oldest_age_hours` null when empty. The warn
+   * threshold is ECHOED like every threshold (the page renders its own
+   * stale badge from it, never hardcodes 24). Live view only — no snapshot
+   * history (depth is ~0 at snapshot time by construction). A pre-#529
+   * server omits the block; the page guards.
+   */
+  distill_queue: {
+    depth: number;
+    oldest_age_hours: number | null;
+    warn_age_hours: number;
+  };
   digest: {
     date: string | null;
     run_at: string | null;
@@ -1062,6 +1078,13 @@ export function handleDashboardData(
         shown_sum: live.adoption?.shown_sum ?? 0,
         used_sum: live.adoption?.used_sum ?? 0,
       }),
+      // #529: live inbox state — depth + oldest age + the echoed warn
+      // threshold. Live only (no series): depth at snapshot time is ~0 by
+      // construction, so history would be a flat line.
+      distill_queue: {
+        ...readQueueStats(db),
+        warn_age_hours: DRAIN_QUEUE_WARN_AGE_HOURS,
+      },
       // #423 phase 3: pauses + presence in one block — one source of truth
       // for the rail's dots, toggles and the capture card's PAUSED badges.
       fleet: {
