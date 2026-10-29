@@ -42,6 +42,7 @@ import { lessonsLimit } from "./features.js";
 import { getLessonSelector } from "./extensions.js";
 import { loadState } from "./state.js";
 import { hicortexHome } from "./paths.js";
+import { canonicalizeProject, parseProjectAliases } from "./project-canonicalize.js";
 import type { ModuleIndex } from "./types.js";
 
 const DEFAULT_PORT = 8787;
@@ -76,6 +77,11 @@ export interface ResolvedConfig {
   agentName: string | null;
   /** Max lessons to inject (config.lessonsLimit, default 10). */
   lessonsLimit?: number;
+  /** #567: the project-identity alias map (config `projectAliases`, folded
+   *  at read) — the client-side fold of the cwd-derived project uses it so
+   *  the lesson-selection comparison converges with the canonical server
+   *  corpus. null when the key is absent (mechanical fold only). */
+  projectAliases?: Readonly<Record<string, string>> | null;
 }
 
 /**
@@ -111,11 +117,29 @@ export function resolveConfig(): ResolvedConfig | null {
     home,
     agentName,
     lessonsLimit: typeof config.lessonsLimit === "number" ? config.lessonsLimit : undefined,
+    projectAliases: parseProjectAliases(config),
   };
 }
 
 function authHeaders(authToken: string | undefined): Record<string, string> {
   return authToken ? { "Authorization": `Bearer ${authToken}` } : {};
+}
+
+/**
+ * #567: the client-side project fold for lesson selection. The SessionStart
+ * hook derives its comparison project LOCALLY (basename of the session's
+ * cwd — the capture-side convention), while the server stores canonical
+ * labels; without folding the local label through the SAME function the
+ * `lesson.project === targetProject` affinity would silently miss on every
+ * case variant. Pure — exported so the fold is testable without stubbing
+ * fetchLessonsBlock's HTTP path (the resolveConfig/parseProjectAliases pair
+ * plus this function are the whole client-side seam).
+ */
+export function deriveHookProject(
+  cwd: string,
+  aliases?: Readonly<Record<string, string>> | null,
+): string | null {
+  return canonicalizeProject(basename(cwd), aliases);
 }
 
 /**
@@ -150,7 +174,9 @@ async function fetchLessonsBlock(cfg: ResolvedConfig): Promise<string | null> {
   // path component matches the capture-side CC project name convention
   // (transcript-reader's decodeProjectDirName also takes the last component).
   // This enables in-project + same-domain lesson boosting on the CC path.
-  const project = basename(process.cwd()) || null;
+  // #567: folded through the shared canonicalizer so the local label
+  // compares equal to the canonical server corpus (see deriveHookProject).
+  const project = deriveHookProject(process.cwd(), cfg.projectAliases);
   const selected = await getLessonSelector().select(data.lessons, { maxLessons, moduleIndex, project });
 
   const lessonLines = selected.map((l) => {

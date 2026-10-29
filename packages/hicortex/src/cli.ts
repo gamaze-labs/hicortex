@@ -16,6 +16,10 @@
  *              dedup --apply           Execute the merge (default: dry run);
  *                                      losers are absorbed (kept as evidence,
  *                                      hidden from recall), not deleted
+ *   reconcile-projects  One-shot project-label reconciliation (issue #567)
+ *              reconcile-projects --apply  Execute the renames (default: dry
+ *                                      run); canonicalizes existing rows via
+ *                                      the case fold + the projectAliases map
  *   sweep-volatile  One-shot sweep of volatile GH-status/version rows (#489)
  *              sweep-volatile --apply  Demote matches via absorb (default:
  *                                      dry run; backup first, audit trail)
@@ -312,6 +316,30 @@ switch (command) {
     break;
   }
 
+  case "reconcile-projects": {
+    // One-shot project-label reconciliation (#567): canonicalize EXISTING
+    // rows under the case fold + the projectAliases map. Mirrors `dedup`:
+    // dry-run default, --apply explicit (backup first, one transaction per
+    // rename group); flags parsed here, the runner lives in
+    // reconcile-projects.ts so this switch stays thin.
+    const args = process.argv.slice(3);
+    let dbPath: string | undefined;
+    try {
+      dbPath = readValueFlag(args, "--db");
+    } catch {
+      console.error("[hicortex] reconcile-projects: --db requires a path value");
+      process.exit(1);
+    }
+    const reconcileOptions = { apply: args.includes("--apply"), dbPath };
+    import("./reconcile-projects.js").then(({ runReconcileProjects }) => {
+      runReconcileProjects(reconcileOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] reconcile-projects failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
   case "sweep-volatile": {
     // One-shot store sweep of volatile GH-status/version rows (#489,
     // deliverable iii): reuses the distill path's deterministic gate over the
@@ -476,6 +504,7 @@ Commands:
   nightly         Run nightly denoise + capture + consolidate
   relink          Resumable link-discovery pass over the ENTIRE corpus (server mode)
   dedup           Cluster + merge near-duplicate memories (server mode; dry run by default)
+  reconcile-projects  Canonicalize existing project labels (server mode; dry run by default)
   history         Show a memory's rewrite history, or roll one back (server mode)
                   history <id>                List rewrite events (read-only)
                   history --rollback <row>    Undo one rewrite + un-absorb its triggers
@@ -511,6 +540,9 @@ Options:
   dedup --threshold <t>     Override the threshold for one run (default: the
                             release-managed calibration ceiling, 0.92)
   dedup --db <path>         DB path override (defaults to the configured DB)
+  reconcile-projects --apply  Execute the project renames (default: dry run, report only)
+                             Backup first; renames memories + distill_queue only
+  reconcile-projects --db <path>  DB path override (defaults to the configured DB)
   history --rollback <row>  Roll back history row <row>: restores prior content/status, un-absorbs triggers
   history --db <path>       DB path override (defaults to the configured DB)
   backup --out <dir>        Write the artifact into <dir> as hicortex-<ISO>.tar.gz (default: <home>/backups)

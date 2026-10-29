@@ -1032,6 +1032,9 @@
   #plan-overlay .po-head b{ font-family:var(--serif); font-weight:500; font-size:17px; letter-spacing:.06em; text-transform:uppercase; }
   #plan-overlay .po-body{ padding:14px 16px 16px; display:flex; flex-direction:column; gap:10px; }
   #plan-overlay .po-current{ font-size:12.5px; color:var(--dim); }
+  /* #411: the currency toggle pill — the site's #cur-toggle idiom (small,
+     accent-bordered pill above the cards). */
+  #plan-overlay .po-cur{ align-self:flex-start; margin:0; padding:3px 12px; font-size:11px; font-weight:700; color:var(--green); background:rgba(61,255,122,0.08); border:1px solid rgba(61,255,122,0.35); border-radius:100px; cursor:pointer; }
   .po-opts{ display:grid; grid-template-columns:1fr 1fr; gap:12px; }
   #acct-options[hidden]{ display:none; }   /* author grid beats [hidden] (renderPlanOverlay hides it when a plan is set) */
   .po-opt{ background:var(--panel); border:1px solid var(--line2); border-radius:12px; padding:14px 16px 13px; display:flex; flex-direction:column; gap:5px; min-width:0; }
@@ -1039,6 +1042,13 @@
   .po-opt .po-price{ font-size:26px; font-weight:640; font-variant-numeric:tabular-nums; letter-spacing:.01em; color:var(--green); }
   html:not([data-theme="light"]) .po-opt .po-price{ text-shadow:0 0 12px rgba(61,255,122,.35); }
   .po-opt .po-note{ font-size:11px; color:var(--dim); }
+  /* #411 tax wording: the price's tax qualifier renders small + muted next
+     to the amount (the .period idiom of the site's pricing card). */
+  .po-opt .po-price .po-price-x{ font-size:12px; font-weight:500; letter-spacing:0; color:var(--dim); text-shadow:none; }
+  /* #411 tax brief: the USD checkout footnote — small print under the plan
+     cards, shown only while the selected currency is USD (setPlanCur). No
+     display rule of its own, so the UA [hidden] hides it. */
+  #plan-overlay .po-tax{ font-size:11px; color:var(--dim); }
   /* what's included (round 3, owner: "NO info on what is included in the
      plan") — the marketing site's Cloud feature lines, verbatim, per card. */
   .po-opt .po-feat{ list-style:none; margin-top:7px; display:flex; flex-direction:column; gap:3px; }
@@ -1427,19 +1437,24 @@
      the dash (not dimmed-partial). × / cover-click / ESC close and return
      where the user was. The option cards are GENERATED from the
      PLAN_OPTIONS data array (round 3: N-driven — a future plan is a data
-     entry + a router price id, not a page rework); prices and the
-     included-features bullets are display constants aligned with the
-     marketing site (lockstep-pinned by tests). The router deliberately
-     knows only Stripe price ids, so there is no server-side amount to
-     read; the Stripe Checkout page shows the authoritative amount before
-     payment. ============ -->
+     entry + a router price id, not a page rework); #411: prices are
+     PER-CURRENCY data (USD + EUR, whole-number mirrors of each other), the
+     included-features bullets stay shared, and both are aligned with the
+     marketing site (lockstep-pinned by tests). The currency toggle pill
+     (#po-cur, the site's #cur-toggle idiom) re-renders the cards, and
+     checkout posts the displayed currency so the charge matches the
+     display. The router deliberately knows only Stripe price ids, so
+     there is no server-side amount to read; the Stripe Checkout page
+     shows the authoritative amount before payment. ============ -->
 <div id="plan-overlay" hidden>
   <div class="po-cover" id="po-cover"></div>
   <div class="po-card" role="dialog" aria-modal="true" aria-labelledby="po-title">
     <div class="po-head"><b id="po-title">Plan &amp; billing</b><button class="pm-close" id="po-close" aria-label="Close">&#10005;</button></div>
     <div class="po-body">
       <div class="po-current" id="po-current"></div>
+      <button id="po-cur" type="button" class="po-cur" aria-label="Toggle currency USD/EUR">$ USD</button>
       <div class="po-opts" id="acct-options"></div>
+      <div class="po-tax" id="po-tax" hidden>No sales tax is currently collected. State sales tax or use tax may apply in your state.</div>
     </div>
   </div>
 </div>
@@ -4614,28 +4629,66 @@ function acctMenuPlan(a) {
     avatar: ((typeof a.name === "string" && a.name) ? a.name : "?").slice(0, 2).toUpperCase(),
   };
 }
+/* #411 — the overlay's currency state (owner rulings 2026-10-12): exactly
+   USD + EUR; the first-visit default follows the browser timezone (an
+   explicit US IANA zone list — exact zones + the Indiana/Kentucky/
+   North_Dakota prefixes — → usd, anything else → eur, ANY error or
+   unrecognized zone fails open to eur); a stored hctx-cur choice is
+   validated and always wins. This duplicates the marketing site's rule on
+   purpose: web/ and this package asset are separate surfaces that share no
+   code — the SAME key keeps the two toggles converged. */
+const US_ZONES = ["America/New_York","America/Chicago","America/Denver","America/Phoenix","America/Los_Angeles","America/Anchorage","America/Juneau","America/Sitka","America/Metlakatla","America/Nome","America/Yakutat","America/Adak","America/Boise","America/Detroit","America/Menominee","America/Puerto_Rico","America/St_Thomas","Pacific/Honolulu","Pacific/Guam","Pacific/Saipan","Pacific/Pago_Pago","America/Indiana/","America/Kentucky/","America/North_Dakota/"];
+function isUsTz(z) {
+  for (const u of US_ZONES) {
+    if (u.slice(-1) === "/") { if (z.slice(0, u.length) === u) return true; }
+    else if (z === u) return true;
+  }
+  return false;
+}
+function tzDefaultCur() {
+  try { return isUsTz(Intl.DateTimeFormat().resolvedOptions().timeZone || "") ? "usd" : "eur"; } catch { return "eur"; }
+}
+let PLAN_CUR = tzDefaultCur();
+try { const saved = localStorage.getItem("hctx-cur"); if (saved === "usd" || saved === "eur") PLAN_CUR = saved; } catch {}
 /* Pure decision (#371) — the purchasable periods. Decided pricing (owner
    2026-08-19): ONE price, TWO periods — €12/mo and €108/yr. ANNUAL FIRST:
    annual is the stated product default; its note is the numeric savings
    sub-line (round-4 addendum 2026-09-24: it replaces the retired
    words-only annual tagline — same fact, numbers not words; effective
    monthly 108/12 = €9, discount (144−108)/144 = 25%, derived-pinned by
-   tests so a price change forces the sub-line update). Prices are
-   display constants — the
-   router deliberately knows only Stripe price ids (no server-side amount
-   exists to read), and the Stripe Checkout page shows the authoritative
-   amount before payment. Round 3: a PURE DATA ARRAY and the single source
-   of truth — the overlay cards are GENERATED from it (renderPlanCards)
-   and the wiring loops it (wireSubscription); no two-plan hardcoding
-   anywhere. The bullets are the marketing site's Cloud feature lines,
-   verbatim (lockstep-pinned against web/index.html) — the seven
-   owner-decided lines (amendment 4, 2026-09-24: copy-first ruling; the
-   agent-cap enforcement rides its own issue); both periods are the same
-   Cloud product, so both carry the same seven. */
+   tests so a price change forces the sub-line update). #411 (rulings
+   2026-10-12): the price/note literals are PER-CURRENCY data — USD
+   MIRRORS the EUR whole numbers ($12/mo, $108/yr), and the savings pair
+   is derived per currency from the same-currency bases (never converted;
+   no exchange-rate arithmetic anywhere). The router deliberately knows
+   only Stripe price ids (no server-side amount exists to read), and the
+   Stripe Checkout page shows the authoritative amount before payment.
+   Round 3: a PURE DATA ARRAY and the single source of truth — the overlay
+   cards are GENERATED from it (renderPlanCards) and the wiring loops it
+   (wireChooseButtons); no two-plan hardcoding anywhere. #411 tax wording
+   (tax research brief, 2026-10-12): the price strings carry the VERBATIM
+   pricing-card wording — EUR consumer prices read VAT-inclusive ("incl.
+   25.5% VAT"), USD tax-exclusive ("excl. tax"); fixed wording, the 25.5%
+   inside it is never a computed value. The savings note is a derived
+   ANNOTATION, not a price point — it carries no qualifier. The bullets
+   are the marketing site's Cloud feature lines, verbatim (lockstep-
+   pinned against web/index.html) — the seven owner-decided lines
+   (amendment 4, 2026-09-24: copy-first ruling; the agent-cap enforcement
+   rides its own issue); both periods are the same Cloud product, so both
+   carry the same seven. */
 const PLAN_OPTIONS = [
-  { id: "annual", posts: "annual", name: "Annual", price: "€108/year", note: "€9/mo · 25% off", cta: "Choose annual", bullets: ["Fully managed — no API keys needed", "Claude Code, Hermes, OpenClaw, Pi, OpenCode", "10,000 memories included", "Up to 10 agents", "Learnings & nightly reflection", "Semantic search + knowledge graph", "Multi-machine support"] },
-  { id: "monthly", posts: "monthly", name: "Monthly", price: "€12/mo", note: "", cta: "Choose monthly", bullets: ["Fully managed — no API keys needed", "Claude Code, Hermes, OpenClaw, Pi, OpenCode", "10,000 memories included", "Up to 10 agents", "Learnings & nightly reflection", "Semantic search + knowledge graph", "Multi-machine support"] },
+  { id: "annual", posts: "annual", name: "Annual", prices: { eur: { price: "€108/year (incl. 25.5% VAT)", note: "€9/mo · 25% off" }, usd: { price: "$108/year (excl. tax)", note: "$9/mo · 25% off" } }, cta: "Choose annual", bullets: ["Fully managed — no API keys needed", "Claude Code, Hermes, OpenClaw, Pi, OpenCode", "10,000 memories included", "Up to 10 agents", "Learnings & nightly reflection", "Semantic search + knowledge graph", "Multi-machine support"] },
+  { id: "monthly", posts: "monthly", name: "Monthly", prices: { eur: { price: "€12/month (incl. 25.5% VAT)", note: "" }, usd: { price: "$12/month (excl. tax)", note: "" } }, cta: "Choose monthly", bullets: ["Fully managed — no API keys needed", "Claude Code, Hermes, OpenClaw, Pi, OpenCode", "10,000 memories included", "Up to 10 agents", "Learnings & nightly reflection", "Semantic search + knowledge graph", "Multi-machine support"] },
 ];
+/* #411 tax brief — presentation split for the big price line: the amount
+   renders at full size, the tax qualifier in the smaller muted style.
+   Pure, and the DATA string stays the brief's verbatim wording either
+   way (the 25.5% lives only inside the fixed wording strings, never as a
+   computed value). */
+function priceParts(s) {
+  const at = s.indexOf(" (");
+  return at === -1 ? [s, ""] : [s.slice(0, at), s.slice(at + 1)];
+}
 /* Pure decision (#371) — the Stripe return parameter (?billing=…, the
    success_url/cancel_url the router stamps on every checkout) → the
    acknowledgment banner spec, or null when there is nothing to acknowledge
@@ -4737,24 +4790,69 @@ function closeConnectOverlay() {
   const ov = $("connect-overlay");
   if (ov) ov.hidden = true;
 }
-/* N-driven card render (#371 round 3): the option cards are GENERATED from
-   PLAN_OPTIONS — N entries, N cards, no per-plan literals anywhere in the
-   markup or this template (a future plan is a data entry + a router price
-   id, not a page rework). Runs once at script init; account data only
-   toggles visibility (renderPlanOverlay). */
+/* N-driven card render (#371 round 3, #411 per-currency): the option cards
+   are GENERATED from PLAN_OPTIONS at the CURRENT currency — N entries, N
+   cards, no per-plan or per-currency literals anywhere in the markup or
+   this template (a future plan is a data entry + a router price id, not a
+   page rework). Runs at script init AND on every currency toggle
+   (setPlanCur); account data only toggles visibility (renderPlanOverlay). */
 function renderPlanCards() {
   const host = $("acct-options");
   if (!host) return;
-  host.innerHTML = PLAN_OPTIONS.map((o) => `
+  host.innerHTML = PLAN_OPTIONS.map((o) => {
+    const p = o.prices[PLAN_CUR];
+    const [main, tax] = priceParts(p.price);
+    return `
     <div class="po-opt" id="acct-opt-${o.id}">
       <div class="po-name">${esc(o.name)}</div>
-      <div class="po-price">${esc(o.price)}</div>
-      ${o.note ? `<div class="po-note">${esc(o.note)}</div>` : ""}
+      <div class="po-price">${esc(main)}${tax ? ` <span class="po-price-x">${esc(tax)}</span>` : ""}</div>
+      ${p.note ? `<div class="po-note">${esc(p.note)}</div>` : ""}
       <ul class="po-feat">${o.bullets.map((b) => `<li>${esc(b)}</li>`).join("")}</ul>
       <button id="acct-buy-${o.id}" type="button" class="po-choose">${esc(o.cta)}</button>
-    </div>`).join("");
+    </div>`;
+  }).join("");
 }
 renderPlanCards();
+/* #411 — bind each card's Choose button from the entry's id (N buttons,
+   one loop). Extracted from wireSubscription because the currency toggle
+   REGENERATES the cards' innerHTML, which drops the listeners — every
+   re-render re-binds through here. */
+function wireChooseButtons() {
+  for (const o of PLAN_OPTIONS) {
+    const buy = $("acct-buy-" + o.id);
+    if (!buy) continue;
+    buy.addEventListener("click", () => { startCheckout(o.posts, PLAN_CUR, buy); });
+  }
+}
+/* #411 — the overlay's currency toggle (the site's #cur-toggle idiom):
+   swap the current currency, persist the choice under the SAME hctx-cur
+   key the site uses, repaint the pill label, and re-render + re-bind the
+   cards (the prices are per-currency data). */
+function setPlanCur(c) {
+  PLAN_CUR = c;
+  try { localStorage.setItem("hctx-cur", c); } catch {}
+  const t = $("po-cur");
+  if (t) t.textContent = c === "usd" ? "$ USD" : "€ EUR";
+  // #411 tax brief: the USD checkout footnote shows ONLY on USD (the
+  // Stripe-hosted page cannot carry custom copy — this overlay is the
+  // checkout surface we own). EUR needs no note: its compliance wording
+  // rides the price strings ("incl. 25.5% VAT").
+  const note = $("po-tax");
+  if (note) note.hidden = c !== "usd";
+  renderPlanCards();
+  wireChooseButtons();
+}
+function wirePlanCurrency() {
+  // Footnote visibility at INIT too — a US-timezone first visit starts on
+  // USD with no toggle ever firing.
+  const note = $("po-tax");
+  if (note) note.hidden = PLAN_CUR !== "usd";
+  const t = $("po-cur");
+  if (!t) return;
+  t.textContent = PLAN_CUR === "usd" ? "$ USD" : "€ EUR";
+  t.addEventListener("click", () => { setPlanCur(PLAN_CUR === "usd" ? "eur" : "usd"); });
+}
+wirePlanCurrency();
 function wireSubscription() {
   const btn = $("acct-subscription");
   if (!btn) return;
@@ -4766,11 +4864,9 @@ function wireSubscription() {
     closeAcctMenu();
     openPlanOverlay();
   });
-  for (const o of PLAN_OPTIONS) {
-    const buy = $("acct-buy-" + o.id);
-    if (!buy) continue;
-    buy.addEventListener("click", () => { startCheckout(o.posts, buy); });
-  }
+  // #411: the Choose-button binding lives in wireChooseButtons (the
+  // currency toggle re-binds through it after every re-render).
+  wireChooseButtons();
 }
 /* #506: the menu's Connect-an-agent entry opens the full-cover connect
    overlay — the same launch idiom as wireSubscription (#371): the menu
@@ -4785,21 +4881,23 @@ function wireConnectEntry() {
     openConnectOverlay();
   });
 }
-/** POST /stripe/checkout for ONE plan, then navigate to the returned Stripe
- *  URL (#371 — each period's action posts its own plan; the hardcoded
- *  annual-only body was the defect). The failure seams are the shipped
- *  checkout-handler contract, kept verbatim for EVERY action: 401 → Google
- *  re-auth where the probe says OAuth exists, else the expired-session
- *  alert; non-ok → the unavailable alert; network error → the unreachable
- *  alert. Each button is disabled independently while its own request is in
- *  flight. */
-async function startCheckout(plan, btn) {
+/** POST /stripe/checkout for ONE plan at the DISPLAYED currency, then
+ *  navigate to the returned Stripe URL (#371 — each period's action posts
+ *  its own plan; the hardcoded annual-only body was the defect. #411 — the
+ *  body now carries the currency the buyer saw, so the charge matches the
+ *  display; the router maps (plan, currency) → its configured price id).
+ *  The failure seams are the shipped checkout-handler contract, kept
+ *  verbatim for EVERY action: 401 → Google re-auth where the probe says
+ *  OAuth exists, else the expired-session alert; non-ok → the unavailable
+ *  alert; network error → the unreachable alert. Each button is disabled
+ *  independently while its own request is in flight. */
+async function startCheckout(plan, currency, btn) {
   btn.disabled = true;
   try {
     const resp = await fetch("/stripe/checkout", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ plan }),
+      body: JSON.stringify({ plan, currency }),
     });
     if (resp.status === 401) {
       // Never hard-redirect to Google on a daemon (dead end / loop) — only

@@ -53,6 +53,7 @@ import type { MemorySearchResult, Memory } from "./types.js";
 import * as storage from "./storage.js";
 import { SessionRecallRegistry } from "./recall-registry.js";
 import { isPureWrapperPrompt } from "./wrapper-prompt.js";
+import { canonicalizeProject } from "./project-canonicalize.js";
 import { labelForType } from "./type-labels.js";
 import {
   retrieve,
@@ -99,6 +100,22 @@ export interface RecallIndexOptions {
    *  coldExposureSlots sizing: small, a floor not a takeover. 0 disables the
    *  pure-prompt search entirely (the kill-switch). Clamped to [0, maxItems]. */
   noveltyFloorSlots?: number;
+  /** #566 cross-project recall fence bar — a candidate from a DIFFERENT
+   *  project than the request's must clear this on a measured cosine
+   *  (scope-conditional; same-project keeps the 0.62 floor, no-scope
+   *  requests are untouched). The one recall knob that is CONFIG-RESOLVED
+   *  (`recallCrossProjectMinSimilarity`, the deliberate #408 exception on
+   *  the firstRunLookbackDays precedent) — production sets it from the
+   *  boot-resolved config value; eval/tests inject through this field.
+   *  Default = calibration CROSS_PROJECT_MIN_SIMILARITY (0.72, fence ON when
+   *  absent — owner ruling 2026-10-28); 0 or ≤ the recall floor = fence off. */
+  crossProjectMinSimilarity?: number;
+  /** #567: the project-identity alias map — `filters.project` is folded at
+   *  its build site so a raw client-pushed label (cwd-derived, unnormalized)
+   *  compares equal to the canonical corpus. null/absent → mechanical fold
+   *  only. Production threads the boot-resolved config value (mcp-server);
+   *  tests inject through this field, like every other option here. */
+  projectAliases?: Readonly<Record<string, string>> | null;
 }
 
 /** Relevance-gate floor for vector-only candidates (release-managed —
@@ -206,21 +223,66 @@ export function formatIndexLine(
 }
 
 /**
+ * #566 cross-project recall fence — the request's project scope plus the
+ * resolved fence bar (see RecallIndexOptions.crossProjectMinSimilarity).
+ * Built by handleRecallIndex when the request carries a `project`; consumed
+ * by passesRelevanceGate's optional third argument.
+ */
+export interface RelevanceScope {
+  project: string;
+  crossProjectMinSimilarity: number;
+}
+
+/**
  * Relevance gate: a real BM25 text match (FTS) passes unconditionally; a
  * vector-only candidate must clear `minSimilarity`.
  *
- * NOTE: FTS hits BYPASS the similarity floor, so raising the floor shifts
- * weight toward FTS-sourced entries. In practice FTS is currently inert on
- * real prompts — eval #3 had 0 FTS rows / 2,208 (2,203 vector + 5 graph), and
- * a relevance sample returned 96/96 vector — so the floor change is safe as
- * measured. But FTS quality is unmeasured; if FTS starts firing
- * (e.g. as #205's fielded-BM25 retune beds in), give it its own eval.
+ * #566 cross-project fence (optional `scope`): when a project scope is
+ * present and the bar is ARMED — strictly above the RECALL floor
+ * (RECALL_MIN_SIMILARITY, the documented OFF threshold: 0 or any value ≤
+ * 0.62 is off on EVERY surface, not just sites that happen to carry a floor;
+ * floor-less surfaces [/search no-param, the MCP tool] must not arm at
+ * values the docs call off) — a candidate whose project DIFFERS from the
+ * scope's (case-insensitive — 161 measured events sat on Hicortex/hicortex
+ * case splits; a null/absent candidate project counts as foreign) must clear
+ * max(bar, the site floor) on a MEASURED cosine — the fence only RAISES a
+ * site's existing floor, never weakens it. No source branching is needed:
+ * FTS-only and graph-only hits carry similarity null → they naturally do not
+ * admit cross-project (that IS the scoped FTS bypass — same-project token
+ * matches still pass unconditionally below); `both` and `vector` carry a
+ * measured cosine → gated like a vector hit. Same-project candidates fall
+ * through to the legacy branch with the site floor unchanged (the fence
+ * never floors same-project). Every pre-#566 two-arg caller (incl. the eval
+ * harness) passes no scope and gets exactly the old behavior.
  */
 export function passesRelevanceGate(
   r: MemorySearchResult,
-  minSimilarity: number
+  minSimilarity: number | undefined,
+  scope?: RelevanceScope
 ): boolean {
+  // #566 fence branch — armed against the RECALL floor (the knob's
+  // documented off threshold, the same constant everywhere), NOT this site's
+  // floor; same-project candidates skip to the legacy branch untouched.
+  if (scope && scope.crossProjectMinSimilarity > CALIBRATION.RECALL_MIN_SIMILARITY) {
+    const sameProject =
+      r.project !== null &&
+      r.project.toLowerCase() === scope.project.toLowerCase();
+    if (!sameProject) {
+      // max(bar, site floor): the fence may only raise the bar — a /search
+      // caller at minSimilarity 0.9 with the knob at 0.72 must not see a
+      // cross 0.75 row re-admitted by this branch. At /recall-index the site
+      // floor IS the recall floor, so max() reduces to the bar there.
+      return (
+        typeof r.similarity === "number" &&
+        r.similarity >= Math.max(scope.crossProjectMinSimilarity, minSimilarity ?? 0)
+      );
+    }
+  }
+  // Legacy branch — byte-identical to pre-#566 (same-project, no scope, or a
+  // disarmed bar). `minSimilarity === undefined` = this site has no base
+  // floor (the /search no-param contract) → only the FTS bypass applies.
   if (r.source === "fts" || r.source === "both") return true;
+  if (minSimilarity === undefined) return true;
   return typeof r.similarity === "number" && r.similarity >= minSimilarity;
 }
 
@@ -472,6 +534,15 @@ export async function handleRecallIndex(
     0,
     1
   );
+  // #566: the cross-project fence bar — resolved once per request from the
+  // options seam (production threads the boot-resolved config value; the
+  // default IS the calibration constant, so the fence is ON out of the box).
+  const crossMinSimilarity = clampNumber(
+    deps.options?.crossProjectMinSimilarity,
+    CALIBRATION.CROSS_PROJECT_MIN_SIMILARITY,
+    0,
+    1
+  );
   // #324: clamped to [0, maxItems] — the floor is a reservation inside the
   // item cap, never an expansion of it.
   const noveltySlots = resolveNoveltyFloorSlots(deps.options?.noveltyFloorSlots, maxItems);
@@ -484,10 +555,28 @@ export async function handleRecallIndex(
   // (plugin config). Neither excludes anything — both are zero-boost-neutral
   // score terms in computeScore. (0.16.x: `privacy` is no longer threaded —
   // vestigial column, never filtered; a plugin's privacy_filter is a no-op.)
+  // #567: project folds through the canonicalizer (the stored corpus is
+  // canonical; a raw pushed label would silently lose its own affinity boost
+  // and arm the #566 fence against its own project on a case variant).
   const filters: RecallFilters = {
-    project: typeof req.project === "string" && req.project ? req.project : undefined,
+    project:
+      typeof req.project === "string" && req.project
+        ? canonicalizeProject(req.project, deps.options?.projectAliases) ?? undefined
+        : undefined,
     mission_domains: parseStringListParam(req.mission_domains),
   };
+
+  // #566: the gate scope exists ONLY when the request carries a project — a
+  // no-project request is byte-identical with the fence on or off. One scope,
+  // threaded into BOTH gate call sites below (blended picks + pureFiltered);
+  // the pure list feeds the #324 novelty floor AND the #329 backfill, so both
+  // inherit the fence through it. No second gate anywhere else (retrieve()
+  // stays fence-free — cold-exposure slots live inside it and their output
+  // flows through the gate here).
+  const gateScope: RelevanceScope | undefined =
+    filters.project !== undefined
+      ? { project: filters.project, crossProjectMinSimilarity: crossMinSimilarity }
+      : undefined;
 
   // #324 + #329 item 3: when the floor is armed AND would differ from the
   // blended search, TWO searches run per recall — the blended (session-intent)
@@ -539,7 +628,7 @@ export async function handleRecallIndex(
   // Blended (session-intent) picks: relevance gate + turn-based suppression,
   // top maxItems — exactly what the index would show with no novelty floor.
   const blendedPicks = results
-    .filter((r) => passesRelevanceGate(r, minSimilarity))
+    .filter((r) => passesRelevanceGate(r, minSimilarity, gateScope))
     .filter((r) => deps.registry.isShowable(sessionId, r.id))
     .slice(0, maxItems);
 
@@ -557,7 +646,7 @@ export async function handleRecallIndex(
   // The gate + suppression are applied ONCE to the pure list: the head feeds
   // the novelty floor, the tail feeds the #329 backfill below.
   const pureFiltered = pureResults
-    .filter((r) => passesRelevanceGate(r, minSimilarity))
+    .filter((r) => passesRelevanceGate(r, minSimilarity, gateScope))
     .filter((r) => deps.registry.isShowable(sessionId, r.id));
   const blendedIds = new Set(blendedPicks.map((r) => r.id));
   const noveltyPicks = pureFiltered

@@ -93,6 +93,28 @@ export const SESSION_INTENT_WEIGHT = 0.33;
  *  below the 0.63 local pessimum. FTS-matched candidates pass regardless. */
 export const RECALL_MIN_SIMILARITY = 0.62;
 
+/**
+ * Cross-project recall fence bar (#566) — a memory from a DIFFERENT project
+ * than the request's must clear this on a MEASURED cosine to be admitted
+ * into recall/search results; same-project and no-scope candidates keep the
+ * RECALL_MIN_SIMILARITY floor above, byte-identical.
+ *
+ * Measured 2026-10-28 on the #565 WS2 snapshot bar sweep: at 0.72 a
+ * scope-conditional bar keeps ~18% of today's cross-project admissions
+ * (projected multi-project cross-share ~29%, audit target ≤35%); a GLOBAL
+ * 0.72 floor would kill 91% of same-project admissions, which is why the bar
+ * is scope-conditional. Owner ruling 2026-10-28: 0.72 now, 0.75 (the stricter
+ * option, keeps ~7.5%) one config edit away.
+ *
+ * Unlike every other constant in the recall family, this one KEEPS a config
+ * override (`recallCrossProjectMinSimilarity`, resolved once at server boot)
+ * — the ONE deliberate #408 exception, on the DEFAULT_FIRST_RUN_LOOKBACK_DAYS
+ * precedent: a posture dial the owner tunes per install, not corpus
+ * calibration. 0 or any value ≤ the recall floor (0.62) disarms the fence
+ * (today's scope-blind behavior).
+ */
+export const CROSS_PROJECT_MIN_SIMILARITY = 0.72;
+
 /** Max lines in the pushed recall index. 5 (lowered from 6 on 2026-08-03):
  *  per-slot decomposition at floor 0.62 showed slot 6 gives NO prompt its
  *  first relevant memory. The K-sweep is monotone toward 4, but the 4-vs-5
