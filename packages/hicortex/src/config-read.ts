@@ -70,6 +70,32 @@ export function readNonNegativeConfig(
 }
 
 /**
+ * Read a finite number clamped into the unit interval [0, 1] (#566 — the
+ * similarity-bar keys). 0 is a VALID value here (the deliberate "off"
+ * setting — unlike readPositiveConfig, which rejects it), and out-of-range
+ * numbers CLAMP rather than warn: the caller's contract is a similarity bar,
+ * and 1.5 / -0.2 carry the same intent as 1 / 0 (full fence / off), not a
+ * typo class the operator must notice. Only a wrong TYPE (string, null,
+ * NaN, …) warns and keeps `def` — the readPositiveConfig boundary posture
+ * against silent coercion.
+ */
+export function readUnitIntervalConfig(
+  config: Record<string, unknown>,
+  key: string,
+  def: number,
+): number {
+  const v = config[key];
+  if (v === undefined) return def;
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return Math.min(1, Math.max(0, v));
+  }
+  console.warn(
+    `[hicortex] config "${key}" = ${String(v)} is not a finite number — using default ${def}.`,
+  );
+  return def;
+}
+
+/**
  * Read + validate an array of scheduling hours (integers 0–23, local time) for
  * the capture/consolidation timers (0.17). Returns the validated, de-duped,
  * ASC-sorted array; `null` when the key is absent (caller applies the role

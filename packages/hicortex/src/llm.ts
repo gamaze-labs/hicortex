@@ -89,10 +89,15 @@ export function resolveExplicitLlmConfig(overrides?: {
   llmBaseUrl?: string;
   llmApiKey?: string;
   llmModel?: string;
+  llmProvider?: string;
 }): LlmConfig | null {
   // 1. Explicit config-file overrides (both baseUrl and apiKey required)
   if (overrides?.llmBaseUrl && overrides?.llmApiKey) {
-    const provider = detectProvider(overrides.llmBaseUrl);
+    // #562: a non-empty llmProvider selects an explicit request DIALECT
+    // (today: "azure") instead of URL detection. Absent/empty → detection
+    // unchanged. The dialect is NEVER inferred from the URL — Azure URLs
+    // detect as "openai" and stay that way without the explicit key.
+    const provider = overrides.llmProvider || detectProvider(overrides.llmBaseUrl);
     return {
       baseUrl: overrides.llmBaseUrl,
       apiKey: overrides.llmApiKey,
@@ -162,6 +167,14 @@ export function applyTierTuningOverlay(
   const thinking = readStrictBoolean(savedConfig, "enableThinking");
   if (thinking !== undefined) {
     llmConfig.enableThinking = thinking;
+    // #562: inert on the azure dialect — the cloud endpoint never receives
+    // chat_template_kwargs (see completeOpenAiCompat). One operator-facing
+    // line; removing the config key clears it.
+    if (llmConfig.provider === "azure") {
+      console.warn(
+        "[hicortex] enableThinking is ignored on the azure dialect (cloud endpoint — no chat_template_kwargs is sent); remove the key to clear this warning"
+      );
+    }
   }
   // #337 resilience knobs. Same boundary discipline as the keys above: absent =
   // call-site defaults (timeout 900 s, probe timeout 60 s, probe TTL 5 min),
@@ -226,6 +239,7 @@ export function resolveSavedLlmConfig(
       llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
       llmApiKey: savedConfig?.llmApiKey as string | undefined,
       llmModel: savedConfig?.llmModel as string | undefined,
+      llmProvider: savedConfig?.llmProvider as string | undefined,
     });
   }
 
@@ -939,6 +953,9 @@ export class LlmClient {
   /**
    * OpenAI-compatible /v1/chat/completions (works for OpenAI, OpenRouter, etc).
    * enableThinking is read from config here (one value, all phases — #231).
+   * #562: the azure dialect (provider "azure", selected ONLY via config
+   * llmProvider) swaps the token-cap parameter to max_completion_tokens and
+   * never sends chat_template_kwargs — Azure 400s on both (probed 2026-10-27).
    *
    * Token usage (#246): the OpenAI spec's `usage` object is always present on
    * a successful completion — `prompt_tokens` / `completion_tokens` /
@@ -972,14 +989,19 @@ export class LlmClient {
     // kwarg rides every call — so it is LOCAL-endpoint only (ollama, mlx-lm
     // gateway); a cloud OpenAI/OpenRouter/Groq endpoint would 400 on the unknown
     // field. provider cannot gate this (the MLX gateway is also provider:openai),
-    // so the operator leaves enableThinking unset for cloud endpoints. See #220.
+    // so the operator leaves enableThinking unset for cloud endpoints — the ONE
+    // exception is the azure dialect (#562), which is explicitly selected via
+    // llmProvider and therefore IS gated off. See #220.
+    const azureDialect = this.config.provider === "azure";
     const thinking = this.config.enableThinking;
     const body: Record<string, unknown> = {
       model,
       messages: [{ role: "user", content: prompt }],
-      max_tokens: maxTokens,
+      // #562: Azure 400s on max_tokens ("not supported with this model") and
+      // requires max_completion_tokens — the only request-shape difference.
+      ...(azureDialect ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
     };
-    if (thinking !== undefined) {
+    if (thinking !== undefined && !azureDialect) {
       body.chat_template_kwargs = { enable_thinking: thinking };
     }
 

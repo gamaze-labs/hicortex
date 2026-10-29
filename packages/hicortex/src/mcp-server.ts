@@ -21,7 +21,7 @@ import type Database from "better-sqlite3";
 import { initDb, getStats, resolveDbPath } from "./db.js";
 import { resolveExplicitLlmConfig, applyTierTuningOverlay, LlmClient, findClaudeBinary, claudeCliConfig, type LlmConfig } from "./llm.js";
 import { initFeatures } from "./features.js";
-import { warnIgnoredConfigKeys, readStrictBoolean } from "./config-read.js";
+import { warnIgnoredConfigKeys, readStrictBoolean, readUnitIntervalConfig } from "./config-read.js";
 import { localhostBypassEnabled, writeLocalhostBypassMarker } from "./localhost-bypass.js";
 import { checkHostedBoot, shouldEmitBypassWarning } from "./hosted-boot.js";
 import { initTokenBudget, isTokenBudgetExceeded, recordDistillUsage } from "./token-budget.js";
@@ -82,6 +82,7 @@ import {
   createStandingContextBasis,
 } from "./recall-precision.js";
 import { capturePauseKey, isCapturePaused } from "./capture-pause.js";
+import { canonicalizeProject, parseProjectAliases } from "./project-canonicalize.js";
 import { ensureAndPersistAgentId, loadConfigStrict, persistConfigUpdates } from "./init.js";
 import type { MemorySearchResult } from "./types.js";
 
@@ -122,9 +123,32 @@ let identityClients: string[] = ["cc"];
 let identityAgents: Record<string, AgentMode> = {};
 // Pushed-recall dedup registry (#192) + options; configured at boot.
 let recallRegistry = new SessionRecallRegistry();
+// #566: the cross-project recall fence bar — the ONE config-resolved recall
+// knob (deliberate #408 exception on the firstRunLookbackDays precedent).
+// Resolved once at boot below; consumed by the two search sites directly and
+// threaded into recallIndexOptions for /recall-index.
+let recallCrossProjectBar = CALIBRATION.CROSS_PROJECT_MIN_SIMILARITY;
 let recallIndexOptions: RecallIndexOptions = {};
+// #567: the project-identity alias map (config `projectAliases`, folded at
+// read — never scaffolded by init). Resolved once at boot; every
+// project-string entry point below folds through it (canonProject) so the
+// same project never lands as two labels regardless of which client sent it.
+let projectAliases: Readonly<Record<string, string>> | null = null;
 // Product-owned memory instructions (#192): on unless config says false.
 let memoryInstructionsEnabled = true;
+
+/**
+ * #567: fold ONE project string through the boot-resolved alias map — the
+ * shared normalization for every project-string entry point in this file
+ * (MCP tools + REST routes). Absent/blank/non-string → undefined (no filter
+ * / SQL NULL via the callers' `?? null` paths — a whitespace label is junk);
+ * otherwise trim + lowercase + one explicit alias hop. insertMemory/
+ * updateMemory themselves stay dumb (no fold inside storage.ts) — this is
+ * the ONE place labels canonicalize, so every comparison downstream (recall
+ * affinity, lesson selection, the dedup project rail) sees the same value.
+ */
+const canonProject = (v: unknown): string | undefined =>
+  canonicalizeProject(typeof v === "string" ? v : null, projectAliases) ?? undefined;
 
 // Cache detectChunkSize results keyed by "<provider>/<model>@<baseUrl>" so we
 // probe each endpoint once per server boot rather than once per /distill request.
@@ -199,8 +223,17 @@ export function createMcpServer(): McpServer {
     async ({ query, limit, project }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
       try {
-        const results = await retrieval.retrieve(db, embed, query, { limit, project });
-        return { content: [{ type: "text" as const, text: formatResults(results) }] };
+        // #567: fold the project scope ONCE so retrieve, the fence scope, and
+        // the gate below all see the same canonical value.
+        const canon = canonProject(project);
+        const results = await retrieval.retrieve(db, embed, query, { limit, project: canon });
+        // #566: gate with the same composed search gate as REST /search —
+        // this site had NO gate at all before (a scope-blind asymmetry).
+        // Same-project and no-project results are unchanged (the helper is
+        // identity for them absent a minSimilarity); cross-project rows below
+        // the fence bar drop only when a project scope is present.
+        const gated = applySearchRelevanceGate(results, { project: canon, crossProjectMinSimilarity: recallCrossProjectBar });
+        return { content: [{ type: "text" as const, text: formatResults(gated) }] };
       } catch (err) {
         return { content: [{ type: "text" as const, text: `Search failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
       }
@@ -242,7 +275,8 @@ export function createMcpServer(): McpServer {
     async ({ project, limit }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
       try {
-        const results = retrieval.searchRecent(db, { project, limit });
+        // #567: fold the filter so a raw client label matches the canonical corpus.
+        const results = retrieval.searchRecent(db, { project: canonProject(project), limit });
         return { content: [{ type: "text" as const, text: formatResults(results) }] };
       } catch (err) {
         return { content: [{ type: "text" as const, text: `Recent recall failed: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
@@ -281,7 +315,8 @@ export function createMcpServer(): McpServer {
         const embedding = await embed(content);
         const id = storage.insertMemory(db, content, embedding, {
           sourceAgent: "claude-code/manual",
-          project,
+          // #567: store canonical (fold + alias hop at the entry point).
+          project: canonProject(project),
           // Normalize legacy raw enum to the canonical term the DB stores.
           memoryType: memory_type ? normalizeMemoryType(memory_type) : "experience",
         });
@@ -319,7 +354,9 @@ export function createMcpServer(): McpServer {
 
         const fields: Record<string, unknown> = {};
         if (content !== undefined) fields.content = content;
-        if (project !== undefined) fields.project = project;
+        // #567: fold — a blank-after-fold label becomes SQL NULL (a
+        // whitespace label is junk), never a stored variant.
+        if (project !== undefined) fields.project = canonicalizeProject(project, projectAliases);
         // Normalize legacy raw enum to canonical human terms before DB write.
         if (memory_type !== undefined) fields.memory_type = normalizeMemoryType(memory_type);
 
@@ -375,7 +412,8 @@ export function createMcpServer(): McpServer {
   const learningsHandler = async ({ days, project }: { days?: number; project?: string }) => {
     if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
     try {
-      const lessons = storage.getLessons(db, days ?? 7, project);
+      // #567: fold the filter — lessons come back canonical, the query must ask canonically.
+      const lessons = storage.getLessons(db, days ?? 7, canonProject(project));
       if (lessons.length === 0) {
         return { content: [{ type: "text" as const, text: "No Learnings found for the specified period." }] };
       }
@@ -582,6 +620,44 @@ export function resolveSearchSimilarityFloor(raw: unknown): number | undefined {
 }
 
 /**
+ * The ONE composed search gate shared by REST /search and the MCP
+ * `hicortex_search` tool (#566). Pure — exported for tests (the
+ * resolveSearchSimilarityFloor precedent).
+ *
+ *   - `minSimilarity` (the #409 optional query floor): applied post-hoc with
+ *     the exported recall gate — FTS/`both` hits pass regardless, vector-only
+ *     hits must clear the floor.
+ *   - `project` + `crossProjectMinSimilarity` (the #566 fence): when a
+ *     NON-EMPTY project scope is present and the bar is > 0, cross-project
+ *     candidates must clear the raised bar on a measured cosine. An
+ *     empty-string project is NO scope (REST /search normalizes "" away with
+ *     its truthiness check; the MCP tool's zod schema lets "" through — the
+ *     normalization lives here so both surfaces agree). A bar of 0 = fence
+ *     off → never scopes → identity. Whether the bar is ARMED (strictly
+ *     above the RECALL floor — the documented OFF threshold, on every
+ *     surface) is decided INSIDE the gate — one decision site, not
+ *     duplicated here.
+ *
+ * Identity when there is nothing to gate (`minSimilarity` undefined AND no
+ * scope) — the pre-#566 no-param / no-project contracts are untouched,
+ * including previously-ungated same-project rows (graph-only hits survive).
+ */
+export function applySearchRelevanceGate(
+  results: MemorySearchResult[],
+  opts: { minSimilarity?: number; project?: string; crossProjectMinSimilarity?: number },
+): MemorySearchResult[] {
+  const scope =
+    typeof opts.project === "string" &&
+    opts.project !== "" &&
+    typeof opts.crossProjectMinSimilarity === "number" &&
+    opts.crossProjectMinSimilarity > 0
+      ? { project: opts.project, crossProjectMinSimilarity: opts.crossProjectMinSimilarity }
+      : undefined;
+  if (opts.minSimilarity === undefined && scope === undefined) return results;
+  return results.filter((r) => passesRelevanceGate(r, opts.minSimilarity, scope));
+}
+
+/**
  * Express error middleware (#7): translate express.json's default HTML 413
  * (entity.too.large) into a consistent JSON response. Catches body-parser
  * errors only — which express.json emits BEFORE any route runs — so by
@@ -767,6 +843,7 @@ export async function startServer(options: {
       llmBaseUrl: savedConfig?.llmBaseUrl as string | undefined,
       llmApiKey: savedConfig?.llmApiKey as string | undefined,
       llmModel: savedConfig?.llmModel as string | undefined,
+      llmProvider: savedConfig?.llmProvider as string | undefined,
     });
   }
 
@@ -871,14 +948,31 @@ export async function startServer(options: {
   // process to the shipped constants (they remain the eval/test seam; see
   // retrieval.ts). The boot log still prints the active values — now sourced
   // from the calibration constants via the configure*() returns.
+  //
+  // #566: the ONE exception — the cross-project fence bar IS config-resolved
+  // (`recallCrossProjectMinSimilarity`, the deliberate #408 exception on the
+  // firstRunLookbackDays precedent: a per-install posture dial, not corpus
+  // calibration). Boot-time; restart to apply.
+  recallCrossProjectBar = readUnitIntervalConfig(
+    savedConfig ?? {},
+    "recallCrossProjectMinSimilarity",
+    CALIBRATION.CROSS_PROJECT_MIN_SIMILARITY
+  );
+  // #567: project-identity alias map, resolved once at boot like the fence
+  // bar above (restart to apply). A rejected/cycle map is null — the fold
+  // degrades to mechanical trim+lowercase, and the reader has already warned
+  // why. No boot log line beyond that: an absent map is the default state.
+  projectAliases = parseProjectAliases(savedConfig);
   retrieval.configureDecay();
   const recallCfg = retrieval.configureRecall();
   const scoringCfg = retrieval.configureScoring();
   const sessionIntentCfg = retrieval.configureSessionIntent();
   console.log(
+    // Everything on this line is release-managed EXCEPT /cross= (config-sourced, #566).
     `[hicortex] Recall (release-managed calibration): k=${recallCfg.searchLimit}/recent=${recallCfg.recentLimit}` +
     `/window=${recallCfg.recentWindowDays}d/cold=${recallCfg.coldExposureSlots}` +
     `/novelty=${CALIBRATION.NOVELTY_FLOOR_SLOTS}` +
+    `/cross=${recallCrossProjectBar}` +
     ` · ` +
     `score sim=${scoringCfg.similarity}/str=${scoringCfg.strength}/conn=${scoringCfg.connections}` +
     `/K=${scoringCfg.connectionsSaturation}` +
@@ -888,10 +982,10 @@ export async function startServer(options: {
     (sessionIntentCfg.weight === 0 ? " (disabled)" : "")
   );
   // Defaults resolve inside recall-index.ts / recall-registry.ts from the
-  // calibration constants (#408) — the options objects stay as the seams the
-  // eval injects through.
+  // calibration constants (#408) — the options object stays the eval/test
+  // seam for the rest, now carrying the one config-resolved recall knob.
   recallRegistry = new SessionRecallRegistry();
-  recallIndexOptions = {};
+  recallIndexOptions = { crossProjectMinSimilarity: recallCrossProjectBar, projectAliases };
   memoryInstructionsEnabled = savedConfig?.memoryInstructions !== false;
   if (resolvedAgents.dropped.length > 0) {
     console.warn(
@@ -1111,7 +1205,9 @@ export async function startServer(options: {
         sourceDomain: typeof source_domain === "string" ? source_domain : null,
         sourceMachine: storage.sanitizeSourceMachine(source_machine),
         sourceSession: source_session ?? undefined,
-        project: project ?? undefined,
+        // #567: store canonical — legacy pre-distilled ingest from an
+        // un-upgraded client folds here too.
+        project: canonProject(project),
         memoryType: normalizedType ?? "experience",
         // 0.16.x: privacy defaults to null (vestigial column). A legacy client
         // that sends an explicit value is honored; absent → null.
@@ -1139,7 +1235,9 @@ export async function startServer(options: {
     // No hardcoded default: absent limit → the release-managed calibration
     // default (#408 — was the searchLimit config key).
     const limit = req.query.limit ? Number(req.query.limit) : undefined;
-    const project = typeof req.query.project === "string" && req.query.project ? req.query.project : undefined;
+    // #567: fold ONCE (blank/non-string → undefined, the old truthiness
+    // normalization) — retrieve and the gate below share the canonical value.
+    const project = canonProject(req.query.project);
     // 0.16.x: `privacy` query param is ACCEPTED for backward compat (old
     // clients/plugins still send it) but no longer read — retrieval ignores
     // privacy entirely (the column is vestigial, never filtered).
@@ -1148,12 +1246,14 @@ export async function startServer(options: {
     // caller) = ungated, byte-identical behavior. The console sends the
     // recall floor (RECALL_MIN_SIMILARITY, via the /dashboard/field echo) so
     // vector nearest-neighbor junk below it never renders as "results".
+    // #566: the same composed call now also carries the cross-project fence —
+    // the #409 floor is unchanged in effect; the fence applies only when the
+    // request carries a project (applySearchRelevanceGate is identity
+    // otherwise).
     const minSimilarity = resolveSearchSimilarityFloor(req.query.minSimilarity);
     try {
       let results = await retrieval.retrieve(db, embed, query, { limit, project });
-      if (minSimilarity !== undefined) {
-        results = results.filter((r) => passesRelevanceGate(r, minSimilarity));
-      }
+      results = applySearchRelevanceGate(results, { minSimilarity, project, crossProjectMinSimilarity: recallCrossProjectBar });
       res.json({ results });
     } catch (err) {
       logAndSendInternalError(res, "search", err);
@@ -1235,7 +1335,9 @@ export async function startServer(options: {
   // REST /recent — recent memories, optionally filtered by project.
   app.get("/recent", (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
-    const project = typeof req.query.project === "string" && req.query.project ? req.query.project : undefined;
+    // #567: fold once (blank/non-string → undefined, the old truthiness
+    // normalization folded in).
+    const project = canonProject(req.query.project);
     // No hardcoded default: absent limit → the release-managed calibration
     // default (#408 — was the recentLimit config key).
     // 0.16.x: `privacy` query param accepted but ignored (vestigial column).
@@ -1391,6 +1493,13 @@ export async function startServer(options: {
     // the guard, so semantics are unchanged.
     const { text, messages, source_agent, source_agent_id, source_domain, source_machine, project, session_id, segment_id, session_date, privacy } = req.body ?? {};
 
+    // #567: fold the wire project ONCE, right after the destructure — the
+    // queue enqueue, the sync distill prompt, and the insert opts below all
+    // carry the canonical value, so an un-upgraded client's raw label never
+    // lands as a stored variant (old npx clients, frozen plugin copies, and
+    // un-refreshed extensions all canonicalize for free at the server).
+    const canonProjectVal = canonProject(project);
+
     // #422 capture health: normalize the wire fields ONCE so every exit below
     // records with a one-liner (recordDistillActivity re-sanitizes machine/
     // agent — the builder only forwards + picks the byte count). bytes = the
@@ -1536,7 +1645,7 @@ export async function startServer(options: {
         source_agent_id,
         source_domain,
         source_machine,
-        project,
+        project: canonProjectVal,
         session_id,
         segment_id,
         session_date,
@@ -1613,7 +1722,7 @@ export async function startServer(options: {
       // server-side per-entry console.log in distillChunk stays as well.
       const dropped: string[] = [];
       const entries = await distillSession(
-        llm, conversationText, project ?? "unknown", date, chunkSize, dropped,
+        llm, conversationText, canonProjectVal ?? "unknown", date, chunkSize, dropped,
         (u) => {
           distillUsage.prompt += u.prompt_tokens ?? 0;
           distillUsage.completion += u.completion_tokens ?? 0;
@@ -1662,7 +1771,8 @@ export async function startServer(options: {
               // Per-chunk key: "<session_id>[#<segment_id>]#<i>". The prefix
               // matches the dedup checks above, so a re-run is idempotent.
               sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
-              project: project ?? undefined,
+              // #567: canonical (folded once above the queue/sync branch).
+              project: canonProjectVal,
               // #216: the distiller now classifies each entry as
               // experience/knowledge/decisions via the [E]/[K]/[D] tag parsed in
               // distiller.ts. Pre-#216 distiller output (no tag) defaults to
@@ -1737,7 +1847,9 @@ export async function startServer(options: {
 
     const fields: Record<string, unknown> = {};
     if (content !== undefined) fields.content = content;
-    if (project !== undefined) fields.project = project;
+    // #567: fold — a blank-after-fold label becomes SQL NULL (a whitespace
+    // label is junk), never a stored variant.
+    if (project !== undefined) fields.project = canonicalizeProject(project, projectAliases);
     if (privacy !== undefined) fields.privacy = privacy;
 
     // Validate + normalize memory_type BEFORE adding to `fields` so the

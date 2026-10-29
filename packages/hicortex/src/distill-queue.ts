@@ -41,6 +41,7 @@ import {
 } from "./calibration.js";
 import * as storage from "./storage.js";
 import { countExistingSegment, countExistingSession } from "./dedup.js";
+import { canonicalizeProject } from "./project-canonicalize.js";
 import type { RunDeadline } from "./run-deadline.js";
 
 // ---------------------------------------------------------------------------
@@ -278,6 +279,14 @@ export interface DrainOptions {
    * real detectChunkSize, cached per endpoint like the /distill handler).
    */
   detectChunkSize?: typeof detectChunkSize;
+  /**
+   * #567: the project-identity alias map — the drain folds `item.project`
+   * once per item (the queue kept the wire project verbatim, so rows queued
+   * before the canonicalization deploy still distill + store canonical;
+   * defense-in-depth beside the /distill handler's own fold). null/absent →
+   * mechanical fold only. The nightly passes the boot-resolved config value.
+   */
+  projectAliases?: Readonly<Record<string, string>> | null;
 }
 
 export interface DrainReport {
@@ -504,13 +513,17 @@ export async function drainDistillQueue(
       // BEFORE distillation — see resolveDrainCreatedAt: a throwing date
       // computation after the LLM calls is the poison row.
       const createdAt = resolveDrainCreatedAt(item);
+      // #567: fold the queued project ONCE per item — both the distill
+      // prompt and the insert opts below carry the canonical value (the
+      // queue row keeps the raw wire label verbatim by design).
+      const canonProject = canonicalizeProject(item.project, opts.projectAliases);
       try {
         // Cast: DrainLlm is the structural surface distillSession uses.
         const llm = opts.llm as unknown as LlmClient;
         const entries: DistilledEntry[] = await distillSession(
           llm,
           item.text,
-          item.project ?? "unknown",
+          canonProject ?? "unknown",
           item.session_date ?? new Date().toISOString().slice(0, 10),
           chunkSize,
           [],
@@ -552,7 +565,7 @@ export async function drainDistillQueue(
               sourceDomain: item.source_domain,
               sourceMachine: storage.sanitizeSourceMachine(item.source_machine),
               sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
-              project: item.project ?? undefined,
+              project: canonProject ?? undefined,
               memoryType,
               privacy: item.privacy,
               createdAt,

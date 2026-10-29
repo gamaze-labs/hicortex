@@ -40,6 +40,7 @@ import { migrateIdentityDir } from "./identity-store.js";
 import { openCursorStore, pruneCursors } from "./capture-cursors.js";
 import { captureBatches, acquireCaptureLock, type PostFn, type PostResult, type DistillBody } from "./capture.js";
 import { drainDistillQueue, type YieldStatus } from "./distill-queue.js";
+import { parseProjectAliases } from "./project-canonicalize.js";
 import { isTokenBudgetExceeded, recordDistillUsage } from "./token-budget.js";
 import { createRunDeadline, resolveNightlyTimeBudgetMinutes, type RunDeadline } from "./run-deadline.js";
 import { writeSnapshot, backfillSnapshots } from "./dashboard.js";
@@ -788,6 +789,10 @@ export async function runNightly(options: {
         deadline,
         yieldUrl: readStringConfig(savedConfig ?? {}, "drainYieldUrl") ?? undefined,
         probeBusy: makeDrainYieldProbe(),
+        // #567: the drain folds queued rows' projects through the same
+        // boot-time alias map the daemon resolved (rows queued pre-deploy
+        // still hold raw wire labels).
+        projectAliases: parseProjectAliases(savedConfig),
       });
       // #5 metering, same as the daemon's sync path: record tokens against
       // the monthly budget (incl. a failed item's partial usage) and fold

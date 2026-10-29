@@ -501,6 +501,14 @@ export interface HicortexConfig {
   llmApiKey?: string;
   /** @deprecated Use the Hicortex server for distillation and consolidation. */
   llmModel?: string;
+  /**
+   * Explicit request-dialect key for the openai-compat path (#562). The only
+   * recognized dialect value today is "azure" — the request sends
+   * max_completion_tokens instead of max_tokens and never chat_template_kwargs
+   * (Azure 400s on both). Absent/empty → the provider is URL-detected
+   * (detectProvider); the dialect is NEVER inferred from the URL.
+   */
+  llmProvider?: string;
   /** @deprecated Consolidation is owned by the server nightly. */
   consolidateHour?: number;
   /** @deprecated The OC plugin no longer opens its own database. */
@@ -705,6 +713,18 @@ export interface HicortexConfig {
    * so these were not surfacing in the top-k anyway).
    */
   memorySoftCap?: number;
+  /**
+   * The cross-project recall fence bar (#566; default 0.72 — fence ON when
+   * the key is absent, owner ruling 2026-10-28). A memory from a different
+   * project than the request's must clear this bar on a measured cosine to be
+   * admitted into recall/search results; same-project and unscoped recall are
+   * unchanged. `0` or any value ≤ the recall floor (0.62) = fence off
+   * (today's scope-blind behavior). Clamped to [0,1]; a wrong type warns and
+   * keeps the default (readUnitIntervalConfig). The one #408 config-key
+   * exception (firstRunLookbackDays precedent) — a per-install posture dial,
+   * not corpus calibration. Resolved once at server boot (restart to apply).
+   */
+  recallCrossProjectMinSimilarity?: number;
   /**
    * Hosted-service mode (issue #110, #271 — spec 2026-07-27 §1-§2). When true,
    * the server enforces hosted-tenant constraints at boot: it refuses to start

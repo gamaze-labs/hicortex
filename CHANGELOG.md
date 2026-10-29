@@ -3,7 +3,29 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased]
+## [0.25.0] — 2026-10-28
+
+### Added — capture
+
+- **Project identity is canonicalized at every entry point, and a one-shot command reconciles existing rows.** The same project could arrive under different labels (`Hicortex` vs `hicortex`, source catch-alls, version-suffix numerics), splitting one project into several — same-project recall affinity silently missed, apparent cross-project leakage inflated, and project mismatch blocked near-duplicate merges. Every project string the server accepts (distill deliveries, ingest, update, search, recent, pushed recall, the MCP tools, and the scheduled inbox drain) is now trimmed, lowercased, and run through an explicit operator-curated synonym map (`projectAliases` in config — single-hop, folded at read, cycles rejected loudly, never scaffolded). Nothing is merged heuristically: without an explicit alias entry, two distinct labels never collapse. The new `hicortex reconcile-projects` command (dry run by default; `--apply` takes a backup first, holds the capture lock, and renames one transaction per label) applies the same fold to existing memories and queued deliveries, prints a surviving-label report flagging pure-numeric junk labels, and is idempotent — a second run finds nothing to rename. The Claude Code session hook folds its locally derived project label through the same function so lesson affinity converges with the canonical corpus. (#567)
+
+### Added — recall
+
+- **Cross-project recall is fenced behind a raised, per-install-tunable similarity bar (`recallCrossProjectMinSimilarity`, default `0.72`).** Measured motivation: multi-project sessions were seeing foreign projects' memories in the large majority of recall citations — the relevance floor was scope-blind, and admitted cross-project memories sat at nearly the same similarity as same-project ones, so no single floor could separate the two. When a recall or search request carries a project, a memory from a *different* project must now clear the raised bar on a measured cosine to be admitted; pushed recall (`/recall-index`), `GET /search`, and the `hicortex_search` tool fence identically (the search tool previously had no relevance gate at all), and same-project token matches still pass unconditionally. Same-project and unscoped recall are unchanged, byte for byte. `0` or any value ≤ the recall floor restores the previous scope-blind behavior; the key is the single deliberate exception to the release-managed-calibration rule (a per-install posture dial on the `firstRunLookbackDays` precedent). (#566)
+
+## [0.24.1] — 2026-10-27
+
+### Added — LLM provider
+
+- **Azure OpenAI endpoints are supported via an explicit `llmProvider: "azure"` dialect key.** Azure's OpenAI-compatible endpoint rejects the `max_tokens` parameter and requires `max_completion_tokens`; with the dialect set (alongside `llmBaseUrl`/`llmModel`/`llmApiKey`), every phase's requests — distill, score, classify, reflect — carry `max_completion_tokens` and never the local-only `chat_template_kwargs` field (an `enableThinking` key alongside the dialect logs a warning that it is ignored). The dialect is explicit-only, never inferred from the base URL, so existing OpenAI-compatible configurations are unchanged. (#562)
+
+### Added — console
+
+- **The plan & billing overlay is dual-currency.** Plan prices display in USD as well as EUR (whole-number mirrors — $12/mo · $108/yr beside €12/€108 — with the annual-savings line derived per currency from the same-currency bases), the first visit defaults from the browser's timezone (US zones → USD, anything else → EUR, failing open to EUR) and a small toggle persists the choice, and a checkout request now carries the currency the buyer saw so the charge matches the display. Prices read VAT-inclusive in EUR and tax-exclusive in USD, and the USD side carries a checkout note that state sales or use tax may apply. (#411)
+
+### Fixed — tests
+
+- Defused the two calendar-dependent tests that turned main's CI red on a fixed date (2026-10-12) with no code change: the capture-pause fleet test now seeds its fixture days relative to today instead of fixed literals (the 30-day insert-time prune had started deleting them), and the #448 AC10 decay-reference computation pins its clock to the test file's frozen-now convention, so its frozen thresholds can no longer rot with the calendar.
 
 ## [0.24.0] — 2026-10-06
 
