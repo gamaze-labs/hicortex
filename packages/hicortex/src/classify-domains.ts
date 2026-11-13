@@ -43,9 +43,8 @@ import { loadState, updateState } from "./state.js";
 import * as storage from "./storage.js";
 import {
   LlmClient,
-  resolveSavedLlmConfig,
-  type LlmConfig,
 } from "./llm.js";
+import { resolveLlmPair } from "./classification.js";
 import {
   classifyMemoryTags,
   parseConfigDomains,
@@ -185,18 +184,23 @@ export async function runClassifyDomains(
       ? floorRaw
       : DEFAULT_WEAK_PRIMARY_FLOOR;
 
-  // Resolve the LLM (one model serves all phases — #231).
+  // Resolve the LLM (one model serves all phases — #231). #332: plus the
+  // confidential client — each row's classify call picks the client matching
+  // its stamp; a confidential row without a client holds (treated like the
+  // infra abort: untouched, retried).
   let llm: LlmClient;
+  let confidentialLlm: LlmClient | null = null;
   if (options.llm) {
     llm = options.llm;
   } else {
-    const resolved = resolveSavedLlmConfig(config);
-    if (!resolved.config) {
+    const resolved = resolveLlmPair(config);
+    if (!resolved.pair) {
       throw new Error(
         "[hicortex] classify-domains: no LLM configured — run `npx @gamaze/hicortex init`.",
       );
     }
-    llm = new LlmClient(resolved.config);
+    llm = resolved.pair.standard;
+    confidentialLlm = resolved.pair.confidential;
   }
 
   const dbPath = resolveDbPath(options.dbPath);
@@ -256,7 +260,7 @@ export async function runClassifyDomains(
         `AND (domain IS NULL OR domain NOT IN (${placeholders}) ` +
         `OR id NOT IN (SELECT DISTINCT memory_id FROM memory_tags))`;
     const batchStmt = db.prepare(
-      `SELECT rowid AS __rowid, id, content, project, domain FROM memories
+      `SELECT rowid AS __rowid, id, content, project, domain, privacy FROM memories
        WHERE ${scopeSql} ORDER BY rowid ASC LIMIT ?`,
     );
 
@@ -273,6 +277,7 @@ export async function runClassifyDomains(
         content: string;
         project: string | null;
         domain: string | null;
+        privacy: string | null;
       }>;
       if (rows.length === 0) break;
 
@@ -293,7 +298,22 @@ export async function runClassifyDomains(
         | { kind: "nofit"; id: string; resolution: NoFitResolution }
       > = [];
       for (const row of rows) {
-        const result = await classifyMemoryTags(row.content, row.project, domains, llm);
+        // #332: per-row client selection — a confidential row classifies on
+        // the confidential client; without one it HOLDS (the infra-abort
+        // posture: untouched, retried next run).
+        const rowLlm =
+          row.privacy === "confidential"
+            ? confidentialLlm
+            : llm;
+        if (!rowLlm) {
+          console.warn(
+            `[hicortex] classify-domains: confidential row ${row.id.slice(0, 8)} held — ` +
+              `no confidential model configured (llmConfidentialBaseUrl/ApiKey)`,
+          );
+          infraAbort = true;
+          break;
+        }
+        const result = await classifyMemoryTags(row.content, row.project, domains, rowLlm);
         if (result === null) {
           // Infra error — stop scanning; leave this row untouched for retry.
           infraAbort = true;

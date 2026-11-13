@@ -41,8 +41,8 @@ import { initDb, resolveDbPath } from "./db.js";
 import { loadState, updateState } from "./state.js";
 import {
   LlmClient,
-  resolveSavedLlmConfig,
 } from "./llm.js";
+import { resolveLlmPair } from "./classification.js";
 import { labelForType } from "./type-labels.js";
 
 const HICORTEX_HOME = hicortexHome();
@@ -254,18 +254,23 @@ export async function runClassifyTypes(
     );
   }
 
-  // Resolve the LLM (one model serves all phases — #231).
+  // Resolve the LLM (one model serves all phases — #231). #332: plus the
+  // confidential client — the type-classify prompt carries memory content, so
+  // each row picks the client matching its stamp; a confidential row without
+  // a client holds (infra-abort posture).
   let llm: LlmClient;
+  let confidentialLlm: LlmClient | null = null;
   if (options.llm) {
     llm = options.llm;
   } else {
-    const resolved = resolveSavedLlmConfig(config);
-    if (!resolved.config) {
+    const resolved = resolveLlmPair(config);
+    if (!resolved.pair) {
       throw new Error(
         "[hicortex] classify-types: no LLM configured — run `npx @gamaze/hicortex init`.",
       );
     }
-    llm = new LlmClient(resolved.config);
+    llm = resolved.pair.standard;
+    confidentialLlm = resolved.pair.confidential;
   }
 
   const dbPath = resolveDbPath(options.dbPath);
@@ -302,7 +307,7 @@ export async function runClassifyTypes(
       ? "rowid > ? AND (memory_type IS NULL OR memory_type != 'learnings')"
       : "rowid > ? AND memory_type = 'experience'";
     const batchStmt = db.prepare(
-      `SELECT rowid AS __rowid, id, content, memory_type FROM memories
+      `SELECT rowid AS __rowid, id, content, memory_type, privacy FROM memories
        WHERE ${scopeSql} ORDER BY rowid ASC LIMIT ?`,
     );
 
@@ -318,6 +323,7 @@ export async function runClassifyTypes(
         id: string;
         content: string;
         memory_type: string | null;
+        privacy: string | null;
       }>;
       if (rows.length === 0) break;
 
@@ -332,7 +338,19 @@ export async function runClassifyTypes(
       // Classify (network) OUTSIDE the write transaction; collect results.
       const writes: Array<{ id: string; type: string; score: number }> = [];
       for (const row of rows) {
-        const result = await classifyMemoryType(row.content, llm);
+        // #332: per-row client selection — the classify prompt carries this
+        // row's content; a confidential row without a confidential client
+        // holds (infra-abort posture: untouched, retried).
+        const rowLlm = row.privacy === "confidential" ? confidentialLlm : llm;
+        if (!rowLlm) {
+          console.warn(
+            `[hicortex] classify-types: confidential row ${row.id.slice(0, 8)} held — ` +
+              `no confidential model configured (llmConfidentialBaseUrl/ApiKey)`,
+          );
+          infraAbort = true;
+          break;
+        }
+        const result = await classifyMemoryType(row.content, rowLlm);
         if (result === null) {
           // Infra error OR two unparseable replies — stop scanning; leave this
           // row untouched for retry. (Two unparseable replies is rare; treating

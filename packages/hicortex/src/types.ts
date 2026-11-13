@@ -3,6 +3,22 @@
  * Ported from the Python hicortex codebase.
  */
 
+/**
+ * The two-level memory classification (#332), carried by `memories.privacy`
+ * (resurrected from its vestigial 0.16.x role — the legacy PUBLIC/WORK/
+ * PERSONAL/SENSITIVE vocabulary is dead; migration v27 maps every legacy
+ * value and NULL to 'standard'). 'confidential' is ONLY ever set by the
+ * server: derived at intake from `source_agent` × the `confidentialAgents`
+ * config roster, a `confidentialPaths` workspace match (#609), or marker
+ * content validated against the server's `confidentialMarkerKey` (#614) — or
+ * stamped by the `backfill-privacy` owner command; the client only RELAYS
+ * raw inputs, it never declares the class. The class is a hard gate on every
+ * agent-facing read path (absent/unknown requester = non-member =
+ * confidential rows omitted, single fetch 404) and routes every LLM touch of
+ * confidential text to the separately configured confidential model.
+ */
+export type MemoryPrivacy = "standard" | "confidential";
+
 /** A stored memory record. */
 export interface Memory {
   id: string;
@@ -30,7 +46,21 @@ export interface Memory {
    * above). NULL when the client declares none. Echoed back on /memory GET.
    */
   source_domain: string | null;
-  privacy: ("PUBLIC" | "WORK" | "PERSONAL" | "SENSITIVE") | null;
+  /**
+   * The workspace path the capture ran in (#609, migration v28) — metadata
+   * for the confidentialPaths intake match and the path backfill. Optional
+   * because rowToMemory is a cast over SELECT * rows; NULL on every pre-v28
+   * row and on deliveries that carried no path (Hermes, pre-#609 clients).
+   */
+  workspace_path?: string | null;
+  /**
+   * The #332 two-level classification ('standard' | 'confidential'; see
+   * MemoryPrivacy). NULL only on rows written before migration v27 — the
+   * migration maps every legacy value to 'standard', and every insert site
+   * defaults to it, so a NULL-safe read gate (`privacy IS NULL OR
+   * privacy != 'confidential'`) treats them as standard.
+   */
+  privacy: MemoryPrivacy | null;
   memory_type: "experience" | "learnings" | "knowledge" | "decisions";
   updated_at: string | null;
   /**
@@ -172,6 +202,13 @@ export interface DeterministicMergeZoneReport {
   links_repointed: number;
   /** Clusters skipped — members disagree on project (#206 decision 2: the source_agent rail is removed). */
   skipped_project_mismatch: number;
+  /**
+   * #332: clusters skipped — members disagree on the standard|confidential
+   * classification (the pools never cross; the classification rail re-added
+   * where #206 removed the old privacy-value rail). Optional because
+   * pre-#332 reports predate it.
+   */
+  skipped_classification_mismatch?: number;
   /**
    * #393 guard-C: clusters skipped because a member pair holds a `conflicts`
    * link — a judge-flagged genuine conflict is never blended, both records
@@ -549,23 +586,23 @@ export interface HicortexConfig {
    */
   domains?: DomainDef[];
   /**
-   * Success-cooldown (hours) for the CAPTURE watchdog (0.17). The capture
-   * timer fires `nightly --watchdog` on a short interval (~20 min); the
-   * watchdog captures only if MORE than this many hours have passed since the
-   * last SUCCESSFUL capture (state `lastNightly`). A failed preflight retries
-   * on the next tick (~20 min) — so a transient fire-instant network miss
-   * costs minutes, not a day (#239). Default 6 (≈4 captures/day). Read at
-   * runtime by the watchdog, not by `init`.
+   * Success-cooldown (hours) for capture-watchdog runs of the nightly (0.17,
+   * #239). The watchdog TIMER was retired in #596 — obsolete since the distill
+   * queue (#529): distillation runs on the server's scheduled drains, so
+   * capture-arrival latency serves nothing. The `--watchdog` flag remains a
+   * manual mode: when used, it captures only if MORE than this many hours have
+   * passed since the last SUCCESSFUL capture (state `lastNightly`); a failed
+   * preflight simply retries on the next manual run. Default 6. Read at
+   * runtime by the nightly, not by `init`.
    */
   captureCooldownHours?: number;
   /**
    * Hours (0–23, local time) for the CONSOLIDATION timer — the full nightly
    * (capture + distill + score + reflect + link), installed by `init` for
    * server/co-located mode ONLY (0.17). Default [10, 22]: the 22:00 evening
-   * slot runs after the day's capture waves (same-day results); the 10:00
-   * morning slot runs AFTER the morning's wake-up capture so it catches those
-   * pushes. Omitted on client installs (no local DB → no timer). Validated by
-   * parseHours.
+   * slot distills the day's sessions the same day; the 10:00 morning slot
+   * catches the night's and the previous evening's tail. Omitted on client
+   * installs (no local DB → no timer). Validated by parseHours.
    */
   consolidationHours?: number[];
   /**
@@ -661,6 +698,23 @@ export interface HicortexConfig {
    * value is ignored (warned), never coerced.
    */
   distillQueue?: boolean;
+  /**
+   * #582 explicit opt-in for the weekly recall-quality grading lane. Default
+   * OFF — the lane sends prompt-derived text to a third-party decisions
+   * endpoint, so it runs only when this is `true` AND `qualityGradeModel` is
+   * set AND the endpoint key resolves; anything missing fails CLOSED (the
+   * stage skips with a greppable health line, never an error). Read through
+   * readStrictBoolean — a non-boolean value is ignored (warned), never
+   * coerced, and the lane stays off.
+   */
+  qualityGrading?: boolean;
+  /**
+   * #582 the model id the weekly grading lane requests when `qualityGrading`
+   * is on. No default — an egress path never gets an implicit model choice;
+   * absent/blank (read through readStringConfig) the stage skips with its
+   * own health line.
+   */
+  qualityGradeModel?: string;
   /**
    * #529 optional interactive-yield signal: a URL the drain polls BETWEEN
    * items. A 2xx answer whose body is JSON with a truthy `busy` field — or
@@ -795,6 +849,60 @@ export interface HicortexConfig {
   orgName?: string;
   /** Plan/tier label rendered as a small badge (e.g. "Cloud · Early bird"). */
   planLabel?: string;
+  /**
+   * #332 — the confidential-circle roster: agent ids (the same sanitized id
+   * namespace as `identityAgents` / `?agent=`) whose captures are stamped
+   * `confidential` at intake (matched by `source_agent` with the first
+   * `<harness>/` segment stripped, so a Hermes profile `nano` capturing as
+   * `hermes/nano` matches the roster entry `nano`) and whose read requests
+   * (the optional `agent` param on every agent-facing read path) see both
+   * pools. Absent/empty (the default) = no circle: every capture is
+   * standard, nothing is ever omitted, zero behavior change. Deploy-time
+   * CONTENT — the mechanism ships in code, the roster is the operator's.
+   * Boot-time (restart to apply).
+   */
+  confidentialAgents?: string[];
+  /**
+   * #614 — the confidential marker key: the owner-set secret the workspace
+   * marker `.hicortex-confidential` must carry (as its single-line content)
+   * for a client-marked folder to stamp `confidential` at intake. The client
+   * RELAYS the marker's content (`client_marker` on /distill); the server
+   * compares it timing-safe against this key — the pre-#614 empty marker (and
+   * the `client_confidential` boolean) were a client-writable classification
+   * channel any token holder could set, and the key closes it: forgery
+   * requires a secret token possession alone does not grant. Distributed
+   * like `authToken` — mirror the server's value into each client machine's
+   * config.json (the `hicortex confidential` command reads it there) or its
+   * env mirror HICORTEX_CONFIDENTIAL_MARKER_KEY (which overrides config on
+   * both ends). Absent/blank (the default) = markers INERT, fail-closed both
+   * directions: marker-carrying deliveries stamp standard and a boot note
+   * names the key when the circle is otherwise active. Boot-time (restart to
+   * apply). This is the N=1 form of the per-space key (#613); the marker
+   * content evolves to space-id + key without a wire change.
+   */
+  confidentialMarkerKey?: string;
+  /**
+   * #332 — the confidential model's endpoint. With `llmConfidentialApiKey`
+   * (both required; `llmConfidentialModel` optional, `llmConfidentialProvider`
+   * selects the request dialect like `llmProvider`), this configures the
+   * second LLM client that handles EVERY touch of confidential text:
+   * distillation, importance scoring, reflection, contradiction checks, domain
+   * classification, and reconsolidation verdicts. When absent while the circle
+   * is active, confidential work HOLDS (queued deliveries stay queued,
+   * sync-mode deliveries answer 503) — it never falls back to the main model.
+   * Env mirrors: HICORTEX_LLM_CONFIDENTIAL_BASE_URL/API_KEY/MODEL.
+   */
+  llmConfidentialBaseUrl?: string;
+  /** #332 — the confidential model's API key (see llmConfidentialBaseUrl). */
+  llmConfidentialApiKey?: string;
+  /** #332 — the confidential model's id (see llmConfidentialBaseUrl). */
+  llmConfidentialModel?: string;
+  /**
+   * #332 — explicit request dialect for the confidential model's
+   * OpenAI-compatible path (the `llmProvider` precedent; today only "azure").
+   * Absent/empty → URL detection.
+   */
+  llmConfidentialProvider?: string;
 }
 
 /** A config-owned life-sphere domain (see HicortexConfig.domains). */
@@ -865,10 +973,22 @@ export interface InsertMemoryOptions {
    *  only — stamped by the nightly (config `machineName` ?? os.hostname()),
    *  accepted optionally from /distill + /ingest. Null on pre-v15 rows. */
   sourceMachine?: string | null;
+  /**
+   * The delivery's workspace path (#609) — the directory the capturing agent
+   * worked in. Metadata only: matched at intake against `confidentialPaths`
+   * and stored so `hicortex backfill-privacy` can re-plan by path; never
+   * distilled into prompt text. Null on pre-v28 rows, Hermes deliveries (no
+   * workspace), and clients that predate the wire field.
+   */
+  workspacePath?: string | null;
   project?: string | null;
-  /** 0.16.x: vestigial — stored but never filtered. null (or absent) when the
-   *  caller doesn't declare one; an explicit value is honored as-is. */
-  privacy?: string | null;
+  /**
+   * #332 classification stamp. Absent → 'standard' (the fail-closed default;
+   * callers that distill a confidential pool pass 'confidential' explicitly).
+   * Server-derived only — the intake handlers pass the source_agent × roster
+   * derivation, never a client-declared value.
+   */
+  privacy?: MemoryPrivacy | null;
   memoryType?: string;
   baseStrength?: number;
   createdAt?: string;

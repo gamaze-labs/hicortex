@@ -33,8 +33,8 @@ import { loadState, updateState } from "./state.js";
 import { scoreMemoriesImportance } from "./consolidate.js";
 import {
   LlmClient,
-  resolveSavedLlmConfig,
 } from "./llm.js";
+import { resolveLlmPair } from "./classification.js";
 import { DEFAULT_BACKUP_RETENTION, pruneBackupArtifacts } from "./backup.js";
 import { readNonNegativeConfig } from "./config-read.js";
 import { IMPORTANCE_CEILING } from "./calibration.js";
@@ -214,16 +214,21 @@ export async function runRescoreImportance(
   }
 
   let llm: LlmClient;
+  // #332: the confidential client — confidential rows in a slice score on it;
+  // without one they hold (the slice's cursor holds below them, retried when
+  // the model is configured).
+  let confidentialLlm: LlmClient | null = null;
   if (options.llm) {
     llm = options.llm;
   } else {
-    const resolved = resolveSavedLlmConfig(config);
-    if (!resolved.config) {
+    const resolved = resolveLlmPair(config);
+    if (!resolved.pair) {
       throw new Error(
         "[hicortex] rescore-importance: no LLM configured — run `npx @gamaze/hicortex init`.",
       );
     }
-    llm = new LlmClient(resolved.config);
+    llm = resolved.pair.standard;
+    confidentialLlm = resolved.pair.confidential;
   }
 
   const dbPath = resolveDbPath(options.dbPath);
@@ -289,10 +294,24 @@ export async function runRescoreImportance(
       const sliceRows = chunk.slice(i, i + LLM_SLICE);
       const memories = memoriesForIds(db, sliceRows);
       const r = await scoreMemoriesImportance(db, memories, llm, {
+        confidentialLlm,
         onBatch: (written, batchFailed) => {
           calls++;
         },
       });
+      if ((r.skipped_confidential ?? 0) > 0) {
+        // #332: confidential rows in this slice are held (no confidential
+        // model). Hold the cursor BELOW the slice — never advance past unscored
+        // rows; they retry once llmConfidential* is configured (the nightly's
+        // watermark pool also re-finds them).
+        aborted = true;
+        console.warn(
+          `[hicortex] rescore-importance ABORTED: ${r.skipped_confidential} confidential row(s) ` +
+            `in the slice at rowid ${sliceRows[0].__rowid} need a confidential model ` +
+            `(llmConfidentialBaseUrl/ApiKey). Cursor held — re-run after configuring.`,
+        );
+        break;
+      }
       if (r.failed > 0) {
         // The slice's call threw (endpoint down) or a write failed — nothing
         // usable came out of it. Stop; the cursor stays at the last

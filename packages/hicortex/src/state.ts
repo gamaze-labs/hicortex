@@ -153,6 +153,15 @@ export interface HicortexState {
    * (`stages.reconsolidation.band_stats`).
    */
   resolutionBandStats?: Record<string, ResolutionBandStat>;
+  /**
+   * #578 — the weekly quality-grade stage's ISO-week cursor ("YYYY-Www",
+   * UTC). Set to the week a pass COMPLETED (the supersessionCursor
+   * advance-past-confirmed-work convention): a capped, deadlined, or failed
+   * pass holds the cursor so the ungraded remainder retries on the next
+   * nightly — dup-over-loss, never a hole in the trend. Absent = the stage
+   * has never completed a week.
+   */
+  qualityGradeWeek?: string;
 }
 
 /**

@@ -80,12 +80,16 @@ export function clusterExcess(clusters: string[][]): number {
 // Metadata-mismatch guard (shared by the #191 audit dump and `hicortex dedup`)
 // ---------------------------------------------------------------------------
 
-/** Metadata row shape for the merge-safety check. `privacy` and `source_agent`
- *  are on the row (the columns still exist) but are NOT merge-safety fields:
- *  privacy is vestigial since 0.16.2, and the agent rail was REMOVED by owner
- *  decision (#206 decision 2, 2026-09-21) — cross-agent clusters merge, because
- *  attribution survives on the retained absorbed-loser row and no recall path
- *  filters by source_agent. Project is the only rail. */
+/** Metadata row shape for the merge-safety check. `source_agent` is on the
+ *  row (the column still exists) but is NOT a merge-safety field: the agent
+ *  rail was REMOVED by owner decision (#206 decision 2, 2026-09-21) —
+ *  cross-agent clusters merge, because attribution survives on the retained
+ *  absorbed-loser row and no recall path filters by source_agent. Project is
+ *  one rail; `privacy` (the #332 classification, standard | confidential) is
+ *  the other — a cluster mixing classes is NEVER blended (the confidential
+ *  pool must not absorb standard rows into hidden view, nor leak
+ *  confidential content onto a standard canonical). This re-adds a
+ *  classification-shaped rail #206 removed when the column was vestigial. */
 export interface ClusterMetaRow {
   project: string | null;
   privacy: string | null;
@@ -94,13 +98,22 @@ export interface ClusterMetaRow {
 
 export interface ClusterMetadataMismatch {
   projectMismatch: boolean;
+  /** #332: members disagree on the standard|confidential classification. */
+  classificationMismatch: boolean;
 }
 
-/** Do cluster members disagree on project? (merge-safety input for #100/#206.)
- *  Privacy and source_agent are intentionally NOT checked — see ClusterMetaRow. */
+/** Do cluster members disagree on project or classification? (merge-safety
+ *  input for #100/#206 + #332.) source_agent is intentionally NOT checked —
+ *  see ClusterMetaRow. */
 export function clusterMetadataMismatch(members: ClusterMetaRow[]): ClusterMetadataMismatch {
   const projects = new Set(members.map((m) => m.project ?? "\u0000null"));
-  return { projectMismatch: projects.size > 1 };
+  // The classification comparison treats NULL (pre-v27 rows) as 'standard' —
+  // the same normalization every read gate applies.
+  const classes = new Set(members.map((m) => (m.privacy === "confidential" ? "confidential" : "standard")));
+  return {
+    projectMismatch: projects.size > 1,
+    classificationMismatch: classes.size > 1,
+  };
 }
 
 // ---------------------------------------------------------------------------

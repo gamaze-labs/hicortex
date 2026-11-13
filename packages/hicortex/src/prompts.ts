@@ -9,6 +9,29 @@
  * infra-name denylist cannot catch conceptual leaks, only known names.
  */
 
+import type { MemoryPrivacy } from "./types.js";
+
+/**
+ * The STANDARD pool's reflection privacy line — pinned verbatim since #602
+ * (it was a literal inside the template before). The standard pool's prompt
+ * must stay byte-identical to the pre-#602 prompt; tests pin this exact string
+ * so nobody edits it silently.
+ */
+export const REFLECTION_PRIVACY_LINE_STANDARD =
+  "Privacy: Never include personal data (names, health, finances, credentials) in lesson text. Abstract to the process level.";
+
+/**
+ * The CONFIDENTIAL pool's reflection privacy line (#602). Three elements:
+ *  (a) the pool serves the owner's inner circle only (confidential circle,
+ *      #598 — its lessons stay inside the pool via the inherited stamp);
+ *  (b) lesson text MAY reference the user's personal domains at the process
+ *      level where needed to make the lesson actionable — the standard line
+ *      suppressed all confidential lessons by construction (#602 finding);
+ *  (c) credentials/passwords/API keys/secrets are STILL never included.
+ */
+export const REFLECTION_PRIVACY_LINE_CONFIDENTIAL =
+  "Privacy: this pool serves the owner's inner circle only (confidential memories). Lesson text may reference the user's personal domains (names, health, finances) at the process level where needed to make the lesson actionable. Credentials, passwords, API keys, and other secrets are still never included — abstract those away.";
+
 /**
  * Importance scoring prompt. Takes a {memories_block} with indexed memories.
  *
@@ -57,11 +80,34 @@ No explanations. Just the JSON array.`;
 
 /**
  * Reflection prompt. Takes a {memories_block} with today's memories.
+ *
+ * POOL-AWARE (#602): the optional `pool` argument swaps ONLY the privacy line.
+ * Absent/undefined = "standard" = the pre-#602 prompt BYTE-IDENTICAL — the
+ * standard pool's prompt must never change. The confidential variant exists
+ * because the confidential pool is BY DEFINITION personal-domain content
+ * (health, finances, the people in the owner's inner circle), so the standard
+ * line ("Never include personal data (names, health, finances, credentials)")
+ * suppressed every confidential lesson by construction — #602's measured
+ * finding: 0 confidential lessons from a real cohort. Owner ruling
+ * 2026-11-12: the confidential pool SHOULD generate lessons for the inner
+ * circle; only the PROMPT suppressed them. The confidential line keeps one
+ * absolute: credentials/passwords/API keys/secrets are never included.
+ * Everything else in the prompt (generality bar, examples, output schema) is
+ * shared verbatim by both pools — pinned by tests/reflection-prompt.test.ts.
  */
-export function reflection(memoriesBlock: string, recentLessons?: string): string {
+export function reflection(
+  memoriesBlock: string,
+  recentLessons?: string,
+  pool?: MemoryPrivacy,
+): string {
   const recentSection = recentLessons
     ? `\nRECENT LESSONS (already generated — do NOT duplicate, but DO escalate if patterns recur):\n${recentLessons}\n`
     : "";
+
+  const privacyLine =
+    pool === "confidential"
+      ? REFLECTION_PRIVACY_LINE_CONFIDENTIAL
+      : REFLECTION_PRIVACY_LINE_STANDARD;
 
   return `You are a learning analyst for a multi-agent AI system. Review today's memories and extract actionable lessons from BOTH successes and failures.
 
@@ -118,7 +164,7 @@ Focus on:
 - CROSS-AGENT PATTERNS: same issue or success across different agents — especially high-value
 - PROCESS FEEDBACK: user feedback about the agent's approach/behavior, not just its output
 
-Privacy: Never include personal data (names, health, finances, credentials) in lesson text. Abstract to the process level.
+${privacyLine}
 
 Skip: isolated trivial actions, already-documented rules, incident notes, changelog entries, and tool-specific recipes. However, if multiple small successes form a consistent pattern of quality, extract that pattern as a reinforcement.
 

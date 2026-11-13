@@ -333,6 +333,11 @@ class HicortexProvider(MemoryProvider):
                     project=self._project,
                     privacy=self._privacy,
                     mission_domains=self._mission_domains,
+                    # #332: the profile's id rides every read call — the
+                    # server's confidential-circle gate keys on it (rostered
+                    # ids see both pools; absent/unknown hard-omits). Old
+                    # servers ignore the field.
+                    agent=self._agent_name,
                 )
                 if status == 404:
                     # Old-server guard: pre-0.14 has no /recall-index. Latch
@@ -385,7 +390,11 @@ class HicortexProvider(MemoryProvider):
             return cached
         try:
             hits = client.search(
-                query, limit=self._recall_limit, project=self._project, privacy=self._privacy
+                query,
+                limit=self._recall_limit,
+                project=self._project,
+                privacy=self._privacy,
+                agent=self._agent_name,
             )
             return self._format_hits(hits)
         except Exception as e:
@@ -408,7 +417,11 @@ class HicortexProvider(MemoryProvider):
         def _bg() -> None:
             try:
                 hits = client.search(
-                    query, limit=self._recall_limit, project=self._project, privacy=self._privacy
+                    query,
+                    limit=self._recall_limit,
+                    project=self._project,
+                    privacy=self._privacy,
+                    agent=self._agent_name,
                 )
                 self._prefetch_cache[key] = self._format_hits(hits)
             except Exception as e:
@@ -467,7 +480,9 @@ class HicortexProvider(MemoryProvider):
 
     def _lessons_block(self, client: HicortexClient) -> str:
         try:
-            data = client.lessons()
+            # #332: the profile id threads into the lessons fetch too —
+            # confidential lessons serve to rostered agents only.
+            data = client.lessons(agent=self._agent_name)
         except Exception as e:
             logger.debug("hicortex lessons fetch failed: %s", e)
             return ""
@@ -690,6 +705,7 @@ class HicortexProvider(MemoryProvider):
                     args.get("query", ""),
                     limit=int(args.get("limit", 5)),
                     project=args.get("project") or self._project,
+                    agent=self._agent_name,
                 )
                 return json.dumps(hits)
 
@@ -698,8 +714,12 @@ class HicortexProvider(MemoryProvider):
                 if not id_val:
                     return json.dumps({"error": "id is required"})
                 # The configured privacy filter rides along (review F1): an
-                # out-of-scope memory reads as 404 server-side.
-                status, resp = client.get_memory(id_val, privacy=self._privacy)
+                # out-of-scope memory reads as 404 server-side. #332: so does
+                # the profile id — a confidential memory is a clean 404 for a
+                # non-member (existence never revealed).
+                status, resp = client.get_memory(
+                    id_val, privacy=self._privacy, agent=self._agent_name
+                )
                 if status == 404:
                     # Either no such memory (0.14+) or a pre-0.14 server with
                     # no /memory endpoint — the id hint covers the common case.
@@ -720,6 +740,7 @@ class HicortexProvider(MemoryProvider):
                 hits = client.recent(
                     project=args.get("project") or self._project,
                     limit=int(args.get("limit", 10)),
+                    agent=self._agent_name,
                 )
                 return json.dumps(hits)
 
@@ -739,7 +760,7 @@ class HicortexProvider(MemoryProvider):
                 return json.dumps({"id": id_val, "message": f"Memory stored (id: {id_val[:8]})"})
 
             elif tool_name == "hicortex_lessons":
-                data = client.lessons()
+                data = client.lessons(agent=self._agent_name)
                 lessons = (data.get("lessons") or [])
                 if not lessons:
                     return json.dumps({"message": "No Learnings found."})
@@ -757,6 +778,7 @@ class HicortexProvider(MemoryProvider):
                     limit=args.get("limit"),
                     domain=args.get("domain"),
                     relationship=args.get("relationship"),
+                    agent=self._agent_name,
                 )
                 return json.dumps(result)
 

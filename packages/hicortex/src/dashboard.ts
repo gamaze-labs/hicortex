@@ -1,14 +1,16 @@
 /**
- * /dashboard — view-only memory analytics (#224) + the console's live-data
- * endpoints (#409/#421 Phase 1: /dashboard/field, /dashboard/events).
+ * /dashboard — memory analytics (#224) + the console's live-data endpoints
+ * (#409/#421 Phase 1: /dashboard/field, /dashboard/events).
  *
- * STRICTLY view-only: this module computes metrics, reads snapshots, writes
- * ONE snapshot row per full nightly run (the writer is here because the
- * metric SQL lives next to its definition, not in nightly.ts), and exposes
- * the pure data handlers mounted at GET /dashboard/data,
- * GET /dashboard/field and GET /dashboard/events. There are NO mutation
- * endpoints on the dashboard surface — the only write path is the nightly
- * snapshot writer + the one-time backfill, both internal.
+ * View-only-leaning with SCOPED writers: this module computes metrics, reads
+ * snapshots, writes ONE snapshot row per full nightly run (the writer is
+ * here because the metric SQL lives next to its definition, not in
+ * nightly.ts), and exposes the pure data handlers mounted at GET
+ * /dashboard/data, GET /dashboard/field and GET /dashboard/events. The
+ * mutation surface is deliberately narrow: PUT /dashboard/model (#422),
+ * PUT /dashboard/capture-pause (#423), and PUT /dashboard/quality/verdict
+ * (#578 — the contested thumbs) — each an owner-ruled scoped writer, never
+ * a general write path.
  *
  * Layering (mirrors how recall-index.ts holds pure logic and viz.ts holds
  * thin express adapters): all metric SQL + snapshot shape lives HERE so it
@@ -29,9 +31,18 @@ import { formatIndexLine, memoryTitle } from "./recall-index.js";
 import { readPositiveConfig, readNonNegativeConfig, readAccount } from "./config-read.js";
 import { resolveMemorySoftCap } from "./consolidate.js";
 import { readCaptureHealth, readCaptureHealthWindow, type CaptureHealthRow } from "./capture-health.js";
-import { readMemoryPrecision, type MemoryPrecision } from "./recall-precision.js";
+import { readMemoryPrecision, effectivePrecisionWindowDays, type MemoryPrecision } from "./recall-precision.js";
+import {
+  buildQualitySnapshotBlock,
+  readQualityTier1,
+  readQualityChanges,
+  listContestedVerdicts,
+  recordOwnerVerdict,
+  type QualitySnapshotBlock,
+} from "./quality-scoreboard.js";
 import { readQueueStats } from "./distill-queue.js";
 import { listCapturePauses, readFleetLastSeen, setCapturePause } from "./capture-pause.js";
+import { resolveConfidentialAgents, isConfidentialSourceAgent } from "./classification.js";
 import { loadState } from "./state.js";
 import { effectiveStrength } from "./retrieval.js";
 import { deriveStage, type Stage } from "./stages.js";
@@ -171,12 +182,40 @@ export interface DashboardMetrics {
     cold_count: number;
     uses_per_showing: number | null;
   };
+  /**
+   * #578 — the quality scoreboard block: Tier-1 aggregates (7d + 30d), the
+   * graded aggregates, and the corpus-health trio. Stamped by the NIGHTLY
+   * snapshot writer ONLY (the dup-cluster KNN is far too heavy per dashboard
+   * load — the card renders the trio from this series, never live); the
+   * live dashboard path computes tier1/changes from raw events at render
+   * instead (handleDashboardData). Undefined on backfilled rows. New keys
+   * only — the metrics blob is a stable contract, existing keys untouched.
+   */
+  quality?: QualitySnapshotBlock;
 }
 
 /** One row of the snapshot series (run_at + parsed metrics). */
 export interface DashboardSnapshot {
   run_at: string;
   metrics: DashboardMetrics;
+}
+
+/**
+ * #601 — the confidential circle's VISIBILITY block: which agents are
+ * inner-circle and, for the observed ones, how many confidential memories
+ * they carry. Purely informational (the dashboard is NOT gated — confidential
+ * content stays visible on the console by the standing ruling); the page
+ * renders amber pills on circle agents, nothing on standard ones.
+ */
+export interface AgentCircle {
+  /** The sanitized roster (resolveConfidentialAgents — the one agent-id
+   *  namespace shared with `?agent=` and identityAgents). */
+  roster: string[];
+  /** OBSERVED source_agent values (e.g. "hermes/nano") that match the
+   *  roster, each mapped to that agent's confidential memory count.
+   *  Membership is KEY PRESENCE (a rostered agent observed with 0
+   *  confidential rows is a member at 0); NULL source_agent never matches. */
+  members: Record<string, number>;
 }
 
 /** The /dashboard/data response — the full payload the page renders. */
@@ -255,10 +294,14 @@ export interface DashboardData {
    * module doc for why recall traffic can never attribute). ALWAYS present;
    * empty arrays when nothing is recorded (fresh install). The page degrades
    * to the phase-2 rendering when the block is absent (pre-phase-3 server).
+   * #601 adds `circle` — the confidential-circle visibility block (roster +
+   * observed members with counts), also always present; the page degrades to
+   * the exact prior rendering when the key is absent (pre-#601 server).
    */
   fleet: {
     pauses: Array<{ machine: string; harness: string; paused_at: string }>;
     last_seen: Array<{ machine: string; harness: string; last_seen: string; last_outcome: string }>;
+    circle: AgentCircle;
   };
   /**
    * #476 — the Memory Precision card: Level 1 (pushed-index precision
@@ -637,6 +680,21 @@ export function writeSnapshot(
   if (memorySoftCap !== undefined) {
     metrics.capacity = { memory_soft_cap: memorySoftCap };
   }
+  // #578 — the quality block: Tier-1 (7d + 30d) + graded aggregates + the
+  // corpus trio, computed HERE (nightly writer only — the per-request
+  // dashboard path never runs the dup-cluster KNN; the card renders the trio
+  // from this snapshot series). `runAt` is the caller-chosen instant, so the
+  // block's windows are deterministic for tests. Fail-soft like every
+  // snapshot extra: a quality computation error must not lose the whole
+  // snapshot row — surface and write the base metrics.
+  try {
+    metrics.quality = buildQualitySnapshotBlock(db, { now: new Date(runAt) });
+  } catch (qErr) {
+    console.warn(
+      `[hicortex] Dashboard snapshot quality block failed: ` +
+        `${qErr instanceof Error ? qErr.message : String(qErr)}`,
+    );
+  }
   db.prepare(
     "INSERT OR REPLACE INTO dashboard_snapshots (run_at, metrics) VALUES (?, ?)",
   ).run(runAt, JSON.stringify(metrics));
@@ -853,6 +911,38 @@ function renderIndexLine(
     maxLen,
   );
   return { id: row.id, line, created_at: row.created_at };
+}
+
+/**
+ * #601 — compute fleet.circle: the sanitized roster plus the OBSERVED
+ * source_agent values that match it, each with its confidential memory count.
+ * Reuses the intake path's own decision core (resolveConfidentialAgents +
+ * isConfidentialSourceAgent from classification.ts — one id namespace, one
+ * match rule; no second matcher to drift). One GROUP BY over memories:
+ * membership is observed-and-rostered (a rostered agent seen with only
+ * standard rows is a member at 0), the value is the confidential row count.
+ * Pure: takes a db + config, returns the block; no side effects.
+ */
+export function readAgentCircle(
+  db: Database.Database,
+  config: Record<string, unknown> | null | undefined,
+): AgentCircle {
+  const { roster } = resolveConfidentialAgents(config);
+  if (roster.length === 0) return { roster: [], members: {} };
+  const rows = db
+    .prepare(
+      `SELECT source_agent AS agent,
+              COUNT(CASE WHEN privacy = 'confidential' THEN 1 END) AS conf
+         FROM memories
+        WHERE source_agent IS NOT NULL
+        GROUP BY source_agent`,
+    )
+    .all() as Array<{ agent: string; conf: number }>;
+  const members: Record<string, number> = {};
+  for (const r of rows) {
+    if (isConfidentialSourceAgent(r.agent, roster)) members[r.agent] = r.conf;
+  }
+  return { roster, members };
 }
 
 /**
@@ -1074,10 +1164,18 @@ export function handleDashboardData(
       // event tables + snapshot deltas. Level 2's "latest" is the SAME live
       // adoption this handler already computed (one definition of corpus
       // shape — computeDashboardMetrics); readMemoryPrecision owns the rest.
-      memory_precision: readMemoryPrecision(db, rangeParam, {
-        shown_sum: live.adoption?.shown_sum ?? 0,
-        used_sum: live.adoption?.used_sum ?? 0,
-      }),
+      // #578 spreads the Tier-1 quality metrics + the change-registry
+      // before/after deltas into the SAME block over the SAME effective
+      // window (≤ 2 KB budget still asserted by test; verdict/contested data
+      // stays OUT — behind the lazy paginated /dashboard/quality/contested).
+      memory_precision: {
+        ...readMemoryPrecision(db, rangeParam, {
+          shown_sum: live.adoption?.shown_sum ?? 0,
+          used_sum: live.adoption?.used_sum ?? 0,
+        }),
+        tier1: readQualityTier1(db, effectivePrecisionWindowDays(rangeParam)),
+        changes: readQualityChanges(db, effectivePrecisionWindowDays(rangeParam)),
+      },
       // #529: live inbox state — depth + oldest age + the echoed warn
       // threshold. Live only (no series): depth at snapshot time is ~0 by
       // construction, so history would be a flat line.
@@ -1087,9 +1185,12 @@ export function handleDashboardData(
       },
       // #423 phase 3: pauses + presence in one block — one source of truth
       // for the rail's dots, toggles and the capture card's PAUSED badges.
+      // #601: circle rides the same block — visibility only (roster +
+      // observed members + counts), never a gate.
       fleet: {
         pauses: listCapturePauses(db),
         last_seen: readFleetLastSeen(db),
+        circle: readAgentCircle(db, config),
       },
       digest,
     },
@@ -2046,6 +2147,57 @@ export function dashboardCapturePausePutHandler(
         req.body ?? null,
         (machine, harness, paused) => setCapturePause(getDb(), machine, harness, paused),
       );
+      res.status(status).json(body);
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GET /dashboard/quality/contested + PUT /dashboard/quality/verdict — the
+// #578 quality drawer's endpoints. Pure handlers live in quality-scoreboard.ts
+// (the recall-precision layering law); these are the thin express adapters
+// (the dashboardDataHandler convention). The GET is lazy + paginated so the
+// graded data stays out of the ≤ 2 KB memory_precision block; the PUT is the
+// dashboard's THIRD scoped writer (owner thumbs — the calibration
+// reference), after /dashboard/model and /dashboard/capture-pause.
+// ---------------------------------------------------------------------------
+
+/**
+ * Express adapter for GET /dashboard/quality/contested. Bearer-only (auth
+ * middleware, no shell exemption — it carries grading data); localhost
+ * bypass applies. Query: `limit` (default 20, cap 100), `offset` (default 0).
+ */
+export function dashboardQualityContestedHandler(
+  getDb: () => Database.Database,
+): express.RequestHandler {
+  return (req, res) => {
+    try {
+      res.status(200).json(
+        listContestedVerdicts(getDb(), req.query as { limit?: unknown; offset?: unknown }),
+      );
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  };
+}
+
+/**
+ * Express adapter for PUT /dashboard/quality/verdict — the contested
+ * drawer's thumbs. Body `{id: number, verdict: 1 | -1}` (numeric thumbs: 1 =
+ * useful, -1 = not). Persists grader='owner' (retained forever — the
+ * calibration reference; the nightly verdict prune never drops owner
+ * rows). Bearer-only like every dashboard writer; localhost bypass
+ * applies. 404 on an unknown id,
+ * 400 on a malformed body — strict validation, the model-PUT convention.
+ */
+export function dashboardQualityVerdictPutHandler(
+  getDb: () => Database.Database,
+): express.RequestHandler {
+  return (req, res) => {
+    try {
+      const { status, body } = recordOwnerVerdict(getDb(), req.body ?? null);
       res.status(status).json(body);
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });

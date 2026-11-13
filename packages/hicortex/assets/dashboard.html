@@ -450,24 +450,45 @@
   .rec-band{ position:absolute; inset:0; border-radius:4px; }
   .rec-dot{ position:absolute; top:50%; transform:translate(-50%,-50%); width:11px; height:11px; border-radius:50%; background:var(--text); border:2px solid var(--panel); box-shadow:0 0 0 1px color-mix(in srgb, var(--text) 40%, transparent), 0 0 8px color-mix(in srgb, var(--text) 30%, transparent); }
   .rec-foot{ display:flex; align-items:center; gap:7px; }
-  /* Memory Precision Level 1 (#476) — the pushed-index row: a compact
-     second line in the .csub scale (the sibling-rhythm ruling 2026-09-14:
-     the card keeps the shared .bseg gap rhythm, header → big → band →
-     index row → foot). Direction-only coloring: green at/above the echoed
-     recall floor, muted below (the index bar reads conservative); the
-     floor tick is amber like the pace marker. Theme tokens only — both
-     themes render from their own table, no JS colors here. */
-  .rec-l1{ display:block; font-size:10.5px; color:var(--dim); min-width:0; line-height:1.6; }
-  .rec-l1 .l1row{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .rec-l1 .lbl{ display:none; }  /* #476 rename: the three-bucket text is self-labeled */
-  .rec-l1 .l1bar{ position:relative; flex:1 1 46px; height:5px; border-radius:3px; background:var(--tbar-bg); min-width:36px; }
-  .rec-l1 .l1bar .l1-fill{ position:absolute; left:0; top:0; bottom:0; border-radius:3px; background:color-mix(in srgb, var(--green) 65%, transparent); }
-  .rec-l1.below .l1bar .l1-fill{ background:color-mix(in srgb, var(--dim) 55%, transparent); }
-  .rec-l1 .l1bar .l1-floor{ position:absolute; top:-2px; bottom:-2px; width:1px; background:var(--amber); }
-  .rec-l1 .l1txt{ color:var(--dim); overflow:hidden; text-overflow:ellipsis; font-size:10.5px; letter-spacing:-.01em; }
-  .rec-l1 b{ color:var(--green-mid); font-weight:600; }
-  .rec-l1.below b{ color:var(--dim); }
-  #rec-div{ color:var(--amber); overflow:hidden; text-overflow:ellipsis; }
+  /* Memory Precision stat rows (#593 round 2, Option B): ONE stat per row in
+     a FIXED three-column grid — value / label / trend chip — so a row can
+     never wrap: the label ellipsizes inside its column, the fixed value
+     column right-aligns every hero number on one edge, the chip sits flush
+     right. The value is the hero (≥2x the label size — tests pin the
+     ratio), neutral --text; the chips are the ONLY colored element on the
+     face (green improving / red worsening / gray flat or no baseline).
+     Rows breathe — the card may grow taller (owner 2026-11-10). Theme
+     tokens only, both themes. */
+  .rec-l1{ display:flex; flex-direction:column; gap:8px; min-width:0; }
+  .rec-l1[hidden]{ display:none; }   /* author display beats the UA's [hidden] — the #billing-banner idiom; without it the flex rule un-hides the container */
+  .rec-l1 .l1stat{ display:grid; grid-template-columns:72px minmax(0,1fr) auto; column-gap:10px; align-items:baseline; min-width:0; white-space:nowrap; }
+  .rec-l1 .l1v{ font-size:12px; font-weight:640; color:var(--text); text-align:right; font-variant-numeric:tabular-nums; line-height:1.15; min-width:0; }
+  .rec-l1 .l1v .l1u{ font-style:normal; font-size:10.5px; font-weight:520; color:var(--dim); margin-left:2px; }
+  .rec-l1 .l1l{ font-size:10.5px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .rec-l1 .l1chip{ justify-self:end; font-size:10.5px; font-weight:620; line-height:1; padding:2.5px 8px; border-radius:999px; white-space:nowrap; color:var(--green-mid); background:color-mix(in srgb, var(--green-mid) 13%, transparent); }
+  .rec-l1 .l1chip.bad{ color:var(--red); background:color-mix(in srgb, var(--red) 13%, transparent); }
+  .rec-l1 .l1chip.flat{ color:var(--faint); background:color-mix(in srgb, var(--faint) 12%, transparent); }
+  .rec-l1 .l1vol{ font-size:10.5px; color:var(--faint); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  /* #578 quality drawers (corpus + contested — the divergence drawer left
+     the card in #593): native details/summary in the card's .csub scale —
+     collapsed they are one dim line, open they stack their rows inside the
+     card (no page modal for ~5 rows/week). Theme tokens only; the thumbs
+     are small ghost buttons. */
+  .rec-det{ font-size:10.5px; color:var(--dim); }
+  .rec-det summary{ cursor:pointer; color:var(--dim); letter-spacing:-.01em; user-select:none; }
+  .rec-det summary:hover{ color:var(--text); }
+  .rec-det[open] summary{ color:var(--text); }
+  .rec-det-body{ margin:4px 0 2px; display:flex; flex-direction:column; gap:4px; }
+  .rec-det-body .rec-line{ font-size:10.5px; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .rec-thumb{ border:1px solid color-mix(in srgb, var(--text) 22%, transparent); background:none; color:var(--dim); border-radius:5px; font-size:11px; line-height:1; padding:2px 6px; cursor:pointer; }
+  .rec-thumb:hover{ color:var(--text); border-color:color-mix(in srgb, var(--text) 45%, transparent); }
+  .rec-thumb.ok:hover{ color:var(--green); border-color:var(--green); }
+  .rec-thumb.no:hover{ color:var(--red); border-color:var(--red); }
+  /* #593: the headline is ONE line — direction word + window caveat, never
+     wrapping; neutral text (the trend chips are the only colored element). */
+  .rec-plain{ font-size:11px; color:var(--dim); line-height:1.5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .rec-item{ display:flex; align-items:center; gap:6px; min-width:0; }
+  .rec-item .rec-item-line{ flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:10.5px; color:var(--dim); }
   .b-health{ display:flex; align-items:center; gap:7px; font-size:11px; color:var(--dim); white-space:nowrap; }
   .dot{ width:6px; height:6px; border-radius:50%; background:var(--green); box-shadow:0 0 10px color-mix(in srgb, var(--green) 70%, transparent); animation:breathe 3.2s ease-in-out infinite; flex:none; }
   .dot.blue{ background:var(--blue); box-shadow:0 0 10px color-mix(in srgb, var(--blue) 70%, transparent); }
@@ -874,6 +895,18 @@
   .cap-stale{ color:var(--amber); margin-left:5px; }
   .cap-qrow .fill.warn{ background:var(--amber); }
   .cap-qrow.stale .cap-dot{ background:var(--amber); }
+  /* #601: the confidential-circle pill — the #593 chip language in the amber
+     family (restricted, not error — never red). One pill metric shared by the
+     Fleet rail (legend chip, bundle cards, context rows) and the capture
+     card's rows; standard agents render NO badge (honest absence). */
+  .conf-pill{ flex:none; display:inline-flex; align-items:center; justify-content:center; line-height:0; padding:3px; border-radius:999px; white-space:nowrap; color:var(--amber); background:color-mix(in srgb, var(--amber) 13%, transparent); }
+  .conf-pill svg{ display:block; width:10px; height:10px; stroke:var(--amber); fill:none; stroke-width:1.8; }
+  /* #601: the rail-header legend host — pushed right inside the .col-head;
+     [hidden] must win over the header's flex (author display beats the UA's
+     hidden — the .cap-qrow idiom) so no-roster / pre-#601 servers show
+     nothing. */
+  #ag-circle{ margin-left:auto; }
+  #ag-circle[hidden]{ display:none; }
 
   /* ================= the memory dropdown — opens UNDER the left search ================= */
   #panel{
@@ -1264,32 +1297,59 @@
         <div class="csub" id="tok-sub">&nbsp;</div>
         <div id="tok-nights" aria-label="LLM tokens per nightly run this billing period"></div>
       </div>
-      <!-- Memory Precision (#476, owner retitle) — ONE card, two context
-           levels. Level 2 (recall depth) keeps the #426 U-band + zone word +
-           provisional-hover semantics; the marker/tooltip read the WINDOW
-           ratio off D.memory_precision.level2 (a pre-#476 server has no block
-           → the headline ratio — today's rendering exactly). Level 1 (pushed
-           index) is a compact second row: mean similarity of pushed lines to
-           their prompt, with a floor marker at the echoed
-           recall_min_similarity and muted below it (the index's bar reads
-           conservative — its noise costs compound per prompt) + the
-           redundancy share; direction-only coloring, NO verdict words (the
-           #426 semantics ruling extended: similarity is
-           conversation-dependent). Divergence count on the FACE, the ≤3
-           titles hover-only (no memory lists on the main page — owner ruling
-           2026-09-12; the header search panel is the list surface). The
-           window rides the #452 selector via the echoed window_days — never
-           hardcoded, never a second range control. -->
+      <!-- Memory Precision (#476, owner retitle; #578 quality audit; #591
+           presentation pass; #593 stat-table round 2) — ONE card, two
+           context levels + the quality instrument. Level 2 (recall depth)
+           keeps the #426 U-band + zone word + provisional-hover semantics;
+           the marker/tooltip read the WINDOW ratio off
+           D.memory_precision.level2 (a pre-#476 server has no block → the
+           headline ratio — today's rendering exactly). The #578 audit
+           (owner: "do the numbers earn their place"): mean similarity and
+           redundant share are TOOLTIP-ONLY (high cosine was the noise's
+           camouflage — not actionable), and the FACE carries what answers
+           "is recall quality improving": uses-per-showing (the big word),
+           pushes/lines volume, and the Tier-1 rows with per-change deltas
+           off the server's change-registry entries while the raw window
+           covers them. The #591 pass (owner product feedback: the card must
+           SELF-INTERPRET) made every row read in plain words (MP_NAME) with
+           deltas valenced by the explicit per-metric map (MP_GOOD) and the
+           technical layer demoted behind per-row tooltips. The #593 round 2
+           (owner amendment 2026-11-10: the card reads as a STAT TABLE)
+           reshapes that face: EXACTLY 4 stat rows (clutter / foreign
+           content / weak matches / churn), ONE stat per row in a fixed
+           value/label/chip grid that can never wrap — the value is the
+           hero (≥2x the label, right-aligned, neutral), the trend chips are
+           the only colored element, labels stay 2-4 words with meanings in
+           tooltips, the headline is ONE neutral line (direction · caveat)
+           and the zone word's tooltip carries the plain meaning +
+           uses-per-showing. The divergence drawer is GONE from the card
+           (owner: the row double-counted the gauge's own reason; the data
+           still flows into the nightly snapshots — the page just never
+           renders it), and the contested row is presence-gated: hidden
+           unless the grading lane ran AND something is contested (no
+           zero-state strings; the count loads eagerly at band render). The
+           window rides the #452 selector via the echoed window_days —
+           never hardcoded, never a second range control. -->
       <div class="bseg" id="lim-rec">
         <div class="gh"><span class="t">Memory Precision</span><span class="sub" id="rec-sub">uses per showing</span></div>
         <div class="big"><b class="n rec-word" id="rec-zone">—</b></div>
         <div class="rec-bandrow" id="rec-bandrow"><div class="rec-band" id="rec-band"></div><i class="rec-dot" id="rec-dot" hidden></i></div>
-        <div class="rec-l1" id="rec-l1" hidden style="display:block">
-          <div class="l1row" id="l1-rel">&nbsp;</div>
-          <div class="l1row" id="l1-rep">&nbsp;</div>
-          <div class="l1row" id="l1-off">&nbsp;</div>
+        <div class="rec-plain" id="rec-plain" hidden></div>
+        <div class="rec-l1" id="rec-l1" hidden>
+          <div class="l1stat" id="l1-blk">&nbsp;</div>
+          <div class="l1stat" id="l1-cross">&nbsp;</div>
+          <div class="l1stat" id="l1-sub">&nbsp;</div>
+          <div class="l1stat" id="l1-recy">&nbsp;</div>
+          <div class="l1vol" id="l1-vol">&nbsp;</div>
         </div>
-        <div class="csub rec-foot"><span id="rec-div" hidden></span></div>
+        <details id="rec-series" class="rec-det" hidden>
+          <summary>corpus &amp; graded &middot; last nightly</summary>
+          <div id="rec-series-body" class="rec-det-body"></div>
+        </details>
+        <details id="rec-contest" class="rec-det" hidden>
+          <summary>contested lines &middot; <span id="rec-contest-n">&mdash;</span></summary>
+          <div id="rec-contest-rows" class="rec-det-body"></div>
+        </details>
       </div>
     </div>
     <!-- row 2 · ops & maturity — capture health · 30 nights · maturity split · model -->
@@ -1378,7 +1438,7 @@
 
   <!-- the agents rail — the only thing beside the brain -->
   <aside id="agentscol" aria-label="Connected agents">
-    <div class="col-head"><span class="t">Fleet</span><small id="ag-sub">0 &middot; auto-detected</small></div>
+    <div class="col-head"><span class="t">Fleet</span><small id="ag-sub">0 &middot; auto-detected</small><span id="ag-circle" hidden></span></div>
     <div id="ag-list"></div>
     <!-- #506: the fleet rail's + connect-an-agent drawer lived here — REMOVED
          (owner 2026-09-24). Both surviving connect entries (the account-menu
@@ -3285,6 +3345,7 @@ function renderBand(){
   // Recall level — the designed U-band (#426 final ruling 2026-09-13; see
   // renderRecBand).
   renderRecBand(h?h.uses_per_showing:null);
+  loadContested();   /* #593: presence needs the count — one guarded GET at render */
 
   // Model — the detected label from /health/detail (configure lands in phase 2)
   renderModelCard();
@@ -3352,6 +3413,53 @@ function recallUsesZone(v,z){
 /* vocabulary amendment (owner, 2026-09-14): the middle zone's word is
    Healthy — Low / Healthy / Overfetching (keys + echo field names stay) */
 const RECALL_ZONE_WORD = {low:'Low',normal:'Healthy',over:'Overfetching'};
+const RECALL_ZONE_PLAIN={low:'shown memories are rarely picked up',normal:'shown memories get picked up at a healthy rate',over:'shown memories get picked up almost always'};
+/* #591 presentation pass — the per-metric direction map: which way is
+   improving for each Tier-1 metric. ONE constant owns every sign
+   assumption on the card; a metric whose good direction flips changes
+   here and nowhere else. Plain names beside it: the reader-facing
+   vocabulary (the internal metric keys stay in the payload; #593 renamed
+   cross_share's face label to the amendment's "Foreign content"). */
+const MP_GOOD={block_size:'down',cross_share:'down',sub_bar_share:'down',recycling:'down'};
+const MP_NAME={block_size:'Clutter per prompt',cross_share:'Foreign content',sub_bar_share:'Weak matches',recycling:'Memory churn'};
+/* #593 plain headline — pure composer (the recallUsesZone convention):
+   ONE neutral line, direction word · window caveat. The direction word
+   derives off the covered tier1 deltas × MP_GOOD (plain text — the trend
+   chips are the card's only colored element); the caveat fires while the
+   window still covers a registry change date (the trend then reads
+   pre-change days too), with the exact dates demoted to the line's own
+   tooltip. Returns {html,title} or null when there is no zone / nothing
+   to say. */
+function mpPlainHeadline(zk,mp,todayStr){
+  if(!zk) return null;
+  if(typeof todayStr!=='string') todayStr=new Date().toISOString().slice(0,10);
+  const wd=mp&&typeof mp.window_days==='number'?mp.window_days:30;
+  const changes=mp&&Array.isArray(mp.changes)?mp.changes:[];
+  let caveat=null,title='';
+  if(changes.length){
+    const from=new Date(Date.parse(todayStr)-wd*86400000).toISOString().slice(0,10);
+    const newest=changes.slice().sort((x,y)=>(x.date<y.date?1:-1))[0];
+    if(typeof newest.date==='string'&&newest.date>=from){
+      caveat='window still holds old data';
+      title='the '+wd+'-day window still covers pre-change days ('+newest.date+')';
+    }
+  }
+  let imp=0,wor=0;
+  for(const ch of changes){
+    for(const k in MP_GOOD){
+      const b=ch&&ch.before&&typeof ch.before[k]==='number'?ch.before[k]:null;
+      const a=ch&&ch.after&&typeof ch.after[k]==='number'?ch.after[k]:null;
+      if(b===null||a===null||a===b) continue;
+      if((a<b)===(MP_GOOD[k]==='down')) imp++; else wor++;
+    }
+  }
+  let dir=null;
+  if(imp>0&&wor===0) dir='improving';
+  else if(wor>0&&imp===0) dir='worsening';
+  else if(imp>0&&wor>0) dir='mixed';
+  const html=[dir,caveat].filter(Boolean).join(' · ');
+  return html?{html,title}:null;
+}
 /* ONE stop table drives the band fill AND the big word's sampled color —
    mirrors the --red/--amber/--green theme tokens (tests pin the lockstep),
    so word, marker, and gradient cannot disagree. Stops sit at 0, low_max,
@@ -3385,12 +3493,14 @@ function renderRecBand(ups){
   if(mp&&mp.level2) ups=mp.level2.uses_per_showing;
   lastRecUses=ups;
   renderRecL1(mp);
+  renderRecSeries();
   const z=F&&F.thresholds?F.thresholds.recall_uses:null;
   const axis=z&&typeof z.axis_max==='number'&&z.axis_max>0?z.axis_max:null;
   const row=el('rec-bandrow'), band=el('rec-band'), dot=el('rec-dot'), word=el('rec-zone');
   const theme=document.documentElement.dataset.theme==='light'?'light':'dark';
   if(!axis){   /* pre-band server — quiet degrade */
     row.hidden=true; dot.hidden=true; dot.title='';
+    const pl0=el('rec-plain'); pl0.hidden=true; pl0.innerHTML='';
     word.textContent='—'; word.className='n rec-word none';
     word.style.color=''; word.style.textShadow='none'; word.title='no showings yet';
     return;
@@ -3417,9 +3527,16 @@ function renderRecBand(ups){
     const rgb=recallGradAt(clamp(ups/axis,0,1),z,theme);
     word.style.color='rgb('+rgb+')';
     word.style.textShadow=theme==='dark'?'0 0 12px rgba('+rgb+',.32)':'none';
-    word.title=dot.title;
+    /* #593: the verdict tooltip = the zone's plain meaning + the gauge's own
+       metric (the numeric detail stays on the dot's tooltip) */
+    word.title=RECALL_ZONE_PLAIN[zk]+' — uses-per-showing';
+    /* #593: the headline beneath is ONE neutral line — direction word ·
+       window caveat (the trend chips are the card's only colored element) */
+    const pl=el('rec-plain'); const ph=mpPlainHeadline(zk,mp);
+    pl.hidden=!ph; pl.innerHTML=ph?ph.html:''; pl.title=ph?ph.title:'';
   }else{
     dot.hidden=true; dot.title='';
+    const pl1=el('rec-plain'); pl1.hidden=true; pl1.innerHTML='';
     word.textContent='—'; word.className='n rec-word none';
     word.style.color=''; word.style.textShadow='none';
     word.title='no showings yet';
@@ -3431,22 +3548,26 @@ function renderRecBand(ups){
      before the counter was ever seeded). */
 }
 
-/* ---------- Memory Precision — Level 1, the pushed index (#476). A compact
-   second row beside Level 2's U-band: mean similarity of pushed lines to
-   their prompt (a 0..1 bar with a floor tick at the /dashboard/field echo of
-   recall_min_similarity — the server's own recall floor, never a page
-   literal), muted below the floor (the index row reads conservative: its
-   noise lands on every prompt), plus the redundancy share (lines restating
-   the session's standing context at/above the echoed cosine). Direction-only
-   coloring, NO verdict words — the #426 semantics ruling extended.
-   Divergence: the COUNT on the card face, the ≤3 titles hover-only (no
-   memory lists on the main page, owner 2026-09-12 — the search panel is the
-   list surface). Absent block (pre-#476 server) → the whole row hides and
-   the sub keeps the old label — today's rendering exactly. */
+/* ---------- Memory Precision — Level 1, the pushed index (#476) + the #578
+   quality audit (owner: "do the numbers earn their place") + the #591
+   presentation pass + the #593 stat-table reshape. The FACE is EXACTLY 4
+   stat rows (MP_NAME labels) + the denominators foot line (.l1vol): ONE
+   stat per row in the fixed value/label/chip grid — the hero value
+   right-aligned and neutral, the trend chip the row's ONLY colored
+   element. ONE chip per metric: the NET move across the window's covered
+   registry entries (oldest before → newest after — successive changes
+   read as one line, never a chip per entry), arrow = sign, color =
+   MP_GOOD valence, no covered entry → the gray no-baseline dash. Row
+   meanings ("fewer is better", attribution coverage, the bar value) live
+   in PER-ROW titles; mean similarity + repeated-known stay card-level
+   TOOLTIP-ONLY (the #578 ruling — high cosine was the noise's camouflage).
+   Absent tier1 (a pre-#578 server) → the stat rows hide and the card
+   keeps the #476 shape; absent block entirely → the whole row hides and
+   the sub keeps the old label (the capture card's block-absence guard). */
 function renderRecL1(mp){
-  const row=el('rec-l1'), sub=el('rec-sub'), dv=el('rec-div');
+  const row=el('rec-l1'), sub=el('rec-sub');
   if(!mp||!mp.level1||!mp.level2){
-    row.hidden=true; dv.hidden=true; dv.title='';
+    row.hidden=true;
     if(sub) sub.textContent='uses per showing';
     return;
   }
@@ -3454,37 +3575,163 @@ function renderRecL1(mp){
   const l1=mp.level1;
   const floor=(F&&F.thresholds&&typeof F.thresholds.recall_min_similarity==='number')?F.thresholds.recall_min_similarity:null;
   const ra=(l1.thresholds&&typeof l1.thresholds.redundant_above==='number')?l1.thresholds.redundant_above:null;
-  const mins=(l1.thresholds&&typeof l1.thresholds.divergence_min_shown==='number')?l1.thresholds.divergence_min_shown:5;
   const sim=(typeof l1.mean_similarity==='number'&&isFinite(l1.mean_similarity))?l1.mean_similarity:null;
   const red=(typeof l1.redundant_share==='number'&&isFinite(l1.redundant_share))?l1.redundant_share:null;
-  if(sim===null){
-    row.hidden=true;   /* nothing measured in the window — the row degrades away */
-  }else{
-    row.hidden=false;
-    row.classList.toggle('below',floor!==null&&sim<floor);
-    /* numbers only on the face — direction carries the meaning, no verdict words */
-    /* #476 owner rename (2026-09-20): the three buckets as named — Relevant /
-       Repeated known / Off-target. Relevant = the mean relevance; Repeated =
-       the redundant share; Off-target = the remainder (pushed lines that were
-       neither relevant nor new). Numbers, no verdict words (#426). */
-    const relPct=Math.round(clamp(sim,0,1)*100);
-    const repPct=red!==null?Math.round(clamp(red,0,1)*100):0;
-    const offPct=Math.max(0,100-relPct-repPct);
-    const dv=mp.divergence, nUsed=(dv&&typeof dv.count==='number')?dv.count:0;
-    el('l1-rel').innerHTML='<b>Relevant: '+relPct+'%</b>';
-    el('l1-rep').textContent='Repeated known: '+repPct+'%';
-    el('l1-off').textContent='Off-target: '+offPct+'%'+(nUsed>0?' ('+nUsed+' never used)':'');
-    row.title='pushed index, last '+(mp.window_days||90)+' days — mean similarity of pushed lines to their prompt (tick at the recall floor '+
-      (floor!==null?floor.toFixed(2):'—')+'; muted below it)'+
-      (ra!==null?'; redundant = share of lines at ≥'+ra.toFixed(2)+' cosine vs the session\'s standing context (lessons + identity)':'')+
-      ' · '+fmt(l1.pushes)+' pushes, '+fmt(l1.lines)+' lines';
+  /* the tooltip carries the demoted #476 numbers — mean similarity (with the
+     recall-floor context) + the redundant share (#578 audit: face rows these
+     are not; high cosine was the noise's camouflage) */
+  row.title='pushed index, last '+(mp.window_days||90)+' days — mean similarity '+
+    (sim!==null?sim.toFixed(2):'—')+
+    (floor!==null?' (recall floor '+floor.toFixed(2)+')':'')+
+    (red!==null&&ra!==null?'; repeated-known '+Math.round(clamp(red,0,1)*100)+'% (≥'+ra.toFixed(2)+' cosine vs the session\'s standing context — lessons + identity)':'');
+  const t=mp.tier1;
+  if(!t){
+    /* pre-#578 server: no quality rows exist — the stat rows hide (their
+       markup is #578's), the tooltip above still carries the #476 numbers. */
+    row.hidden=true;
+    return;
   }
-  /* divergence — the face count is amber; the ≤3 lines ride the native
-     tooltip ONLY (text via .title, never face content) */
-  /* #476 owner bundling (2026-09-20): the never-used count rides inside
-     Off-target; the separate face element stays hidden (titles on hover) */
-  const dEl=el('rec-div');
-  if(dEl){ dEl.hidden=true; }
+  row.hidden=false;
+  /* the good-direction word derives off the map — 'fewer is better' for a
+     down-good metric — never written inline per row */
+  const better=k=>MP_GOOD[k]==='down'?'fewer is better':'more is better';
+  /* ONE trend chip per row (#593): the window's covered registry entries for
+     the metric aggregate into a single NET move — oldest before → newest
+     after, so successive changes read as one line. The ARROW is the sign of
+     the move (↓ a<b, ↑ a>b); the COLOR says whether that direction is good
+     for the metric (MP_GOOD) — green = improving regardless of sign. pct
+     when the oldest before is nonzero, the raw pair otherwise (a 0→x move
+     has no honest percentage); a flat pair is ±0%; no covered entry → the
+     gray no-baseline dash. */
+  const chip=(k)=>{
+    const es=(Array.isArray(mp.changes)?mp.changes:[])
+      .filter(ch=>ch&&ch.before&&typeof ch.before[k]==='number'&&ch.after&&typeof ch.after[k]==='number')
+      .sort((x,y)=>(x.date<y.date?-1:x.date>y.date?1:0));
+    if(!es.length) return '<span class="l1chip flat">—</span>';
+    const b=es[0].before[k], a=es[es.length-1].after[k];
+    if(a===b) return '<span class="l1chip flat">±0%</span>';
+    const text=b!==0?Math.abs(Math.round((a-b)/b*100))+'%':b+'→'+a;
+    const arrow=a<b?'↓':'↑';
+    const cls=(MP_GOOD[k]==='down'?a<b:a>b)?'good':'bad';
+    return '<span class="l1chip '+cls+'">'+arrow+text+'</span>';
+  };
+  const bs=(typeof t.block_size==='number'&&isFinite(t.block_size))?t.block_size.toFixed(1):'—';
+  const cs=(typeof t.cross_share==='number'&&isFinite(t.cross_share))?Math.round(t.cross_share*100)+'%':'—';
+  const cv=(typeof t.attribution_coverage==='number'&&isFinite(t.attribution_coverage))?Math.round(t.attribution_coverage*100)+'%':'—';
+  const sb=(typeof t.sub_bar_share==='number'&&isFinite(t.sub_bar_share))?Math.round(t.sub_bar_share*100)+'%':'—';
+  const rc=(typeof t.recycling==='number'&&isFinite(t.recycling))?Math.round(t.recycling).toString():'—';
+  const bar=(typeof t.cross_project_bar==='number'&&isFinite(t.cross_project_bar))?t.cross_project_bar.toFixed(2):'—';
+  el('l1-blk').innerHTML='<span class="l1v">'+bs+'</span><span class="l1l">'+MP_NAME.block_size+'</span>'+chip('block_size');
+  el('l1-blk').title='average memories shown per prompt — '+better('block_size');
+  el('l1-cross').innerHTML='<span class="l1v">'+cs+'</span><span class="l1l">'+MP_NAME.cross_share+'</span>'+chip('cross_share');
+  el('l1-cross').title='share of attributable pushed lines from a different project ('+better('cross_share')+') · attribution coverage '+cv;
+  el('l1-sub').innerHTML='<span class="l1v">'+sb+'</span><span class="l1l">'+MP_NAME.sub_bar_share+'</span>'+chip('sub_bar_share');
+  el('l1-sub').title='foreign-project lines below the cross-project bar ('+bar+') — '+better('sub_bar_share');
+  el('l1-recy').innerHTML='<span class="l1v">'+rc+'<i class="l1u">/day</i></span><span class="l1l">'+MP_NAME.recycling+'</span>'+chip('recycling');
+  el('l1-recy').title='average distinct memories shown per day — '+better('recycling');
+  el('l1-vol').innerHTML=fmt(t.pushes)+' prompts · '+fmt(t.lines)+' memories shown';
+  el('l1-vol').title='denominators: recall pushes · pushed index lines';
+}
+
+/* ---------- corpus &amp; graded drawer (#578): the snapshot-stamped half.
+   The corpus-health trio (near-dup clusters, scope-anchor rate, canonical
+   label drift) and the graded aggregates are computed by the NIGHTLY
+   snapshot writer only (the dup-cluster KNN alone forbids a per-request
+   path), so they render from the SNAPSHOT SERIES — the newest snapshot row
+   carrying metrics.quality — never from live work. No snapshots with the
+   block yet (first nights after upgrade) → the drawer hides. */
+function renderRecSeries(){
+  const det=el('rec-series'), body=el('rec-series-body');
+  if(!det||!body) return;
+  let q=null;
+  if(D&&Array.isArray(D.series)){
+    for(let i=D.series.length-1;i>=0;i--){
+      const m=D.series[i]&&D.series[i].metrics;
+      if(m&&m.quality){ q=m.quality; break; }
+    }
+  }
+  if(!q){ det.hidden=true; return; }
+  det.hidden=false;
+  const c=q.corpus||{}, g=q.graded||{};
+  body.innerHTML='';
+  const row=(k,v)=>{
+    const d=document.createElement('div');
+    d.className='rec-line';
+    d.textContent=k+': '+v;
+    body.appendChild(d);
+  };
+  row('near-dup clusters',(typeof c.dup_clusters==='number'?c.dup_clusters:'—')+' at the merge bar');
+  row('scope-anchored',(typeof c.scope_anchor_rate==='number'?Math.round(c.scope_anchor_rate*100)+'%':'—')+' of live memories');
+  row('label drift',(typeof c.canonical_drift==='number'?c.canonical_drift:'—')+' non-canonical');
+  row('graded useful',(typeof g.useful_share==='number'?Math.round(g.useful_share*100)+'%':'—')+' of '+(typeof g.graded==='number'?g.graded:0)+' verdicts');
+}
+
+/* ---------- contested drawer (#578 judgment layer). Graded data NEVER
+   rides the memory_precision block (≤ 2 KB discipline); the list comes
+   from the paginated endpoint. #593 makes the row PRESENCE-GATED: hidden
+   in markup, the count loads EAGERLY at band render (one guarded GET) and
+   the row appears only when the opt-in weekly lane ran AND something is
+   contested — a hidden row claims nothing, so the zero-state strings are
+   gone. Thumbs PUT /dashboard/quality/verdict {id, verdict:1|-1}
+   (numeric — the server's strict body), a thumbed item leaves the list
+   (the server clears owner-answered rows), and thumbing away the last row
+   re-hides it. Fail-soft: a fetch error keeps the row hidden — an unknown
+   count never earns a place on the face. */
+function newestGradedCount(){
+  if(!D||!Array.isArray(D.series)) return null;
+  for(let i=D.series.length-1;i>=0;i--){
+    const q=D.series[i]&&D.series[i].metrics&&D.series[i].metrics.quality;
+    if(q&&q.graded&&typeof q.graded.graded==='number') return q.graded.graded;
+  }
+  return null;
+}
+let CONTESTED_LOADED=false;
+async function loadContested(force){
+  const box=el('rec-contest-rows'), num=el('rec-contest-n'), det=el('rec-contest');
+  if(!box) return;
+  if(CONTESTED_LOADED&&!force) return;
+  try{
+    const r=await api('/dashboard/quality/contested?limit=20');
+    CONTESTED_LOADED=true;
+    const items=r.items||[];
+    const graded=newestGradedCount();
+    const show=items.length>0&&graded!==0;
+    if(det) det.hidden=!show;
+    if(!show){ box.innerHTML=''; return; }
+    if(num) num.textContent=String(r.total);
+    box.innerHTML='';
+    for(const it of items){
+      const row=document.createElement('div');
+      row.className='rec-item';
+      const line=document.createElement('span');
+      line.className='rec-item-line';
+      line.textContent=(it.line||('['+it.memory_id+'] memory no longer available'))+
+        (it.prompt_excerpt?' — prompt: '+it.prompt_excerpt:'');
+      line.title='score '+(typeof it.score==='number'?it.score.toFixed(2):'—')+
+        ', confidence '+(typeof it.confidence==='number'?it.confidence.toFixed(2):'—');
+      const up=document.createElement('button');
+      up.className='rec-thumb ok'; up.textContent='👍'; up.title='useful';
+      const down=document.createElement('button');
+      down.className='rec-thumb no'; down.textContent='👎'; down.title='not useful';
+      const send=async(v)=>{
+        try{
+          await api('/dashboard/quality/verdict',{method:'PUT',body:JSON.stringify({id:it.id,verdict:v})});
+          row.remove();
+          if(num){
+            const left=Math.max(0,(parseInt(num.textContent,10)||1)-1);
+            num.textContent=String(left);
+            if(left===0&&det) det.hidden=true;   /* thumbing away the last row re-hides */
+          }
+        }catch(e){ /* fail-soft: the row stays, the next load retries */ }
+      };
+      up.addEventListener('click',()=>send(1));
+      down.addEventListener('click',()=>send(-1));
+      row.appendChild(line); row.appendChild(up); row.appendChild(down);
+      box.appendChild(row);
+    }
+  }catch(e){
+    if(det) det.hidden=true;   /* fail-soft: an unknown count stays off the face */
+  }
 }
 
 let MODEL_LABEL='';
@@ -3792,6 +4039,56 @@ function agoLabel(iso){
   const hrs=Math.max(0,(Date.now()-t)/3.6e6);
   return hrs<48?Math.round(hrs)+'h ago':Math.round(hrs/24)+'d ago';
 }
+/* ---------- #601: the confidential circle — fleet.circle rides the same
+   /dashboard/data payload (ALWAYS present; roster [] when nothing is
+   configured). VISIBILITY ONLY: the dashboard stays ungated (confidential
+   content remains visible here — the standing ruling); standard agents
+   render NO badge (honest absence — red would read as error, amber reads as
+   restricted). D.fleet.circle is ABSENT on a pre-#601 server → every helper
+   degrades to the exact prior rendering. members is keyed by the OBSERVED
+   source_agent ids (the server already ran the roster match — membership is
+   key presence, the value the confidential count). ---------- */
+function circleBlock(){
+  return (D&&D.fleet&&D.fleet.circle)?D.fleet.circle:null;
+}
+/** The confidential count for one observed source_agent id — null when the
+    id is not a circle member (not a members key). */
+function circleCount(agentId){
+  const c=circleBlock();
+  if(!c||typeof agentId!=='string'||!c.members) return null;
+  const n=Object.prototype.hasOwnProperty.call(c.members,agentId)?c.members[agentId]:null;
+  return typeof n==='number'?n:null;
+}
+/** Per-agent pill — '' for standard agents (no markup at all); the meaning
+    and the count live in the tooltip (tech detail in tooltips). */
+function circlePill(agentId){
+  const n=circleCount(agentId);
+  if(n===null) return '';
+  return '<span class="conf-pill" title="Inner circle — this agent\'s captures are confidential, hidden from other agents\' recall · '+n+' confidential '+(n===1?'memory':'memories')+'">confidential</span>';
+}
+/** Bundle-level pill (rail card header / capture rows) — the tooltip names
+    every member agent + its count; '' when none of the ids are members. */
+function circleBundlePill(ids){
+  if(!Array.isArray(ids)) return '';
+  const hits=[];
+  for(const id of ids){
+    const n=circleCount(id);
+    if(n!==null) hits.push(id+' ('+n+')');
+  }
+  if(!hits.length) return '';
+  return '<span class="conf-pill" role="img" aria-label="confidential bundle" title="Confidential circle agents in this bundle: '+esc(hits.join(', '))+'"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.2" y="5.2" width="7.6" height="5.6" rx="1.2"/><path d="M4 5.2V3.8a2 2 0 0 1 4 0v1.4"/></svg></span>';
+}
+/** The rail-header legend chip — null when no roster exists (nothing
+    rendered, honest empty state); the tooltip carries the ROSTER itself plus
+    the capturing members (the issue's presence rule: the roster is visible
+    somewhere minimal). */
+function circleLegend(){
+  const c=circleBlock();
+  if(!c||!Array.isArray(c.roster)||!c.roster.length) return null;
+  const capturing=Object.keys(c.members||{});
+  const title='Confidential circle — amber pills mark agents whose captures are confidential, visible only to circle members (this dashboard shows everything). Roster ('+c.roster.length+'): '+c.roster.join(', ')+(capturing.length?' · capturing: '+capturing.join(', '):'');
+  return {html:'<span class="conf-pill" role="img" aria-label="confidential agent" title="'+esc(title)+'"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.2" y="5.2" width="7.6" height="5.6" rx="1.2"/><path d="M4 5.2V3.8a2 2 0 0 1 4 0v1.4"/></svg></span>', title};
+}
 function buildCapture(){
   const host=el('cap-rows');
   host.innerHTML='';
@@ -3837,11 +4134,14 @@ function buildCapture(){
       const harness=agent.split('/')[0]||agent;
       const key=(r.machine||'')+'|'+harness;
       let g=groups.get(key);
-      if(!g){ g={machine:r.machine||null, harness, posts:0, sessions:0, bytes:0, held:0, retried:0, agents:[]}; groups.set(key,g); }
+      if(!g){ g={machine:r.machine||null, harness, posts:0, sessions:0, bytes:0, held:0, retried:0, agents:[], ids:[]}; groups.set(key,g); }
       g.posts+=r.posts||0; g.sessions+=r.sessions||0; g.bytes+=r.bytes||0;
       g.held+=r.held||0; g.retried+=r.retried||0;
       g.agents.push(agent+' — '+r.posts+' post'+(r.posts===1?'':'s')+' · '+r.sessions+' sess · '+mbFmt(r.bytes||0)
         +(r.held?' · '+r.held+' held':'')+(r.retried?' · '+r.retried+' retried':''));
+      /* #601: the raw agent id rides alongside the display line — the circle
+         pill matches observed ids, never the formatted tooltip text */
+      g.ids.push(agent);
     }
     /* newest-night secondary: per-bundle sessions + held off capture_health
        rows (the newest day with rows). held keys the badge — a held post is
@@ -3863,6 +4163,9 @@ function buildCapture(){
     const pausedKeys=fleetPausesByKey();
     for(const g of gs2){
       const n=night.get((g.machine||'')+'|'+g.harness);
+      /* #601: the bundle's circle member ids (observed × roster) feed the
+         tooltip note + the amber pill in the .st cluster */
+      const confIds=(g.ids||[]).filter(id=>circleCount(id)!==null);
       const row=document.createElement('div');
       row.className='cap-row2';
       const label=g.machine?g.machine+' · '+g.harness:g.harness;
@@ -3872,6 +4175,7 @@ function buildCapture(){
         +(g.retried>0?' · '+g.retried+' retried in window':'')
         +(n?' · '+nightLabel+': '+n.sessions+' sess'+(n.held>0?' ('+n.held+' held)':''):'')
         +(paused?' · CAPTURE PAUSED (posts are skipped — sessions are not backfilled)':'')
+        +(confIds.length?' · confidential circle: '+confIds.join(', '):'')
         +':\n'+g.agents.join('\n');
       row.innerHTML='<span class="cap-dot"></span>'+
         '<span class="hn" title="'+esc(label)+'">'+esc(label)+'</span>'+
@@ -3879,6 +4183,7 @@ function buildCapture(){
         '<span class="st"><b>'+fmt(g.sessions)+'</b> sess · '+mbFmt(g.bytes)
         +(paused?'<span class="cap-paused" title="capture paused — posts are skipped (200) and sessions are not backfilled">PAUSED</span>':'')
         +(n&&n.held>0?'<span class="cap-held" title="'+nightLabel+' — failed posts the client will retry — cursor held">&#9888; '+n.held+' held</span>':'')
+        +circleBundlePill(g.ids)
         +'</span>'
         /* the newest-night sub-line — a full-basis flex child, so it wraps
            UNDER the primary line (the suffix never fits beside it; see the
@@ -3900,16 +4205,21 @@ function buildCapture(){
       const harness=agent.split('/')[0]||agent;
       const key=(r.machine||'')+'|'+harness;
       let g=groups.get(key);
-      if(!g){ g={machine:r.machine||null, harness, posts:0, sessions:0, bytes:0, held:0, retried:0, agents:[]}; groups.set(key,g); }
+      if(!g){ g={machine:r.machine||null, harness, posts:0, sessions:0, bytes:0, held:0, retried:0, agents:[], ids:[]}; groups.set(key,g); }
       g.posts+=r.posts||0; g.sessions+=r.sessions||0; g.bytes+=r.bytes||0;
       g.held+=r.held||0; g.retried+=r.retried||0;
       g.agents.push(agent+' — '+r.posts+' post'+(r.posts===1?'':'s')+' · '+r.sessions+' sess · '+mbFmt(r.bytes||0)
         +(r.held?' · '+r.held+' held':'')+(r.retried?' · '+r.retried+' retried':''));
+      /* #601: the raw agent id rides alongside the display line — the circle
+         pill matches observed ids, never the formatted tooltip text */
+      g.ids.push(agent);
     }
     const gs2=[...groups.values()].sort((a,b)=>b.bytes-a.bytes);
     const maxB=gs2[0].bytes;
     const pausedKeys=fleetPausesByKey();
     for(const g of gs2){
+      /* #601: circle member ids — tooltip note + pill (same as the window branch) */
+      const confIds=(g.ids||[]).filter(id=>circleCount(id)!==null);
       const row=document.createElement('div');
       row.className='cap-row2';
       const label=g.machine?g.machine+' · '+g.harness:g.harness;
@@ -3918,6 +4228,7 @@ function buildCapture(){
         +(paused?' · CAPTURE PAUSED (posts are skipped — sessions are not backfilled)':'')
         +(g.held>0?' · '+g.held+' held (failed posts the client will retry — cursor held)':'')
         +(g.retried>0?' · '+g.retried+' retried':'')
+        +(confIds.length?' · confidential circle: '+confIds.join(', '):'')
         +':\n'+g.agents.join('\n');
       row.innerHTML='<span class="cap-dot"></span>'+
         '<span class="hn" title="'+esc(label)+'">'+esc(label)+'</span>'+
@@ -3925,6 +4236,7 @@ function buildCapture(){
         '<span class="st"><b>'+fmt(g.sessions)+'</b> sess · '+mbFmt(g.bytes)
         +(paused?'<span class="cap-paused" title="capture paused — posts are skipped (200) and sessions are not backfilled">PAUSED</span>':'')
         +(g.held>0?'<span class="cap-held" title="failed posts the client will retry — cursor held">&#9888; '+g.held+' held</span>':'')
+        +circleBundlePill(g.ids)
         +'</span>';
       host.appendChild(row);
     }
@@ -3938,6 +4250,9 @@ function buildCapture(){
   const totalMem=gs.reduce((a,g)=>a+g.mem,0);
   const pausedKeys=fleetPausesByKey();
   for(const g of gs){
+    /* #601: circle member ids — tooltip note + pill (same as the live branches) */
+    const ctxIds=g.contexts.map(c=>c.id);
+    const confIds=ctxIds.filter(id=>circleCount(id)!==null);
     const row=document.createElement('div');
     row.className='cap-row2';
     const label=bundleLabel(g);
@@ -3949,12 +4264,14 @@ function buildCapture(){
     row.title=label+' — '+fmt(g.mem)+' memories across '+g.contexts.length
       +' context'+(g.contexts.length===1?'':'s')+(g.machine?'':' (pre-machine-stamp captures)')
       +(paused?' · CAPTURE PAUSED (posts are skipped — sessions are not backfilled)':'')
+      +(confIds.length?' · confidential circle: '+confIds.join(', '):'')
       +':\n'+tail;
     row.innerHTML='<span class="cap-dot"></span>'+
       '<span class="hn" title="'+esc(label)+'">'+esc(label)+'</span>'+
       '<span class="cap-bar"><span class="fill" style="width:'+(g.mem/Math.max(totalMem,1)*100)+'%"></span></span>'+
       '<span class="st"><b>'+g.contexts.length+'</b> ctx · '+fmt(g.mem)+' mem'
       +(paused?'<span class="cap-paused" title="capture paused — posts are skipped (200) and sessions are not backfilled">PAUSED</span>':'')
+      +circleBundlePill(ctxIds)
       +'</span>';
     host.appendChild(row);
   }
@@ -3974,6 +4291,13 @@ function lastNightByAgent(){
 }
 function buildAgents(){
   const listEl=el('ag-list'); listEl.innerHTML='';
+  /* #601: the circle legend rides the rail header — rendered BEFORE the
+     no-contexts early return (the circle exists even with no contexts yet);
+     no roster / pre-#601 server → hidden, no markup (honest absence) */
+  const legendEl=el('ag-circle');
+  const legend=circleLegend();
+  if(legend){ legendEl.innerHTML=legend.html; legendEl.title=legend.title; legendEl.hidden=false; }
+  else{ legendEl.innerHTML=''; legendEl.title=''; legendEl.hidden=true; }
   const gs=contextGroups();
   /* #506: the "below" target (the rail drawer) is gone — the empty state
      points at the one remaining connect surface, the account menu */
@@ -4004,6 +4328,7 @@ function buildAgents(){
         (presence?'<span class="presence '+presence.cls+'" title="'+presence.label+' — last seen '+agoLabel(seen.last_seen)+' ('+(seen.last_outcome||'?')+' /distill)"></span>':'')+
         '<span class="ag-main"><b>'+esc(g.harness)+'</b>'+
         '<small>'+esc(bundleLabel(g))+' · '+g.contexts.length+' context'+(g.contexts.length===1?'':'s')+' · '+fmt(g.mem)+' memories</small></span>'+
+        circleBundlePill(g.contexts.map(c=>c.id))+
         (fleetOk?'<button type="button" class="ag-pause" title="capture pause for '+esc(bundleLabel(g))+' — sessions while paused are NOT captured and will not be backfilled">'+(paused?'resume capture':'pause capture')+'</button>':'')+
       '</div>'+
       '<div class="last-night" title="last complete night: learned / enriched / merged (all '+esc(g.harness)+' contexts on '+esc(machineLabel(g)||'this store')+')">'+
@@ -4034,6 +4359,7 @@ function buildAgents(){
         const note=machineNote(c.machines);
         if(note) row.title=c.name+note; // property assignment — no HTML escaping needed
         row.innerHTML='<span class="cn">'+esc(c.name)+'<small>'+esc(c.id)+'</small></span>'+
+          circlePill(c.id)+
           '<span class="cc">'+fmt(c.count)+' mem</span>';
         row.onclick=(e)=>{ e.stopPropagation(); selected=c; renderCtxList(); openContext(c); wake(); };
         listBox.appendChild(row);
@@ -4043,6 +4369,7 @@ function buildAgents(){
       detail.hidden=false;
       detail.innerHTML=
         '<div class="ctx-head"><b>'+esc(c.name)+'</b><small>'+esc(c.id)+'</small>'+
+        circlePill(c.id)+
         '<span class="idscope" title="identity scope — applies immediately · survives restart">'+
           ['override','global','off'].map(m=>'<button type="button" class="idpill seg '+m+'" data-mode="'+m+'" aria-pressed="false">'+m+'</button>').join('')+
         '</span></div>'+

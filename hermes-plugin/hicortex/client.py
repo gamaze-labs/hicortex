@@ -176,10 +176,15 @@ class HicortexClient:
         limit: int = 5,
         project: Optional[str] = None,
         privacy: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> list[dict]:
+        """Search shared memory. ``agent`` (plugin 0.7.11, server ≥ #332) is
+        this profile's id — a server-rostered id also sees the confidential
+        pool; absent/unknown stays non-member (the server hard-omits
+        confidential rows). Older servers ignore the parameter."""
         return self._get(
             "/search",
-            {"query": query, "limit": limit, "project": project, "privacy": privacy},
+            {"query": query, "limit": limit, "project": project, "privacy": privacy, "agent": agent},
         ).get("results", [])
 
     def recent(
@@ -187,13 +192,18 @@ class HicortexClient:
         project: Optional[str] = None,
         limit: int = 10,
         privacy: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> list[dict]:
+        """Recent memories. ``agent`` — see :meth:`search` (#332 membership)."""
         return self._get(
-            "/recent", {"project": project, "limit": limit, "privacy": privacy}
+            "/recent",
+            {"project": project, "limit": limit, "privacy": privacy, "agent": agent},
         ).get("results", [])
 
-    def lessons(self) -> dict[str, Any]:
-        return self._get("/lessons")
+    def lessons(self, agent: Optional[str] = None) -> dict[str, Any]:
+        """Lessons + memory index. ``agent`` — see :meth:`search` (#332:
+        confidential lessons serve to rostered agents only)."""
+        return self._get("/lessons", {"agent": agent})
 
     def context(self, agent: Optional[str] = None) -> dict[str, Any]:
         """Standing context layer (L2). When ``agent`` is set, the server
@@ -213,7 +223,10 @@ class HicortexClient:
         limit: Optional[int] = None,
         domain: Optional[str] = None,
         relationship: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> dict[str, Any]:
+        """Graph query (neighbors/hubs/path). ``agent`` — see :meth:`search`
+        (#332 membership; the export op is the ungated owner surface)."""
         return self._get(
             "/graph",
             {
@@ -223,6 +236,7 @@ class HicortexClient:
                 "limit": limit,
                 "domain": domain,
                 "relationship": relationship,
+                "agent": agent,
             },
         )
 
@@ -281,6 +295,7 @@ class HicortexClient:
         project: Optional[str] = None,
         privacy: Optional[str] = None,
         mission_domains: Optional[list[str]] = None,
+        agent: Optional[str] = None,
     ) -> tuple[int, dict[str, Any]]:
         """Pushed recall index (0.14). ``prompt`` → ``{block, shown, turn}``
         where ``block`` is None when nothing is new/relevant; ``reset=True``
@@ -288,7 +303,11 @@ class HicortexClient:
         ``privacy`` (CSV accepted server-side), and ``mission_domains`` (list)
         scope the recall — all SOFT on a 0.16+ server (affinity boosts, never
         hard filters); ``project``/``privacy`` stay hard on older servers.
-        Returns the status so the caller can old-server-guard on 404."""
+        ``agent`` (plugin 0.7.11, server ≥ #332) is this profile's id for the
+        confidential-circle membership gate (rostered ids see both pools in
+        the index; absent/unknown hard-omits confidential rows). Older servers
+        ignore the field. Returns the status so the caller can old-server-guard
+        on 404."""
         body: dict[str, Any] = {"session_id": session_id}
         if reset:
             body["reset"] = True
@@ -300,16 +319,24 @@ class HicortexClient:
                 body["privacy"] = privacy
             if mission_domains:
                 body["mission_domains"] = mission_domains
+            if agent:
+                body["agent"] = agent
         return self._post("/recall-index", body, timeout=self.RECALL_TIMEOUT)
 
     def get_memory(
-        self, id: str, privacy: Optional[str] = None
+        self,
+        id: str,
+        privacy: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> tuple[int, dict[str, Any]]:
         """Fetch ONE memory's full content (lazy-load counterpart of the recall
         index). The server marks it as USED (access_count + 1) and returns
         ``{memory, citation}`` — citation is server-rendered so every harness
-        surfaces the same provenance norm. ``privacy`` (CSV) makes an
-        out-of-scope memory read as 404 (the server never reveals existence)."""
+        surfaces the same provenance norm. ``agent`` (plugin 0.7.11, server ≥
+        #332) is the membership gate: a confidential memory fetched by a
+        non-member answers 404 (the server never reveals existence)."""
         return self._get_with_status(
-            "/memory", {"id": id, "privacy": privacy}, timeout=self.RECALL_TIMEOUT
+            "/memory",
+            {"id": id, "privacy": privacy, "agent": agent},
+            timeout=self.RECALL_TIMEOUT,
         )

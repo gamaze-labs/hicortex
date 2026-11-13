@@ -23,7 +23,8 @@ try { VERSION = JSON.parse(readFileSync(join(__dirname, "..", "package.json"), "
 import { initDb, resolveDbPath } from "./db.js";
 import { readNonNegativeConfig, readPositiveConfig, readStringConfig, warnIgnoredConfigKeys } from "./config-read.js";
 import { DEFAULT_FIRST_RUN_LOOKBACK_DAYS, DRAIN_YIELD_PROBE_TIMEOUT_MS } from "./calibration.js";
-import { resolveSavedLlmConfig, LlmClient, type LlmConfig } from "./llm.js";
+import { type LlmConfig } from "./llm.js";
+import { resolveLlmPair, resolveConfidentialAgents, resolveConfidentialPaths, warnIfCircleUnconfigured } from "./classification.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import { runConsolidation, resolveNightlyLlmCallBudget, resolveMemorySoftCap, stageMemoryCapEviction, shouldThrottleTokens, isStaleTokenPeriod, warnUnmeteredTokensRun } from "./consolidate.js";
@@ -45,6 +46,7 @@ import { isTokenBudgetExceeded, recordDistillUsage } from "./token-budget.js";
 import { createRunDeadline, resolveNightlyTimeBudgetMinutes, type RunDeadline } from "./run-deadline.js";
 import { writeSnapshot, backfillSnapshots } from "./dashboard.js";
 import { pruneRecallPrecision } from "./recall-precision.js";
+import { runQualityGradeStage } from "./quality-scoreboard.js";
 import { isTelemetryEnabled, getTelemetryId, sendTelemetry, TELEMETRY_PAYLOAD_VERSION } from "./telemetry.js";
 import { ensureAndPersistAgentId, loadConfigStrict } from "./init.js";
 import { createBackup, runBackupHook, newestBackupArtifactMs, DEFAULT_BACKUP_RETENTION } from "./backup.js";
@@ -622,12 +624,35 @@ export async function runNightly(options: {
     // is handled by the running daemon over /distill — no local distill LLM needed.
     // No LLM → capture loop still runs (sessions POST to /distill, which will 503
     // transient-fail and hold the watermark), but consolidation is skipped.
-    const resolved = resolveSavedLlmConfig(savedConfig);
-    if (resolved.reason === "claude_binary_missing") {
+    // #332: resolveLlmPair resolves BOTH clients at this funnel — the main
+    // model plus the confidential one (llmConfidential* config /
+    // HICORTEX_LLM_CONFIDENTIAL_* env). The confidential client serves the
+    // drain's confidential items and (from the pool-aware stages) every
+    // consolidation touch of confidential text; absent = those hold/skip,
+    // never fall back.
+    const resolvedPair = resolveLlmPair(savedConfig);
+    if (resolvedPair.reason === "claude_binary_missing") {
       console.warn("[hicortex] claude-cli configured but binary not found — consolidation skipped");
     }
-    const llmConfig: LlmConfig | null = resolved.config;
-    const llm = llmConfig ? new LlmClient(llmConfig) : null;
+    const llmConfig: LlmConfig | null = resolvedPair.standardConfig;
+    const llm = resolvedPair.pair?.standard ?? null;
+    const confidentialLlm = resolvedPair.pair?.confidential ?? null;
+    const confidentialLlmConfig = resolvedPair.confidentialConfig;
+    // #332: the ONE loud warning when the circle is active without the
+    // confidential model (daemon boot mirrors this). "Active" includes
+    // confidentialPaths patterns configured (#609) — a patterns-only circle
+    // warns here too, not just at daemon boot (one clock, one definition).
+    warnIfCircleUnconfigured({
+      roster: resolveConfidentialAgents(savedConfig).roster,
+      patterns: resolveConfidentialPaths(savedConfig).patterns,
+      confidentialLlm: confidentialLlm ?? confidentialLlmConfig,
+      confidentialRows: (
+        db.prepare("SELECT COUNT(*) AS c FROM memories WHERE privacy = 'confidential'").get() as { c: number }
+      ).c,
+      queueConfidential: (
+        db.prepare("SELECT COUNT(*) AS c FROM distill_queue WHERE privacy = 'confidential'").get() as { c: number }
+      ).c,
+    });
 
     // Steps 1+2: single-flight capture. The lock guards ONLY the capture phase
     // (fix 10). We acquire it BEFORE reading the cursor store so a run that
@@ -784,6 +809,10 @@ export async function runNightly(options: {
       const drainReport = await drainDistillQueue(db, {
         llm,
         llmConfig,
+        // #332: the confidential client — confidential queue items distill on
+        // it; without it they hold (per-item skip-and-continue).
+        confidentialLlm,
+        confidentialLlmConfig,
         embed,
         budgetExceeded: () => isTokenBudgetExceeded(stateDir),
         deadline,
@@ -959,6 +988,10 @@ export async function runNightly(options: {
               // #405: the ONE run-wide deadline — capture and every
               // consolidation stage check this same handle.
               deadline,
+              // #332: the confidential client — every pool-aware stage
+              // (importance batches, reflection, domain classification,
+              // reconsolidation) routes confidential text here; absent ⇒ hold.
+              confidentialLlm,
             );
             console.log(
               `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
@@ -1273,6 +1306,33 @@ export async function runNightly(options: {
           `${pruneErr instanceof Error ? pruneErr.message : String(pruneErr)}`
         );
       }
+
+      // #578 — the weekly quality-grade stage (third-party decisions
+      // endpoint); explicit operator opt-in (#582: `qualityGrading` +
+      // `qualityGradeModel` config) — absent → skip.
+      // Gated by the state.json ISO-week cursor: one pass per week, on its
+      // OWN call lane (cap 60/week — deliberately separate from
+      // nightlyLlmCallBudget, different provider), deadline-aware between
+      // items, fail-soft against every documented failure mode (absent key →
+      // skip; HTTP-200-empty-answers → nothing written, retried). The cursor
+      // advances ONLY on a completed pass (dup-over-loss). Own try/catch —
+      // telemetry housekeeping must never fail the run (the prune above is
+      // the precedent). Snapshot ordering: this run's fresh verdicts land in
+      // tomorrow's snapshot block — the trend lags a day by construction.
+      try {
+        const gradedWeek = loadState(stateDir).qualityGradeWeek;
+        const report = await runQualityGradeStage(db, gradedWeek, { deadline, config: savedConfig });
+        if (report.complete && !report.skipped) {
+          updateState((s) => {
+            s.qualityGradeWeek = report.week;
+          }, stateDir);
+        }
+      } catch (gradeErr) {
+        console.warn(
+          `[hicortex] Quality-grade stage failed: ` +
+          `${gradeErr instanceof Error ? gradeErr.message : String(gradeErr)}`
+        );
+      }
     }
 
     // Anonymous telemetry (fire-and-forget, full nightly only).
@@ -1305,7 +1365,9 @@ export async function runNightly(options: {
         mode: "server",
         agent: agentType,
         mem: storage.countMemories(db),
-        lessons: storage.getLessons(db, 365).length,
+        // #332: telemetry counts the whole store (server-internal metric —
+        // not an agent-facing surface, so no membership gate).
+        lessons: storage.getLessons(db, 365, null, { includeConfidential: true }).length,
         lessonsGenerated,
         consolidation: consolidationStatus,
         // #246: total tokens consumed by this run's consolidation (absent on

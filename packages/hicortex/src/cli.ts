@@ -340,6 +340,58 @@ switch (command) {
     break;
   }
 
+  case "backfill-privacy": {
+    // One-shot classification stamping for EXISTING rows, by source agent
+    // (#332): every row whose source_agent matches the confidentialAgents
+    // roster flips to confidential. Mirrors `dedup`/`reconcile-projects`:
+    // dry-run default, --apply explicit (backup + capture lock + ONE
+    // transaction); flags parsed here, the runner lives in
+    // backfill-privacy.ts so this switch stays thin.
+    const args = process.argv.slice(3);
+    let dbPath: string | undefined;
+    try {
+      dbPath = readValueFlag(args, "--db");
+    } catch {
+      console.error("[hicortex] backfill-privacy: --db requires a path value");
+      process.exit(1);
+    }
+    const backfillOptions = { apply: args.includes("--apply"), dbPath };
+    import("./backfill-privacy.js").then(({ runBackfillPrivacy }) => {
+      runBackfillPrivacy(backfillOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] backfill-privacy failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
+  case "confidential": {
+    // #609: mark/unmark a workspace folder confidential via the local
+    // .hicortex-confidential marker file; the nightly's marker walk reads the
+    // file at the next capture. #616: the marker key is provisioned in ONE
+    // command — no local key → fetch it from the server (or generate +
+    // register one there); --key <value> rotates (PUTs the new value).
+    // Precedent: backfill-privacy (thin switch, runner in its own module).
+    const args = process.argv.slice(3);
+    const off = args.includes("--off");
+    let key: string | undefined;
+    try {
+      key = readValueFlag(args, "--key");
+    } catch {
+      console.error("[hicortex] confidential: --key requires a value");
+      process.exit(1);
+    }
+    // Positional path: the first bare arg that is not a --key value pair.
+    const pathArg = args.find((a, i) => !a.startsWith("-") && args[i - 1] !== "--key");
+    import("./confidential-marker.js").then(({ runConfidentialCommand }) => {
+      runConfidentialCommand({ path: pathArg, off, key }).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] confidential failed: ${err}`);
+        process.exit(1);
+      });
+    });
+    break;
+  }
+
   case "sweep-volatile": {
     // One-shot store sweep of volatile GH-status/version rows (#489,
     // deliverable iii): reuses the distill path's deterministic gate over the
@@ -505,6 +557,13 @@ Commands:
   relink          Resumable link-discovery pass over the ENTIRE corpus (server mode)
   dedup           Cluster + merge near-duplicate memories (server mode; dry run by default)
   reconcile-projects  Canonicalize existing project labels (server mode; dry run by default)
+  backfill-privacy  Stamp history confidential by source agent (#332; server mode;
+                    dry run by default — --apply executes: backup + capture lock + stamp)
+  confidential    Mark a workspace folder confidential via a local marker file
+                    (#616: the marker carries the server's confidentialMarkerKey,
+                    provisioned by this very command — fetched from the server,
+                    or generated + registered there on first use; --key <value>
+                    rotates); confidential [path] writes, --off [path] removes
   history         Show a memory's rewrite history, or roll one back (server mode)
                   history <id>                List rewrite events (read-only)
                   history --rollback <row>    Undo one rewrite + un-absorb its triggers
@@ -543,6 +602,27 @@ Options:
   reconcile-projects --apply  Execute the project renames (default: dry run, report only)
                              Backup first; renames memories + distill_queue only
   reconcile-projects --db <path>  DB path override (defaults to the configured DB)
+  backfill-privacy --apply   Execute the stamps (default: dry run, report only)
+                             Backup + capture lock first; stamps memories + distill_queue;
+                             never stamps back to standard (a roster removal is not a demotion)
+                             #609: also plans/stamps per confidentialPaths pattern (rows' stored
+                             workspace_path); NULL-path rows are never matched
+  backfill-privacy --db <path>  DB path override (defaults to the configured DB)
+  confidential [path]       Mark a folder confidential — writes .hicortex-confidential carrying
+                             the server's confidentialMarkerKey at its root (default path: cwd).
+                             ONE command, no manual key mirroring (#616): no local key → fetch
+                             the server's, or generate + register one there on first use; the
+                             fetched/generated key is saved into ~/.hicortex/config.json for
+                             offline reuse. An env (HICORTEX_CONFIDENTIAL_MARKER_KEY) or config
+                             key already on this machine is used as-is, no server contact.
+                             Refuses when no key exists AND no server is reachable (an
+                             unvalidated marker would be inert). A marked parent covers child
+                             workspaces; unmarking never demotes already-captured memories
+  confidential --key <v> [path]  ROTATION: register <v> as the server's confidentialMarkerKey
+                             (PUT), save it locally, write the marker — markers carrying a
+                             previous key then stamp standard. The server refuses (409) while
+                             its HICORTEX_CONFIDENTIAL_MARKER_KEY env override is set
+  confidential --off [path]  Remove the marker (succeeds when absent; no key needed, no network)
   history --rollback <row>  Roll back history row <row>: restores prior content/status, un-absorbs triggers
   history --db <path>       DB path override (defaults to the configured DB)
   backup --out <dir>        Write the artifact into <dir> as hicortex-<ISO>.tar.gz (default: <home>/backups)

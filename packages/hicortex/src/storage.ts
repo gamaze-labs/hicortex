@@ -5,7 +5,7 @@
 
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
-import type { Memory, MemoryLink, InsertMemoryOptions } from "./types.js";
+import type { Memory, MemoryLink, InsertMemoryOptions, MemoryPrivacy } from "./types.js";
 import { derivePrimary, type WeightedTag } from "./schema-prototypes.js";
 import * as CALIBRATION from "./calibration.js";
 
@@ -26,6 +26,18 @@ export function embedToBlob(embedding: Float32Array): Buffer {
 
 function rowToMemory(row: Record<string, unknown>): Memory {
   return row as unknown as Memory;
+}
+
+/**
+ * Normalize any wire/unknown privacy value into the #332 classification
+ * vocabulary — the insert-boundary guard that keeps legacy values ('WORK',
+ * 'PERSONAL', blank, NULL, wrong type) out of the column after migration
+ * v27 normalized history. 'confidential' passes through (it is only ever
+ * server-derived by the time it reaches storage); everything else becomes
+ * 'standard' (the fail-closed default class).
+ */
+export function normalizeStoredPrivacy(v: unknown): MemoryPrivacy {
+  return v === "confidential" ? "confidential" : "standard";
 }
 
 // ---------------------------------------------------------------------------
@@ -69,8 +81,8 @@ export function insertMemory(
       `INSERT OR IGNORE INTO memories
        (id, content, base_strength, last_accessed, access_count,
         created_at, ingested_at, source_agent, source_agent_id, source_session,
-        source_domain, project, privacy, memory_type, source_machine)
-       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        source_domain, workspace_path, project, privacy, memory_type, source_machine)
+       VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       id,
@@ -83,8 +95,15 @@ export function insertMemory(
       opts.sourceAgentId ?? null,
       sourceSession,
       opts.sourceDomain ?? null,
+      // #609: the workspace path rides the row (metadata for the
+      // confidentialPaths match + backfill); null when the delivery had none.
+      opts.workspacePath ?? null,
       opts.project ?? null,
-      opts.privacy ?? null,
+      // #332: 'standard' is the fail-closed default class — a NULL here would
+      // pre-date migration v27's normalization and force every read gate to
+      // keep a NULL arm forever. Confidential rows always carry an explicit
+      // server-derived 'confidential'.
+      opts.privacy ?? "standard",
       opts.memoryType ?? "experience",
       opts.sourceMachine ?? null
     );
@@ -147,8 +166,9 @@ const ALLOWED_UPDATE_FIELDS = new Set([
   "last_accessed",
   "access_count",
   // shown_count is normally maintained by touchMemoriesShown (bulk +1 per
-  // recall-index appearance); it's also allowed here so `hicortex dedup`
-  // (#100) can sum a merged cluster's counters onto the canonical row.
+  // recall-index appearance — exposure only, never the use clock, #569); it's
+  // also allowed here so `hicortex dedup` (#100) can sum a merged cluster's
+  // counters onto the canonical row.
   "shown_count",
   "source_agent",
   "source_session",
@@ -263,24 +283,28 @@ export function enrichMemory(
 
 /**
  * Record that memories appeared in a pushed recall index (#192): bump
- * shown_count and refresh last_accessed (a mild strengthen — the decay clock
- * resets so topically-live memories stop sinking) WITHOUT touching
- * access_count, which stays reserved for real use (the promotion signal
- * #448 + the prune shield).
+ * shown_count ONLY. #569 closed the exposure-refresh loop: last_accessed is
+ * the USE clock — the clock effectiveStrength decays on, i.e. the strength
+ * term of computeScore, the stageDecayPrune predicate, and the
+ * stageMemoryCapEviction ordering — and a memory the index keeps choosing
+ * must still age when nobody ever fetches it. Exposure is not use. It is
+ * written ONLY by insert (= created_at), strengthenMemory (real use),
+ * enrichMemory (owner corroboration), updateMemory (explicit), and the dedup
+ * canonical merge (max). access_count likewise stays reserved for real use
+ * (the promotion signal #448 + the adoption metric).
  */
 export function touchMemoriesShown(
   db: Database.Database,
-  memoryIds: string[],
-  nowIsoStr: string
+  memoryIds: string[]
 ): void {
   if (memoryIds.length === 0) return;
   const stmt = db.prepare(
     `UPDATE memories
-     SET shown_count = COALESCE(shown_count, 0) + 1, last_accessed = ?
+     SET shown_count = COALESCE(shown_count, 0) + 1
      WHERE id = ?`
   );
   const run = db.transaction((ids: string[]) => {
-    for (const id of ids) stmt.run(nowIsoStr, id);
+    for (const id of ids) stmt.run(id);
   });
   run(memoryIds);
 }
@@ -784,14 +808,13 @@ export function insertMemoriesBatch(
     sourceDomain?: string | null;
     sourceSession?: string | null;
     project?: string | null;
-    privacy?: string;
+    privacy?: MemoryPrivacy;
     memoryType?: string;
     baseStrength?: number;
   }>
 ): number {
-  // privacy default is null (0.16.x: the distiller no longer sets WORK — the
-  // column is vestigial, never filtered, and goes NULL unless a caller sends
-  // an explicit value).
+  // #332: privacy defaults to 'standard' (the class carrier) — same default
+  // as insertMemory; see the comment there.
   const insertMem = db.prepare(
     `INSERT INTO memories
      (id, content, base_strength, last_accessed, access_count,
@@ -820,7 +843,7 @@ export function insertMemoriesBatch(
         mem.sourceSession ?? null,
         mem.sourceDomain ?? null,
         mem.project ?? null,
-        mem.privacy ?? null,
+        mem.privacy ?? "standard",
         mem.memoryType ?? "experience"
       );
       insertVec.run(id, embedToBlob(mem.embedding));
@@ -881,19 +904,34 @@ export function getMemoriesSince(
 
 /**
  * Get lesson-type memories from the last N days.
+ *
+ * #332: lessons inherit their pool's classification (confidential-pool
+ * reflection stamps them confidential at birth), and the SAME membership gate
+ * applies — `includeConfidential` defaults to FALSE (fail-closed: the
+ * agent-facing consumers — /learnings, the MCP lessons tools — serve standard
+ * lessons only unless the requester is a circle member). Server-internal
+ * consumers (nightly telemetry, the seed check, the recall-precision standing
+ * basis) pass true explicitly: they run inside the server, on the whole store.
  */
 export function getLessons(
   db: Database.Database,
   days = 7,
-  project?: string | null
+  project?: string | null,
+  opts?: { includeConfidential?: boolean },
 ): Memory[] {
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  // The hard-omit predicate — NULL-safe by construction (NULL privacy, the
+  // pre-v27 population, reads standard).
+  const classPredicate =
+    opts?.includeConfidential === true
+      ? ""
+      : " AND (privacy IS NULL OR privacy != 'confidential')";
 
   if (project) {
     const rows = db
       .prepare(
         `SELECT * FROM memories
-         WHERE memory_type = 'learnings' AND created_at > ? AND project = ?
+         WHERE memory_type = 'learnings' AND created_at > ? AND project = ?${classPredicate}
          ORDER BY created_at DESC`
       )
       .all(cutoff, project) as Array<Record<string, unknown>>;
@@ -903,7 +941,7 @@ export function getLessons(
   const rows = db
     .prepare(
       `SELECT * FROM memories
-       WHERE memory_type = 'learnings' AND created_at > ?
+       WHERE memory_type = 'learnings' AND created_at > ?${classPredicate}
        ORDER BY created_at DESC`
     )
     .all(cutoff) as Array<Record<string, unknown>>;

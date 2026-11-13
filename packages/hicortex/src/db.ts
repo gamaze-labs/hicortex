@@ -109,7 +109,11 @@ CREATE TABLE IF NOT EXISTS memories (
     source_agent TEXT DEFAULT 'default',
     source_session TEXT,
     project TEXT,
-    privacy TEXT DEFAULT 'WORK',
+    -- #332: the two-level memory classification ('standard' | 'confidential').
+    -- Server-derived at intake from source_agent × the confidentialAgents
+    -- roster — never client-declared. The fresh-schema default flipped from the
+    -- pre-0.16 'WORK' (migration v27 maps every legacy value/NULL → standard).
+    privacy TEXT DEFAULT 'standard',
     memory_type TEXT DEFAULT 'experience',
     updated_at TIMESTAMP
 );
@@ -845,6 +849,130 @@ const MIGRATIONS: Migration[] = [
       db.exec(
         "CREATE INDEX IF NOT EXISTS idx_distill_queue_arrived ON distill_queue(arrived_at)",
       );
+    },
+  },
+  {
+    version: 25,
+    name: "use_clock_correction",
+    up: (db) => {
+      // #569 — close the exposure-refresh loop. Since v8 (#192) every
+      // recall-index showing stamped last_accessed = now, and that column is
+      // the clock effectiveStrength decays on (the strength term of
+      // computeScore, the stageDecayPrune predicate, the cap-eviction
+      // ordering) — so shown-but-never-fetched noise stayed young forever.
+      // touchMemoriesShown now bumps shown_count only, superseding the v8
+      // refresh semantics, and this one-time correction re-anchors the
+      // accumulated false youth: for rows never fetched AND never
+      // owner-corroborated, no use ever happened, so creation age is the
+      // honest decay clock. Used and enriched rows keep their stamps — the
+      // classes that earned them. The v20 promotion-baseline backfill is the
+      // precedent for correcting a signal's history when its semantics
+      // change. Idempotent: re-running rewrites the same creation value onto
+      // the same rows (the fixed writer produces no new exposure stamps).
+      db.exec(
+        `UPDATE memories SET last_accessed = created_at
+         WHERE access_count = 0 AND COALESCE(corroboration_count, 0) = 0`
+      );
+    },
+  },
+  {
+    version: 26,
+    name: "quality_verdicts",
+    up: (db) => {
+      // #578 — the quality scoreboard's store half. Two additions:
+      //
+      // (1) recall_pushes.project — the CANONICALIZED wire label the #566
+      // fence gated with (handleRecallIndex already computes
+      // canonicalizeProject(req.project) before the recorder runs; the label
+      // was simply dropped on the floor). Nullable, NO backfill — the v15
+      // source_machine precedent: pre-v26 rows stay NULL and attribute via
+      // the `#`-prefix join on memories.source_session (which is
+      // segment-scoped `<sessionId>#<segment>` — bare equality matches 0
+      // rows, measured #578); the join covers 96%+ of pushes, and the
+      // attribution COVERAGE % renders beside the cross-project share so the
+      // gap is explicit, never silent.
+      //
+      // (2) recall_verdicts — the judgment sidecar (the v16/v22 sidecar law:
+      // OPERATIONS/judgment telemetry, no memories FK — a verdict row
+      // outliving its memory, or grading a memory later absorbed, is valid;
+      // memory_id is DATA). One row per (grader × push × memory × time):
+      // grader 'auto' (weekly grade stage), 'owner' (dashboard thumbs — the
+      // calibration reference, NEVER pruned), or 'revealed'
+      // (shown-then-fetched, marked useful with zero grading calls). score +
+      // confidence are stored RAW and THRESHOLD-FREE (the #476 law —
+      // "useful" and "contested" are derived at render), verdict carries the
+      // owner's ±1 thumb (NULL for the 'auto' grader, derived at render). Pruned with
+      // the 90-day horizon EXCEPT grader='owner' rows.
+      //
+      // Idempotent: hasColumn-guarded ALTER (v15 pattern) + IF NOT EXISTS.
+      if (!hasColumn(db, "recall_pushes", "project")) {
+        db.exec("ALTER TABLE recall_pushes ADD COLUMN project TEXT");
+      }
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS recall_verdicts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          day TEXT NOT NULL,
+          push_id INTEGER,
+          memory_id TEXT NOT NULL,
+          grader TEXT NOT NULL,
+          score REAL,
+          confidence REAL,
+          verdict INTEGER
+        )
+      `);
+      db.exec("CREATE INDEX IF NOT EXISTS idx_recall_verdicts_day ON recall_verdicts(day)");
+      db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_recall_verdicts_push_memory ON recall_verdicts(push_id, memory_id)",
+      );
+    },
+  },
+  {
+    version: 27,
+    name: "privacy_standard",
+    up: (db) => {
+      // #332 — the privacy column becomes the two-level classification carrier
+      // ('standard' | 'confidential'). Production rows carry BOTH legacy
+      // populations: 'WORK' (the pre-0.16 schema default) and NULL (modern
+      // inserts, which passed `privacy ?? null`). Both map to 'standard' — the
+      // fail-closed default class; 'confidential' only ever exists once the
+      // server derives it at intake (source_agent × the confidentialAgents
+      // roster) or the operator backfills it. Any other legacy value ('',
+      // 'PERSONAL', …) maps the same way. The distill_queue rows are normalized
+      // with the SAME predicate so a pre-upgrade queued segment distills with
+      // the same stamp the migration just gave its already-stored siblings.
+      // Idempotent: re-running rewrites the same 'standard' onto the same rows.
+      db.exec(
+        `UPDATE memories SET privacy = 'standard'
+         WHERE privacy IS NULL OR privacy NOT IN ('standard', 'confidential')`
+      );
+      db.exec(
+        `UPDATE distill_queue SET privacy = 'standard'
+         WHERE privacy IS NULL OR privacy NOT IN ('standard', 'confidential')`
+      );
+    },
+  },
+  {
+    version: 28,
+    name: "workspace_path",
+    up: (db) => {
+      // #609 — confidential birthplace by workspace. Both tables gain the
+      // delivery's workspace path (the wire `workspace_path` field): the
+      // intake matcher stamps confidential when it matches a
+      // `confidentialPaths` pattern, and `hicortex backfill-privacy` re-plans
+      // retroactively from the stored value — impossible without persisting
+      // it. Metadata in the same class as the already-stored `project`
+      // (matched/attributed, never distilled into prompt text). Pre-v28 rows
+      // have no path by construction and stay NULL — there is deliberately no
+      // client re-scan to recover them (the spec's non-goal); their routes to
+      // confidential remain the agent-roster backfill or explicit acceptance.
+      // Idempotent: hasColumn-guarded ALTER (the v15/v26 pattern).
+      if (!hasColumn(db, "memories", "workspace_path")) {
+        db.exec("ALTER TABLE memories ADD COLUMN workspace_path TEXT");
+      }
+      if (!hasColumn(db, "distill_queue", "workspace_path")) {
+        db.exec("ALTER TABLE distill_queue ADD COLUMN workspace_path TEXT");
+      }
     },
   },
 ];

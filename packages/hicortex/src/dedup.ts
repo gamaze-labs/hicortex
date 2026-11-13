@@ -421,9 +421,12 @@ export function planDedup(db: Database.Database, threshold: number): PlanDedupRe
     }
 
     const mismatch = clusterMetadataMismatch(members);
-    // #206 decision 2: project is the ONLY rail — the source_agent rail was
-    // removed (cross-agent clusters merge; the skip reason is project_mismatch).
-    if (mismatch.projectMismatch) {
+    // #206 decision 2: the source_agent rail was removed (cross-agent
+    // clusters merge). Project stayed the only METADATA rail until #332 added
+    // the classification rail — a cluster mixing standard and confidential
+    // rows is skipped, never blended (either skip reason keeps every member
+    // live; the pair re-detects structurally).
+    if (mismatch.projectMismatch || mismatch.classificationMismatch) {
       mismatchSkipped.push({ size: members.length, memberIds: members.map((m) => m.id), mismatch });
       continue;
     }
@@ -540,7 +543,7 @@ function mergeCluster(
 
 export type MergeMemoryIdsResult =
   | { ok: true; canonicalId: string; loserIds: string[]; linksRepointed: number }
-  | { ok: false; reason: "project_mismatch" | "conflict_linked" | "no_members" };
+  | { ok: false; reason: "project_mismatch" | "classification_mismatch" | "conflict_linked" | "no_members" };
 
 /**
  * Merge an explicit set of memories (the judged-pair phase of #392: the
@@ -548,8 +551,10 @@ export type MergeMemoryIdsResult =
  * through THIS function so the merge math stays single-definition). Loads the
  * LIVE rows at apply time — members that vanished or were absorbed between
  * verdict and apply are dropped defensively; a project disagreement refuses
- * the merge (both memories stay live — the only metadata rail left, #206
- * decision 2); a conflicts-linked pair refuses it exactly the same way
+ * the merge (both memories stay live — the #206 metadata rail); a
+ * CLASSIFICATION disagreement refuses it the same way (#332: the pools never
+ * cross — a confidential row never blends into a standard canonical or vice
+ * versa); a conflicts-linked pair refuses it exactly the same way
  * (#393 guard-C). One transaction for the whole set.
  */
 export function mergeMemoryIds(db: Database.Database, ids: string[]): MergeMemoryIdsResult {
@@ -567,6 +572,9 @@ export function mergeMemoryIds(db: Database.Database, ids: string[]): MergeMemor
   const mismatch = clusterMetadataMismatch(members);
   if (mismatch.projectMismatch) {
     return { ok: false, reason: "project_mismatch" };
+  }
+  if (mismatch.classificationMismatch) {
+    return { ok: false, reason: "classification_mismatch" };
   }
 
   const { canonical, losers } = pickCanonical(members);
@@ -664,7 +672,10 @@ export async function runDeterministicMergeZone(
       merged_clusters: 0,
       losers_merged: 0,
       links_repointed: 0,
-      skipped_project_mismatch: plan.mismatchSkipped.length,
+      // #332: mismatch skips split by rail — project vs classification (a
+      // cluster can only trip one: either skip keeps every member live).
+      skipped_project_mismatch: plan.mismatchSkipped.filter((c) => c.mismatch.projectMismatch).length,
+      skipped_classification_mismatch: plan.mismatchSkipped.filter((c) => c.mismatch.classificationMismatch).length,
       skipped_conflict: plan.conflictSkipped.length,
       capped: 0,
       failed: 0,
@@ -783,6 +794,7 @@ export async function runDeterministicMergeZone(
         `[hicortex] deterministic-merge zone (>= ${threshold}): ${report.merged_clusters}/${plan.mergePlans.length} ` +
           `cluster(s) merged, ${report.losers_merged} loser(s) absorbed, ` +
           `${report.skipped_project_mismatch} skipped (project mismatch), ` +
+          `${report.skipped_classification_mismatch ?? 0} skipped (classification mismatch, #332), ` +
           `${report.skipped_conflict} skipped (conflict-flagged)` +
           (report.capped > 0 ? `, ${report.capped} deferred (run deadline)` : "") +
           (report.failed > 0 ? `, ${report.failed} FAILED` : ""),
@@ -803,7 +815,8 @@ export async function runDeterministicMergeZone(
     return {
       threshold, clusters_found: 0, mergeable_clusters: 0,
       merged_clusters: 0, losers_merged: 0, links_repointed: 0,
-      skipped_project_mismatch: 0, skipped_conflict: 0, capped: 0, failed: 0,
+      skipped_project_mismatch: 0, skipped_classification_mismatch: 0,
+      skipped_conflict: 0, capped: 0, failed: 0,
     };
   }
 }
@@ -882,7 +895,7 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
 
     console.log(
       `[hicortex] dedup: ${plan.clusterCount} cluster(s) found, ${mergeable.length} mergeable ` +
-        `(${plannedMerges} row(s) would be absorbed), ${plan.mismatchSkipped.length} skipped (project mismatch), ` +
+        `(${plannedMerges} row(s) would be absorbed), ${plan.mismatchSkipped.length} skipped (project/classification mismatch), ` +
         `${plan.conflictSkipped.length} skipped (conflict-flagged), ` +
         `${linksSkippedExistingPreview} link(s) would be skipped (existing edge on the canonical)`,
     );
@@ -897,11 +910,12 @@ export async function runDedup(options: DedupOptions = {}): Promise<DedupReport>
         );
       }
       for (const c of plan.mismatchSkipped) {
-        // #206 decision 2: project_mismatch is the only skip reason left on
-        // this rail (the source_agent rail was removed) — the reference dry
-        // run sizes the project rail alone off this line.
+        // The skip rail: project (#206 decision 2 — the source_agent rail was
+        // removed) or classification (#332 — the pools never cross). The dry
+        // run sizes each rail off these lines.
+        const reason = c.mismatch.classificationMismatch ? "classification_mismatch" : "project_mismatch";
         console.log(
-          `[hicortex]   SKIPPED (project_mismatch): ${c.memberIds.map((id) => id.slice(0, 8)).join(", ")}`,
+          `[hicortex]   SKIPPED (${reason}): ${c.memberIds.map((id) => id.slice(0, 8)).join(", ")}`,
         );
       }
       // #393 guard-C: listed for review like the mismatch clusters — a

@@ -64,7 +64,7 @@ class FakeClient:
         self.recent_calls.append((a, k))
         return []
 
-    def lessons(self):
+    def lessons(self, *a, **k):
         return {}
 
 
@@ -140,7 +140,7 @@ class CtxClient:
             raise RuntimeError("boom")
         return self.context_payload
 
-    def lessons(self):
+    def lessons(self, agent=None):
         if self.raise_lessons:
             raise RuntimeError("boom")
         return self.lessons_payload
@@ -440,7 +440,7 @@ def test_context_and_lessons_run_concurrently():
             time.sleep(0.2)
             return {"sections": {"user": "U."}, "clients": ["hermes"], "agent": "test-agent"}
 
-        def lessons(self):
+        def lessons(self, agent=None):
             time.sleep(0.2)
             return _LESSONS
 
@@ -465,22 +465,22 @@ class RecallClient:
         self.memory_responses = list(memory_responses or [])
         self.recall_calls = []      # dicts: session_id/prompt/reset/project/privacy/mission_domains
         self.search_calls = []
-        self.get_calls = []         # (id, privacy)
+        self.get_calls = []         # (id, privacy, agent)
 
     def _next(self, responses):
         return responses.pop(0) if len(responses) > 1 else responses[0]
 
     def recall_index(self, session_id, prompt=None, reset=False, project=None,
-                     privacy=None, mission_domains=None):
+                     privacy=None, mission_domains=None, agent=None):
         self.recall_calls.append(
             {"session_id": session_id, "prompt": prompt, "reset": reset,
              "project": project, "privacy": privacy,
-             "mission_domains": mission_domains}
+             "mission_domains": mission_domains, "agent": agent}
         )
         return self._next(self.recall_responses)
 
-    def get_memory(self, id, privacy=None):
-        self.get_calls.append((id, privacy))
+    def get_memory(self, id, privacy=None, agent=None):
+        self.get_calls.append((id, privacy, agent))
         return self._next(self.memory_responses)
 
     def search(self, query, **kwargs):
@@ -682,8 +682,9 @@ def test_hicortex_get_renders_content_behind_citation_and_scopes_privacy():
     p._privacy = "WORK"
     out = p.handle_tool_call("hicortex_get", {"id": "abc12345"})
     assert out == "(memory abc12345, 2026-07-01, from cc/laptop)\n\nFull memory body."
-    # The configured privacy filter rides along (review F1).
-    assert client.get_calls == [("abc12345", "WORK")]
+    # The configured privacy filter rides along (review F1); the third tuple
+    # slot is the #332 agent id (None — this fake provider has no resolved id).
+    assert client.get_calls == [("abc12345", "WORK", None)]
 
 
 def test_hicortex_get_404_and_missing_id():
@@ -1112,6 +1113,107 @@ def test_client_end_to_end_keeps_auth_on_same_origin_redirect():
         srv.server_close()
 
     assert seen["landed"] == "Bearer hctx-integration"
+
+
+# --------------------------------------------------------------------------- #
+# #332 — the resolved agent id threads into EVERY read call (plugin 0.7.11):
+# a rostered profile sees the confidential pool, an unrostered profile does
+# not (the server gates; the plugin's job is to send the identity).
+# --------------------------------------------------------------------------- #
+class MembershipClient:
+    """Fake recording client for the #332 read-call surface."""
+
+    def __init__(self, results=None, lessons=None, block=None):
+        self.results = results or []
+        self.lessons_payload = lessons or {"lessons": []}
+        self.block = block
+        self.search_agents = []
+        self.recent_agents = []
+        self.lessons_agents = []
+        self.recall_agents = []
+        self.get_agents = []
+        self.graph_agents = []
+
+    def search(self, query, limit=5, project=None, privacy=None, agent=None):
+        self.search_agents.append(agent)
+        return self.results
+
+    def recent(self, project=None, limit=10, privacy=None, agent=None):
+        self.recent_agents.append(agent)
+        return self.results
+
+    def lessons(self, agent=None):
+        self.lessons_agents.append(agent)
+        return self.lessons_payload
+
+    def recall_index(self, session_id, prompt=None, reset=False, project=None,
+                     privacy=None, mission_domains=None, agent=None):
+        self.recall_agents.append(agent)
+        return (200, {"block": self.block})
+
+    def get_memory(self, id, privacy=None, agent=None):
+        self.get_agents.append(agent)
+        return (200, {"memory": {"content": "row", "id": id}, "citation": "(memory x)"})
+
+    def graph(self, op, id=None, target_id=None, limit=None, domain=None,
+              relationship=None, agent=None):
+        self.graph_agents.append(agent)
+        return {"results": []}
+
+
+def test_read_calls_carry_the_resolved_agent_id():
+    """Every read path sends the profile id — rostered or not, the identity
+    rides; the server decides membership."""
+    c = MembershipClient()
+    p = _mk(c, "nano")
+    p.prefetch("portfolio question", session_id="s1")
+    p.system_prompt_block()
+    p.handle_tool_call("hicortex_search", {"query": "q"})
+    p.handle_tool_call("hicortex_recent", {})
+    p.handle_tool_call("hicortex_lessons", {})
+    p.handle_tool_call("hicortex_get", {"id": "abc"})
+    p.handle_tool_call("hicortex_graph", {"operation": "hubs"})
+    assert c.recall_agents == ["nano"]
+    # lessons is called TWICE with the id: the session-start block and the tool
+    assert c.lessons_agents == ["nano", "nano"]
+    assert c.search_agents == ["nano"]
+    assert c.recent_agents == ["nano"]
+    assert c.get_agents == ["nano"]
+    assert c.graph_agents == ["nano"]
+
+
+def test_unresolved_agent_name_sends_none_not_a_guess():
+    """No resolvable identity → the calls send agent=None (bare fetch — the
+    server's non-member default), never a guessed id."""
+    c = MembershipClient()
+    p = _mk(c, None)
+    p.prefetch("anything at all", session_id="s2")
+    p.system_prompt_block()
+    p.handle_tool_call("hicortex_search", {"query": "q"})
+    assert c.recall_agents == [None]
+    assert c.lessons_agents == [None]
+    assert c.search_agents == [None]
+
+
+def test_rostered_profile_sees_confidential_rows_nonrostered_does_not():
+    """Behavioral parity with the server contract: the plugin forwards
+    whatever rows the (gated) server returns — the roster decides. A rostered
+    profile's calls return confidential rows and the plugin renders them; an
+    unrostered profile's calls return them absent."""
+    confidential = [{"created_at": "2026-11-10", "project": "finance",
+                     "content": "CONFIDENTIAL portfolio row", "id": "c1"}]
+
+    rostered = MembershipClient(results=confidential)
+    p_in = _mk(rostered, "nano")
+    hits = json.loads(p_in.handle_tool_call("hicortex_search", {"query": "portfolio"}))
+    assert any("CONFIDENTIAL" in h.get("content", "") for h in hits)
+    assert rostered.search_agents == ["nano"]  # the identity was sent
+
+    outsider = MembershipClient(results=[])  # the server omitted the row
+    p_out = _mk(outsider, "someone-else")
+    hits_out = json.loads(p_out.handle_tool_call("hicortex_search", {"query": "portfolio"}))
+    assert hits_out == []
+    assert outsider.search_agents == ["someone-else"]
 
 
 if __name__ == "__main__":

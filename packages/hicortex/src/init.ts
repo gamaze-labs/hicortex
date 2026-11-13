@@ -2018,12 +2018,12 @@ export async function runInit(
     }
   }
 
-  // Install the scheduling timers (0.17): a CAPTURE WATCHDOG (short-interval
-  // poll, success-cooldown-throttled — uniform with clients) + a CONSOLIDATION
-  // timer (the full nightly, fixed slots). Re-init rewrites both; customize the
-  // consolidation slots via consolidationHours in config.json (capture cadence
-  // via captureCooldownHours).
-  installCaptureWatchdogTimer();
+  // Install the scheduling timer: the CONSOLIDATION timer (full nightly — its
+  // capture phase IS the capture mechanism; #596 retired the separate capture
+  // watchdog as obsolete since the distill queue #529). A leftover watchdog
+  // unit from a 0.17–0.26 install is removed so re-init never resurrects it;
+  // customize the consolidation slots via consolidationHours in config.json.
+  removeCaptureWatchdogTimer();
   installConsolidationTimer(resolveConsolidationHours("server") ?? DEFAULT_CONSOLIDATION_HOURS);
 
   // Install daemon if needed
@@ -2263,11 +2263,14 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
     console.log(`  ✓ Removed old static lessons block from CLAUDE.md — lessons now injected at session start`);
   }
 
-  // Step 7: Install the CAPTURE WATCHDOG (denoise locally, POST to server
-  // /distill, throttled + preflight-gated) — the same capture mechanism every
-  // install gets. Clients have no local DB → no consolidation timer; also
-  // remove any legacy full-nightly timer a pre-0.17 install left behind.
-  installCaptureWatchdogTimer();
+  // Step 7: Scheduling cleanup — clients have no local DB → no consolidation
+  // timer. Remove the RETIRED capture watchdog (#596 — obsolete since the
+  // distill queue #529) and any legacy full-nightly timer a pre-0.17 install
+  // left behind, so re-init never resurrects either. Client capture runs
+  // whenever `hicortex nightly` fires on the machine (the nightly's capture
+  // phase; no separate capture timer exists — see the #596 note for the
+  // stock-npx-client scheduling story).
+  removeCaptureWatchdogTimer();
   removeConsolidationTimer();
 
   // Step 8: Setup Hermes if detected
@@ -2319,30 +2322,30 @@ async function runClientInit(serverUrl: string, agentName?: string): Promise<voi
 }
 
 /**
- * Scheduling (0.17): one UNIFORM capture mechanism + one role-specific
- * consolidation timer, replacing the old single daily full-nightly.
+ * Scheduling: ONE scheduled unit — the CONSOLIDATION timer
+ * (`hicortex-nightly`): full `nightly` (capture + distill + score + reflect +
+ * link). Server/co-located ONLY — clients have no local DB, so no
+ * consolidation timer is installed (and a legacy one left by a pre-0.17
+ * install is removed). Fixed slots (default [10, 22]).
  *
- *   - CAPTURE WATCHDOG (`hicortex-capture`): a short-interval timer fires
- *     `nightly --capture-only --watchdog`. The watchdog throttles by a
- *     success-cooldown (`captureCooldownHours`, default 6 ≈ 4 captures/day) and
- *     preflights before capturing, so a transient fire-instant network miss
- *     retries in minutes, not at the next daily slot (#239: a once-daily client
- *     fire that caught a slow/flaky link lost ~24h of capture). Installed
- *     UNIFORMLY for client AND server/co-located — one capture code path, no
- *     per-topology branch. A failed preflight retries on the next tick; a
- *     successful capture waits the cooldown (success-based cooldown — the
- *     better semantics; the custom server watchdog used trigger-based).
- *   - CONSOLIDATION timer (`hicortex-nightly`): full `nightly` (capture +
- *     distill + score + reflect + link). Server/co-located ONLY — clients have
- *     no local DB, so no consolidation timer is installed (and a legacy one
- *     left by a pre-0.17 install is removed). Fixed slots (default [10, 22]).
+ * The CAPTURE WATCHDOG (`hicortex-capture`, 0.17 #239 — a short-interval
+ * timer firing `nightly --capture-only --watchdog`) is RETIRED (#596): since
+ * the distill queue (#529) distillation runs on the server's scheduled drains
+ * regardless of when captures arrive, the watchdog only shortened
+ * inbox-arrival latency, which nothing consumes. init no longer generates or
+ * enables `hicortex-capture` units and instead REMOVES a leftover pair from a
+ * 0.17–0.26 install (so an old install is cleaned by its next init, and a
+ * re-init can never resurrect the unit). The watchdog's latent self-seed
+ * failure (a unit replaced mid-boot keeps a stale OnBootSec anchor and never
+ * elapses again) dies with it — if a timer of this shape is ever rebuilt for a
+ * real need, anchor it with OnActiveSec, not OnBootSec.
  *
- * Customize: `consolidationHours` (the consolidation slots) and
- * `captureCooldownHours` (the watchdog throttle) in config.json. Re-init
- * rewrites the timers to the resolved standard (the pre-0.17 "never overwrite"
- * contract is intentionally relaxed so the fleet adopts the standard). The
- * legacy single `nightlyHour` is honoured as a one-slot consolidation fallback
- * only when `consolidationHours` is absent (preserves "one daily job at H").
+ * Customize: `consolidationHours` (the consolidation slots) in config.json.
+ * Re-init rewrites the timer to the resolved standard (the pre-0.17 "never
+ * overwrite" contract is intentionally relaxed so the fleet adopts the
+ * standard). The legacy single `nightlyHour` is honoured as a one-slot
+ * consolidation fallback only when `consolidationHours` is absent (preserves
+ * "one daily job at H").
  */
 const DEFAULT_CONSOLIDATION_HOURS = [10, 22];
 
@@ -2396,20 +2399,8 @@ export function randomMinuteOffset(jitterSec: number, rand: () => number = Math.
 }
 
 /**
- * Capture-watchdog poll interval (minutes). The capture timer fires
- * `nightly --capture-only --watchdog` this often; the watchdog itself throttles
- * by the success-cooldown (`captureCooldownHours`, read at runtime). Short so a
- * transient fire-instant network miss retries in minutes, not at the next daily
- * slot (#239). Cheap: a tick against a down server is one 5s preflight.
- */
-const CAPTURE_WATCHDOG_INTERVAL_MIN = 20;
-
-/**
- * Resolve the CONSOLIDATION hours (the only slot-based timer in 0.17). The
- * CAPTURE mechanism is the watchdog (an interval timer, not slots) — uniform
- * across client + server/co-located — so this function no longer returns a
- * capture schedule. Returns null in client mode (no local DB → no
- * consolidation timer).
+ * Resolve the CONSOLIDATION hours (the only scheduled timer). Returns null in
+ * client mode (no local DB → no consolidation timer).
  *
  * Priority: `consolidationHours` array → legacy `nightlyHour` (single int, only
  * when the array key is absent → one consolidation slot at H, preserving the
@@ -2453,9 +2444,9 @@ export function resolveNightlyHour(mode: "server" | "client", configDir = HICORT
 }
 
 interface ScheduleUnitOpts {
-  /** systemd unit base, e.g. "hicortex-capture" → .service/.timer. */
+  /** systemd unit base, e.g. "hicortex-nightly" → .service/.timer. */
   unitBase: string;
-  /** launchd Label, e.g. "com.gamaze.hicortex-capture". */
+  /** launchd Label, e.g. "com.gamaze.hicortex-nightly". */
   plistLabel: string;
   serviceDesc: string;
   timerDesc: string;
@@ -2463,12 +2454,17 @@ interface ScheduleUnitOpts {
   nightlyArgs: string[];
   /**
    * Fixed calendar hours (OnCalendar / StartCalendarInterval array) — used for
-   * the consolidation timer. Exactly one of `hours` / `intervalSec` is set.
+   * the consolidation timer, today's only generated unit. Exactly one of
+   * `hours` / `intervalSec` is set.
    */
   hours?: number[];
   /**
-   * Poll interval in seconds (OnUnitActiveSec / StartInterval) — used for the
-   * capture watchdog timer. Exactly one of `hours` / `intervalSec` is set.
+   * Poll interval in seconds (OnUnitActiveSec / StartInterval). No current
+   * caller: the capture watchdog that used it is retired (#596) — the interval
+   * path is kept because `formatSystemdTimerBody`'s interval form is exported
+   * and tested (and would be the shape of any future poll timer, which must
+   * anchor with OnActiveSec — see the scheduling doc). Exactly one of
+   * `hours` / `intervalSec` is set.
    */
   intervalSec?: number;
   /**
@@ -2482,7 +2478,7 @@ interface ScheduleUnitOpts {
    * #256 — timer jitter spread in seconds. systemd: emitted as
    * `RandomizedDelaySec=<jitterSec>` (one line, applies to all OnCalendar /
    * OnUnitActiveSec entries). launchd: a per-install randomized `Minute` offset
-   * baked into each `StartCalendarInterval` dict (interval/watchdog plists keep
+   * baked into each `StartCalendarInterval` dict (interval plists keep
    * their StartInterval untouched — no clean jitter knob, and interval timers
    * don't thundering-herd the way fixed-slot timers do). 0 = disabled. Defaults
    * to `resolveTimerJitterSeconds(HICORTEX_HOME)` when omitted.
@@ -2527,10 +2523,11 @@ export function formatLaunchdIntervals(hours: number[], minuteOffset = 0): strin
 
 /**
  * The systemd `[Timer]` body (everything between `[Timer]` and the next stanza).
- * Exported for testing the #256 jitter line. `isInterval` selects the watchdog
- * poll form (OnBootSec + OnUnitActiveSec); otherwise one `OnCalendar` line per
- * hour. When `jitterSec > 0` a single `RandomizedDelaySec=<n>` is appended — it
- * applies to every OnCalendar entry AND to OnUnitActiveSec (systemd semantics).
+ * Exported for testing the #256 jitter line. `isInterval` selects the interval
+ * poll form (OnBootSec + OnUnitActiveSec — no current caller since the capture
+ * watchdog retired, #596); otherwise one `OnCalendar` line per hour. When
+ * `jitterSec > 0` a single `RandomizedDelaySec=<n>` is appended — it applies to
+ * every OnCalendar entry AND to OnUnitActiveSec (systemd semantics).
  */
 export function formatSystemdTimerBody(
   isInterval: boolean,
@@ -2547,10 +2544,11 @@ export function formatSystemdTimerBody(
 
 /**
  * Write + enable one schedule unit (timer + service on Linux, plist on macOS),
- * multi-slot. Shared by the capture and consolidation installers. Always
- * rewrites both files (the 0.17 migration decision: re-init brings an install
- * up to the resolved standard; customization is via config keys, not hand-
- * edited unit files). Logs the resolved slots.
+ * multi-slot. Used by the consolidation installer (the only generated unit
+ * since the capture watchdog retired, #596). Always rewrites both files (the
+ * 0.17 migration decision: re-init brings an install up to the resolved
+ * standard; customization is via config keys, not hand-edited unit files).
+ * Logs the resolved slots.
  */
 function writeScheduleUnit(opts: ScheduleUnitOpts): void {
   const binaryArgs = resolveBinaryArgs();
@@ -2579,18 +2577,18 @@ function writeScheduleUnit(opts: ScheduleUnitOpts): void {
     const programArgs = [...binaryArgs, ...opts.nightlyArgs]
       .map((a) => `    <string>${a}</string>`)
       .join("\n");
-    // Schedule block: StartInterval (seconds) for the watchdog poll, or
+    // Schedule block: StartInterval (seconds) for an interval poll (no current
+    // caller — the capture watchdog that used it is retired, #596), or
     // StartCalendarInterval as an ARRAY of dicts (one per hour) for slots.
-    // RunAtLoad ONLY on the interval (watchdog) plist — so a Mac that reboots
-    // gets a first capture tick on load (~parity with systemd's OnBootSec=2min),
-    // not 20 min later. The cooldown gate makes a load-time fire a cheap no-op
-    // if a capture ran recently.
+    // RunAtLoad ONLY on the interval plist — so a Mac that reboots gets a first
+    // tick on load (~parity with systemd's OnBootSec=2min), not one interval
+    // later; a cooldown gate would make a load-time fire a cheap no-op.
     //
     // #256 — jitter: launchd has no native RandomizedDelaySec, so the slot
     // plist bakes a per-install randomized Minute offset into every dict
-    // (generated here, stable across reboots). The interval/watchdog plist
-    // keeps its StartInterval untouched — interval timers drift naturally and
-    // don't share the fixed-slot thundering-herd risk.
+    // (generated here, stable across reboots). The interval plist keeps its
+    // StartInterval untouched — interval timers drift naturally and don't
+    // share the fixed-slot thundering-herd risk.
     const jitterSec = opts.jitterSec ?? resolveTimerJitterSeconds();
     const minuteOffset = !isInterval ? randomMinuteOffset(jitterSec) : 0;
     const scheduleBlock = isInterval
@@ -2650,7 +2648,7 @@ Environment=PATH=${supervisorPath}
 Environment=HOME=${homedir()}
 WorkingDirectory=${homedir()}`;
 
-    // Timer body: OnUnitActiveSec (interval, watchdog) or one OnCalendar line
+    // Timer body: OnUnitActiveSec (interval poll) or one OnCalendar line
     // per hour (multi-slot). systemd ORs multiple OnCalendar entries.
     // #256 — a single RandomizedDelaySec=<jitterSec> applies to all entries.
     const jitterSec = opts.jitterSec ?? resolveTimerJitterSeconds();
@@ -2689,23 +2687,43 @@ WantedBy=timers.target`;
 }
 
 /**
- * Install the CAPTURE WATCHDOG timer — a short-interval poll that fires
- * `nightly --capture-only --watchdog`. The watchdog itself throttles by the
- * success-cooldown (`captureCooldownHours`) and preflights, so a transient
- * fire-instant network miss retries in minutes, not at the next daily slot
- * (#239). Installed UNIFORMLY for client + server/co-located (one capture
- * mechanism everywhere — no per-topology branch).
+ * Remove the CAPTURE WATCHDOG timer (retired, #596 — obsolete since the
+ * distill queue #529: distillation runs on the server's scheduled drains, so
+ * shortening capture-arrival latency served nothing; see the scheduling doc
+ * above, incl. the OnActiveSec note if a timer of this shape is ever rebuilt).
+ * Stops + deletes a `hicortex-capture` timer/service pair (or the macOS plist)
+ * left by a 0.17–0.26 install, so an old install is cleaned by its next init
+ * and a re-init can never resurrect the unit. Fail-soft: nothing installed →
+ * silent no-op. Exported for the #596 retirement tests.
  */
-function installCaptureWatchdogTimer(): void {
-  writeScheduleUnit({
-    unitBase: "hicortex-capture",
-    plistLabel: "com.gamaze.hicortex-capture",
-    serviceDesc: "Hicortex Capture Watchdog (denoise + POST /distill, throttled)",
-    timerDesc: "Hicortex Capture Watchdog",
-    nightlyArgs: ["nightly", "--capture-only", "--watchdog"],
-    intervalSec: CAPTURE_WATCHDOG_INTERVAL_MIN * 60,
-    timeoutMin: 30, // backstop only — capture is no-LLM, bounded; 30min catches a stuck POST
-  });
+export function removeCaptureWatchdogTimer(): void {
+  const os = platform();
+  if (os === "darwin") {
+    const plistPath = join(homedir(), "Library", "LaunchAgents", "com.gamaze.hicortex-capture.plist");
+    if (existsSync(plistPath)) {
+      try { execSync(`launchctl unload ${plistPath} 2>/dev/null`, { stdio: "pipe" }); } catch { /* not loaded */ }
+      try {
+        rmSync(plistPath);
+        console.log("  ✓ Removed retired capture watchdog timer (#596)");
+      } catch { /* leave it */ }
+    }
+  } else if (os === "linux") {
+    // Stop before delete — a live timer keeps firing against a half-removed
+    // unit. Unconditional + swallowed: a fresh install has nothing to disable.
+    try { execSync("systemctl --user disable --now hicortex-capture.timer 2>/dev/null", { stdio: "pipe" }); } catch { /* not installed */ }
+    const unitDir = join(homedir(), ".config", "systemd", "user");
+    let removed = false;
+    for (const name of ["hicortex-capture.timer", "hicortex-capture.service"]) {
+      const p = join(unitDir, name);
+      if (existsSync(p)) {
+        try { rmSync(p); removed = true; } catch { /* leave it */ }
+      }
+    }
+    if (removed) {
+      try { execSync("systemctl --user daemon-reload 2>/dev/null", { stdio: "pipe" }); } catch { /* fine */ }
+      console.log("  ✓ Removed retired capture watchdog timer (#596)");
+    }
+  }
 }
 
 /**
@@ -2771,8 +2789,8 @@ function warnSystemdDropInShadow(unitBase: string, derivedTimeoutMin: number): v
 /**
  * Remove the consolidation timer + service (and the macOS plist). Used on
  * CLIENT installs: clients have no local DB, so a pre-0.17 `hicortex-nightly`
- * timer (which auto-capture-onlys on clients) is redundant with the new capture
- * timer — remove it so it doesn't double-fire.
+ * timer (which auto-capture-onlys on clients) is redundant with the nightly
+ * their host already runs — remove it so it doesn't double-fire.
  */
 function removeConsolidationTimer(): void {
   const os = platform();

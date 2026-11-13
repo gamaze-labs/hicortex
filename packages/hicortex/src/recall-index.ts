@@ -7,13 +7,13 @@
  * memory — a menu, not the meal); the agent lazy-loads full content with
  * `hicortex_get(id)` only when a line is actually relevant.
  *
- * Strengthening semantics (the recall/decay alignment):
- *   - Appearing in the index = exposure: shown_count + last_accessed refresh
- *     (mild, temporary strengthen — the decay clock resets) via
- *     storage.touchMemoriesShown. NO access_count bump: the promotion signal
- *     (#448), the prune shield, and the adoption metric stay driven by real
- *     use.
- *   - hicortex_get = use: full strengthen (access_count + 1).
+ * Strengthening semantics (the recall/decay alignment, refined #569):
+ *   - Appearing in the index = exposure ONLY: shown_count via
+ *     storage.touchMemoriesShown. NO last_accessed write (that is the use
+ *     clock — #569 closed the exposure-refresh loop that kept never-fetched
+ *     noise young forever) and NO access_count bump: the promotion signal
+ *     (#448) and the adoption metric stay driven by real use.
+ *   - hicortex_get = use: full strengthen (access_count + 1, clock refresh).
  *
  * Anti-bloat gates: relevance floor (measured cosine, or a real BM25 match),
  * per-session TURN-based dedup (SessionRecallRegistry), short-prompt skip,
@@ -292,11 +292,11 @@ export function passesRelevanceGate(
  *  silently would leak out-of-scope memory titles into the injected index.
  *
  *  #203: `project` and `mission_domains` are SOFT affinity signals in
- *  retrieval (zero-boost neutral, never a filter / penalty). 0.16.x: `privacy`
- *  is gone from this shape entirely — the column is vestigial, never filtered,
- *  so a plugin's `privacy_filter` is a harmless no-op the server no longer
- *  threads through. The body field is still ACCEPTED (backward compat) but
- *  ignored. */
+ *  retrieval (zero-boost neutral, never a filter / penalty). #332: the old
+ *  `privacy` body field stays ACCEPTED-but-IGNORED (backward compat) — the
+ *  classification gate rides the `agent` body field instead: the route
+ *  adapter checks it against the boot roster and builds the retrieve closure
+ *  with includeConfidential accordingly. */
 export interface RecallFilters {
   project?: string;
   /** #203: Hermes mission domains (declared in plugin config). Soft domain
@@ -404,6 +404,13 @@ export function createRecallRetrieveFn(deps: {
   embedFn: (text: string) => Promise<Float32Array>;
   /** FTS resolution override (tests). Defaults to storage.searchFts. */
   ftsFn?: typeof storage.searchFts;
+  /**
+   * #332 classification gate: TRUE only when the request's `agent` is a
+   * circle member (the route adapter computes membership per request — the
+   * factory is built per request). Default false = hard omit of confidential
+   * rows inside retrieve().
+   */
+  includeConfidential?: boolean;
 }): RecallRetrieveFactory {
   let embMemo: { query: string; p: Promise<Float32Array> } | null = null;
   const embedOnce = (query: string): Promise<Float32Array> => {
@@ -450,6 +457,9 @@ export function createRecallRetrieveFn(deps: {
         project: filters?.project,
         missionDomains: filters?.mission_domains,
         queryEmbedding: queryVec,
+        // #332: the classification gate — hard omit unless the requesting
+        // agent is a circle member (the factory was built with membership).
+        includeConfidential: deps.includeConfidential === true,
         // #329: shared per-request FTS list. The recall path never passes
         // sourceAgent, so the memo is keyed on (query, fetchLimit) only —
         // exactly the two things retrieve() would pass to searchFts.
@@ -514,7 +524,8 @@ export async function handleRecallIndex(
   // before any precision recording, so a pure plumbing payload (CC delivers
   // task-notifications/command envelopes as user-role messages; any client
   // could POST one) gets {block: null} with NO recall_pushes row, NO turn
-  // burn, NO shown_count bump, NO last_accessed refresh. The SAME shared
+  // burn, NO shown_count bump — no exposure of any kind (and since #569
+  // exposure never writes last_accessed anyway). The SAME shared
   // classifier the hook client guards with (wrapper-prompt.ts) — defense in
   // depth. A wrapper carrying real payload prose falls through and recalls on
   // the full text, exactly today's behavior (owner decision 4).
@@ -687,7 +698,10 @@ export async function handleRecallIndex(
     // Fail-soft like every recording site.
     if (deps.precision) {
       try {
-        deps.precision.recorder(deps.db, { sessionId, prompt, ids: [] });
+        // #578: the canonicalized project label threads into the push row
+        // too (attribution) — filters.project is already computed above; a
+        // silent turn carries it like any other.
+        deps.precision.recorder(deps.db, { sessionId, prompt, ids: [], project: filters.project ?? null });
       } catch (err) {
         console.warn(
           `[hicortex] recall-precision push recording failed (fail-soft): ` +
@@ -702,8 +716,8 @@ export async function handleRecallIndex(
   deps.registry.markShown(sessionId, ids);
   const nowIso = new Date().toISOString();
   // #476 Memory Precision: record the push + per-line events IN THE SAME
-  // TRANSACTION as the exposure write (the recorder owns the unit — it calls
-  // touchMemoriesShown inside its own transaction). FAIL-SOFT: on any error
+  // TRANSACTION as the exposure counter write (the recorder owns the unit —
+  // it calls touchMemoriesShown inside its own transaction). FAIL-SOFT: on any error
   // (or when the seams are absent — library callers, test doubles) the plain
   // exposure write runs instead, so shown_count NEVER depends on telemetry.
   let exposureWritten = false;
@@ -715,7 +729,7 @@ export async function handleRecallIndex(
       ]);
       deps.precision.recorder(
         deps.db,
-        { ts: nowIso, sessionId, prompt, ids, promptEmbedding: promptEmb },
+        { ts: nowIso, sessionId, prompt, ids, promptEmbedding: promptEmb, project: filters.project ?? null },
         basis
       );
       exposureWritten = true;
@@ -727,8 +741,9 @@ export async function handleRecallIndex(
     }
   }
   if (!exposureWritten) {
-    // Exposure signal: shown_count + last_accessed refresh, NOT access_count.
-    storage.touchMemoriesShown(deps.db, ids, nowIso);
+    // Exposure signal: shown_count only — NOT last_accessed (the use clock,
+    // #569), NOT access_count.
+    storage.touchMemoriesShown(deps.db, ids);
   }
 
   const lines = picked.map((r) => formatIndexLine(r, titleChars));
@@ -767,14 +782,16 @@ export interface MemoryGetDeps {
  *     citation ids agents are taught must work here like on /update, /delete.
  *   - A successful fetch is real use: access_count + 1 (strengthen).
  *
- * 0.16.x: the `privacy` filter gate was removed — the column is vestigial and
- * never filtered. Callers may still send a `privacy` field (backward compat)
- * but it is ignored.
+ * #332: `opts.includeConfidential` (default false) is the classification gate
+ * — a confidential memory fetched by a non-member answers 404 BEFORE any
+ * side effect (no strengthen, no precision event: existence is not revealed).
+ * Members (the adapter passes true) fetch both pools normally.
  */
 export function handleMemoryGet(
   db: Database.Database,
   query: { id?: unknown },
-  deps?: MemoryGetDeps
+  deps?: MemoryGetDeps,
+  opts?: { includeConfidential?: boolean },
 ): RecallIndexResult {
   const id = typeof query.id === "string" ? query.id : "";
   if (!id) return { status: 400, body: { error: "Missing 'id'" } };
@@ -787,6 +804,13 @@ export function handleMemoryGet(
   if (!fullId) return notFound;
   const mem = storage.getMemory(db, fullId);
   if (!mem) return notFound;
+
+  // #332: the gate fires BEFORE strengthenMemory + the fetch recorder — a
+  // refused fetch must leave no trace on the row and record no event (the
+  // same 404 shape an unknown id produces).
+  if (mem.privacy === "confidential" && opts?.includeConfidential !== true) {
+    return notFound;
+  }
 
   storage.strengthenMemory(db, fullId, new Date().toISOString());
   // #476: one kind='fetch' precision event per successful fetch (the use

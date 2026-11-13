@@ -200,14 +200,36 @@ export function louvainCommunities(
 // ---------------------------------------------------------------------------
 
 /**
+ * #332: the confidential id set — the hard-omit set for the gated graph
+ * surfaces. Computed once per call (the graph ops are single-query + small
+ * loops; a corpus-wide id set is cheap). NULL-safe: only
+ * privacy = 'confidential' rows enter.
+ */
+export function confidentialNodeIds(db: Database.Database): Set<string> {
+  const rows = db
+    .prepare("SELECT id FROM memories WHERE privacy = 'confidential'")
+    .all() as Array<{ id: string }>;
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
  * Find hub nodes — memories with link count significantly above median.
  * Returns nodes with links > threshold (default: 2x median, minimum 3 links).
+ *
+ * #332: `includeConfidential` defaults to FALSE — the agent-facing surfaces
+ * (REST /graph?op=hubs without a member agent, the MCP graph tool) hard-omit
+ * confidential hubs (their content snippets ARE content-bearing). The /viz
+ * export (the owner surface — deliberately ungated per the #332 owner ruling)
+ * passes true.
  */
 export function detectHubs(
   db: Database.Database,
   thresholdMultiplier = 2,
   minLinks = 3,
+  opts?: { includeConfidential?: boolean },
 ): HubNode[] {
+  const hidden =
+    opts?.includeConfidential === true ? null : confidentialNodeIds(db);
   const rows = db
     .prepare(
       `SELECT id, cnt FROM (
@@ -230,6 +252,7 @@ export function detectHubs(
   const hubs: HubNode[] = [];
   for (const { id, cnt } of rows) {
     if (cnt < threshold) break; // sorted desc, no more hubs
+    if (hidden?.has(id)) continue;
     const mem = db
       .prepare("SELECT content, project, domain FROM memories WHERE id = ?")
       .get(id) as { content: string; project: string | null; domain: string | null } | undefined;
@@ -264,7 +287,15 @@ export function getNeighbors(
   memoryId: string,
   limit = 10,
   relationship?: string,
+  opts?: { includeConfidential?: boolean },
 ): GraphNeighbor[] {
+  // #332: hard-omit set for confidential NEIGHBORS (their content rides the
+  // row). The CENTER memory's own class is the CALLER's gate — an
+  // agent-facing adapter must refuse a confidential center id before calling
+  // (REST /graph and the MCP tool 404 it for non-members, same contract as
+  // GET /memory). Default false = omit; the owner surfaces pass true.
+  const hidden =
+    opts?.includeConfidential === true ? null : confidentialNodeIds(db);
   let sql = `SELECT source_id, target_id, relationship, strength
        FROM memory_links
        WHERE (source_id = ? OR target_id = ?)`;
@@ -288,6 +319,7 @@ export function getNeighbors(
   for (const row of rows) {
     const isOutgoing = row.source_id === memoryId;
     const neighborId = isOutgoing ? row.target_id : row.source_id;
+    if (hidden?.has(neighborId)) continue;
     const mem = db
       .prepare("SELECT content, project FROM memories WHERE id = ?")
       .get(neighborId) as { content: string; project: string | null } | undefined;
@@ -427,7 +459,10 @@ export function exportGraph(
     created_at: string | null;
   }>;
 
-  const hubIds = new Set(detectHubs(db).map((h) => h.id));
+  // #332: the /viz export is the OWNER surface — deliberately ungated per the
+  // issue-332 owner ruling ("dashboard/viz NOT gated in this build"; a
+  // show-confidential graph toggle is a separate later item). Explicit true.
+  const hubIds = new Set(detectHubs(db, 2, 3, { includeConfidential: true }).map((h) => h.id));
 
   // Score, filter on effective strength, rank, cap
   const scored = rows.map((row) => {
@@ -524,19 +559,30 @@ export function exportGraph(
 // Shortest path (for MCP tool)
 // ---------------------------------------------------------------------------
 
+/**
+ * BFS shortest path. #332: `includeConfidential` defaults to FALSE —
+ * confidential nodes are excluded from TRAVERSAL entirely (a confidential id
+ * must not appear even as an intermediate hop; the endpoints' own classes are
+ * the caller's gate, same contract as getNeighbors' center).
+ */
 export function shortestPath(
   db: Database.Database,
   fromId: string,
   toId: string,
   maxDepth = 5,
+  opts?: { includeConfidential?: boolean },
 ): string[] | null {
   // BFS on the memory_links graph
   const links = db
     .prepare("SELECT source_id, target_id FROM memory_links")
     .all() as Array<{ source_id: string; target_id: string }>;
 
+  const hidden =
+    opts?.includeConfidential === true ? null : confidentialNodeIds(db);
+
   const adj = new Map<string, Set<string>>();
   for (const { source_id, target_id } of links) {
+    if (hidden?.has(source_id) || hidden?.has(target_id)) continue;
     if (!adj.has(source_id)) adj.set(source_id, new Set());
     adj.get(source_id)!.add(target_id);
     if (!adj.has(target_id)) adj.set(target_id, new Set());

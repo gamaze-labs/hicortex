@@ -1044,12 +1044,13 @@ export interface EmbedFn {
  *
  * #203 retrieval scoping: `project` and `missionDomains` are SOFT affinity
  * terms in computeScore (zero-boost neutral, never a penalty), NOT filters.
- * `privacy` is NOT a filter (0.16.x: the column is fully vestigial — stored,
- * never filtered; the distiller no longer sets it and retrieval ignores it
- * entirely). `sourceAgent` remains a hard filter (kept for completeness; no
- * production caller currently passes it). When neither project nor
- * missionDomains is sent, scoring is byte-identical to pre-#203 — the
- * kill-switch / no-op guarantee.
+ * `sourceAgent` remains a hard filter (kept for completeness; no production
+ * caller currently passes it). #332: `privacy` is a HARD filter again — the
+ * two-level classification gate (includeConfidential, default false = omit
+ * confidential rows on every channel; TRUE for circle-member requests). On an
+ * install with no confidential rows the gate is a no-op — byte-identical to
+ * pre-#332. When neither project nor missionDomains is sent, scoring is
+ * byte-identical to pre-#203 — the kill-switch / no-op guarantee.
  */
 export async function retrieve(
   db: Database.Database,
@@ -1092,6 +1093,16 @@ export async function retrieve(
      *  the live clock (byte-identical to pre-#458). Mirrors the
      *  injectable-clock idiom of run-deadline.ts; see eval/eval-clock.ts. */
     now?: Date;
+    /**
+     * #332 classification gate. FALSE (the default) = hard omit: confidential
+     * rows never enter the candidate set on ANY channel (vector, FTS, graph
+     * pull-in, belief-walk terminals) — they cannot consume a top-k slot
+     * either, because the filter runs at candidate-build time, not post-hoc.
+     * TRUE only for requests whose `agent` is a circle member (the additive
+     * circle: members see both pools). On an install with no confidential
+     * rows the predicate is a no-op — byte-identical behavior.
+     */
+    includeConfidential?: boolean;
   }
 ): Promise<MemorySearchResult[]> {
   const limit = options?.limit ?? recallDefaults.searchLimit;
@@ -1099,6 +1110,11 @@ export async function retrieve(
   const sourceAgent = options?.sourceAgent;
   const missionDomains = options?.missionDomains;
   const now = options?.now ?? new Date();
+  // #332: hard-omit gate — confidential candidates are dropped on EVERY
+  // channel at candidate-build time (never post-hoc, so they never consume a
+  // top-k slot). `privacy !== 'confidential'` is NULL-safe by construction.
+  const includeConfidential = options?.includeConfidential === true;
+  const visible = (m: Memory): boolean => includeConfidential || m.privacy !== "confidential";
 
   // #203 affinity scope — passed to computeScore for every candidate. Built
   // once; absent fields yield no boost (zero-boost neutral).
@@ -1116,7 +1132,9 @@ export async function retrieve(
   // median project) ~1% of the corpus, starving every filtered query.
   // #203: project is NO LONGER a filter (soft affinity now), so it does not
   // trigger over-fetch; only sourceAgent still does (it remains a hard filter).
-  // 0.16.x: privacy is no longer a filter either (column is vestigial).
+  // #332: the classification gate filters in JS after both lists return (the
+  // #192 post-filter pattern) — on the default no-confidential-rows install it
+  // costs one comparison per candidate and changes nothing.
   const filtered = Boolean(sourceAgent);
   const fetchLimit = filtered ? Math.min(limit * 20, 200) : limit * 3;
   let vecCandidates = storage.vectorSearch(db, queryEmbedding, fetchLimit, []);
@@ -1124,8 +1142,9 @@ export async function retrieve(
   let ftsCandidates: Array<Memory & { rank: number }> = [];
   try {
     // sourceAgent is pushed into the FTS SQL (hard filter). project is NOT (it
-    // is a soft affinity boost in computeScore as of #203). privacy is NOT
-    // (0.16.x: vestigial column, never filtered). With a caller-provided
+    // is a soft affinity boost in computeScore as of #203). privacy is NOT in
+    // the SQL — the #332 gate filters the returned rows once (below), so the
+    // shared #329 request memo stays provider-agnostic. With a caller-provided
     // provider (#329 request-level memo) the same list is shared across the
     // retrieves of one recall request instead of re-executed.
     ftsCandidates = options?.ftsCandidates
@@ -1141,12 +1160,16 @@ export async function retrieve(
 
   // Post-filter vector candidates (sqlite-vec can't filter). sourceAgent stays
   // a hard filter (see options doc); project is scored not filtered (#203);
-  // privacy is no longer filtered (0.16.x — vestigial).
+  // #332: the classification gate is a hard filter on every channel.
+  vecCandidates = vecCandidates.filter(visible);
   if (sourceAgent) {
     vecCandidates = vecCandidates.filter(
       (c) => c.source_agent === sourceAgent
     );
   }
+  // The FTS list carries the same gate (the /recall-index memo provider feeds
+  // from storage.searchFts — filter here so the shared memo is gated once).
+  ftsCandidates = ftsCandidates.filter((c) => visible(c));
 
   // 3. RRF fusion (#205: per-list weights + config-driven k). The vector list
   // carries the composite-side affinity in the next step, so we let it dominate
@@ -1195,8 +1218,10 @@ export async function retrieve(
     // reach them, but they are invisible to recall by contract.
     if (mem.status === "absorbed") continue;
     // #203: project check removed — project is a soft affinity in computeScore,
-    // not a filter. 0.16.x: privacy check removed — the column is vestigial,
-    // never filtered. sourceAgent stays a hard filter.
+    // not a filter. sourceAgent stays a hard filter. #332: the classification
+    // gate applies to graph-discovered candidates exactly like the retrieval
+    // channels — a link into the confidential pool is not a side door.
+    if (!visible(mem)) continue;
     if (sourceAgent && mem.source_agent !== sourceAgent) continue;
     candidateMap.set(gid, { mem, distance: DEFAULT_GRAPH_DISTANCE, source: "graph" });
   }
@@ -1305,7 +1330,9 @@ export async function retrieve(
     // in retrieve(), and the walk must not bypass it — a terminal authored by
     // a different agent never slips into recall through its link entry
     // (mirrors the graph pull-in guard above; fail-soft: the ancestor keeps
-    // its slot, demoted).
+    // its slot, demoted). #332: same for the classification gate — a
+    // confidential terminal never surfaces through a supersession chain.
+    if (!visible(mem)) return null;
     if (sourceAgent && mem.source_agent !== sourceAgent) return null;
     const connCount = storage.getLinks(db, terminalId, "both").length;
     const composite = computeScore(
@@ -1328,8 +1355,9 @@ export async function retrieve(
   );
 
   // 7. Strengthen — skipped for pushed recall (#192): appearing in a pushed
-  // index is exposure, not use; the /recall-index path records shown_count +
-  // last_accessed via storage.touchMemoriesShown instead.
+  // index is exposure, not use; the /recall-index path records shown_count
+  // via storage.touchMemoriesShown instead (#569: exposure never touches the
+  // use clock, so no last_accessed write happens there either).
   if (!options?.noStrengthen) {
     strengthen(db, top.map((t) => t.mem), now);
   }
@@ -1345,11 +1373,19 @@ export function searchRecent(
   options?: {
     project?: string | null;
     limit?: number;
+    /**
+     * #332 classification gate — same contract as retrieve()'s: FALSE (the
+     * default) hard-omits confidential rows from the candidate set AND the
+     * belief-walk terminals; TRUE only for circle-member requests.
+     */
+    includeConfidential?: boolean;
   }
 ): MemorySearchResult[] {
   const limit = options?.limit ?? recallDefaults.recentLimit;
   const project = options?.project;
   const now = new Date();
+  const includeConfidential = options?.includeConfidential === true;
+  const visible = (m: Memory): boolean => includeConfidential || m.privacy !== "confidential";
 
   // #192 breadth: 30 → 180-day default window (config recentWindowDays).
   // "Recent" for a long-lived corpus is a season, not a month; the narrow
@@ -1359,7 +1395,9 @@ export function searchRecent(
   if (project) {
     candidates = candidates.filter((c) => c.project === project);
   }
-  // 0.16.x: privacy filter removed — the column is vestigial, never filtered.
+  // #332: the classification gate (hard omit at candidate-build time — a
+  // confidential row never consumes a top-k slot).
+  candidates = candidates.filter(visible);
   if (candidates.length === 0) return [];
 
   const allIds = candidates.map((c) => c.id);
@@ -1403,7 +1441,9 @@ export function searchRecent(
     // edges are discovered corpus-wide (no project predicate), so a terminal
     // in a different project never slips into project-scoped recall through
     // its link entry (mirrors retrieve()'s sourceAgent guard; fail-soft: the
-    // ancestor keeps its slot, demoted).
+    // ancestor keeps its slot, demoted). #332: same for the classification
+    // gate.
+    if (!visible(mem)) return null;
     if (project && mem.project !== project) return null;
     const connCount = storage.getLinks(db, terminalId, "both").length;
     const score = computeScore(

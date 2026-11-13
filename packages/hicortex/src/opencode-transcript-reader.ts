@@ -186,6 +186,9 @@ export function readOpencodeSessions(
       batches.push({
         sessionId: s.id,
         projectName: basename(s.directory ?? "") || "opencode",
+        // #609: session.directory IS the workspace path (the basename above
+        // keeps serving only the project label).
+        workspacePath: typeof s.directory === "string" && s.directory ? s.directory : null,
         sourceAgent: "opencode",
         date: new Date(rows[rows.length - 1].time_created).toISOString().slice(0, 10),
         entries,

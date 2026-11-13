@@ -156,6 +156,9 @@ export function readPiTranscripts(
           projectName,
           date: deltaDate || sessionDate || new Date().toISOString().slice(0, 10),
           entries: delta,
+          // #609: the session header's `cwd` is the canonical workspace path
+          // (the encoded directory name is only a filesystem-safe form).
+          workspacePath: sessionCwd || null,
           cursorKey,
           startCursor: start,
           generation: gen,

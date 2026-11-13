@@ -21,8 +21,9 @@
  * FAIL-SOFT LAW: recording is telemetry. Any error here is caught by the
  * CALLER (handleRecallIndex / handleMemoryGet) and swallowed — the recall
  * response (status 200 + block) is never affected, and the exposure signal
- * (touchMemoriesShown) never depends on it (the handler falls back to the
- * plain exposure write when recording is absent or fails).
+ * (touchMemoriesShown — shown_count only, never the use clock #569) never
+ * depends on it (the handler falls back to the plain exposure write when
+ * recording is absent or fails).
  *
  * The perf law (bounded hot-path cost): the recorder computes cosines with
  * the request's ALREADY-MEMOIZED prompt embedding (createRecallRetrieveFn's
@@ -38,6 +39,7 @@ import { cosineBetweenVectors } from "./retrieval.js";
 import { embedBatch } from "./embedder.js";
 import { readSections, KNOWN_IDENTITY_CLIENTS } from "./identity-store.js";
 import { formatIndexLine } from "./recall-index.js";
+import type { QualityTier1, QualityChangeDelta } from "./quality-scoreboard.js";
 import {
   MEMORY_PRECISION_PROMPT_EXCERPT_CHARS,
   MEMORY_PRECISION_WINDOW_DAYS,
@@ -63,15 +65,22 @@ export interface RecallPushEntry {
    *  memoized embed; unused on a silent turn, so no embed is ever spent on
    *  recording). */
   promptEmbedding?: Float32Array;
+  /** #578: the request's CANONICALIZED project label — exactly the value the
+   *  #566 fence gated with (handleRecallIndex's filters.project). Null when
+   *  the request carried none. Stored on recall_pushes (migration v26) so the
+   *  quality scoreboard attributes pushes from the row itself going forward;
+   *  pre-v26 history attributes via the `#`-prefix join on
+   *  memories.source_session (segment-scoped — bare equality matches 0). */
+  project?: string | null;
 }
 
 /**
  * Record one /recall-index push: the push row + (when lines were shown) the
  * per-line kind='shown' event rows, in ONE transaction WITH the existing
- * exposure write (storage.touchMemoriesShown — the spec's "same transaction";
- * better-sqlite3 nests the inner transaction as a savepoint, so a recording
- * failure rolls back the whole unit and the CALLER's fallback re-runs the
- * exposure touch alone — shown_count never depends on telemetry).
+ * exposure counter write (storage.touchMemoriesShown — the spec's "same
+ * transaction"; better-sqlite3 nests the inner transaction as a savepoint, so
+ * a recording failure rolls back the whole unit and the CALLER's fallback
+ * re-runs the exposure touch alone — shown_count never depends on telemetry).
  *
  * similarity = cosine(memory embedding, PURE prompt embedding), computed
  * UNIFORMLY via cosineBetweenVectors against the stored vector — FTS-sourced
@@ -99,15 +108,16 @@ export function recordRecallPush(
 
   const tx = db.transaction(() => {
     if (entry.ids.length > 0) {
-      // The exposure write rides INSIDE the recording transaction (spec: one
-      // atomic unit). Nested db.transaction → savepoint.
-      storage.touchMemoriesShown(db, entry.ids, ts);
+      // The exposure counter write rides INSIDE the recording transaction
+      // (spec: one atomic unit; shown_count only — never the use clock, #569).
+      // Nested db.transaction → savepoint.
+      storage.touchMemoriesShown(db, entry.ids);
     }
     const info = db
       .prepare(
-        "INSERT INTO recall_pushes (ts, day, session_id, prompt_excerpt) VALUES (?, ?, ?, ?)",
+        "INSERT INTO recall_pushes (ts, day, session_id, prompt_excerpt, project) VALUES (?, ?, ?, ?, ?)",
       )
-      .run(ts, day, entry.sessionId, excerpt);
+      .run(ts, day, entry.sessionId, excerpt, entry.project ?? null);
     const pushId = Number(info.lastInsertRowid);
 
     if (entry.ids.length === 0) return; // silent turn — push row only
@@ -168,6 +178,13 @@ export function recordRecallFetch(
  * window the store no longer has rows for). Inclusive cutoff: the last N
  * calendar days with today counted stay (day >= today−(N−1)), the complement
  * is deleted — retained rows == window rows.
+ *
+ * #578 retention split — recall_verdicts rides the SAME horizon with ONE
+ * carve-out: grader='owner' rows are NEVER dropped (they are the owner's
+ * calibration reference, tiny volume by construction — about
+ * five thumbs a week). Machine rows ('auto', 'revealed') prune with the events
+ * they were derived from — a revealed verdict outliving its own event rows
+ * would claim a window the store no longer holds.
  */
 export function pruneRecallPrecision(db: Database.Database): void {
   db.exec(
@@ -175,6 +192,11 @@ export function pruneRecallPrecision(db: Database.Database): void {
   );
   db.exec(
     `DELETE FROM recall_events WHERE day < date('now', '-${MEMORY_PRECISION_WINDOW_DAYS - 1} days')`,
+  );
+  db.exec(
+    `DELETE FROM recall_verdicts
+      WHERE grader != 'owner'
+        AND day < date('now', '-${MEMORY_PRECISION_WINDOW_DAYS - 1} days')`,
   );
 }
 
@@ -248,7 +270,9 @@ export function createStandingContextBasis(
     // Read errors degrade to an empty lesson half — the basis is a reference,
     // not a ledger.
     try {
-      for (const lesson of storage.getLessons(db, 30)) texts.push(lesson.content);
+      // #332: the basis is a server-internal redundancy reference over the
+      // whole lesson store (no agent sees it) — ungated by design.
+      for (const lesson of storage.getLessons(db, 30, null, { includeConfidential: true })) texts.push(lesson.content);
     } catch (err) {
       console.warn(
         `[hicortex] standing-context basis: lesson read failed (degraded): ` +
@@ -339,7 +363,15 @@ export interface MemoryPrecisionLevel2 {
 }
 
 /** The whole /dashboard/data memory_precision block (one card's payload,
- *  budget ≤ 2 KB — the top-3 divergence lines are the only content). */
+ *  budget ≤ 2 KB — the top-3 divergence lines are the only content).
+ *
+ *  #578 adds the OPTIONAL `tier1` (deterministic quality metrics — block
+ *  size, cross-project share + coverage, sub-bar share, recycling) and
+ *  `changes` (per-registry-entry before/after deltas, computed from raw
+ *  events at render) beside the original fields; both come from
+ *  quality-scoreboard.ts and are spread in by handleDashboardData. Optional
+ *  so older callers (and the ≤ 2 KB test's minimal shapes) keep the base
+ *  contract; the card guards on their absence like every block before it. */
 export interface MemoryPrecision {
   /** The EFFECTIVE window (min(range, retention)); the page renders
    *  "last N days" from this echo, never a hardcoded literal. */
@@ -356,6 +388,11 @@ export interface MemoryPrecision {
      *  the main page — owner ruling 2026-09-12). */
     top: Array<{ id: string; line: string; shown: number }>;
   };
+  /** #578: the Tier-1 quality metrics over the SAME effective window. */
+  tier1?: QualityTier1;
+  /** #578: before/after deltas for every change-registry entry the raw
+   *  event window still covers (numbers computed at render, never frozen). */
+  changes?: QualityChangeDelta[];
 }
 
 /** Read-time seams (the #408 experiment pattern — the eval/tests sweep
@@ -378,6 +415,17 @@ function rangeToDays(range: string): number | null {
   if (range === "all") return null;
   const n = parseInt(range, 10);
   return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** The EFFECTIVE memory-precision window for a range: min(range, retention)
+ *  — the #578 quality metrics (quality-scoreboard.ts) ride the SAME window
+ *  as the block they extend, so tier1/changes and level1 never disagree on
+ *  which days they cover. Exported for handleDashboardData's spread. */
+export function effectivePrecisionWindowDays(range: string): number {
+  return Math.min(
+    rangeToDays(range) ?? MEMORY_PRECISION_WINDOW_DAYS,
+    MEMORY_PRECISION_WINDOW_DAYS,
+  );
 }
 
 /**
@@ -404,7 +452,7 @@ export function readMemoryPrecision(
 ): MemoryPrecision {
   const now = opts?.now ?? new Date();
   const redundantAbove = opts?.redundantAbove ?? MEMORY_PRECISION_REDUNDANT_ABOVE;
-  const windowDays = Math.min(rangeToDays(range) ?? MEMORY_PRECISION_WINDOW_DAYS, MEMORY_PRECISION_WINDOW_DAYS);
+  const windowDays = effectivePrecisionWindowDays(range);
   // Inclusive window start (UTC YYYY-MM-DD): today counts as day 1.
   const cutoffDay = new Date(now.getTime() - (windowDays - 1) * DAY_MS).toISOString().slice(0, 10);
 

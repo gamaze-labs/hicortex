@@ -5,8 +5,9 @@
  */
 
 import type Database from "better-sqlite3";
-import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain, ResolutionBandStat } from "./types.js";
+import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain, ResolutionBandStat, MemoryPrivacy } from "./types.js";
 import type { LlmClient } from "./llm.js";
+import { clientForPool, type LlmPair } from "./classification.js";
 import type { EmbedFn } from "./retrieval.js";
 import { effectiveStrength, l2ToCosine, findDemotedIds } from "./retrieval.js";
 import * as storage from "./storage.js";
@@ -94,6 +95,17 @@ const CONSOLIDATE_PRUNE_MIN_AGE_DAYS = 90;
 export const CONSOLIDATE_LINK_THRESHOLD = 0.75;
 /** Max link candidates kept per memory (highest-cosine neighbors first). */
 export const CONSOLIDATE_LINK_TOP_K = 3;
+/**
+ * Initial vector window for link-candidate discovery (#602). The fetch is
+ * UNFILTERED by class (see CONSOLIDATE_LINK_FETCH_MAX_K for why), so this is
+ * just the starting width of the adaptive escalation below.
+ */
+export const CONSOLIDATE_LINK_FETCH_K = 10;
+/**
+ * Hard cap on the escalated vector window (#602) — the same over-fetch cap
+ * #192 established for filtered recall queries.
+ */
+export const CONSOLIDATE_LINK_FETCH_MAX_K = 200;
 /**
  * Minimum COSINE similarity for a CROSS-PROJECT link candidate.
  *
@@ -415,19 +427,30 @@ export async function scoreMemoriesImportance(
     deadline?: RunDeadline;
     dryRun?: boolean;
     onBatch?: (written: number, failed: number) => void;
+    /**
+     * #332: the confidential-pool client. The batch builder partitions the
+     * pool by class FIRST (buildImportanceBatches — batches are single-class
+     * by construction), so every LLM call carries one class of text to one
+     * client. Confidential batches without a client are SKIPPED (their rows
+     * keep importance_scored_at NULL — the watermark pool re-finds them next
+     * run; counted in skipped_confidential), never scored on the main model.
+     */
+    confidentialLlm?: LlmClient | null;
   } = {}
-): Promise<{ scored: number; failed: number; skipped_budget: number }> {
-  const batchSize = 10;
+): Promise<{ scored: number; failed: number; skipped_budget: number; skipped_confidential?: number }> {
   const budget = opts.budget;
   const deadline = opts.deadline;
   const dryRun = opts.dryRun ?? false;
   let scored = 0;
   let failed = 0;
   let skippedBudget = 0;
+  let skippedConfidential = 0;
+  let remaining = memories.length;
+  const pair: LlmPair = { standard: llm, confidential: opts.confidentialLlm ?? null };
 
-  for (let i = 0; i < memories.length; i += batchSize) {
+  for (const batch of buildImportanceBatches(memories, 10)) {
     if (budget?.exhausted) {
-      skippedBudget += memories.length - i;
+      skippedBudget += remaining;
       break;
     }
     // #405: the run deadline bounds the batch loop too — a large unscored
@@ -435,35 +458,44 @@ export async function scoreMemoriesImportance(
     // Same stage label as the boundary check, so the defer log fires once.
     if (deadline?.hit("importance")) break;
 
-    const batch = memories.slice(i, i + batchSize);
-    const lines = batch.map(
+    const lines = batch.memories.map(
       (mem, idx) => `[${idx}] ${mem.content.slice(0, 500)}`
     );
     const memoriesBlock = lines.join("\n\n");
     const prompt = importanceScoring(memoriesBlock);
 
-    if (dryRun) continue;
+    if (dryRun) { remaining -= batch.memories.length; continue; }
+
+    // #332 per-pool selection: the confidential pool needs its client —
+    // absent ⇒ skip-and-hold (rows stay unscored; retried next run).
+    const batchLlm = clientForPool(pair, batch.pool);
+    if (!batchLlm) {
+      skippedConfidential += batch.memories.length;
+      remaining -= batch.memories.length;
+      continue;
+    }
 
     if (budget && !budget.use("importance")) {
-      skippedBudget += memories.length - i;
+      skippedBudget += remaining;
       break;
     }
 
     try {
-      const r = await llm.complete(prompt);
+      const r = await batchLlm.complete(prompt);
       budget?.recordUsage("importance", r.usage);
       let scores = parseJsonLenient<number[] | null>(r.text, null);
 
       if (!Array.isArray(scores)) {
-        scores = new Array(batch.length).fill(0.5);
+        scores = new Array(batch.memories.length).fill(0.5);
       }
 
-      while (scores.length < batch.length) scores.push(0.5);
-      scores = scores.slice(0, batch.length);
+      while (scores.length < batch.memories.length) scores.push(0.5);
+      scores = scores.slice(0, batch.memories.length);
+      remaining -= batch.memories.length;
 
       let batchWritten = 0;
       let batchFailed = 0;
-      for (let j = 0; j < batch.length; j++) {
+      for (let j = 0; j < batch.memories.length; j++) {
         let scoreVal = 0.5;
         try {
           scoreVal = Math.max(0, Math.min(1, Number(scores[j])));
@@ -479,7 +511,7 @@ export async function scoreMemoriesImportance(
         // re-rolled genuinely-0.5 rows every night).
         scoreVal = Math.min(scoreVal, CALIBRATION.IMPORTANCE_CEILING);
         try {
-          storage.updateMemory(db, batch[j].id, {
+          storage.updateMemory(db, batch.memories[j].id, {
             base_strength: scoreVal,
             importance_scored_at: new Date().toISOString(),
           });
@@ -492,12 +524,59 @@ export async function scoreMemoriesImportance(
       }
       opts.onBatch?.(batchWritten, batchFailed);
     } catch {
-      failed += batch.length;
-      opts.onBatch?.(0, batch.length);
+      failed += batch.memories.length;
+      opts.onBatch?.(0, batch.memories.length);
     }
   }
 
-  return { scored, failed, skipped_budget: skippedBudget };
+  // #602: the held count previously landed ONLY in the return value — a
+  // confidential pool silently unscored for weeks was invisible in
+  // nightly.log. ONE aggregate warn (not one per batch), mirroring
+  // stageReflection's held line below. Dry runs never reach the skip branch
+  // (they continue before client resolution), so no warn fires on dryRun.
+  if (skippedConfidential > 0) {
+    console.warn(
+      `[hicortex] importance: ${skippedConfidential} confidential memories held — ` +
+        `no confidential model configured (llmConfidentialBaseUrl/ApiKey). Retried next run.`,
+    );
+  }
+
+  return {
+    scored,
+    failed,
+    skipped_budget: skippedBudget,
+    ...(skippedConfidential > 0 ? { skipped_confidential: skippedConfidential } : {}),
+  };
+}
+
+/**
+ * #332 — the importance batch builder: partition by classification, then
+ * slice into batches. Every batch is SINGLE-CLASS by construction (AC-10),
+ * so the scoring call site can route each batch to the client matching its
+ * pool with no per-item checks. Exported for the unit test.
+ */
+export function buildImportanceBatches(
+  memories: Memory[],
+  batchSize = 10,
+): Array<{ pool: MemoryPrivacy; memories: Memory[] }> {
+  const byPool = new Map<MemoryPrivacy, Memory[]>();
+  for (const mem of memories) {
+    const pool: MemoryPrivacy = mem.privacy === "confidential" ? "confidential" : "standard";
+    const list = byPool.get(pool);
+    if (list) list.push(mem);
+    else byPool.set(pool, [mem]);
+  }
+  // Standard pool first (arrival order), then confidential — a stable,
+  // greppable order.
+  const out: Array<{ pool: MemoryPrivacy; memories: Memory[] }> = [];
+  for (const pool of ["standard", "confidential"] as const) {
+    const list = byPool.get(pool);
+    if (!list) continue;
+    for (let i = 0; i < list.length; i += batchSize) {
+      out.push({ pool, memories: list.slice(i, i + batchSize) });
+    }
+  }
+  return out;
 }
 
 async function stageImportance(
@@ -511,8 +590,16 @@ async function stageImportance(
    *  boundary — reported, not scored, so the run's evidence shows the
    *  promotion/enrichment gains that survived the nightly. */
   guardSkipped = 0,
-): Promise<{ scored: number; failed: number; skipped_budget: number; guard_skipped: number }> {
-  const r = await scoreMemoriesImportance(db, memories, llm, { budget, deadline, dryRun });
+  /** #332: the confidential-pool client (see scoreMemoriesImportance). */
+  confidentialLlm?: LlmClient | null,
+): Promise<{
+  scored: number;
+  failed: number;
+  skipped_budget: number;
+  guard_skipped: number;
+  skipped_confidential?: number;
+}> {
+  const r = await scoreMemoriesImportance(db, memories, llm, { budget, deadline, dryRun, confidentialLlm });
   return { ...r, guard_skipped: guardSkipped };
 }
 
@@ -520,25 +607,29 @@ async function stageImportance(
 // Stage 2.5: Reflection
 // ---------------------------------------------------------------------------
 
-async function stageReflection(
+/**
+ * One reflection run over ONE class-pure cohort (#332). The cohort never
+ * mixes classes (the caller splits), the recent-lessons dedup block is
+ * class-scoped, the contradiction check only sees same-class lessons, and
+ * every generated lesson inherits the pool's stamp at insert. `client` is the
+ * client matching `pool` — the caller guarantees it (a confidential cohort
+ * without a client never reaches here; it holds instead).
+ */
+async function reflectPool(
   db: Database.Database,
-  memories: Memory[],
-  llm: LlmClient,
+  cohort: Memory[],
+  pool: MemoryPrivacy,
+  client: LlmClient,
   budget: BudgetTracker,
   embedFn: EmbedFn,
-  dryRun: boolean
-): Promise<{
-  lessons_generated: number;
-  failed?: boolean;
-  skipped?: boolean;
-  reason?: string;
-}> {
-  if (memories.length === 0) {
-    return { lessons_generated: 0, skipped: true, reason: "no memories" };
+  dryRun: boolean,
+): Promise<{ generated: number; failed?: boolean; skipped?: boolean; reason?: string }> {
+  if (cohort.length === 0) {
+    return { generated: 0, skipped: true, reason: "no memories" };
   }
 
   // Build summary
-  const lines = memories.slice(0, 50).map((mem) => {
+  const lines = cohort.slice(0, 50).map((mem) => {
     const project = mem.project ?? "unknown";
     const agent = mem.source_agent ?? "unknown";
     const content = mem.content.slice(0, 300);
@@ -546,29 +637,43 @@ async function stageReflection(
   });
   const memoriesBlock = lines.join("\n\n");
 
-  // Feed recent lessons to prevent duplicates and enable escalation
-  const recentLessons = storage.getLessons(db, 7).slice(0, 10);
+  // Feed recent lessons to prevent duplicates and enable escalation.
+  // #332: the dedup block is CLASS-SCOPED — a confidential run's prompt must
+  // not quote standard lessons (and vice versa); the pool's own lessons are
+  // the coherent reference set.
+  const recentLessons = storage
+    .getLessons(db, 7, null, { includeConfidential: pool === "confidential" })
+    .slice(0, 10);
   const recentBlock = recentLessons.length > 0
     ? recentLessons.map(l => `- ${l.content.slice(0, 150)}`).join("\n")
     : undefined;
 
-  const prompt = reflection(memoriesBlock, recentBlock);
+  // #602: pool-aware prompt — the confidential pool's reflection prompt swaps
+  // ONLY the privacy line (personal domains allowed at the process level;
+  // secrets still never), so the pool can actually generate its lessons.
+  const prompt = reflection(memoriesBlock, recentBlock, pool);
 
   if (dryRun) {
-    return { lessons_generated: 0, skipped: false };
+    return { generated: 0, skipped: false };
   }
 
   if (!budget.use("reflection")) {
-    return { lessons_generated: 0, skipped: true, reason: "budget_exhausted" };
+    return { generated: 0, skipped: true, reason: "budget_exhausted" };
   }
 
   try {
-    const r = await llm.complete(prompt);
+    const r = await client.complete(prompt);
     budget.recordUsage("reflection", r.usage);
     const lessons = parseJsonLenient<unknown[]>(r.text, []);
 
     if (!Array.isArray(lessons)) {
-      return { lessons_generated: 0, failed: true };
+      // #602: this branch was silent — a pool could fail every night with
+      // nothing in nightly.log. All logging below sits after the dryRun
+      // early-return, so a dry run logs nothing by construction.
+      console.warn(
+        `[hicortex] reflection (${pool} pool): LLM reply was not a JSON array — no lessons stored (retried next run)`,
+      );
+      return { generated: 0, failed: true };
     }
 
     let generated = 0;
@@ -611,9 +716,14 @@ async function stageReflection(
         // TRUE cosine > 0.80 (#145): the old `1 − n.distance > 0.80` sat on
         // the accidental 1−L2 scale and required cosine > 0.98 — the check
         // effectively never fired. See isContradictionCandidate.
+        // #332: class-scoped — only SAME-POOL lessons enter the check (the
+        // vector search is unscoped; the filter narrows it).
         const similarLessons = storage.vectorSearch(db, embedding, 3)
           .filter(
-            (n) => isContradictionCandidate(n.distance) && n.memory_type === "learnings"
+            (n) =>
+              isContradictionCandidate(n.distance) &&
+              n.memory_type === "learnings" &&
+              (n.privacy === "confidential") === (pool === "confidential")
           );
 
         let contradicted = false;
@@ -621,7 +731,7 @@ async function stageReflection(
           const existingText = similarLessons[0].content.slice(0, 300);
           const newText = content.slice(0, 300);
           try {
-            const verdictR = await llm.complete(
+            const verdictR = await client.complete(
               `Two lessons from an AI memory system. Do they CONTRADICT each other (opposite advice on the same topic)?\n\n` +
               `EXISTING: ${existingText}\n\nNEW: ${newText}\n\n` +
               `Answer ONLY "yes" or "no". If the new lesson updates/refines the existing one (not contradicts), answer "no".`,
@@ -648,18 +758,103 @@ async function stageReflection(
             project,
             memoryType: "learnings",
             baseStrength: baseStrength[severity] ?? 0.8,
+            // #332: lessons inherit their pool's stamp — the class is born
+            // with the cohort, never judged from content.
+            privacy: pool,
           });
           generated++;
         }
-      } catch {
-        // Failed to store lesson
+      } catch (err) {
+        // #602: was silent — an embed/insert failure dropped the lesson with
+        // no trace. Tagged with the pool so the nightly log shows WHICH pool
+        // is losing lessons.
+        console.warn(
+          `[hicortex] reflection (${pool} pool): failed to store a lesson (embed/insert error): ` +
+            `${lessonText.slice(0, 80)} — ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
 
-    return { lessons_generated: generated, failed: false };
+    // #602: ONE per-pool success line so a healthy-empty (0 lessons from a
+    // clean cohort) is distinguishable from a broken run in nightly.log.
+    console.log(`[hicortex] reflection (${pool} pool): generated ${generated} lessons`);
+    return { generated, failed: false };
   } catch {
-    return { lessons_generated: 0, failed: true };
+    // #602: was silent — the pool's whole run could fail (endpoint down,
+    // timeout) and nightly.log showed nothing but the report's failed flag.
+    console.warn(
+      `[hicortex] reflection (${pool} pool): LLM call failed — no lessons generated (retried next run)`,
+    );
+    return { generated: 0, failed: true };
   }
+}
+
+async function stageReflection(
+  db: Database.Database,
+  memories: Memory[],
+  llm: LlmClient,
+  budget: BudgetTracker,
+  embedFn: EmbedFn,
+  dryRun: boolean,
+  /** #332: the confidential-pool client; absent ⇒ the confidential cohort
+   *  holds (skipped, no fallback to the main model). */
+  confidentialLlm?: LlmClient | null,
+): Promise<{
+  lessons_generated: number;
+  failed?: boolean;
+  skipped?: boolean;
+  reason?: string;
+  /** #332: the confidential cohort was skipped — no confidential client. */
+  confidential_skipped?: boolean;
+}> {
+  if (memories.length === 0) {
+    return { lessons_generated: 0, skipped: true, reason: "no memories" };
+  }
+
+  // #332: split the watermark cohort by class — the pools NEVER mix in a
+  // reflection prompt (a mixed cohort would distill cross-class lessons with
+  // no honest stamp). Standard run unchanged on the main client.
+  const standardCohort = memories.filter((m) => m.privacy !== "confidential");
+  const confidentialCohort = memories.filter((m) => m.privacy === "confidential");
+
+  let generated = 0;
+  let anyFailed = false;
+  let anySkipped = false;
+  let reason: string | undefined;
+  let confidentialSkipped = false;
+
+  if (standardCohort.length > 0) {
+    const r = await reflectPool(db, standardCohort, "standard", llm, budget, embedFn, dryRun);
+    generated += r.generated;
+    anyFailed = anyFailed || r.failed === true;
+    anySkipped = anySkipped || r.skipped === true;
+    reason = reason ?? r.reason;
+  }
+  if (confidentialCohort.length > 0) {
+    if (!confidentialLlm) {
+      // Hold: the cohort is retried next run (it is the lastConsolidated
+      // watermark cohort — a held watermark re-finds it). Never the main model.
+      confidentialSkipped = true;
+      console.warn(
+        `[hicortex] reflection: ${confidentialCohort.length} confidential memorie(s) held — ` +
+          `no confidential model configured (llmConfidentialBaseUrl/ApiKey). No lessons generated for the pool.`,
+      );
+    } else {
+      const r = await reflectPool(db, confidentialCohort, "confidential", confidentialLlm, budget, embedFn, dryRun);
+      generated += r.generated;
+      anyFailed = anyFailed || r.failed === true;
+      anySkipped = anySkipped || r.skipped === true;
+      reason = reason ?? r.reason;
+    }
+  }
+
+  return {
+    lessons_generated: generated,
+    ...(anyFailed ? { failed: true } : {}),
+    ...(anySkipped ? { skipped: true } : {}),
+    ...(reason ? { reason } : {}),
+    ...(confidentialSkipped ? { confidential_skipped: true } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -733,6 +928,9 @@ async function stageContentDomains(
   stateDir?: string,
   weakPrimaryFloor: number = DEFAULT_WEAK_PRIMARY_FLOOR,
   deadline?: RunDeadline,
+  /** #332: the confidential-pool client — classification calls pick the
+   *  client matching EACH memory's stamp (AC-10 second half). */
+  confidentialLlm?: LlmClient | null,
 ): Promise<{
   curated: boolean;
   domains: number;
@@ -742,6 +940,8 @@ async function stageContentDomains(
   primaries_updated?: number;
   weak_primary?: number;
   no_association_decayed?: number;
+  /** #332: confidential rows held (no confidential client) — retried next run. */
+  held_confidential?: number;
   reason?: string;
 }> {
   // Rows needing (re)classification:
@@ -757,7 +957,7 @@ async function stageContentDomains(
   const placeholders = domains.map(() => "?").join(", ");
   const rows = db
     .prepare(
-      `SELECT id, content, project FROM memories
+      `SELECT id, content, project, privacy FROM memories
        WHERE COALESCE(status, '') != 'absorbed'
          AND (domain IS NULL
               OR domain NOT IN (${placeholders})
@@ -767,6 +967,7 @@ async function stageContentDomains(
       id: string;
       content: string;
       project: string | null;
+      privacy: string | null;
     }>;
 
   if (dryRun) {
@@ -777,6 +978,8 @@ async function stageContentDomains(
   let classified = 0;
   let weakPrimary = 0;
   let noAssociationDecayed = 0;
+  let heldConfidential = 0;
+  const pair: LlmPair = { standard: llm, confidential: confidentialLlm ?? null };
 
   if (rows.length > 0) {
     // Prototypes at run start — newly classified memories get their weights
@@ -793,6 +996,15 @@ async function stageContentDomains(
         console.warn(`[hicortex] content-domain: budget exhausted after ${classified} classified`);
         break;
       }
+      // #332 per-row client selection: the classify call carries this row's
+      // CONTENT — a confidential row goes to the confidential client, and
+      // without one it is HELD (tags untouched, retried next run), never
+      // classified on the main model.
+      const rowLlm = clientForPool(pair, row.privacy === "confidential" ? "confidential" : "standard");
+      if (!rowLlm) {
+        heldConfidential++;
+        continue;
+      }
       // classifyMemoryTags returns null ONLY on infra error (throws after retry) —
       // skip that memory, leaving domain/tags/strength untouched so a later
       // run retries it (issue #150: never file or decay on infra errors).
@@ -800,7 +1012,7 @@ async function stageContentDomains(
       // into this stage's BudgetTracker slot — same stage label the budget.use
       // call above uses, so call count + tokens stay aligned.
       const result = await classifyMemoryTags(
-        row.content, row.project, domains, llm,
+        row.content, row.project, domains, rowLlm,
         (u) => budget.recordUsage("content_domain", u),
       );
       if (result === null) {
@@ -840,6 +1052,12 @@ async function stageContentDomains(
   const seeded = stats.filter((s) => s.seeded).length;
 
   const { domains: domainCount } = rebuildContentModuleIndex(db, domains, stateDir);
+  if (heldConfidential > 0) {
+    console.warn(
+      `[hicortex] content-domain: ${heldConfidential} confidential row(s) held — ` +
+        `no confidential model configured; they retry next run`,
+    );
+  }
   console.log(
     `[hicortex] Graded tags: ${classified} classified, ${weakPrimary} weak-primary, ` +
       `${noAssociationDecayed} no-association decayed, ${prototypes.size} prototypes ` +
@@ -855,6 +1073,7 @@ async function stageContentDomains(
     primaries_updated: primariesUpdated,
     weak_primary: weakPrimary,
     no_association_decayed: noAssociationDecayed,
+    ...(heldConfidential > 0 ? { held_confidential: heldConfidential } : {}),
     ...(rows.length === 0 ? { reason: "nothing_stale" } : {}),
   };
 }
@@ -1081,9 +1300,29 @@ export interface LinkCandidate {
 
 /**
  * Discovery: find link candidates for one memory given its embedding.
- * Top-10 vector neighbors (excluding self), keep the CONSOLIDATE_LINK_TOP_K
- * highest-cosine neighbors above CONSOLIDATE_LINK_THRESHOLD, pre-compute the
- * heuristic relationship type.
+ * Vector neighbors (excluding self), keep the CONSOLIDATE_LINK_TOP_K
+ * highest-cosine SAME-CLASS neighbors above CONSOLIDATE_LINK_THRESHOLD,
+ * pre-compute the heuristic relationship type.
+ *
+ * #602 — ADAPTIVE CLASS-SCOPED FETCH. The pre-#602 code fetched a fixed
+ * top-10 UNFILTERED window and then dropped cross-class neighbors in the
+ * loop — the #192 filtered-over-fetch defect class. Starvation math: in a
+ * 22K-standard / 1K-confidential corpus a confidential memory's 10 nearest
+ * neighbors are usually ALL standard (the classes are topically distinct but
+ * the majority class is 22× larger), so the confidential pool systematically
+ * under-linked — its same-class neighbors never made the window. The fix
+ * escalates the window (k × 4 per step, capped at CONSOLIDATE_LINK_FETCH_MAX_K
+ * = the #192 over-fetch cap) until the window holds CONSOLIDATE_LINK_TOP_K
+ * same-class neighbors, comes back short (no more rows may exist), or hits
+ * the cap. Balanced corpora do ZERO extra queries (the first window already
+ * holds 3+ same-class neighbors).
+ *
+ * WHY the class is not denormalized into the vec0 table (a WHERE clause
+ * would make this a one-fetch query): memory_vectors carries only id +
+ * embedding, and privacy is MUTABLE post-insert (`hicortex backfill-privacy`
+ * and REST /update can reclassify a row) — a vec0-side class column would go
+ * stale the moment a row's class changed without a re-embed. The class is
+ * read live from memories, so it can never disagree with the row.
  *
  * Shared between the nightly `stageLinks` (which embeds via embedFn) and
  * `hicortex relink` (which reuses stored embeddings from memory_vectors).
@@ -1093,7 +1332,33 @@ export function discoverLinkCandidates(
   mem: Memory,
   embedding: Float32Array,
 ): LinkCandidate[] {
-  const neighbors = storage.vectorSearch(db, embedding, 10, [mem.id]);
+  // #332: class-pure link discovery — a candidate NEVER crosses the circle
+  // (no memory_links row joins the two classes; a pre-#332 cross-class link
+  // stays as historical data, but the stage creates none). NULL privacy (a
+  // pre-v27 row) reads standard, the same normalization everywhere else uses.
+  const memClass = mem.privacy === "confidential" ? "confidential" : "standard";
+  const isSameClass = (m: { privacy: MemoryPrivacy | null }) =>
+    (m.privacy === "confidential" ? "confidential" : "standard") === memClass;
+
+  // The excluded self (distance 0 — always the nearest stored row) occupies
+  // one seat of the raw window, so each fetch asks for k + 1: a FULL window
+  // then yields exactly k non-self neighbors and `neighbors.length === k`
+  // means "more rows may exist beyond it".
+  const fetchWindow = (k: number) => storage.vectorSearch(db, embedding, k + 1, [mem.id]);
+
+  // #602 adaptive escalation: widen while the window starves the memory's
+  // own class AND the corpus may hold more rows beyond it.
+  let k = CONSOLIDATE_LINK_FETCH_K;
+  let neighbors = fetchWindow(k);
+  while (
+    neighbors.filter(isSameClass).length < CONSOLIDATE_LINK_TOP_K &&
+    neighbors.length === k &&
+    k < CONSOLIDATE_LINK_FETCH_MAX_K
+  ) {
+    k = Math.min(k * 4, CONSOLIDATE_LINK_FETCH_MAX_K);
+    neighbors = fetchWindow(k);
+  }
+
   const candidates: LinkCandidate[] = [];
 
   // vectorSearch orders by L2 distance ascending (`ORDER BY distance` in
@@ -1102,6 +1367,9 @@ export function discoverLinkCandidates(
   // exactly the highest-cosine neighbors.
   for (const neighbor of neighbors) {
     if (candidates.length >= CONSOLIDATE_LINK_TOP_K) break;
+    // The in-loop class filter stays: it enforces purity (#332) and top-K
+    // cosine order regardless of how wide the escalated window got (#602).
+    if (!isSameClass(neighbor)) continue;
     // sqlite-vec vec0 `distance` is L2, not a similarity. Embeddings are
     // L2-normalized (embedder.ts, normalize: true), so cos = 1 − d²/2.
     // The old `1 − distance` formula silently required cosine > 0.90.
@@ -1724,6 +1992,15 @@ export async function runConsolidation(
    * un-advanced so the next run re-finds the pending work.
    */
   deadline?: RunDeadline,
+  /**
+   * #332: the CONFIDENTIAL model client. Every stage that can touch
+   * confidential text (importance batches, reflection, domain classification,
+   * reconsolidation verdicts/rewrites) selects per-pool — confidential work
+   * goes here; when null, that work HOLDS/skips, never falls back to `llm`.
+   * Optional so every pre-#332 caller (and corpora with no confidential
+   * rows) is byte-identical.
+   */
+  confidentialLlm?: LlmClient | null,
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -1879,6 +2156,7 @@ export async function runConsolidation(
         dryRun,
         deadline,
         scoreMemories.length - settleCandidates.length,
+        confidentialLlm,
       );
     }
 
@@ -1898,7 +2176,8 @@ export async function runConsolidation(
         llm,
         budget,
         embedFn,
-        dryRun
+        dryRun,
+        confidentialLlm,
       );
     }
 
@@ -1920,6 +2199,7 @@ export async function runConsolidation(
             db, cfgDomains, llm, budget, embedFn, dryRun, stateDir,
             domainOptions?.weakPrimaryFloor ?? DEFAULT_WEAK_PRIMARY_FLOOR,
             deadline,
+            confidentialLlm,
           );
         }
       } else {
@@ -1950,7 +2230,7 @@ export async function runConsolidation(
     if (!deadline?.hit("reconsolidation")) {
       report.stages.reconsolidation = await stageReconsolidation(
         db, llm, budget, embedFn, dryRun, stateDir,
-        { ...reconsolidationOptions, deadline },
+        { ...reconsolidationOptions, deadline, confidentialLlm },
       );
     }
 

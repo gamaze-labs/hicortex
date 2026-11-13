@@ -27,6 +27,16 @@ export interface TranscriptBatch {
    */
   sourceAgent?: string;
   /**
+   * The session's workspace path (#609) — the directory the capturing agent
+   * worked in (CC: the delta entries' `cwd`; Pi/OC: the session header `cwd`;
+   * opencode: `session.directory`). The nightly sends it on every segment
+   * POST (`workspace_path`) and walks the confidential marker from it.
+   * AUTHORITATIVE over `projectName`, which stays the lossy last-segment
+   * label. Null when the harness has no workspace (Hermes — per-profile
+   * conversations, no cwd in its store; never invented).
+   */
+  workspacePath?: string | null;
+  /**
    * Per-session cursor key (`<prefix>:<sessionId>`) — the capture-cursors.json
    * key whose value gates and advances this session's incremental capture (#189).
    */
@@ -196,6 +206,19 @@ function parseTranscriptFile(
     if (timestamps[i]) lastTimestamp = timestamps[i];
   }
 
+  // #609: the workspace path — the first non-empty `cwd` among the DELTA's
+  // entries (CC writes the session's cwd on every entry; the delta slice keeps
+  // the value authoritative for what THIS capture covers). projectName stays
+  // the lossy directory-name decode — it keeps serving only the label.
+  let workspacePath: string | null = null;
+  for (const entry of delta) {
+    const cwd = (entry as { cwd?: unknown } | null)?.cwd;
+    if (typeof cwd === "string" && cwd) {
+      workspacePath = cwd;
+      break;
+    }
+  }
+
   return {
     sessionId: basename(filePath, ".jsonl"),
     projectName,
@@ -203,6 +226,7 @@ function parseTranscriptFile(
       ? lastTimestamp.slice(0, 10)
       : new Date().toISOString().slice(0, 10),
     entries: delta,
+    workspacePath,
     cursorKey,
     startCursor: start,
     generation: gen,

@@ -40,6 +40,7 @@ import {
   DRAIN_YIELD_WAIT_CAP_MS,
 } from "./calibration.js";
 import * as storage from "./storage.js";
+import type { MemoryPrivacy } from "./types.js";
 import { countExistingSegment, countExistingSession } from "./dedup.js";
 import { canonicalizeProject } from "./project-canonicalize.js";
 import type { RunDeadline } from "./run-deadline.js";
@@ -56,10 +57,23 @@ export interface DistillQueueRow {
   source_agent: string | null;
   source_agent_id: string | null;
   source_domain: string | null;
+  /**
+   * The delivery's workspace path (#609, migration v28) — carried through the
+   * inbox so the drain's inserts keep it and `hicortex backfill-privacy` can
+   * path-match queued rows. NULL when the delivery had none (Hermes,
+   * pre-#609 clients).
+   */
+  workspace_path: string | null;
   source_machine: string | null;
   project: string | null;
   session_date: string | null;
-  privacy: string | null;
+  /**
+   * #332 classification stamp. 'standard' | 'confidential' on every row
+   * written after v27 (enqueue normalizes; the intake handler derives);
+   * nullable defensively because the column is loose TEXT and pre-v27 rows
+   * existed — readers treat NULL as standard (the fail-closed default).
+   */
+  privacy: MemoryPrivacy | null;
   text: string;
   arrived_at: string;
 }
@@ -77,6 +91,8 @@ export interface EnqueueDistillInput {
   source_agent_id?: unknown;
   source_domain?: unknown;
   source_machine?: unknown;
+  /** #609: the delivery's workspace path (wire `workspace_path`). */
+  workspace_path?: unknown;
   project?: unknown;
   session_id?: unknown;
   segment_id?: unknown;
@@ -105,8 +121,8 @@ export function enqueueDistill(
     .prepare(
       `INSERT OR IGNORE INTO distill_queue
          (session_id, segment_id, source_agent, source_agent_id, source_domain,
-          source_machine, project, session_date, privacy, text, arrived_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          workspace_path, source_machine, project, session_date, privacy, text, arrived_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       str(input.session_id),
@@ -114,13 +130,22 @@ export function enqueueDistill(
       str(input.source_agent),
       str(input.source_agent_id),
       str(input.source_domain),
+      // #609: the workspace path rides the queue row (the drain's inserts and
+      // the path backfill read it back); NULL when the delivery had none.
+      str(input.workspace_path),
       str(input.source_machine),
       str(input.project),
       // Resolve the date ONCE at delivery (mirrors the sync handler): absent
       // or non-string becomes today, and the drain reuses the stored value so
       // a queued segment keeps its session date.
       str(input.session_date) ?? new Date().toISOString().slice(0, 10),
-      str(input.privacy),
+      // #332: the classification stamp, normalized at the insert boundary —
+      // a legacy client's 'WORK'/blank/absent value lands as 'standard'
+      // (migration v27 normalized pre-existing rows the same way). The intake
+      // handler derives the stamp from source_agent × roster before it gets
+      // here, so a rostered agent's delivery is queued 'confidential' even
+      // when the client declares nothing.
+      storage.normalizeStoredPrivacy(input.privacy),
       input.text,
       new Date().toISOString(),
     );
@@ -287,6 +312,16 @@ export interface DrainOptions {
    * mechanical fold only. The nightly passes the boot-resolved config value.
    */
   projectAliases?: Readonly<Record<string, string>> | null;
+  /**
+   * #332: the CONFIDENTIAL model client. Items stamped 'confidential' distill
+   * on THIS client; when it is absent they are HELD — the row stays queued
+   * (skip-and-continue, the no_llm precedent but per-item) and standard items
+   * keep draining. There is NO fallback to `llm`: confidential text never
+   * reaches the standard model, held beats exposed.
+   */
+  confidentialLlm?: DrainLlm | null;
+  /** Its config — drives the confidential endpoint's own chunk-size cache. */
+  confidentialLlmConfig?: LlmConfig | null;
 }
 
 export interface DrainReport {
@@ -308,6 +343,13 @@ export interface DrainReport {
   memories: number;
   /** Items still queued after this run. */
   remaining: number;
+  /**
+   * #332: items HELD this run — stamped confidential with no confidential
+   * client configured. They stay queued (skip-and-continue); standard items
+   * drained normally. The boot warning names the exposure; this count is the
+   * per-run queue-growth signal.
+   */
+  held_confidential?: number;
   /** Tokens metered this drain (incl. a failed item's partial usage). */
   usage: { prompt: number; completion: number; total: number };
 }
@@ -315,8 +357,10 @@ export interface DrainReport {
 /** Chunk-size cache, keyed per endpoint exactly like the handler's. */
 const chunkSizeCache = new Map<string, number>();
 
-async function resolveDrainChunkSize(opts: DrainOptions): Promise<number> {
-  const cfg = opts.llmConfig!;
+async function resolveDrainChunkSizeFor(
+  opts: DrainOptions,
+  cfg: LlmConfig,
+): Promise<number> {
   const detect = opts.detectChunkSize ?? detectChunkSize;
   const cacheKey = `${cfg.provider}/${cfg.model}@${cfg.baseUrl}`;
   if (!chunkSizeCache.has(cacheKey)) {
@@ -415,6 +459,7 @@ export async function drainDistillQueue(
     duplicates: 0,
     memories: 0,
     remaining: 0,
+    held_confidential: 0,
     usage: { prompt: 0, completion: 0, total: 0 },
   };
 
@@ -422,6 +467,19 @@ export async function drainDistillQueue(
     .prepare("SELECT * FROM distill_queue ORDER BY rowid ASC")
     .all() as unknown as DistillQueueRow[];
   if (rows.length === 0) return report; // the healthy steady state: depth 0
+
+  // #332: confidential items with no confidential client HOLD (skip-and-
+  // continue) — one warn per run, then the drain proceeds over the standard
+  // items. The rows stay queued; the report carries the held count.
+  const confidentialCount = rows.filter((r) => r.privacy === "confidential").length;
+  const hasConfidentialClient = !!(opts.confidentialLlm && opts.confidentialLlmConfig);
+  if (confidentialCount > 0 && !hasConfidentialClient) {
+    console.warn(
+      `[hicortex] drain: ${confidentialCount} confidential item(s) HELD — no confidential model configured ` +
+        `(llmConfidentialBaseUrl/ApiKey). They stay queued; standard items drain normally. ` +
+        `Confidential text never touches the standard model.`,
+    );
+  }
 
   // No LLM configured: delivery still queued (queue mode needs no LLM), but
   // distillation cannot run. Report + defer — items stay queued; the
@@ -452,7 +510,6 @@ export async function drainDistillQueue(
     `[hicortex] Distill inbox: ${rows.length} item(s) from ${queues.length} client(s) — draining`,
   );
 
-  const chunkSize = await resolveDrainChunkSize(opts);
   const warned = { unreachable: false };
   let stopped: DrainReport["outcome"] | undefined;
 
@@ -505,6 +562,24 @@ export async function drainDistillQueue(
       // usage accrues even on throw (some chunks' LLM calls already happened)
       // — the caller records it against the monthly meter, same as the sync
       // path's finally.
+      //
+      // #332 per-pool client selection: a confidential item distills on the
+      // CONFIDENTIAL client; without one it HOLDS here (skip-and-continue —
+      // the row stays queued, standard items drain on, held count reported).
+      // Standard items use the main client as before.
+      if (item.privacy === "confidential") {
+        if (!opts.confidentialLlm || !opts.confidentialLlmConfig) {
+          report.held_confidential = (report.held_confidential ?? 0) + 1;
+          continue;
+        }
+      }
+      const itemLlm = (item.privacy === "confidential"
+        ? opts.confidentialLlm
+        : opts.llm) as unknown as LlmClient;
+      const itemLlmConfig = item.privacy === "confidential"
+        ? opts.confidentialLlmConfig!
+        : opts.llmConfig!;
+      const chunkSize = await resolveDrainChunkSizeFor(opts, itemLlmConfig);
       const usage = { prompt: 0, completion: 0, total: 0 };
       const label =
         item.segment_id !== ""
@@ -519,7 +594,7 @@ export async function drainDistillQueue(
       const canonProject = canonicalizeProject(item.project, opts.projectAliases);
       try {
         // Cast: DrainLlm is the structural surface distillSession uses.
-        const llm = opts.llm as unknown as LlmClient;
+        const llm = itemLlm as unknown as LlmClient;
         const entries: DistilledEntry[] = await distillSession(
           llm,
           item.text,
@@ -563,11 +638,18 @@ export async function drainDistillQueue(
               sourceAgent: item.source_agent ?? "unknown",
               sourceAgentId: item.source_agent_id,
               sourceDomain: item.source_domain,
+              // #609: the queue row's workspace path flows onto the stored
+              // memories (the drain SELECT is `SELECT *`, so the column
+              // arrives for free — this opt is what lands it).
+              workspacePath: item.workspace_path ?? null,
               sourceMachine: storage.sanitizeSourceMachine(item.source_machine),
               sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
               project: canonProject ?? undefined,
               memoryType,
-              privacy: item.privacy,
+              // #332: the row's class stamp rides into the stored memories —
+              // normalized defensively (a NULL from a pre-v27 row reads
+              // standard, same as the read gates).
+              privacy: storage.normalizeStoredPrivacy(item.privacy),
               createdAt,
             });
           }
@@ -607,7 +689,10 @@ export async function drainDistillQueue(
   if (report.outcome === "completed") {
     console.log(
       `[hicortex] Distill inbox drained: ${report.processed} item(s), ` +
-        `${report.memories} memories, ${report.duplicates} duplicate skip(s)`,
+        `${report.memories} memories, ${report.duplicates} duplicate skip(s)` +
+        (report.held_confidential
+          ? `, ${report.held_confidential} confidential item(s) HELD (no confidential model)`
+          : ""),
     );
   }
   return report;

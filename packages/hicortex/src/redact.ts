@@ -36,6 +36,12 @@ export interface RedactionConfig {
   extraPatterns?: string[];
   /** Replacement string. Default: "[REDACTED]". */
   replacement?: string;
+  /**
+   * #332: the confidential preset — DEFAULT_PATTERNS PLUS emails and phone
+   * numbers. Set by the /distill intake for confidential deliveries only;
+   * standard deliveries keep today's pattern set byte-identically.
+   */
+  extended?: boolean;
 }
 
 /**
@@ -89,10 +95,32 @@ const DEFAULT_PATTERNS: { name: string; pattern: RegExp }[] = [
 ];
 
 /**
+ * The CONFIDENTIAL preset (#332 redaction pilot, the #558 gap): everything in
+ * DEFAULT_PATTERNS plus emails and phone numbers. Confidential-pool content
+ * is the material an inner-circle agent captures (finance, medical, personal
+ * correspondence), so its intake redacts contact identifiers BEFORE queueing
+ * — standard deliveries keep today's set unchanged (the general email/phone
+ * fix for standard rows is deliberately out of scope, #332 non-goals).
+ */
+const CONFIDENTIAL_PATTERNS: { name: string; pattern: RegExp }[] = [
+  // Email addresses — local@domain with a TLD. The negative lookbehind keeps
+  // already-redacted [REDACTED] markers (no @) from re-matching; surrounding
+  // angle brackets (markdown autolinks) are not captured.
+  { name: "email", pattern: /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g },
+
+  // Phone numbers — international E.164 (+4670...) and common dashed/dotted/
+  // spaced national forms, 7-15 digits total. Word-ish boundaries avoid
+  // matching inside longer digit runs (order ids, timestamps).
+  { name: "phone", pattern: /(?:\+\d{1,3}[\s.-]?)?(?:\(\d{1,4}\)[\s.-]?)?\d{2,4}(?:[\s.-]\d{2,4}){1,4}(?!\d)/g },
+];
+
+/**
  * Redact secrets and PII from text.
  *
  * @param text The raw transcript text to redact
- * @param config Optional configuration (extra patterns, replacement string)
+ * @param config Optional configuration (extra patterns, replacement string,
+ *   and `extended: true` for the confidential preset — #332: DEFAULT_PATTERNS
+ *   plus emails and phone numbers)
  * @returns The redacted text and count of redactions applied
  */
 export function redact(text: string, config?: RedactionConfig): RedactionResult {
@@ -110,6 +138,18 @@ export function redact(text: string, config?: RedactionConfig): RedactionResult 
       count++;
       return replacement;
     });
+  }
+
+  // #332: the confidential preset's extra patterns (emails + phones) — only
+  // when `extended` is set (confidential deliveries at /distill intake).
+  if (config?.extended) {
+    for (const { pattern } of CONFIDENTIAL_PATTERNS) {
+      pattern.lastIndex = 0;
+      result = result.replace(pattern, () => {
+        count++;
+        return replacement;
+      });
+    }
   }
 
   // Apply user-configured extra patterns

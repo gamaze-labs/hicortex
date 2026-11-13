@@ -17,12 +17,14 @@ import {
   openSync,
   writeSync,
   closeSync,
+  readSync,
   readFileSync,
   unlinkSync,
   mkdirSync,
   statSync,
 } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { CONFIDENTIAL_MARKER_FILENAME } from "./confidential-marker.js";
 import { extractConversationText } from "./distiller.js";
 import type { TranscriptBatch } from "./transcript-reader.js";
 import type { CursorStore } from "./capture-cursors.js";
@@ -83,9 +85,107 @@ export interface DistillBody {
   session_id: string;
   segment_id: string;
   session_date: string;
+  /**
+   * #609: the session's workspace path (batch.workspacePath) — the directory
+   * the capturing agent worked in. Always sent when known (the server cannot
+   * match confidentialPaths or backfill by path without it); null/omitted
+   * when the harness has no workspace (Hermes) or the reader predates #609.
+   * Old servers ignore unknown body fields by construction.
+   */
+  workspace_path?: string | null;
+  /**
+   * #614: the marker file's relayed CONTENT — readConfidentialMarker's walk
+   * result (the trimmed first line of `.hicortex-confidential` at the
+   * workspace or an ancestor). "" when the marker exists but is empty (the
+   * pre-#614 shape — the server warns on it, never validates it); null when
+   * no marker was found. Content = the server's confidentialMarkerKey today,
+   * a space-id + key pair later (#613) — the wire field never changes shape.
+   * Sent on every segment of the batch; the SERVER validates it against its
+   * own key at intake (a client-side match alone is never trusted).
+   */
+  client_marker?: string | null;
+  /**
+   * LEGACY (pre-#614): the marker-walk boolean. Capture STOPPED sending it
+   * in #614 — the boolean was the client-writable classification channel the
+   * server-side key validation closes; a #614 server accepts-and-ignores it
+   * (not even destructured, the #332 client `privacy` precedent). Kept on
+   * the interface for the version-skew window exactly like `privacy` below:
+   * a #609-era client's `true` against a #614 server reads standard, and a
+   * #614 client against a #609-era server reads standard too — fail-closed
+   * in both directions (intended; both ends must upgrade for marker-derived
+   * confidentiality).
+   */
+  client_confidential?: boolean;
   /** 0.16.x: optional/vestigial. The distiller no longer sets it; a legacy
    *  client may. Honored if present, else the memory stores NULL. */
   privacy?: string;
+}
+
+/**
+ * #614 read cap for the relayed marker content, in BYTES. A marker is ONE
+ * short line (the key); anything larger is junk someone planted in the file,
+ * not a marker — the walk relays at most this many bytes so a multi-KB blob
+ * can never ride the capture body. (Judgment constant — a key comfortably
+ * fits; matches the common single-read page intuition.)
+ */
+export const MARKER_READ_CAP_BYTES = 4096;
+
+/**
+ * #614 marker walk: does `.hicortex-confidential` (the constant lives in
+ * confidential-marker.ts — the command writes it, this walk reads it) exist
+ * at `workspacePath` or any ancestor directory up to `/`, and WHAT does it
+ * carry? Returns the marker file's trimmed FIRST line — the content the
+ * server validates against its `confidentialMarkerKey` (was a boolean walk
+ * in #609; #614 made the marker carry a key, so the client relays content
+ * and the SERVER decides). "" = a marker exists but is empty (the pre-#614
+ * shape — present, never valid); null = no marker found.
+ *
+ * Same walk semantics as the #609 boolean: a marked parent covers child
+ * workspaces, the marker rides folder renames/moves, one bounded read per
+ * ancestor, FIRST hit wins, a PLAIN STRING walk with NO symlink resolution
+ * (a symlinked workspace must not silently change which directory chain is
+ * inspected), null/empty path → null (Hermes, unknown workspace — a signal
+ * is never invented), any stat error reads as absent and the walk continues.
+ * A stat-successful but UNREADABLE marker relays "" — the marker is present,
+ * its content cannot be validated, so the server refuses it (fail-closed:
+ * never confidential off a file we could not read).
+ */
+export function readConfidentialMarker(
+  workspacePath: string | null | undefined,
+): string | null {
+  if (!workspacePath) return null;
+  let dir = workspacePath;
+  for (;;) {
+    const markerPath = join(dir, CONFIDENTIAL_MARKER_FILENAME);
+    try {
+      if (statSync(markerPath).isFile()) {
+        try {
+          // Bounded read: open + readSync at the cap, never readFileSync (a
+          // planted "marker" of arbitrary size must not be buffered whole).
+          const fd = openSync(markerPath, "r");
+          try {
+            const buf = Buffer.alloc(MARKER_READ_CAP_BYTES);
+            const n = readSync(fd, buf, 0, MARKER_READ_CAP_BYTES, 0);
+            // First line only, trimmed: "key\n…" → "key" (CRLF folds through
+            // the trim); an empty file → "".
+            return buf.subarray(0, n).toString("utf-8").split("\n")[0].trim();
+          } finally {
+            closeSync(fd);
+          }
+        } catch {
+          // Present but unreadable — see the doc comment: "" (refused), not
+          // absent (the marker IS there; pretending otherwise would let a
+          // chmod decide confidentiality).
+          return "";
+        }
+      }
+    } catch {
+      /* absent — walk on */
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null; // reached "/"
+    dir = parent;
+  }
 }
 
 /** Normalized POST result the caller's transport returns. */
@@ -407,6 +507,17 @@ export async function captureBatches(
     // stored on an older server.
     const genPrefix = batch.generation > 0 ? `g${batch.generation}.` : "";
 
+    // #609/#614: the workspace birthplace signals, computed ONCE per batch
+    // before the segment loop — the marker walk reads the workspace and each
+    // ancestor (first hit wins), and both values ride EVERY segment POST so
+    // the server can compose its confidentialPaths rule and validate the
+    // marker key. null workspace (Hermes / unknown) sends a null path and a
+    // null marker — never invented. #614: the client RELAYS marker content
+    // (client_marker); it no longer asserts a confidentiality boolean —
+    // validation is server-side.
+    const workspacePath = batch.workspacePath ?? null;
+    const markerContent = readConfidentialMarker(workspacePath);
+
     // Cursor value the last confirmed boundary reached — advanced once, at
     // session end (A4), so per-session file writes stay bounded.
     let lastConfirmedEnd = batch.startCursor;
@@ -448,6 +559,15 @@ export async function captureBatches(
         session_id: batch.sessionId,
         segment_id: `${genPrefix}${seg.segStart}-${seg.segEnd}${seg.idSuffix}`,
         session_date: batch.date,
+        // #609/#614: both workspace signals on every segment (see the
+        // per-batch computation above) — the path verbatim, the marker's
+        // relayed CONTENT. Old servers never read unknown fields; the
+        // pre-#614 client_confidential boolean is deliberately NOT sent
+        // (DistillBody keeps the field documented as legacy for the skew
+        // window — a #609 server reading only the boolean sees standard,
+        // fail-closed, intended).
+        workspace_path: workspacePath,
+        client_marker: markerContent,
       };
 
       let result: PostResult;

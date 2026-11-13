@@ -205,6 +205,88 @@ export const MEMORY_PRECISION_DIVERGENCE_MIN_SHOWN = 5;
  */
 export const MEMORY_PRECISION_PROMPT_EXCERPT_CHARS = 256;
 
+// Quality-scoreboard family (#578) — the Memory Precision card as a standing
+// quality instrument. Same #408/#476 family law as the block above: constants
+// are release-managed (no config keys), storage is threshold-free, verdicts
+// derive at render.
+
+/**
+ * One pinned quality change — the Tier-3 baseline discipline (#578): every
+ * change that can move recall quality pins its deploy DATE here (edited at
+ * release, exactly like a calibration constant's rationale comment), and the
+ * card computes each entry's before/after from the RAW event store at render
+ * (before = window up to the date, after = the date onward). No frozen
+ * numbers: a pinned number freezes a metric definition that will evolve
+ * (the moving-reference problem), a date does not. Baselines age out of raw
+ * events after the 90-day retention; the nightly snapshot's quality block
+ * carries the trend from there.
+ */
+export interface QualityChange {
+  /** Short machine id (rendered as the delta tag on the card face). */
+  id: string;
+  /** ISO date (UTC) the change deployed — the before/after split day. */
+  date: string;
+  /** Human label for the drawer/tooltip. */
+  label: string;
+  /** Source issue (provenance, the house convention). */
+  issue: number;
+}
+
+/**
+ * The seeded change registry (#578): TWO
+ * entries for 2026-10-28 — #566 (the cross-project recall fence, bar
+ * CROSS_PROJECT_MIN_SIMILARITY) and #567 (project-label reconciliation,
+ * shipped in the same 0.25.0 release) — independent changes, independent
+ * before/afters, back-pinned now while the 90-day raw window still covers
+ * them. Future quality changes append their entry at release time (#569's
+ * decay fix is the next: its date lands when it deploys).
+ */
+export const QUALITY_CHANGES: readonly QualityChange[] = Object.freeze([
+  Object.freeze({
+    id: "fence",
+    date: "2026-10-28",
+    label: "cross-project recall fence (0.72 bar)",
+    issue: 566,
+  }),
+  Object.freeze({
+    id: "labels",
+    date: "2026-10-28",
+    label: "project-label reconciliation (canonicalize at gate + ingest)",
+    issue: 567,
+  }),
+]);
+
+/**
+ * Weekly quality-grading call cap (#578: its own weekly lane, separate from
+ * nightlyLlmCallBudget) — different provider, different endpoint,
+ * independent starvation risk; folding it into the one #405 ceiling would
+ * let the consolidation LLM starve grading (or vice versa) with no signal.
+ * The per-call cost is negligible, so the cap bounds spend trivially.
+ * At cap the remaining sampled items DEFER to the next week (the week
+ * cursor does not advance past ungraded items — dup-over-loss).
+ * Release-managed: no config key, moving it is a release decision.
+ */
+export const QUALITY_GRADE_WEEKLY_CALL_CAP = 60;
+
+/**
+ * Auto-grader confidence below which a graded line lands in the CONTESTED
+ * slice for the owner's thumbs (#578). PROVISIONAL first anchor (the #426
+ * posture): 0.70, expected to move on fleet data. Applied at RENDER only
+ * (raw score + confidence are stored threshold-free; a recalibration never
+ * rewrites history).
+ */
+export const QUALITY_CONTESTED_CONFIDENCE = 0.70;
+
+/**
+ * Render edge for "useful" on a graded score (#578): a grading `score`
+ * question answers 0..1; ≥ this reads useful in the graded-useful share.
+ * 0.5 — the scale's own midpoint, deliberately NOT the utility threshold
+ * calibrated for recall INJECTION trimming (0.75 — a different decision).
+ * Derived at render, never stored. PROVISIONAL alongside
+ * QUALITY_CONTESTED_CONFIDENCE.
+ */
+export const QUALITY_USEFUL_SCORE = 0.5;
+
 // ---------------------------------------------------------------------------
 // Volatility gate (#489) — deterministic drop of GH-ticket-status /
 // version-bump / commit-state entries at the distill gate, and the one-shot

@@ -38,6 +38,8 @@ import {
   dashboardModelGetHandler,
   dashboardModelPutHandler,
   dashboardCapturePausePutHandler,
+  dashboardQualityContestedHandler,
+  dashboardQualityVerdictPutHandler,
   accountHandler,
   accountTokenHandler,
 } from "./dashboard.js";
@@ -83,7 +85,20 @@ import {
 } from "./recall-precision.js";
 import { capturePauseKey, isCapturePaused } from "./capture-pause.js";
 import { canonicalizeProject, parseProjectAliases } from "./project-canonicalize.js";
+import {
+  resolveConfidentialAgents,
+  resolveConfidentialPaths,
+  resolveConfidentialMarkerKey,
+  deriveIntakePrivacy,
+  isCircleMember,
+  buildConfidentialLlm,
+  warnIfCircleUnconfigured,
+  confidentialMarkerKeyNote,
+  warnRefusedMarker,
+  type ConfidentialPathPattern,
+} from "./classification.js";
 import { ensureAndPersistAgentId, loadConfigStrict, persistConfigUpdates } from "./init.js";
+import { handleMarkerKeyGet, handleMarkerKeyPut } from "./marker-key-api.js";
 import type { MemorySearchResult } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -95,6 +110,12 @@ let llm: LlmClient | null = null;
 // llmConfig is module-level so the /distill handler can read numCtx without
 // re-resolving on every request. null when no LLM is configured.
 let llmConfig: LlmConfig | null = null;
+// #332: the CONFIDENTIAL model client (llmConfidential* config /
+// HICORTEX_LLM_CONFIDENTIAL_* env). null when unconfigured — confidential
+// work then refuses/holds, never falls back to the main client. Built at the
+// same funnel as the main client (boot), with the same tuning overlay.
+let confidentialLlm: LlmClient | null = null;
+let confidentialLlmConfig: LlmConfig | null = null;
 
 // One-time-per-process deprecation warning for the `?privacy=` query param
 // (0.16.x: the column is vestigial, never filtered). Old clients/plugins still
@@ -136,6 +157,21 @@ let recallIndexOptions: RecallIndexOptions = {};
 let projectAliases: Readonly<Record<string, string>> | null = null;
 // Product-owned memory instructions (#192): on unless config says false.
 let memoryInstructionsEnabled = true;
+// #332: the confidential-circle roster (config `confidentialAgents`),
+// resolved once at boot like identityAgents (restart to apply). Empty = no
+// circle: every delivery stamps standard, nothing is ever omitted from read
+// paths — the zero-change default.
+let confidentialRoster: string[] = [];
+// #609: the workspace-path patterns (config `confidentialPaths`), resolved at
+// the same boot seam as the roster (restart to apply). Empty = the path
+// birthplace signal never fires; the matcher itself lives in classification.ts.
+let confidentialPathPatterns: ConfidentialPathPattern[] = [];
+// #614: the marker key (config `confidentialMarkerKey` / env
+// HICORTEX_CONFIDENTIAL_MARKER_KEY), resolved at the same boot seam. Null =
+// client workspace markers are INERT (ignored with a boot note when the
+// circle is otherwise active) — the attack surface ships disabled by
+// default. The compare itself lives in classification.ts (timing-safe).
+let confidentialMarkerKey: string | null = null;
 
 /**
  * #567: fold ONE project string through the boot-resolved alias map — the
@@ -149,6 +185,21 @@ let memoryInstructionsEnabled = true;
  */
 const canonProject = (v: unknown): string | undefined =>
   canonicalizeProject(typeof v === "string" ? v : null, projectAliases) ?? undefined;
+
+/**
+ * #332: resolve the classification visibility for ONE request's `agent` param
+ * against the boot-resolved roster. Absent/blank/unknown agent → FALSE
+ * (fail-closed non-member — confidential rows are hard-omitted); a rostered
+ * agent id → TRUE (the additive circle: members see both pools). The `agent`
+ * self-asserts identity, exactly like the client-pushed project field — same
+ * trust level, documented in the spec (per-agent tokens are the known future
+ * fix). Shared by every agent-facing read route below.
+ */
+const requestSeesConfidential = (rawAgent: unknown): boolean =>
+  isCircleMember(
+    typeof rawAgent === "string" && rawAgent ? rawAgent : null,
+    confidentialRoster,
+  );
 
 // Cache detectChunkSize results keyed by "<provider>/<model>@<baseUrl>" so we
 // probe each endpoint once per server boot rather than once per /distill request.
@@ -319,6 +370,11 @@ export function createMcpServer(): McpServer {
           project: canonProject(project),
           // Normalize legacy raw enum to the canonical term the DB stores.
           memoryType: memory_type ? normalizeMemoryType(memory_type) : "experience",
+          // #332: the MCP ingest path derives the stamp from its fixed
+          // source_agent like every write path (a roster entry
+          // "claude-code/manual" — or its bare "manual" — would stamp
+          // confidential; mechanical rule, no special case).
+          privacy: deriveIntakePrivacy("claude-code/manual", confidentialRoster),
         });
         if (explicitMark) applyExplicitMark(db, id, explicitMark);
         return { content: [{ type: "text" as const, text: `Memory stored (id: ${id.slice(0, 8)})${explicitMark ? ` — marked as ${explicitMark.kind === "corrects" ? "correcting" : "superseding"} ${explicitMark.target}` : ""}` }] };
@@ -522,11 +578,20 @@ export function createMcpServer(): McpServer {
     },
     async ({ operation, id, target_id, limit: resultLimit, domain: filterDomain, relationship: filterRelationship }) => {
       if (!db) return { content: [{ type: "text" as const, text: "Hicortex not initialized" }], isError: true };
+      // #332: MCP tools carry NO requester identity, so they are non-members
+      // by construction — confidential rows (incl. hub/neighbor content) are
+      // hard-omitted, and a confidential center/endpoint id reads as not
+      // found. Accepted in the spec: circle agents read through their
+      // plugin's agent-threaded REST calls, not through MCP tools.
+      const idVisible = (fullId: string): boolean => {
+        const row = db!.prepare("SELECT privacy FROM memories WHERE id = ?").get(fullId) as { privacy: string | null } | undefined;
+        return row?.privacy !== "confidential";
+      };
       try {
         if (operation === "neighbors") {
           if (!id) return { content: [{ type: "text" as const, text: "id is required for neighbors operation" }], isError: true };
           const resolvedId = resolveMemoryId(db, id);
-          if (!resolvedId) return { content: [{ type: "text" as const, text: `Memory not found: ${id}` }], isError: true };
+          if (!resolvedId || !idVisible(resolvedId)) return { content: [{ type: "text" as const, text: `Memory not found: ${id}` }], isError: true };
           const neighbors = getNeighbors(db, resolvedId, resultLimit ?? 10, filterRelationship);
           if (neighbors.length === 0) return { content: [{ type: "text" as const, text: "No connected memories found." }] };
           const text = neighbors.map((n) =>
@@ -551,7 +616,7 @@ export function createMcpServer(): McpServer {
           if (!id || !target_id) return { content: [{ type: "text" as const, text: "id and target_id are required for path operation" }], isError: true };
           const fromId = resolveMemoryId(db, id);
           const toId = resolveMemoryId(db, target_id);
-          if (!fromId || !toId) return { content: [{ type: "text" as const, text: "One or both memory IDs not found" }], isError: true };
+          if (!fromId || !toId || !idVisible(fromId) || !idVisible(toId)) return { content: [{ type: "text" as const, text: "One or both memory IDs not found" }], isError: true };
           const path = shortestPath(db, fromId, toId);
           if (!path) return { content: [{ type: "text" as const, text: "No path found between these memories." }] };
           const text = path.map((nodeId, i) => {
@@ -870,6 +935,20 @@ export async function startServer(options: {
     console.warn("");
   }
 
+  // #332: the confidential model — built at the SAME funnel (boot) with the
+  // same tuning overlay (buildConfidentialLlm). Absent is legal (standard-only
+  // installs never need it); the loud warning below fires only when the
+  // circle is actually active.
+  const confidentialBuilt = buildConfidentialLlm(savedConfig);
+  confidentialLlm = confidentialBuilt?.llm ?? null;
+  confidentialLlmConfig = confidentialBuilt?.config ?? null;
+  if (confidentialLlmConfig) {
+    console.log(
+      `[hicortex] Confidential LLM: ${confidentialLlmConfig.provider}/${confidentialLlmConfig.model}` +
+        ` — every touch of confidential text routes here`,
+    );
+  }
+
   // One-time migration of legacy state files (no-op if state.json exists)
   migrateLegacyState(stateDir);
 
@@ -994,6 +1073,82 @@ export async function startServer(options: {
     );
   }
 
+  // #332 confidential circle: resolve the roster (boot-time, like
+  // identityAgents — restart to apply). Every write path below derives the
+  // classification stamp from source_agent × this roster; the read paths
+  // membership-check the `agent` param against it. An empty roster is the
+  // zero-change default (deriveIntakePrivacy answers standard for everything).
+  const resolvedConfidential = resolveConfidentialAgents(savedConfig);
+  confidentialRoster = resolvedConfidential.roster;
+  if (resolvedConfidential.dropped.length > 0) {
+    console.warn(
+      `[hicortex] Ignoring invalid confidentialAgents entries: ${resolvedConfidential.dropped.join(", ")} ` +
+      `(ids must sanitize like ?agent= — a dropped id means that agent is NOT in the circle)`
+    );
+  }
+  // #609: workspace-path patterns resolve at the SAME boot seam (restart to
+  // apply, like the roster). Dropped entries are named once — a dropped
+  // pattern matches nothing, so a typo must surface in the log, never as a
+  // folder silently staying standard.
+  const resolvedConfidentialPaths = resolveConfidentialPaths(savedConfig);
+  confidentialPathPatterns = resolvedConfidentialPaths.patterns;
+  if (resolvedConfidentialPaths.dropped.length > 0) {
+    console.warn(
+      `[hicortex] Ignoring invalid confidentialPaths entries: ${resolvedConfidentialPaths.dropped.join(", ")} ` +
+      `(entries must be absolute paths or ~/…, with * only as a full segment and ** only as a trailing /** — ` +
+      `a dropped pattern matches nothing)`
+    );
+  }
+  // #614: resolve the marker key at the SAME boot seam (restart to apply).
+  // Null = client workspace markers are INERT — see the note below.
+  confidentialMarkerKey = resolveConfidentialMarkerKey(savedConfig);
+  if (confidentialRoster.length > 0 || confidentialPathPatterns.length > 0) {
+    console.log(
+      `[hicortex] Confidential circle: ${confidentialRoster.length} agent(s) rostered` +
+      `${confidentialPathPatterns.length > 0 ? `, ${confidentialPathPatterns.length} path pattern(s)` : ""}` +
+      // #614: name the marker arm's state on the same status line — a keyed
+      // marker is the third birthplace signal, and its being armed (or not)
+      // is exactly what an operator scanning the boot log needs to see.
+      (confidentialMarkerKey !== null ? ", workspace markers keyed" : "")
+    );
+  }
+  // The two "is the circle active" counts, computed ONCE for the marker-key
+  // boot note below and the unconfigured-circle warning after it (the same
+  // active predicate, warnIfCircleUnconfigured's).
+  const confidentialRowsCount = (
+    db!
+      .prepare("SELECT COUNT(*) AS c FROM memories WHERE privacy = 'confidential'")
+      .get() as { c: number }
+  ).c;
+  const queueConfidentialCount = (
+    db!
+      .prepare("SELECT COUNT(*) AS c FROM distill_queue WHERE privacy = 'confidential'")
+      .get() as { c: number }
+  ).c;
+  // #614: absent key + otherwise-active circle → the one-line inert note, so
+  // a marked folder's standard stamps are explained in the log, never silent.
+  // Zero-config installs stay silent (the classification zero-change rule).
+  const markerKeyNote = confidentialMarkerKeyNote({
+    markerKey: confidentialMarkerKey,
+    roster: confidentialRoster,
+    patterns: confidentialPathPatterns,
+    confidentialRows: confidentialRowsCount,
+    queueConfidential: queueConfidentialCount,
+  });
+  if (markerKeyNote) console.warn(markerKeyNote);
+  // #332: the ONE loud boot warning when the circle is active without the
+  // confidential model. "Active" = roster set OR path patterns set (#609) OR
+  // confidential rows already stored OR confidential items already queued —
+  // on a zero-config install none of those hold and the warning stays silent
+  // (AC-2).
+  warnIfCircleUnconfigured({
+    roster: confidentialRoster,
+    patterns: confidentialPathPatterns,
+    confidentialLlm,
+    confidentialRows: confidentialRowsCount,
+    queueConfidential: queueConfidentialCount,
+  });
+
   // #264 dir migration: rename <hicortex-home>/context/ → identity/ on boot
   // when only the legacy dir exists. The fallback read in identity-store.ts
   // (readSectionsWithFallback) is the safety net for a partial/no migration.
@@ -1104,10 +1259,14 @@ export async function startServer(options: {
   // memory index for client CLAUDE.md injection. Both routes share ONE handler
   // so the alias can never drift from the canonical shape. The legacy name is
   // kept indefinitely (existing SessionStart hooks literally fetch /lessons).
-  const learningsIndexHandler = (_req: express.Request, res: express.Response): void => {
+  // #332: the optional `agent` query param is the circle-membership gate —
+  // confidential lessons (born in the confidential reflection pool) serve to
+  // members only; non-members get today's shape minus those rows.
+  const learningsIndexHandler = (req: express.Request, res: express.Response): void => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     try {
-      const lessons = storage.getLessons(db, 30);
+      const member = requestSeesConfidential(req.query.agent);
+      const lessons = storage.getLessons(db, 30, null, { includeConfidential: member });
       const totalCount = storage.countMemories(db);
 
       // Project index
@@ -1145,7 +1304,11 @@ export async function startServer(options: {
   app.post("/ingest", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
 
-    const { content, source_agent, source_agent_id, source_domain, source_machine, project, memory_type, privacy, source_session, session_date, corrects, supersedes } = req.body ?? {};
+    // NOTE (#332): a client-declared `privacy` field is IGNORED here too —
+    // /ingest is a write path, and the stamp is server-derived from
+    // source_agent × the roster (a lying legacy client cannot smuggle itself
+    // into — or out of — the confidential class).
+    const { content, source_agent, source_agent_id, source_domain, source_machine, project, memory_type, source_session, session_date, corrects, supersedes } = req.body ?? {};
 
     if (!content || typeof content !== "string") {
       res.status(400).json({ error: "Missing or invalid 'content' field" });
@@ -1209,9 +1372,12 @@ export async function startServer(options: {
         // un-upgraded client folds here too.
         project: canonProject(project),
         memoryType: normalizedType ?? "experience",
-        // 0.16.x: privacy defaults to null (vestigial column). A legacy client
-        // that sends an explicit value is honored; absent → null.
-        privacy: typeof privacy === "string" ? privacy : null,
+        // #332: server-derived stamp — same source_agent × roster rule as
+        // /distill, so the legacy write path is not a stamping bypass.
+        privacy: deriveIntakePrivacy(
+          typeof source_agent === "string" ? source_agent : null,
+          confidentialRoster,
+        ),
         createdAt: session_date ? new Date(session_date).toISOString() : undefined,
       });
       if (explicitMark) applyExplicitMark(db, id, explicitMark);
@@ -1250,9 +1416,12 @@ export async function startServer(options: {
     // the #409 floor is unchanged in effect; the fence applies only when the
     // request carries a project (applySearchRelevanceGate is identity
     // otherwise).
+    // #332: the optional `agent` param is the circle-membership gate —
+    // absent/unknown = hard omit of confidential rows.
+    const member = requestSeesConfidential(req.query.agent);
     const minSimilarity = resolveSearchSimilarityFloor(req.query.minSimilarity);
     try {
-      let results = await retrieval.retrieve(db, embed, query, { limit, project });
+      let results = await retrieval.retrieve(db, embed, query, { limit, project, includeConfidential: member });
       results = applySearchRelevanceGate(results, { minSimilarity, project, crossProjectMinSimilarity: recallCrossProjectBar });
       res.json({ results });
     } catch (err) {
@@ -1262,8 +1431,9 @@ export async function startServer(options: {
 
   // REST /recall-index — pushed recall index (#192). One recall logic for all
   // harnesses: CC UserPromptSubmit hook, Hermes/OC per-turn plugins. Returns a
-  // compact index block (or null); exposure is recorded as shown_count +
-  // last_accessed, NOT access_count (that stays reserved for hicortex_get /
+  // compact index block (or null); exposure is recorded as shown_count ONLY
+  // (#569: last_accessed is the use clock — fetches/enrich — never refreshed
+  // by listing) and NOT access_count (that stays reserved for hicortex_get /
   // GET /memory — real use). {reset: true} clears the session's dedup state
   // (SessionStart/compaction).
   //
@@ -1293,10 +1463,15 @@ export async function startServer(options: {
     // that searches unblended and touches no centroid state. Extracted so the
     // exact behavior is unit-testable without HTTP (blendQueryVector
     // precedent); this adapter stays thin.
+    // #332: the optional body `agent` is the circle-membership gate — the
+    // factory (built per request) carries it into retrieve() so the omit
+    // happens at candidate-build time, not post-hoc. A client-declared
+    // `privacy` body field remains ignored (0.16.x backcompat posture).
     const factory = createRecallRetrieveFn({
       db,
       registry: recallRegistry,
       embedFn: embed,
+      includeConfidential: requestSeesConfidential((req.body as Record<string, unknown> | null)?.agent),
     });
     const r = await handleRecallIndex(
       {
@@ -1324,8 +1499,16 @@ export async function startServer(options: {
   app.get("/memory", (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     warnDeprecatedPrivacyParamIfPresent(req.query as Record<string, unknown>, "memory");
+    // #332: the optional `agent` param is the circle-membership gate — a
+    // confidential id fetched by a non-member answers 404 (before any
+    // strengthening side effect, inside handleMemoryGet).
     try {
-      const r = handleMemoryGet(db, { id: req.query.id }, { recordFetch: recordRecallFetch });
+      const r = handleMemoryGet(
+        db,
+        { id: req.query.id },
+        { recordFetch: recordRecallFetch },
+        { includeConfidential: requestSeesConfidential(req.query.agent) },
+      );
       res.status(r.status).json(r.body);
     } catch (err) {
       logAndSendInternalError(res, "memory", err);
@@ -1341,10 +1524,12 @@ export async function startServer(options: {
     // No hardcoded default: absent limit → the release-managed calibration
     // default (#408 — was the recentLimit config key).
     // 0.16.x: `privacy` query param accepted but ignored (vestigial column).
+    // #332: the optional `agent` param is the circle-membership gate.
     const limit = req.query.limit ? Number(req.query.limit) : undefined;
     warnDeprecatedPrivacyParamIfPresent(req.query as Record<string, unknown>, "recent");
+    const member = requestSeesConfidential(req.query.agent);
     try {
-      const results = retrieval.searchRecent(db, { project, limit });
+      const results = retrieval.searchRecent(db, { project, limit, includeConfidential: member });
       res.json({ results });
     } catch (err) {
       logAndSendInternalError(res, "recent", err);
@@ -1476,6 +1661,48 @@ export async function startServer(options: {
     }
   });
 
+  // GET/PUT /confidential/marker-key — ONE-COMMAND marker-key provisioning
+  // (#616). The pair behind `hicortex confidential`'s fetch-or-generate flow:
+  // GET answers the EFFECTIVE key (the boot-resolved module var — the value
+  // markers must carry) so a second machine reuses it instead of minting a
+  // second key; PUT registers a generated/chosen key (first machine, or
+  // rotation). Scoped to THIS key only — not a general config API (AC-4).
+  //
+  // Single-writer discipline, the PUT /identity/mode pattern: the key is
+  // normally resolved once at boot, and THIS route is the one live writer.
+  // On a successful PUT the adapter (1) persists through persistConfigUpdates
+  // (survives restarts, unrelated keys untouched) and (2) assigns the
+  // module-level confidentialMarkerKey to the SAME value — a rotation bites
+  // at the NEXT /distill intake with no restart, where an old-marker relay
+  // flips to standard + the #615 refusal warn. A PUT under the
+  // HICORTEX_CONFIDENTIAL_MARKER_KEY env override 409s (the env would shadow
+  // the write — no no-op success; the rule lives in the pure handler).
+  // Bearer-only: the standard auth middleware above, no exemption — the key
+  // is the confidential circle's secret, fetchable by token = owner (the
+  // #616 accepted trade-off). Pure handlers in marker-key-api.ts.
+  app.get("/confidential/marker-key", (_req, res) => {
+    const r = handleMarkerKeyGet(confidentialMarkerKey);
+    res.status(r.status).json(r.body);
+  });
+  app.put("/confidential/marker-key", (req, res) => {
+    try {
+      const r = handleMarkerKeyPut(req.body ?? null, process.env.HICORTEX_CONFIDENTIAL_MARKER_KEY);
+      if (r.status === 200 && r.key !== undefined) {
+        persistConfigUpdates(pathJoin(stateDir, "config.json"), { confidentialMarkerKey: r.key });
+        confidentialMarkerKey = r.key;
+        // One line, never the key value — the operator sees THAT the key
+        // rotated, not WHAT it is (same discipline as the CLI output).
+        console.log(
+          "[hicortex] confidentialMarkerKey set — the next delivery with a matching marker stamps confidential; " +
+          "markers carrying a previous key now stamp standard"
+        );
+      }
+      res.status(r.status).json(r.body);
+    } catch (err) {
+      logAndSendInternalError(res, "confidential/marker-key", err);
+    }
+  });
+
   // REST /distill — canonical capture endpoint (0.9.0+).
   // Every machine (including the server itself) POSTs denoised session text here.
   // The server distills, embeds, stores. Body limit: see `distillBodyLimitMb`
@@ -1491,7 +1718,26 @@ export async function startServer(options: {
     // attribution fields exist at EVERY exit incl. the 503 — capture-health
     // accounting records held posts there too. Nothing else reads them before
     // the guard, so semantics are unchanged.
-    const { text, messages, source_agent, source_agent_id, source_domain, source_machine, project, session_id, segment_id, session_date, privacy } = req.body ?? {};
+    // NOTE (#332): a client-declared `privacy` body field is IGNORED — the
+    // classification stamp is server-derived below from source_agent × the
+    // roster. The field is deliberately not even destructured.
+    // NOTE (#614): the pre-#614 `client_confidential` BOOLEAN is ignored the
+    // same way (accepted-and-ignored, deliberately not destructured) — it was
+    // the client-writable classification channel the marker key closes; only
+    // the relayed marker CONTENT (`client_marker`), validated server-side
+    // below, can stamp a delivery confidential from the client end.
+    // #609/#614: `workspace_path` (the session's workspace) and `client_marker`
+    // (the marker file's relayed content) join the destructure — the two
+    // client-carried birthplace signals, composed below. An old client sends
+    // neither; a new client against an old server is a no-op (unknown fields
+    // are never read).
+    const { text, messages, source_agent, source_agent_id, source_domain, source_machine, workspace_path, client_marker, project, session_id, segment_id, session_date } = req.body ?? {};
+    // typeof guards at the one boundary — anything malformed reads as absent.
+    const workspacePath = typeof workspace_path === "string" && workspace_path ? workspace_path : null;
+    // #614: unlike workspace_path, an EMPTY string stays PRESENT — an empty
+    // pre-#614 marker file relays as "" and is refused (warned) below, never
+    // silently treated as "no marker".
+    const clientMarker = typeof client_marker === "string" ? client_marker : null;
 
     // #567: fold the wire project ONCE, right after the destructure — the
     // queue enqueue, the sync distill prompt, and the insert opts below all
@@ -1499,6 +1745,36 @@ export async function startServer(options: {
     // lands as a stored variant (old npx clients, frozen plugin copies, and
     // un-refreshed extensions all canonicalize for free at the server).
     const canonProjectVal = canonProject(project);
+
+    // #332: the classification stamp, derived ONCE per delivery from the
+    // source agent × the boot-resolved roster (deterministic, by birthplace —
+    // never a content judgment and never client-declared). Every downstream
+    // landing (queue row, sync insert) carries THIS value.
+    // #609: the derivation composes the birthplace signals — roster agent OR
+    // confidentialPaths pattern OR the marker arm.
+    // #614: the marker arm is now KEY-VALIDATED server-side — the boot-resolved
+    // confidentialMarkerKey compared timing-safe against the relayed content
+    // (an absent key makes every marker inert; a refused marker never reduces
+    // a server rule).
+    const derivedPrivacy = deriveIntakePrivacy(
+      typeof source_agent === "string" ? source_agent : null,
+      confidentialRoster,
+      {
+        workspacePath,
+        markerContent: clientMarker,
+        markerKey: confidentialMarkerKey,
+        paths: confidentialPathPatterns,
+      },
+    );
+    // #614: the rate-limited refusal warn at the intake seam. Marker content
+    // arrived and did NOT validate — no key configured (the arm is inert), or
+    // a mismatch (stale pre-key marker / rotated key / forgery). One guard
+    // covers both cases; warnRefusedMarker itself is once-per-process and
+    // never echoes the content or the key. A matching marker never warns; an
+    // absent marker (null) never warns.
+    if (clientMarker !== null && clientMarker !== confidentialMarkerKey) {
+      warnRefusedMarker({ markerKey: confidentialMarkerKey, workspacePath });
+    }
 
     // #422 capture health: normalize the wire fields ONCE so every exit below
     // records with a one-liner (recordDistillActivity re-sanitizes machine/
@@ -1549,6 +1825,23 @@ export async function startServer(options: {
       // an LLM is configured.
     }
 
+    // #332 sync-mode refusal: a CONFIDENTIAL delivery with no confidential
+    // model answers 503 — the client holds its cursor and retries (the
+    // strict-mode watermark precedent). It is NEVER distilled on the main
+    // model. Queue mode stores it and the drain holds it instead (per-item
+    // skip-and-continue); a fresh install's first delivery can never be
+    // confidential (no roster configured ⇒ nothing derives confidential), so
+    // the fresh-brain immediate-distill carve-out is untouched.
+    if (derivedPrivacy === "confidential" && !queueMode && (!confidentialLlm || !confidentialLlmConfig)) {
+      recordDistillActivity(db, capEntry(0, "held"));
+      res.status(503).json({
+        error:
+          "Confidential delivery held — no confidential model configured " +
+          "(llmConfidentialBaseUrl/ApiKey). It will be retried; it is never distilled on the main model.",
+      });
+      return;
+    }
+
     // Resolve the conversation text from either the pre-denoised string or raw messages array.
     // `fromTextBranch` is captured once so the redaction gate below uses the SAME
     // discriminator as the resolution (avoids re-redacting the messages-derived
@@ -1560,8 +1853,12 @@ export async function startServer(options: {
       conversationText = text;
     } else if (Array.isArray(messages) && messages.length > 0) {
       // The messages branch already redacts via extractConversationText
-      // (distiller.ts), which calls redact() as its final step.
-      conversationText = extractConversationText(messages);
+      // (distiller.ts), which calls redact() as its final step. #332: it
+      // receives the SAME redaction config (the extended preset for
+      // confidential deliveries) so both branches redact identically.
+      conversationText = extractConversationText(messages, {
+        extended: derivedPrivacy === "confidential",
+      });
     } else {
       res.status(400).json({ error: "Provide either 'text' (string) or 'messages' (array)" });
       return;
@@ -1577,8 +1874,14 @@ export async function startServer(options: {
     // negative lookahead, and format-specific patterns don't match it). The
     // messages branch is already covered above. Disable-resistance
     // (hostedMode) is Phase 0b.
+    // #332 redaction pilot: CONFIDENTIAL deliveries use the extended preset
+    // (DEFAULT_PATTERNS + emails + phone numbers) — the material an
+    // inner-circle agent captures is exactly the contact-identifier-rich
+    // kind (#558). Standard deliveries keep today's set byte-identically.
     if (fromTextBranch) {
-      const { text: redacted, count } = redact(conversationText);
+      const { text: redacted, count } = redact(conversationText, {
+        extended: derivedPrivacy === "confidential",
+      });
       if (count > 0) {
         console.log(`[hicortex] Redacted ${count} secret(s) from /distill text`);
       }
@@ -1645,11 +1948,16 @@ export async function startServer(options: {
         source_agent_id,
         source_domain,
         source_machine,
+        // #609: the workspace path rides the queue row so the drain's inserts
+        // keep it and backfill-privacy can path-match queued rows.
+        workspace_path: workspacePath,
         project: canonProjectVal,
         session_id,
         segment_id,
         session_date,
-        privacy,
+        // #332: the queue row carries the DERIVED stamp — the drain trusts it
+        // (and routes the item to the matching model).
+        privacy: derivedPrivacy,
       });
       recordDistillActivity(db, capEntry(conversationText.length, duplicate ? "skipped" : "ok"));
       if (duplicate) {
@@ -1668,7 +1976,7 @@ export async function startServer(options: {
       return;
     }
 
-    // #529: from here on queueMode is false, so the no-LLM guard above has
+    // #529: from here on queueMode is false, so the no-LLM guards above have
     // already answered 503 in every path that reaches this line. Restated so
     // the sync flow keeps its non-null llm/llmConfig typing unchanged.
     if (!llm || !llmConfig) {
@@ -1676,13 +1984,21 @@ export async function startServer(options: {
       return;
     }
 
+    // #332 per-pool client selection (the sync path's mirror of the drain's
+    // selection): a confidential delivery distills on the CONFIDENTIAL client
+    // — the refusal above guarantees it exists by here — and the probe gate +
+    // chunk-size cache below use ITS endpoint. Standard deliveries are
+    // byte-identical to today.
+    const syncLlm: LlmClient = derivedPrivacy === "confidential" ? confidentialLlm! : llm;
+    const syncLlmConfig: LlmConfig = derivedPrivacy === "confidential" ? confidentialLlmConfig! : llmConfig;
+
     // #337: readiness gate — cached minimal generation probe BEFORE
     // detectChunkSize + distillSession, so a dead endpoint never even pays the
     // chunk-size probe. Placed AFTER the dedup short-circuits (a duplicate
     // costs nothing and must not trip the gate). On failure: 503 with the
     // diagnosis — the capture client treats non-201/200 as transient and holds
     // its cursor (capture.ts), so the segment is retried next run, never lost.
-    if (!(await resolveDistillProbeGate(llm, llmConfig))) {
+    if (!(await resolveDistillProbeGate(syncLlm, syncLlmConfig))) {
       recordDistillActivity(db, capEntry(conversationText.length, "held"));
       res.status(503).json({ error: "LLM endpoint not generating — session will be retried" });
       return;
@@ -1691,9 +2007,9 @@ export async function startServer(options: {
     // Cache detectChunkSize per endpoint so we probe at most once per server boot.
     // numCtx is passed so chunk size derives from the request's ACTUAL context
     // window (#231, #228) — the chunker and the request agree by construction.
-    const cacheKey = `${llmConfig.provider}/${llmConfig.model}@${llmConfig.baseUrl}`;
+    const cacheKey = `${syncLlmConfig.provider}/${syncLlmConfig.model}@${syncLlmConfig.baseUrl}`;
     if (!chunkSizeCache.has(cacheKey)) {
-      chunkSizeCache.set(cacheKey, await detectChunkSize(llmConfig.provider, llmConfig.model, llmConfig.baseUrl, llmConfig.numCtx));
+      chunkSizeCache.set(cacheKey, await detectChunkSize(syncLlmConfig.provider, syncLlmConfig.model, syncLlmConfig.baseUrl, syncLlmConfig.numCtx));
     }
     const chunkSize = chunkSizeCache.get(cacheKey)!;
 
@@ -1722,7 +2038,9 @@ export async function startServer(options: {
       // server-side per-entry console.log in distillChunk stays as well.
       const dropped: string[] = [];
       const entries = await distillSession(
-        llm, conversationText, canonProjectVal ?? "unknown", date, chunkSize, dropped,
+        // #332: the per-pool selection — syncLlm is the confidential client
+        // for confidential deliveries (guaranteed non-null by the refusal).
+        syncLlm, conversationText, canonProjectVal ?? "unknown", date, chunkSize, dropped,
         (u) => {
           distillUsage.prompt += u.prompt_tokens ?? 0;
           distillUsage.completion += u.completion_tokens ?? 0;
@@ -1767,6 +2085,9 @@ export async function startServer(options: {
               // filtered. Default null for older clients that don't send them.
               sourceAgentId: typeof source_agent_id === "string" ? source_agent_id : null,
               sourceDomain: typeof source_domain === "string" ? source_domain : null,
+              // #609: the workspace path (metadata for the path backfill +
+              // attribution); null for deliveries that carried none.
+              workspacePath,
               sourceMachine: storage.sanitizeSourceMachine(source_machine),
               // Per-chunk key: "<session_id>[#<segment_id>]#<i>". The prefix
               // matches the dedup checks above, so a re-run is idempotent.
@@ -1778,9 +2099,9 @@ export async function startServer(options: {
               // distiller.ts. Pre-#216 distiller output (no tag) defaults to
               // experience in the parser, so this is backward compatible.
               memoryType,
-              // 0.16.x: privacy defaults to null (vestigial column). A legacy
-              // client that sends an explicit value is honored; absent → null.
-              privacy: typeof privacy === "string" ? privacy : null,
+              // #332: the DERIVED stamp — same value the queue branch would
+              // have carried (client-declared privacy never reaches here).
+              privacy: derivedPrivacy,
               createdAt,
             }),
           );
@@ -1822,7 +2143,11 @@ export async function startServer(options: {
   // -------------------------------------------------------------------------
   app.post("/update", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
-    const { id, content, project, memory_type, privacy } = req.body ?? {};
+    // NOTE (#332): `privacy` is no longer a writable field — classification is
+    // server-derived at intake and changed only by the owner's
+    // `hicortex backfill-privacy`. A body privacy field is ignored (kept out
+    // of the destructure so the intent is structural).
+    const { id, content, project, memory_type } = req.body ?? {};
     if (!id || typeof id !== "string") {
       res.status(400).json({ error: "Missing or invalid 'id' field" });
       return;
@@ -1850,7 +2175,6 @@ export async function startServer(options: {
     // #567: fold — a blank-after-fold label becomes SQL NULL (a whitespace
     // label is junk), never a stored variant.
     if (project !== undefined) fields.project = canonicalizeProject(project, projectAliases);
-    if (privacy !== undefined) fields.privacy = privacy;
 
     // Validate + normalize memory_type BEFORE adding to `fields` so the
     // empty-fields check below correctly counts a memory_type-only update.
@@ -2031,20 +2355,31 @@ export async function startServer(options: {
     const resultLimit = rawLimit && Number.isFinite(rawLimit) && rawLimit >= 1 ? Math.floor(rawLimit) : 10;
     const filterDomain = typeof req.query.domain === "string" && req.query.domain ? req.query.domain : undefined;
     const filterRelationship = typeof req.query.relationship === "string" && req.query.relationship ? req.query.relationship : undefined;
+    // #332: the optional `agent` param gates neighbors/hubs/path (the
+    // content-bearing ops). op=export stays UNGATED — it is the /viz owner
+    // surface (owner ruling: dashboard/viz not gated in this build; a
+    // show-confidential toggle is a separate later item).
+    const member = requestSeesConfidential(req.query.agent);
+    // A confidential endpoint/center id is invisible to non-members — same
+    // 404 contract as GET /memory (existence is not revealed).
+    const visibleId = (id: string): boolean => {
+      const row = db!.prepare("SELECT privacy FROM memories WHERE id = ?").get(id) as { privacy: string | null } | undefined;
+      return member || row?.privacy !== "confidential";
+    };
 
     try {
       if (op === "neighbors") {
         const idParam = typeof req.query.id === "string" ? req.query.id : "";
         if (!idParam) { res.status(400).json({ error: "id is required for neighbors operation" }); return; }
         const resolvedId = resolveMemoryId(db, idParam);
-        if (!resolvedId) { res.status(404).json({ error: `Memory not found: ${idParam}` }); return; }
-        const neighbors = getNeighbors(db, resolvedId, resultLimit, filterRelationship);
+        if (!resolvedId || !visibleId(resolvedId)) { res.status(404).json({ error: `Memory not found: ${idParam}` }); return; }
+        const neighbors = getNeighbors(db, resolvedId, resultLimit, filterRelationship, { includeConfidential: member });
         res.json({ results: neighbors });
         return;
       }
 
       if (op === "hubs") {
-        let hubs = detectHubs(db);
+        let hubs = detectHubs(db, 2, 3, { includeConfidential: member });
         if (filterDomain) {
           hubs = hubs.filter((h) => h.domain === filterDomain || h.project === filterDomain);
         }
@@ -2061,8 +2396,8 @@ export async function startServer(options: {
         }
         const fromId = resolveMemoryId(db, fromParam);
         const toId = resolveMemoryId(db, toParam);
-        if (!fromId || !toId) { res.status(404).json({ error: "One or both memory IDs not found" }); return; }
-        const path = shortestPath(db, fromId, toId);
+        if (!fromId || !toId || !visibleId(fromId) || !visibleId(toId)) { res.status(404).json({ error: "One or both memory IDs not found" }); return; }
+        const path = shortestPath(db, fromId, toId, 5, { includeConfidential: member });
         res.json({ path: path ?? null });
         return;
       }
@@ -2145,8 +2480,10 @@ export async function startServer(options: {
   // GET /dashboard/data — the metric payload (series, composition, digest).
   // Bearer-only (the auth middleware is installed at app boot); no separate
   // exemption. The handler lives in src/dashboard.ts (pure); this is the thin
-  // express adapter that injects the live db + config. STRICTLY view-only —
-  // no mutation endpoints on the dashboard surface.
+  // express adapter that injects the live db + config. Read-only like every
+  // /dashboard/data GET; the dashboard surface's deliberately narrow
+  // mutation set lives in the scoped PUTs below (model settings #422,
+  // capture-pause #423, quality verdict #578).
   app.get("/dashboard/data", dashboardDataHandler(
     () => db!,
     () => readConfigFile(stateDir),
@@ -2208,6 +2545,32 @@ export async function startServer(options: {
   // (auth middleware, no shell exemption — it mutates operator state);
   // localhost bypass applies. Handler + adapter live in src/dashboard.ts.
   app.put("/dashboard/capture-pause", dashboardCapturePausePutHandler(
+    () => db!,
+  ));
+
+  // GET /dashboard/quality/contested — the #578 quality drawer's contested
+  // slice: auto-graded verdict rows below the (render-edge) confidence threshold,
+  // least-confident first, with the index line AS PUSHED re-rendered through
+  // the shared formatIndexLine + the stored prompt excerpt. LAZY + paginated
+  // (?limit= default 20 cap 100, ?offset=) so grading data stays out of the
+  // ≤ 2 KB memory_precision block. Items the owner has answered (thumbs
+  // recorded) leave the list. Bearer-only (auth middleware, no shell
+  // exemption — it carries grading data); localhost bypass applies. Handler
+  // lives in src/quality-scoreboard.ts (pure) via a thin adapter in
+  // src/dashboard.ts.
+  app.get("/dashboard/quality/contested", dashboardQualityContestedHandler(
+    () => db!,
+  ));
+
+  // PUT /dashboard/quality/verdict — the dashboard's THIRD scoped writer
+  // (after /dashboard/model and /dashboard/capture-pause): the owner's thumbs
+  // on a contested line. Body {id, verdict: 1|-1} (numeric: 1 useful, -1
+  // not) — persisted as grader='owner', a NEW verdict row against the same
+  // (push, memory) so history is append-only; these rows are the
+  // owner calibration reference and are NEVER pruned by the nightly verdict
+  // retention. 404 on an unknown id, 400 on a malformed body. Bearer-only
+  // like every dashboard writer; localhost bypass applies.
+  app.put("/dashboard/quality/verdict", dashboardQualityVerdictPutHandler(
     () => db!,
   ));
 

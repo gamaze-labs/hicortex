@@ -143,11 +143,12 @@ export async function runUninstall(): Promise<void> {
 
   console.log();
 
-  // 1. Stop and remove daemon + capture/nightly timers (all units, or a timer
-  //    keeps firing against a half-removed install). Since 0.17 there are two
-  //    scheduled jobs: the capture timer (hicortex-capture) and the
-  //    consolidation timer (hicortex-nightly); remove both either way (a client
-  //    install has no consolidation timer, a server install has both).
+  // 1. Stop and remove the daemon + every Hicortex timer (or a timer keeps
+  //    firing against a half-removed install). Current installs have one
+  //    scheduled job — the consolidation timer (hicortex-nightly; server /
+  //    co-located only). Legacy units are removed too: the capture watchdog
+  //    (hicortex-capture, retired #596 — an old install keeps it until its
+  //    next init/uninstall) and the pre-0.17 single nightly.
   const os = platform();
   if (os === "darwin") {
     for (const name of ["com.gamaze.hicortex.plist", "com.gamaze.hicortex-nightly.plist", "com.gamaze.hicortex-capture.plist"]) {

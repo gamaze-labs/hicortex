@@ -176,6 +176,11 @@ export function readHermesSessions(
         batches.push({
           sessionId: s.id,
           projectName: profile,
+          // #609: Hermes has NO workspace — sessions are per-profile
+          // conversations and the message query selects no path field — so
+          // path/marker birthplace signals deliberately never fire for Hermes
+          // deliveries (roster-only coverage). Never invent a path here.
+          workspacePath: null,
           sourceAgent: `hermes/${profile}`,
           date: new Date(endTs * 1000).toISOString().slice(0, 10),
           entries,
