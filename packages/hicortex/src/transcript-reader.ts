@@ -37,6 +37,16 @@ export interface TranscriptBatch {
    */
   workspacePath?: string | null;
   /**
+   * Per-DELTA-entry workspace (#619), aligned with `entries` (length ===
+   * entries.length) — entry i's OWN workspace, null when that entry carries
+   * none. CC fills it (CC writes `cwd` on every entry) so the packer can
+   * split the delta at every mid-session workspace change; readers with a
+   * session-level workspace (Pi/OC/opencode: the header `cwd` /
+   * `session.directory`) or none (Hermes) OMIT it and keep `workspacePath`
+   * as the whole batch's birthplace — the capture loop falls back to it.
+   */
+  entryWorkspaces?: Array<string | null>;
+  /**
    * Per-session cursor key (`<prefix>:<sessionId>`) — the capture-cursors.json
    * key whose value gates and advances this session's incremental capture (#189).
    */
@@ -210,6 +220,9 @@ function parseTranscriptFile(
   // entries (CC writes the session's cwd on every entry; the delta slice keeps
   // the value authoritative for what THIS capture covers). projectName stays
   // the lossy directory-name decode — it keeps serving only the label.
+  // #619: this stays the BATCH-LEVEL fallback; `entryWorkspaces` below carries
+  // each entry's own cwd so a mid-session cd re-birthplaces only the entries
+  // after it (the packer splits on changes, never rewrites this label).
   let workspacePath: string | null = null;
   for (const entry of delta) {
     const cwd = (entry as { cwd?: unknown } | null)?.cwd;
@@ -218,6 +231,10 @@ function parseTranscriptFile(
       break;
     }
   }
+  const entryWorkspaces = delta.map((entry) => {
+    const cwd = (entry as { cwd?: unknown } | null)?.cwd;
+    return typeof cwd === "string" && cwd ? cwd : null;
+  });
 
   return {
     sessionId: basename(filePath, ".jsonl"),
@@ -227,6 +244,7 @@ function parseTranscriptFile(
       : new Date().toISOString().slice(0, 10),
     entries: delta,
     workspacePath,
+    entryWorkspaces,
     cursorKey,
     startCursor: start,
     generation: gen,

@@ -901,7 +901,7 @@ const MIGRATIONS: Migration[] = [
       // (shown-then-fetched, marked useful with zero grading calls). score +
       // confidence are stored RAW and THRESHOLD-FREE (the #476 law —
       // "useful" and "contested" are derived at render), verdict carries the
-      // owner's ±1 thumb (NULL for the 'auto' grader, derived at render). Pruned with
+      // reviewer's ±1 thumb (NULL for the 'auto' grader, derived at render). Pruned with
       // the 90-day horizon EXCEPT grader='owner' rows.
       //
       // Idempotent: hasColumn-guarded ALTER (v15 pattern) + IF NOT EXISTS.

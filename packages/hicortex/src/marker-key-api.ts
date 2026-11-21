@@ -5,7 +5,7 @@
  * The problem (#616): `hicortex confidential` (#614) requires the server's
  * `confidentialMarkerKey` on the machine it runs on, and distributing it by
  * hand (mirror into each client's config.json, or export its env mirror) is
- * ceremony an owner does once per machine. The fix keeps the client's ONE
+ * ceremony the operator repeats once per machine. The fix keeps the client's ONE
  * existing credential: the machine already holds the server URL + authToken,
  * so the command can FETCH the key (second machine: no new key generated) or
  * GENERATE one and REGISTER it with the server (first machine ever) — one
@@ -16,12 +16,12 @@
  * and NOTHING else. Anything richer would turn the bearer token into a
  * config exfiltration/write surface it deliberately is not today.
  *
- * Accepted trade-off (owner ruling on the issue — do not re-litigate): the
- * key is fetchable by token, which collapses the marker key's barrier to
- * token = owner. Fine: the marker key's real protection is against workspace
- * processes WITHOUT the token/config access (a shell script or agent reading
- * the marker file cannot forge one); a token holder can already POST
- * arbitrary content (the #599 F5 ruling).
+ * Accepted trade-off (settled design decision — do not re-litigate): the key
+ * is fetchable by token, which collapses the marker key's barrier to the
+ * token itself. That is acceptable: the marker key's real protection is
+ * against workspace processes WITHOUT the token/config access (a shell
+ * script or agent reading the marker file cannot forge one); a token holder
+ * can already POST arbitrary content.
  *
  * Layout follows the identity-store.ts precedent: pure, side-effect-free
  * handlers HERE (validation + response shaping), thin adapters in

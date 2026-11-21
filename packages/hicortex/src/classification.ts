@@ -3,13 +3,13 @@
  * memory classification (`standard` | `confidential`, carried by
  * `memories.privacy`; see MemoryPrivacy in types.ts).
  *
- * The model, in one paragraph: an operator lists inner-circle agents in
+ * The model, in one paragraph: an operator lists confidential-circle agents in
  * config (`confidentialAgents`, the same agent-id namespace as
  * `identityAgents` / `?agent=`). Captures whose `source_agent` is rostered
  * are stamped `confidential` at intake — server-derived, deterministic, by
  * birthplace; never a content judgment (content classification was rejected,
  * #197) and never client-declared. The workspace marker (#609/#614) is
- * client-RELAYED but server-VALIDATED: the marker file carries the owner-set
+ * client-RELAYED but server-VALIDATED: the marker file carries the operator-set
  * `confidentialMarkerKey` as its content, compared timing-safe at intake —
  * marker content without the key never stamps (the client-writable
  * classification channel #614 closes; an unkeyed install ignores markers
@@ -76,11 +76,11 @@ export function resolveConfidentialAgents(
 
 /**
  * Normalize a capture-side `source_agent` for roster matching. Capture stamps
- * harness-qualified ids (`hermes/nano`, `claude-code/myproject`), while the
+ * harness-qualified ids (`hermes/atlas`, `claude-code/myproject`), while the
  * roster carries bare agent ids (the same ids the read side receives as
  * `agent`) — ONE config list, no read-ids/capture-ids sync hazard. The match
- * is exact, or exact after stripping the FIRST path segment (so `hermes/nano`
- * matches roster `nano`, and a future `anything/nano` matches too — generic
+ * is exact, or exact after stripping the FIRST path segment (so `hermes/atlas`
+ * matches roster `atlas`, and a future `anything/atlas` matches too — generic
  * prefix, not a per-harness table). Case-insensitive on the id half via the
  * roster's sanitized (lowercased) form.
  */
@@ -95,8 +95,8 @@ export function isConfidentialSourceAgent(
   if (slash < 0) return false;
   const bare = agent.slice(slash + 1);
   const rest = bare.indexOf("/");
-  // Strip only the FIRST segment — `hermes/nano` → `nano`, but
-  // `a/b/nano` → `b/nano` (never a deep-suffix match; capture ids are
+  // Strip only the FIRST segment — `hermes/atlas` → `atlas`, but
+  // `a/b/atlas` → `b/atlas` (never a deep-suffix match; capture ids are
   // single-qualified by construction).
   return rest < 0 && roster.includes(bare);
 }
@@ -274,7 +274,7 @@ export function safeMarkerKeyEqual(markerContent: string, key: string): boolean 
 }
 
 /**
- * Resolve the `confidentialMarkerKey` (#614) — the owner-set secret a
+ * Resolve the `confidentialMarkerKey` (#614) — the operator-set secret a
  * workspace marker must carry for its folder to stamp confidential at
  * intake. Precedence: env `HICORTEX_CONFIDENTIAL_MARKER_KEY` OVERRIDES the
  * config value (the env-last-word ops override, so a restart-free rotation
@@ -308,7 +308,7 @@ export function resolveConfidentialMarkerKey(
  * inert (the empty-marker client-writable channel is closed), and a
  * present-but-refused marker never reduces a server rule (markers only add,
  * never subtract — safe because a token holder can already POST arbitrary
- * content, the #599 F5 ruling, token = owner). The optional third argument
+ * content). The optional third argument
  * keeps every existing caller byte-identical (no signals = the #332
  * agent-only rule).
  */
@@ -366,8 +366,8 @@ export interface IntakeWorkspaceSignals {
  * blank, or unknown `agent` → false (fail-closed: an unknown id can never
  * widen visibility, exactly like the identity layer's mode resolution). The
  * `agent` value is sanitized first so a wire id arrives in the roster's
- * namespace (`Nano` → `nano`); note sanitizeAgentId also collapses inner
- * separators, so `hermes/nano` sent as a requester id reads as `hermes-nano`
+ * namespace (`Atlas` → `atlas`); note sanitizeAgentId also collapses inner
+ * separators, so `hermes/atlas` sent as a requester id reads as `hermes-atlas`
  * — the read side intentionally matches BARE ids only (plugins send their
  * resolved profile name, not their capture-side qualified stamp).
  */

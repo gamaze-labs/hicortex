@@ -180,8 +180,8 @@ export function recordRecallFetch(
  * is deleted — retained rows == window rows.
  *
  * #578 retention split — recall_verdicts rides the SAME horizon with ONE
- * carve-out: grader='owner' rows are NEVER dropped (they are the owner's
- * calibration reference, tiny volume by construction — about
+ * carve-out: grader='owner' rows are NEVER dropped (they are the
+ * manual-verdict calibration reference, tiny volume by construction — about
  * five thumbs a week). Machine rows ('auto', 'revealed') prune with the events
  * they were derived from — a revealed verdict outliving its own event rows
  * would claim a window the store no longer holds.

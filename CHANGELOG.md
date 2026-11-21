@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.27.3] — 2026-11-20
+
+### Fixed — security
+
+- **The opt-in weekly grading lane now samples standard-class memories only.** With quality grading enabled, the weekly population query fed every shown memory — including confidential ones — to the sampling stage, so confidential index lines and their prompt excerpts could be egressed to the third-party grading endpoint. The population is now standard-only by construction (confidential rows are excluded from both arms of the lane, revealed-useful marking and auto-grading), and the line-render path independently refuses confidential rows as a second layer — no verdict row of any grader is ever written for a confidential memory, and nothing about it leaves the machine via the lane. The lane remains off unless explicitly enabled. (#618)
+
+- **Mid-session directory changes no longer mis-stamp the workspace birthplace of captured segments.** A session whose working directory changed partway through (a session started outside a confidential workspace that later `cd`-ed into one, or the reverse) had ALL its capture segments stamped with the first directory of the batch — later entries silently took the wrong birthplace, and confidential-workspace content could lose its classification. The Claude Code reader now records each delta entry's own working directory, and the segment packer breaks the batch at every workspace change: each POSTed segment carries the workspace its own entries ran in (with the marker-key walk resolved per segment), while readers that only know a session-level workspace keep the previous single-stamp behavior exactly. The added splits only introduce extra segment boundaries — cursor discipline, ordering, and dedup semantics are unchanged. (#619)
+
+### Changed — internal
+
+- **Internal comment hygiene pass over shipped sources.** Comments in the published package, its bundled dashboard asset, and the Pi/opencode client files were reworded to neutral product voice — the same technical meaning with internal decision history and framing removed. No code, prompt, or behavior change. (#575)
+
+## [0.27.2] — 2026-11-17
+
+### Added — privacy
+
+- **The CC, Pi, and opencode read clients now identify themselves by their workspace folder name, extending confidential reads to those harnesses.** One concept, no new mechanism: the folder basename IS the agent id. The CC hooks send the sanitized basename on `/recall-index`, `/learnings`, and `/identity`; the Pi extension and opencode plugin send it on all six read paths (the recall body plus the `/search`, `/memory`, `/recent`, `/learnings`, `/graph` tool proxies, which read the id a per-prompt hook resolved from the session directory — never a process-cwd fallback). A circle member working in a roster-named workspace (`~/Agents/nano/` → the agent `nano`) now sees its confidential memories through those clients too. The id is sanitized like every agent id, and a basename with nothing valid left omits the param entirely — fail-closed, the request reads as a non-member, never a 400 a fail-soft hook would swallow. The per-session lessons caches store the id they fetched under and re-fetch when it changes, so a first turn without a known workspace cannot pin a standard-pool block for a member's session. CC's install-global `agentName` no longer drives the hook's identity (the basename does; `agentName` remains config/status-reported via `hicortex status`). Older clients are safe but anonymous: they send no id, read the standard pool only, and cannot see confidential memories. The Hermes plugin (0.7.11+) already sent its profile id; OpenClaw sends none. (#600)
+
 ## [0.27.1] — 2026-11-12
 
 ### Added — privacy

@@ -98,8 +98,8 @@
       within ~2–2.5× (owner: no huge green balls, nothing barely visible);
       stage colors untouched.
 
-  FIX ROUND 6 (owner-approved proto of record mockups/progress-bar.html,
-    2026-09-14 — variant 3 + copy A): ENTRY LOADING SCREEN. Pure inline
+  FIX ROUND 6 (the approved mockup, variant 3 + copy A): ENTRY LOADING
+    SCREEN. Pure inline
     HTML+CSS at the very top of the body, BEFORE the app markup and the
     engine script — it paints on URL entry with ZERO script (the real
     page is black for seconds while the engine parses/boots; the splash
@@ -457,7 +457,7 @@
      right. The value is the hero (≥2x the label size — tests pin the
      ratio), neutral --text; the chips are the ONLY colored element on the
      face (green improving / red worsening / gray flat or no baseline).
-     Rows breathe — the card may grow taller (owner 2026-11-10). Theme
+     Rows breathe — the card may grow taller. Theme
      tokens only, both themes. */
   .rec-l1{ display:flex; flex-direction:column; gap:8px; min-width:0; }
   .rec-l1[hidden]{ display:none; }   /* author display beats the UA's [hidden] — the #billing-banner idiom; without it the flex rule un-hides the container */
@@ -1177,9 +1177,9 @@
 </script>
 </head>
 <body class="booting">
-<!-- ============ entry loading screen (#409 fix round 6 — the owner-
-     approved proto of record mockups/progress-bar.html, variant 3 + copy
-     A). Sits at the very top of the body with its OWN style block: it paints
+<!-- ============ entry loading screen (#409 fix round 6 — the approved
+     mockup, variant 3 + copy A). Sits at the very top of the body with
+     its OWN style block: it paints
      on URL entry with ZERO script, fully opaque black in both themes, and
      the engine only ever fades it away (entrySplashDismiss at the boot
      reveal). On failure the copy line swaps to an honest error — never an
@@ -1297,24 +1297,24 @@
         <div class="csub" id="tok-sub">&nbsp;</div>
         <div id="tok-nights" aria-label="LLM tokens per nightly run this billing period"></div>
       </div>
-      <!-- Memory Precision (#476, owner retitle; #578 quality audit; #591
+      <!-- Memory Precision (#476 retitle; #578 quality audit; #591
            presentation pass; #593 stat-table round 2) — ONE card, two
            context levels + the quality instrument. Level 2 (recall depth)
            keeps the #426 U-band + zone word + provisional-hover semantics;
            the marker/tooltip read the WINDOW ratio off
            D.memory_precision.level2 (a pre-#476 server has no block → the
-           headline ratio — today's rendering exactly). The #578 audit
-           (owner: "do the numbers earn their place"): mean similarity and
-           redundant share are TOOLTIP-ONLY (high cosine was the noise's
-           camouflage — not actionable), and the FACE carries what answers
+           headline ratio — today's rendering exactly). The #578 audit:
+           mean similarity and redundant share are TOOLTIP-ONLY (high cosine
+           was the noise's camouflage — not actionable), and the FACE
+           carries what answers
            "is recall quality improving": uses-per-showing (the big word),
            pushes/lines volume, and the Tier-1 rows with per-change deltas
            off the server's change-registry entries while the raw window
-           covers them. The #591 pass (owner product feedback: the card must
+           covers them. The #591 pass (the card must
            SELF-INTERPRET) made every row read in plain words (MP_NAME) with
            deltas valenced by the explicit per-metric map (MP_GOOD) and the
            technical layer demoted behind per-row tooltips. The #593 round 2
-           (owner amendment 2026-11-10: the card reads as a STAT TABLE)
+           (the card reads as a STAT TABLE)
            reshapes that face: EXACTLY 4 stat rows (clutter / foreign
            content / weak matches / churn), ONE stat per row in a fixed
            value/label/chip grid that can never wrap — the value is the
@@ -1323,7 +1323,7 @@
            tooltips, the headline is ONE neutral line (direction · caveat)
            and the zone word's tooltip carries the plain meaning +
            uses-per-showing. The divergence drawer is GONE from the card
-           (owner: the row double-counted the gauge's own reason; the data
+           (the row double-counted the gauge's own reason; the data
            still flows into the nightly snapshots — the page just never
            renders it), and the contested row is presence-gated: hidden
            unless the grading lane ran AND something is contested (no
@@ -3419,7 +3419,7 @@ const RECALL_ZONE_PLAIN={low:'shown memories are rarely picked up',normal:'shown
    assumption on the card; a metric whose good direction flips changes
    here and nowhere else. Plain names beside it: the reader-facing
    vocabulary (the internal metric keys stay in the payload; #593 renamed
-   cross_share's face label to the amendment's "Foreign content"). */
+   cross_share's face label to "Foreign content"). */
 const MP_GOOD={block_size:'down',cross_share:'down',sub_bar_share:'down',recycling:'down'};
 const MP_NAME={block_size:'Clutter per prompt',cross_share:'Foreign content',sub_bar_share:'Weak matches',recycling:'Memory churn'};
 /* #593 plain headline — pure composer (the recallUsesZone convention):
@@ -3549,7 +3549,7 @@ function renderRecBand(ups){
 }
 
 /* ---------- Memory Precision — Level 1, the pushed index (#476) + the #578
-   quality audit (owner: "do the numbers earn their place") + the #591
+   quality audit + the #591
    presentation pass + the #593 stat-table reshape. The FACE is EXACTLY 4
    stat rows (MP_NAME labels) + the denominators foot line (.l1vol): ONE
    stat per row in the fixed value/label/chip grid — the hero value
@@ -3560,7 +3560,7 @@ function renderRecBand(ups){
    MP_GOOD valence, no covered entry → the gray no-baseline dash. Row
    meanings ("fewer is better", attribution coverage, the bar value) live
    in PER-ROW titles; mean similarity + repeated-known stay card-level
-   TOOLTIP-ONLY (the #578 ruling — high cosine was the noise's camouflage).
+   TOOLTIP-ONLY (high cosine was the noise's camouflage).
    Absent tier1 (a pre-#578 server) → the stat rows hide and the card
    keeps the #476 shape; absent block entirely → the whole row hides and
    the sub keeps the old label (the capture card's block-absence guard). */
@@ -4042,7 +4042,7 @@ function agoLabel(iso){
 /* ---------- #601: the confidential circle — fleet.circle rides the same
    /dashboard/data payload (ALWAYS present; roster [] when nothing is
    configured). VISIBILITY ONLY: the dashboard stays ungated (confidential
-   content remains visible here — the standing ruling); standard agents
+   content remains visible here — by design); standard agents
    render NO badge (honest absence — red would read as error, amber reads as
    restricted). D.fleet.circle is ABSENT on a pre-#601 server → every helper
    degrades to the exact prior rendering. members is keyed by the OBSERVED
@@ -4064,7 +4064,7 @@ function circleCount(agentId){
 function circlePill(agentId){
   const n=circleCount(agentId);
   if(n===null) return '';
-  return '<span class="conf-pill" title="Inner circle — this agent\'s captures are confidential, hidden from other agents\' recall · '+n+' confidential '+(n===1?'memory':'memories')+'">confidential</span>';
+  return '<span class="conf-pill" title="Confidential circle — this agent\'s captures are confidential, hidden from other agents\' recall · '+n+' confidential '+(n===1?'memory':'memories')+'">confidential</span>';
 }
 /** Bundle-level pill (rail card header / capture rows) — the tooltip names
     every member agent + its count; '' when none of the ids are members. */

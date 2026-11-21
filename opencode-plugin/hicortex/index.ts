@@ -33,6 +33,19 @@
  *   tool × 9             → the hicortex_* tools as direct REST proxies with
  *                         plain-object args (no zod — verified live).
  *
+ * #600: the workspace folder basename IS the agent name. Every read call
+ *                         (the /recall-index body + the /search, /memory,
+ *                         /recent, /learnings, /graph tool queries) carries
+ *                         agent=<sanitized basename of the request's
+ *                         directory> so a rostered workspace reads as a
+ *                         confidential-circle member server-side; a
+ *                         null-sanitizing basename omits the param
+ *                         (fail-closed non-member). The tool executes get no
+ *                         input of their own, so they read the LAST_AGENT the
+ *                         per-prompt hooks resolved (strict rule: only a
+ *                         genuine session directory names the agent — never
+ *                         the process.cwd fallback `project` uses).
+ *
  * Capture is NOT the plugin's job — the nightly reader on the server machine
  * distills ~/.local/share/opencode/opencode.db centrally
  * (opencode-transcript-reader).
@@ -275,21 +288,55 @@ function renderLessonsBlock(data: LessonsResponse | null, maxLessons: number): s
 }
 
 /**
+ * Dependency-free twin of sanitizeAgentId (identity-store.ts): lowercase →
+ * collapse every [^a-z0-9_-]+ run to `-` → strip leading `-`/`_` → truncate to
+ * 64 → must match the section/agent allowlist `^[a-z0-9][a-z0-9_-]*$` (1..64
+ * chars), else null. identity-store.ts is the SOURCE OF TRUTH — keep the two
+ * in sync (this file cannot import package code; same duplication precedent
+ * as resolveOpencodeConfig).
+ */
+function sanitizeAgentId(raw: string): string | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[-_]+/, "")
+    .slice(0, 64);
+  return /^[a-z0-9][a-z0-9_-]*$/.test(cleaned) ? cleaned : null;
+}
+
+/**
+ * #600: the workspace-scoped agent id sent on every read call — the sanitized
+ * basename of the working directory (the same basename `project` is derived
+ * from; the folder name IS the agent name). null
+ * when the basename sanitizes to nothing → the caller omits `agent` entirely
+ * (fail-closed: the request reads as a non-member, never an id the server
+ * would 400 on and a fail-soft path would silently swallow).
+ */
+function workspaceAgentId(cwd: string): string | null {
+  return sanitizeAgentId(basename(cwd ?? ""));
+}
+
+/**
  * Build the /recall-index request body, or null when there is nothing to
  * send (no session id, or an empty prompt). Mirrors the CC hook's
  * buildHookRequest: project = basename(working directory) so retrieval can
  * apply the soft project-affinity boost (retrieval-scoping: opencode is a
- * cwd-based client and must send `project`).
+ * cwd-based client and must send `project`), and agent = the sanitized
+ * workspace basename threaded by the caller (#600 — from the input's OWN
+ * directory via currentAgent, never the process.cwd fallback `project` uses).
  */
 function buildRecallBody(
   sessionId: string,
   prompt: string,
   cwd: string,
+  agent: string | null,
 ): Record<string, unknown> | null {
   if (!sessionId || !prompt) return null;
   const body: Record<string, unknown> = { session_id: sessionId, prompt };
   const project = basename(cwd ?? "");
   if (project) body.project = project;
+  if (agent) body.agent = agent;
   return body;
 }
 
@@ -414,6 +461,41 @@ function cwdFromInput(input: unknown): string {
   return process.cwd();
 }
 
+/**
+ * #600: the working directory a hook input carries — STRICT (no process.cwd()
+ * fallback): only a genuine session directory names the workspace agent; the
+ * gateway process's cwd is not a workspace. `project` keeps the looser
+ * cwdFromInput fallback above (unchanged behavior).
+ */
+function strictCwd(input: unknown): string | null {
+  const i = input as { directory?: unknown; cwd?: unknown } | null | undefined;
+  if (typeof i?.directory === "string" && i.directory) return i.directory;
+  if (typeof i?.cwd === "string" && i.cwd) return i.cwd;
+  return null;
+}
+
+/**
+ * #600: the last workspace agent id a per-prompt hook resolved. The tool
+ * executes receive no input of their own, so the five read proxies read this
+ * directly. Multi-session gateways interleave — a tool read may carry a
+ * sibling session's id; bounded by the trust model (the agent param is
+ * self-asserted, the bearer token is the boundary) and it fails toward the
+ * standard pool in the common case.
+ */
+let LAST_AGENT: string | null = null;
+
+/**
+ * The workspace agent for a hook input: the sanitized basename of its
+ * directory when it carries one (updating LAST_AGENT), else the last-known
+ * id — a null-sanitizing basename never overwrites a known id.
+ */
+function currentAgent(input: unknown): string | null {
+  const cwd = strictCwd(input);
+  const id = cwd ? workspaceAgentId(cwd) : null;
+  if (id) LAST_AGENT = id;
+  return id ?? LAST_AGENT;
+}
+
 /** Best-effort session id from a hook input (shape not stable upstream). */
 function inputSessionId(input: unknown): string | null {
   const i = input as { info?: { sessionID?: unknown }; sessionID?: unknown; session?: { id?: unknown } } | null | undefined;
@@ -435,11 +517,15 @@ function inputSessionId(input: unknown): string | null {
  * request (the OC plugin's #313 memoize-only-on-success rule). Bounded: a
  * long-lived opencode process accumulating sessions would otherwise grow the
  * maps forever.
+ *
+ * #600: the lessons cache stores the agent id the block was fetched UNDER
+ * (the lessons pool is member-gated) — see cachedAgentBlock. The identity
+ * cache is NOT agent-scoped (identity is global for opencode).
  */
 const RECALL_BLOCKS = new Map<string, string | null>();
 const PROMPT_KEYS = new Map<string, string>();
 const IDENTITY_BLOCKS = new Map<string, string | null>();
-const LESSONS_BLOCKS = new Map<string, string | null>();
+const LESSONS_BLOCKS = new Map<string, { block: string | null; agent: string | null }>();
 /** In-flight / recently-fired dedup resets, keyed by session id (#316 ordering). */
 const PENDING_RESETS = new Map<string, Promise<void>>();
 const SESSION_STATE_CAP = 32;
@@ -482,6 +568,31 @@ async function cachedBlock(
   }
 }
 
+/**
+ * #600: the lessons-cache identity guard — memoize the settled render UNDER
+ * the agent id it was fetched for. A later request that resolves a DIFFERENT
+ * (or newly known) workspace id re-fetches; without this, a system.transform
+ * firing before any directory is known would pin a standard-pool lessons
+ * block for a member's whole session. Same memoize-only-on-success rule as
+ * cachedBlock (a throw degrades to null and retries next request).
+ */
+async function cachedAgentBlock(
+  cache: Map<string, { block: string | null; agent: string | null }>,
+  sessionId: string,
+  agent: string | null,
+  fetcher: () => Promise<string | null>,
+): Promise<string | null> {
+  const hit = cache.get(sessionId);
+  if (hit && hit.agent === agent) return hit.block;
+  try {
+    const block = await fetcher();
+    cache.set(sessionId, { block, agent });
+    return block;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Fetchers — every failure path THROWS to the caller's fail-soft catch
 // ---------------------------------------------------------------------------
@@ -491,8 +602,9 @@ async function fetchRecallBlock(
   sessionId: string,
   prompt: string,
   cwd: string,
+  agent: string | null,
 ): Promise<string | null> {
-  const body = buildRecallBody(sessionId, prompt, cwd);
+  const body = buildRecallBody(sessionId, prompt, cwd, agent);
   if (!body) return null;
   const resp = await fetch(`${cfg.serverUrl}/recall-index`, {
     method: "POST",
@@ -517,11 +629,19 @@ async function fetchIdentityBlock(cfg: OpencodeConfig): Promise<string | null> {
   return gateAndRenderIdentity(await resp.json() as IdentityResponse);
 }
 
-async function fetchLessonsBlock(cfg: OpencodeConfig): Promise<string | null> {
-  const resp = await fetch(`${cfg.serverUrl}/learnings`, {
-    headers: authHeaders(cfg),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+/**
+ * #600: `agent` is the session's workspace id — the lessons pool is
+ * member-gated server-side, so the block must be fetched under the id it
+ * will be cached under (see cachedAgentBlock). null → bare /learnings.
+ */
+async function fetchLessonsBlock(cfg: OpencodeConfig, agent: string | null): Promise<string | null> {
+  const resp = await fetch(
+    agent ? `${cfg.serverUrl}/learnings?agent=${encodeURIComponent(agent)}` : `${cfg.serverUrl}/learnings`,
+    {
+      headers: authHeaders(cfg),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    },
+  );
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const block = renderLessonsBlock(await resp.json() as LessonsResponse, cfg.lessonsLimit);
   return block === null ? null : block;
@@ -665,6 +785,7 @@ function registerTools(): Record<string, unknown> {
           const params = new URLSearchParams({ query: String(args?.query ?? "") });
           if (args?.limit) params.set("limit", String(args.limit));
           if (args?.project) params.set("project", String(args.project));
+          if (LAST_AGENT) params.set("agent", LAST_AGENT);
           const { data, status } = await serverGet(cfg, `/search?${params}`);
           if (!data) return errorResult(`Search failed: ${describeGetFailure(status)}`);
           return formatSearchResults(data.results ?? []);
@@ -686,6 +807,7 @@ function registerTools(): Record<string, unknown> {
           const cfg = resolveOpencodeConfig();
           if (!cfg) return errorResult(NOT_CONFIGURED);
           const params = new URLSearchParams({ id: String(args.id) });
+          if (LAST_AGENT) params.set("agent", LAST_AGENT);
           const { data, status } = await serverGet(cfg, `/memory?${params}`);
           if (status === 404) {
             // Either no such memory (0.14+) or a pre-0.14 server with no
@@ -716,6 +838,7 @@ function registerTools(): Record<string, unknown> {
           const params = new URLSearchParams();
           if (args?.project) params.set("project", String(args.project));
           if (args?.limit) params.set("limit", String(args.limit));
+          if (LAST_AGENT) params.set("agent", LAST_AGENT);
           const qs = params.toString();
           const { data, status } = await serverGet(cfg, `/recent${qs ? `?${qs}` : ""}`);
           if (!data) return errorResult(`Recent recall failed: ${describeGetFailure(status)}`);
@@ -770,7 +893,10 @@ function registerTools(): Record<string, unknown> {
         try {
           const cfg = resolveOpencodeConfig();
           if (!cfg) return errorResult(NOT_CONFIGURED);
-          const { data, status } = await serverGet(cfg, "/learnings");
+          const lessonsUrl = LAST_AGENT
+            ? `/learnings?agent=${encodeURIComponent(LAST_AGENT)}`
+            : "/learnings";
+          const { data, status } = await serverGet(cfg, lessonsUrl);
           if (!data) return errorResult(`Lessons fetch failed: ${describeGetFailure(status)}`);
           const lessons = data.lessons ?? [];
           if (lessons.length === 0) {
@@ -822,6 +948,7 @@ function registerTools(): Record<string, unknown> {
           if (args?.limit) params.set("limit", String(args.limit));
           if (args?.domain) params.set("domain", String(args.domain));
           if (args?.relationship) params.set("relationship", String(args.relationship));
+          if (LAST_AGENT) params.set("agent", LAST_AGENT);
           const { data, status } = await serverGet(cfg, `/graph?${params}`);
           if (!data) return errorResult(`Graph query failed: ${describeGetFailure(status)}`);
           return JSON.stringify(data);
@@ -941,6 +1068,10 @@ export const HicortexPlugin: any = async (_input: any): Promise<Record<string, u
           const cfg = resolveOpencodeConfig();
           if (!cfg) return;
           pruneSessionState();
+          // #600: resolve the workspace agent from the input's OWN directory
+          // (strict — no process.cwd fallback); publishes to LAST_AGENT for
+          // the tool proxies and rides the recall body.
+          const agent = currentAgent(input);
 
           // Ordering (#316): a pending reset for THIS session registered
           // before this fetch must complete first — bounded by the reset's
@@ -955,7 +1086,7 @@ export const HicortexPlugin: any = async (_input: any): Promise<Record<string, u
           const promptKey = typeof last.msg.id === "string" && last.msg.id ? last.msg.id : prompt;
           if (PROMPT_KEYS.get(sessionId) !== promptKey) {
             const block = prompt
-              ? await fetchRecallBlock(cfg, sessionId, prompt, cwdFromInput(input)).catch(() => null)
+              ? await fetchRecallBlock(cfg, sessionId, prompt, cwdFromInput(input), agent).catch(() => null)
               : null;
             RECALL_BLOCKS.set(sessionId, block);
             PROMPT_KEYS.set(sessionId, promptKey);
@@ -983,9 +1114,13 @@ export const HicortexPlugin: any = async (_input: any): Promise<Record<string, u
           // versions — fall back to one process-wide cache key rather than
           // skipping injection entirely.
           const sessionId = inputSessionId(input) ?? FALLBACK_SESSION_KEY;
+          // #600: the workspace agent for the lessons pool (member-gated) —
+          // the input's own directory when it carries one, else the
+          // last-known id a prompt hook resolved.
+          const agent = currentAgent(input);
           const [identityBlock, lessonsBlock] = await Promise.all([
             cachedBlock(IDENTITY_BLOCKS, sessionId, () => fetchIdentityBlock(cfg)),
-            cachedBlock(LESSONS_BLOCKS, sessionId, () => fetchLessonsBlock(cfg)),
+            cachedAgentBlock(LESSONS_BLOCKS, sessionId, agent, () => fetchLessonsBlock(cfg, agent)),
           ]);
           const entry = renderContextEntry([identityBlock, lessonsBlock]);
           if (entry) (system as unknown[]).push(entry);

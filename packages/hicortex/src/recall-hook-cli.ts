@@ -5,6 +5,9 @@
  * dispatches on the payload):
  *   - UserPromptSubmit: POST the prompt to the server's /recall-index; print
  *     the returned index block to stdout (CC injects hook stdout as context).
+ *     #600: the body carries `agent` = the sanitized basename of the session
+ *     cwd (the workspace folder name IS the agent name) so the server's
+ *     confidential-circle gate can recognize the session.
  *   - SessionStart (startup/resume/clear/compact): POST a reset so the
  *     server's per-session shown-set matches the fresh context window.
  *
@@ -13,7 +16,7 @@
  * slow a CC session beyond the fetch timeout (1000 ms, owner-set).
  */
 
-import { resolveConfig } from "./learnings-identity.js";
+import { resolveConfig, workspaceAgentId } from "./learnings-identity.js";
 import { isPureWrapperPrompt } from "./wrapper-prompt.js";
 import { basename } from "node:path";
 
@@ -68,7 +71,16 @@ export function buildHookRequest(
   // soft project-affinity boost. basename(cwd) matches capture's
   // decodeProjectDirName for non-hyphenated dirs (the common case); a hyphen
   // edge case is a pre-existing capture bug, filed separately.
-  return { session_id: sessionId, prompt, project: basename(cwd) };
+  // #600: the same basename IS the agent id — sent SANITIZED so the server's
+  // confidential-circle gate can recognize the session (a rostered workspace
+  // reads as a member). A basename that sanitizes to null omits the field
+  // entirely (non-member, fail-closed — never an id the server would 400 on).
+  // The SessionStart reset above deliberately carries NO agent: a reset
+  // returns no rows, so there is nothing to gate.
+  const body: Record<string, unknown> = { session_id: sessionId, prompt, project: basename(cwd) };
+  const agent = workspaceAgentId(cwd);
+  if (agent) body.agent = agent;
+  return body;
 }
 
 export async function runRecallHook(): Promise<void> {

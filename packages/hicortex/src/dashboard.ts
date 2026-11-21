@@ -9,7 +9,7 @@
  * /dashboard/data, GET /dashboard/field and GET /dashboard/events. The
  * mutation surface is deliberately narrow: PUT /dashboard/model (#422),
  * PUT /dashboard/capture-pause (#423), and PUT /dashboard/quality/verdict
- * (#578 — the contested thumbs) — each an owner-ruled scoped writer, never
+ * (#578 — the contested thumbs) — each an explicitly scoped writer, never
  * a general write path.
  *
  * Layering (mirrors how recall-index.ts holds pure logic and viz.ts holds
@@ -202,16 +202,16 @@ export interface DashboardSnapshot {
 
 /**
  * #601 — the confidential circle's VISIBILITY block: which agents are
- * inner-circle and, for the observed ones, how many confidential memories
- * they carry. Purely informational (the dashboard is NOT gated — confidential
- * content stays visible on the console by the standing ruling); the page
+ * confidential-circle and, for the observed ones, how many confidential
+ * memories they carry. Purely informational (the dashboard is NOT gated —
+ * confidential content stays visible on the console by design); the page
  * renders amber pills on circle agents, nothing on standard ones.
  */
 export interface AgentCircle {
   /** The sanitized roster (resolveConfidentialAgents — the one agent-id
    *  namespace shared with `?agent=` and identityAgents). */
   roster: string[];
-  /** OBSERVED source_agent values (e.g. "hermes/nano") that match the
+  /** OBSERVED source_agent values (e.g. "hermes/atlas") that match the
    *  roster, each mapped to that agent's confidential memory count.
    *  Membership is KEY PRESENCE (a rostered agent observed with 0
    *  confidential rows is a member at 0); NULL source_agent never matches. */
@@ -2160,7 +2160,7 @@ export function dashboardCapturePausePutHandler(
 // (the recall-precision layering law); these are the thin express adapters
 // (the dashboardDataHandler convention). The GET is lazy + paginated so the
 // graded data stays out of the ≤ 2 KB memory_precision block; the PUT is the
-// dashboard's THIRD scoped writer (owner thumbs — the calibration
+// dashboard's THIRD scoped writer (manual thumbs — the calibration
 // reference), after /dashboard/model and /dashboard/capture-pause.
 // ---------------------------------------------------------------------------
 

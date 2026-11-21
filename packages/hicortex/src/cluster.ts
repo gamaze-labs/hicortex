@@ -82,7 +82,7 @@ export function clusterExcess(clusters: string[][]): number {
 
 /** Metadata row shape for the merge-safety check. `source_agent` is on the
  *  row (the column still exists) but is NOT a merge-safety field: the agent
- *  rail was REMOVED by owner decision (#206 decision 2, 2026-09-21) —
+ *  rail was REMOVED (#206 decision 2) —
  *  cross-agent clusters merge, because attribution survives on the retained
  *  absorbed-loser row and no recall path filters by source_agent. Project is
  *  one rail; `privacy` (the #332 classification, standard | confidential) is

@@ -1678,8 +1678,8 @@ export async function startServer(options: {
   // HICORTEX_CONFIDENTIAL_MARKER_KEY env override 409s (the env would shadow
   // the write — no no-op success; the rule lives in the pure handler).
   // Bearer-only: the standard auth middleware above, no exemption — the key
-  // is the confidential circle's secret, fetchable by token = owner (the
-  // #616 accepted trade-off). Pure handlers in marker-key-api.ts.
+  // is the confidential circle's secret, fetchable by token (the #616
+  // accepted trade-off). Pure handlers in marker-key-api.ts.
   app.get("/confidential/marker-key", (_req, res) => {
     const r = handleMarkerKeyGet(confidentialMarkerKey);
     res.status(r.status).json(r.body);
@@ -1875,8 +1875,8 @@ export async function startServer(options: {
     // messages branch is already covered above. Disable-resistance
     // (hostedMode) is Phase 0b.
     // #332 redaction pilot: CONFIDENTIAL deliveries use the extended preset
-    // (DEFAULT_PATTERNS + emails + phone numbers) — the material an
-    // inner-circle agent captures is exactly the contact-identifier-rich
+    // (DEFAULT_PATTERNS + emails + phone numbers) — the material a
+    // confidential-circle agent captures is exactly the contact-identifier-rich
     // kind (#558). Standard deliveries keep today's set byte-identically.
     if (fromTextBranch) {
       const { text: redacted, count } = redact(conversationText, {
@@ -2144,8 +2144,8 @@ export async function startServer(options: {
   app.post("/update", async (req, res) => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     // NOTE (#332): `privacy` is no longer a writable field — classification is
-    // server-derived at intake and changed only by the owner's
-    // `hicortex backfill-privacy`. A body privacy field is ignored (kept out
+    // server-derived at intake and changed only by the `hicortex
+    // backfill-privacy` command. A body privacy field is ignored (kept out
     // of the destructure so the intent is structural).
     const { id, content, project, memory_type } = req.body ?? {};
     if (!id || typeof id !== "string") {
@@ -2356,9 +2356,9 @@ export async function startServer(options: {
     const filterDomain = typeof req.query.domain === "string" && req.query.domain ? req.query.domain : undefined;
     const filterRelationship = typeof req.query.relationship === "string" && req.query.relationship ? req.query.relationship : undefined;
     // #332: the optional `agent` param gates neighbors/hubs/path (the
-    // content-bearing ops). op=export stays UNGATED — it is the /viz owner
-    // surface (owner ruling: dashboard/viz not gated in this build; a
-    // show-confidential toggle is a separate later item).
+    // content-bearing ops). op=export stays UNGATED — it feeds /viz, which
+    // is deliberately ungated (a show-confidential toggle is a separate
+    // later item).
     const member = requestSeesConfidential(req.query.agent);
     // A confidential endpoint/center id is invisible to non-members — same
     // 404 contract as GET /memory (existence is not revealed).
@@ -2563,13 +2563,13 @@ export async function startServer(options: {
   ));
 
   // PUT /dashboard/quality/verdict — the dashboard's THIRD scoped writer
-  // (after /dashboard/model and /dashboard/capture-pause): the owner's thumbs
-  // on a contested line. Body {id, verdict: 1|-1} (numeric: 1 useful, -1
-  // not) — persisted as grader='owner', a NEW verdict row against the same
-  // (push, memory) so history is append-only; these rows are the
-  // owner calibration reference and are NEVER pruned by the nightly verdict
-  // retention. 404 on an unknown id, 400 on a malformed body. Bearer-only
-  // like every dashboard writer; localhost bypass applies.
+  // (after /dashboard/model and /dashboard/capture-pause): manual review
+  // (thumbs) on a contested line. Body {id, verdict: 1|-1} (numeric: 1
+  // useful, -1 not) — persisted as grader='owner', a NEW verdict row against
+  // the same (push, memory) so history is append-only; these rows are the
+  // manual-verdict calibration reference and are NEVER pruned by the nightly
+  // verdict retention. 404 on an unknown id, 400 on a malformed body.
+  // Bearer-only like every dashboard writer; localhost bypass applies.
   app.put("/dashboard/quality/verdict", dashboardQualityVerdictPutHandler(
     () => db!,
   ));

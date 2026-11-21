@@ -68,6 +68,14 @@ export interface Segment {
    * memories collide on the UNIQUE index.
    */
   idSuffix: string;
+  /**
+   * #619: the running per-entry workspace this segment's entries ran in (the
+   * packer splits at every workspace CHANGE). Null when the caller passed no
+   * `entryWorkspaces` (the whole-batch fallback applies) or the group's
+   * entries carried none — the POST layer resolves `seg.workspacePath ??
+   * batch.workspacePath ?? null`.
+   */
+  workspacePath: string | null;
 }
 
 /** The wire body for POST /distill. */
@@ -311,12 +319,23 @@ export function hardSplitText(text: string, maxChars = SEGMENT_MAX_CHARS): strin
  * the grouped entries (extractConversationText) so cleaning/redaction stay
  * coherent. A single entry larger than maxChars is emitted as its own run of
  * hard-split pieces (A2).
+ *
+ * #619: with `entryWorkspaces` (CC's per-entry `cwd`, aligned with `entries`)
+ * the packer ALSO breaks the group at every workspace change, and each flushed
+ * segment (and each hard-split piece of an oversized entry) carries the
+ * running workspace as `workspacePath`. The splits only ADD boundaries —
+ * segStart/segEnd stay exact entry-cursor boundaries and the segments remain a
+ * contiguous partition of the delta, so the cursor discipline is unchanged.
+ * Without `entryWorkspaces` every segment gets `workspacePath: null` and the
+ * caller falls back to the batch-level workspace — byte-identical to the
+ * pre-#619 behavior for Hermes/Pi/OC/opencode.
  */
 export function packSegments(
   entries: unknown[],
   startCursor: number,
   entryCursors: number[],
   maxChars = SEGMENT_MAX_CHARS,
+  entryWorkspaces?: Array<string | null>,
 ): Segment[] {
   const segments: Segment[] = [];
   // Boundary cursor before entry i (startCursor for i=0, else entryCursors[i-1]).
@@ -324,6 +343,11 @@ export function packSegments(
 
   let groupStartIdx = -1;
   let groupSize = 0;
+  // #619: the running workspace of the OPEN group. Starts null; a non-empty
+  // per-entry value that DIFFERS flushes the open group first (the group
+  // belongs to the old workspace) and then becomes the running value. null
+  // entries (no cwd of their own) never split — they inherit the run.
+  let groupWorkspace: string | null = null;
 
   const flushGroup = (endIdxExclusive: number) => {
     if (groupStartIdx < 0) return;
@@ -333,12 +357,24 @@ export function packSegments(
       segStart: boundaryBefore(groupStartIdx),
       segEnd: entryCursors[endIdxExclusive - 1],
       idSuffix: "",
+      workspacePath: groupWorkspace,
     });
     groupStartIdx = -1;
     groupSize = 0;
   };
 
   for (let i = 0; i < entries.length; i++) {
+    // #619: a mid-session workspace change is a HARD boundary — the open
+    // group must not absorb entries from the new workspace (a confidential
+    // workspace's entries would silently take the previous birthplace).
+    if (entryWorkspaces) {
+      const ws = entryWorkspaces[i];
+      if (typeof ws === "string" && ws && ws !== groupWorkspace) {
+        flushGroup(i);
+        groupWorkspace = ws;
+      }
+    }
+
     const entryText = extractConversationText([entries[i]]);
     const entryLen = entryText.length;
 
@@ -356,6 +392,7 @@ export function packSegments(
           segStart: boundaryBefore(i),
           segEnd: entryCursors[i],
           idSuffix: `.p${p}`,
+          workspacePath: groupWorkspace,
         });
       });
       continue;
@@ -478,7 +515,9 @@ export async function captureBatches(
 
   for (const [batchIdx, batch] of batches.entries()) {
     const short = batch.sessionId.slice(0, 8);
-    const segments = packSegments(batch.entries, batch.startCursor, batch.entryCursors, segmentMaxChars);
+    const segments = packSegments(
+      batch.entries, batch.startCursor, batch.entryCursors, segmentMaxChars, batch.entryWorkspaces,
+    );
 
     if (segments.length === 0) continue;
 
@@ -507,16 +546,25 @@ export async function captureBatches(
     // stored on an older server.
     const genPrefix = batch.generation > 0 ? `g${batch.generation}.` : "";
 
-    // #609/#614: the workspace birthplace signals, computed ONCE per batch
-    // before the segment loop — the marker walk reads the workspace and each
-    // ancestor (first hit wins), and both values ride EVERY segment POST so
-    // the server can compose its confidentialPaths rule and validate the
-    // marker key. null workspace (Hermes / unknown) sends a null path and a
-    // null marker — never invented. #614: the client RELAYS marker content
-    // (client_marker); it no longer asserts a confidentiality boolean —
-    // validation is server-side.
-    const workspacePath = batch.workspacePath ?? null;
-    const markerContent = readConfidentialMarker(workspacePath);
+    // #609/#614/#619: the workspace birthplace signals, resolved PER SEGMENT
+    // below. The packer splits the delta at every per-entry workspace change
+    // (CC writes cwd on every entry), so each segment carries the workspace
+    // its OWN entries ran in — a mid-session cd must not silently re-
+    // birthplace later entries under the session's first workspace (#619:
+    // that mis-stamp lost confidential-workspace content its classification).
+    // Batches without per-entry workspaces (Pi/OC/opencode session cwd,
+    // Hermes null) pack null and fall back to `batch.workspacePath` —
+    // byte-identical to the pre-#619 single-stamp behavior. null workspace
+    // sends a null path and a null marker — never invented. #614: the client
+    // RELAYS marker content (client_marker); it no longer asserts a
+    // confidentiality boolean — validation is server-side. The walk is
+    // memoized per resolved path so the same workspace across segments never
+    // re-reads the filesystem (readConfidentialMarker semantics unchanged).
+    const markerCache = new Map<string | null, string | null>();
+    const markerFor = (ws: string | null): string | null => {
+      if (!markerCache.has(ws)) markerCache.set(ws, readConfidentialMarker(ws));
+      return markerCache.get(ws)!;
+    };
 
     // Cursor value the last confirmed boundary reached — advanced once, at
     // session end (A4), so per-session file writes stay bounded.
@@ -549,6 +597,10 @@ export async function captureBatches(
         continue;
       }
 
+      // #619: this segment's own workspace — the per-entry value the packer
+      // stamped, falling back to the batch-level one when the reader had no
+      // per-entry cwds (the pre-#619 single-stamp shape).
+      const segWorkspace = seg.workspacePath ?? batch.workspacePath ?? null;
       const body: DistillBody = {
         text: seg.text,
         source_agent: batch.sourceAgent ?? `claude-code/${batch.projectName}`,
@@ -559,15 +611,15 @@ export async function captureBatches(
         session_id: batch.sessionId,
         segment_id: `${genPrefix}${seg.segStart}-${seg.segEnd}${seg.idSuffix}`,
         session_date: batch.date,
-        // #609/#614: both workspace signals on every segment (see the
-        // per-batch computation above) — the path verbatim, the marker's
+        // #609/#614/#619: both workspace signals on every segment (see the
+        // per-segment derivation above) — the path verbatim, the marker's
         // relayed CONTENT. Old servers never read unknown fields; the
         // pre-#614 client_confidential boolean is deliberately NOT sent
         // (DistillBody keeps the field documented as legacy for the skew
         // window — a #609 server reading only the boolean sees standard,
         // fail-closed, intended).
-        workspace_path: workspacePath,
-        client_marker: markerContent,
+        workspace_path: segWorkspace,
+        client_marker: markerFor(segWorkspace),
       };
 
       let result: PostResult;

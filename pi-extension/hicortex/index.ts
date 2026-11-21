@@ -15,6 +15,16 @@
  *                         base prompt on any turn no extension returns one
  *                         (verified against pi 0.84.3), so the blocks are
  *                         re-applied EVERY turn from a session-scoped cache.
+ *
+ * #600: the workspace folder basename IS the agent name. Every read call
+ *                         (/recall-index body + the /search, /memory, /recent,
+ *                         /learnings, /graph tool queries) carries
+ *                         agent=<sanitized basename of the session cwd> so a
+ *                         rostered workspace reads as a confidential-circle
+ *                         member server-side; a null-sanitizing basename omits
+ *                         the param (fail-closed non-member). The tools have
+ *                         no per-request cwd, so they read the LAST_AGENT the
+ *                         per-prompt hook resolved.
  *   session_start       → POST /recall-index {reset:true} (fresh context
  *                         window — the server's per-session shown-set is
  *                         stale by definition) and drop the block caches.
@@ -250,10 +260,42 @@ export function renderLessonsBlock(data: LessonsResponse | null, maxLessons: num
 }
 
 /**
+ * Dependency-free twin of sanitizeAgentId (identity-store.ts): lowercase →
+ * collapse every [^a-z0-9_-]+ run to `-` → strip leading `-`/`_` → truncate to
+ * 64 → must match the section/agent allowlist `^[a-z0-9][a-z0-9_-]*$` (1..64
+ * chars), else null. identity-store.ts is the SOURCE OF TRUTH — keep the two
+ * in sync (this file cannot import package code; same duplication precedent
+ * as resolvePiConfig).
+ */
+function sanitizeAgentId(raw: string): string | null {
+  if (typeof raw !== "string") return null;
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[-_]+/, "")
+    .slice(0, 64);
+  return /^[a-z0-9][a-z0-9_-]*$/.test(cleaned) ? cleaned : null;
+}
+
+/**
+ * #600: the workspace-scoped agent id sent on every read call — the sanitized
+ * basename of the session cwd (the same basename `project` is derived from;
+ * the folder name IS the agent name). null when the
+ * basename sanitizes to nothing → the caller omits `agent` entirely
+ * (fail-closed: the request reads as a non-member, never an id the server
+ * would 400 on and a fail-soft path would silently swallow). Exported for
+ * tests like the other pure helpers.
+ */
+export function workspaceAgentId(cwd: string): string | null {
+  return sanitizeAgentId(basename(cwd ?? ""));
+}
+
+/**
  * Build the /recall-index request body, or null when there is nothing to
  * send (no session id, or an empty prompt). Mirrors the CC hook's
  * buildHookRequest: project = basename(cwd) so retrieval can apply the soft
- * project-affinity boost.
+ * project-affinity boost, and agent = the SANITIZED basename (#600) so the
+ * server's confidential-circle gate can recognize the session.
  */
 export function buildRecallBody(
   sessionId: string,
@@ -264,6 +306,8 @@ export function buildRecallBody(
   const body: Record<string, unknown> = { session_id: sessionId, prompt };
   const project = basename(cwd ?? "");
   if (project) body.project = project;
+  const agent = workspaceAgentId(project);
+  if (agent) body.agent = agent;
   return body;
 }
 
@@ -294,11 +338,22 @@ export function appendContextBlocks(
  * memoized for the session; a FAILED fetch is NOT — it retries next turn
  * (the OC plugin's #313 memoize-only-on-success rule). Bounded: a long-lived
  * pi process accumulating sessions would otherwise grow the maps forever.
+ *
+ * #600: the lessons cache stores the agent id the block was fetched UNDER
+ * (the lessons pool is member-gated) — see cachedAgentBlock. The identity
+ * cache is NOT agent-scoped (identity is global for pi).
  */
 const IDENTITY_BLOCKS = new Map<string, string | null>();
-const LESSONS_BLOCKS = new Map<string, string | null>();
+const LESSONS_BLOCKS = new Map<string, { block: string | null; agent: string | null }>();
 /** In-flight / recently-fired dedup resets, keyed by session id (#316 ordering). */
 const PENDING_RESETS = new Map<string, Promise<void>>();
+/**
+ * #600: the last workspace agent id a before_agent_start resolved from
+ * ctx.cwd. The tool executes receive no per-request cwd, so the five read
+ * proxies read this. Reset per turn from the turn's own cwd — a turn with no
+ * cwd clears it (the tools then omit agent: fail-closed).
+ */
+let LAST_AGENT: string | null = null;
 const SESSION_STATE_CAP = 32;
 
 /** Test seam: wipe the module-level session state between cases. */
@@ -306,6 +361,7 @@ export function __resetSessionState(): void {
   IDENTITY_BLOCKS.clear();
   LESSONS_BLOCKS.clear();
   PENDING_RESETS.clear();
+  LAST_AGENT = null;
 }
 
 function pruneSessionState(): void {
@@ -339,6 +395,31 @@ async function cachedBlock(
   try {
     const block = await fetcher();
     cache.set(sessionId, block);
+    return block;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #600: the lessons-cache identity guard — memoize the settled render UNDER
+ * the agent id it was fetched for. A later turn that resolves a DIFFERENT
+ * (or newly known) workspace id re-fetches; without this, a first turn whose
+ * cwd was unavailable would pin a standard-pool lessons block for a member's
+ * whole session. Same memoize-only-on-success rule as cachedBlock (a throw
+ * degrades to null and retries next turn).
+ */
+async function cachedAgentBlock(
+  cache: Map<string, { block: string | null; agent: string | null }>,
+  sessionId: string,
+  agent: string | null,
+  fetcher: () => Promise<string | null>,
+): Promise<string | null> {
+  const hit = cache.get(sessionId);
+  if (hit && hit.agent === agent) return hit.block;
+  try {
+    const block = await fetcher();
+    cache.set(sessionId, { block, agent });
     return block;
   } catch {
     return null;
@@ -380,11 +461,19 @@ async function fetchIdentityBlock(cfg: PiConfig): Promise<string | null> {
   return gateAndRenderIdentity(await resp.json() as IdentityResponse);
 }
 
-async function fetchLessonsBlock(cfg: PiConfig): Promise<string | null> {
-  const resp = await fetch(`${cfg.serverUrl}/learnings`, {
-    headers: authHeaders(cfg),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+/**
+ * #600: `agent` is the session's workspace id — the lessons pool is
+ * member-gated server-side, so the block must be fetched under the id it
+ * will be cached under (see cachedAgentBlock). null → bare /learnings.
+ */
+async function fetchLessonsBlock(cfg: PiConfig, agent: string | null): Promise<string | null> {
+  const resp = await fetch(
+    agent ? `${cfg.serverUrl}/learnings?agent=${encodeURIComponent(agent)}` : `${cfg.serverUrl}/learnings`,
+    {
+      headers: authHeaders(cfg),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    },
+  );
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const block = renderLessonsBlock(await resp.json() as LessonsResponse, cfg.lessonsLimit);
   return block === null ? null : block;
@@ -537,6 +626,7 @@ function registerTools(pi: any): void {
         const params = new URLSearchParams({ query: String(args?.query ?? "") });
         if (args?.limit) params.set("limit", String(args.limit));
         if (args?.project) params.set("project", String(args.project));
+        if (LAST_AGENT) params.set("agent", LAST_AGENT);
         const { data, status } = await serverGet(cfg, `/search?${params}`);
         if (!data) return errorResult(`Search failed: ${describeGetFailure(status)}`);
         return formatSearchResults(data.results ?? []);
@@ -564,6 +654,7 @@ function registerTools(pi: any): void {
         const cfg = resolvePiConfig();
         if (!cfg) return errorResult(NOT_CONFIGURED);
         const params = new URLSearchParams({ id: String(args.id) });
+        if (LAST_AGENT) params.set("agent", LAST_AGENT);
         const { data, status } = await serverGet(cfg, `/memory?${params}`);
         if (status === 404) {
           // Either no such memory (0.14+) or a pre-0.14 server with no
@@ -600,6 +691,7 @@ function registerTools(pi: any): void {
         const params = new URLSearchParams();
         if (args?.project) params.set("project", String(args.project));
         if (args?.limit) params.set("limit", String(args.limit));
+        if (LAST_AGENT) params.set("agent", LAST_AGENT);
         const qs = params.toString();
         const { data, status } = await serverGet(cfg, `/recent${qs ? `?${qs}` : ""}`);
         if (!data) return errorResult(`Recent recall failed: ${describeGetFailure(status)}`);
@@ -665,7 +757,10 @@ function registerTools(pi: any): void {
       try {
         const cfg = resolvePiConfig();
         if (!cfg) return errorResult(NOT_CONFIGURED);
-        const { data, status } = await serverGet(cfg, "/learnings");
+        const lessonsUrl = LAST_AGENT
+          ? `/learnings?agent=${encodeURIComponent(LAST_AGENT)}`
+          : "/learnings";
+        const { data, status } = await serverGet(cfg, lessonsUrl);
         if (!data) return errorResult(`Lessons fetch failed: ${describeGetFailure(status)}`);
         const lessons = data.lessons ?? [];
         if (lessons.length === 0) {
@@ -733,6 +828,7 @@ function registerTools(pi: any): void {
         if (args?.limit) params.set("limit", String(args.limit));
         if (args?.domain) params.set("domain", String(args.domain));
         if (args?.relationship) params.set("relationship", String(args.relationship));
+        if (LAST_AGENT) params.set("agent", LAST_AGENT);
         const { data, status } = await serverGet(cfg, `/graph?${params}`);
         if (!data) return errorResult(`Graph query failed: ${describeGetFailure(status)}`);
         return textResult(JSON.stringify(data));
@@ -874,9 +970,15 @@ export default function hicortexExtension(pi: any): void {
         if (pending) await pending;
 
         const prompt = typeof event?.prompt === "string" ? event.prompt : "";
+        const cwd = ctx?.cwd ?? "";
+        // #600: the workspace basename IS the agent id — resolved from the
+        // turn's cwd. Published to LAST_AGENT for the tool proxies (they get
+        // no cwd of their own); a turn with no cwd clears it (fail-closed).
+        const agent = workspaceAgentId(basename(cwd));
+        LAST_AGENT = agent;
         let message: { customType: string; content: string; display: boolean } | undefined;
         if (prompt) {
-          const block = await fetchRecallBlock(cfg, sessionId, prompt, ctx?.cwd ?? "").catch(() => null);
+          const block = await fetchRecallBlock(cfg, sessionId, prompt, cwd).catch(() => null);
           if (block) {
             // display:false — the index is FOR the model; pi hides it from
             // the transcript UI but sends it alongside the user message.
@@ -886,10 +988,11 @@ export default function hicortexExtension(pi: any): void {
 
         // Identity + lessons: fetched once per session (independent
         // fail-soft), re-APPLIED every turn — pi resets a systemPrompt
-        // override to base whenever no extension returns one.
+        // override to base whenever no extension returns one. The lessons
+        // block is cached UNDER the agent it was fetched for (#600).
         const [identityBlock, lessonsBlock] = await Promise.all([
           cachedBlock(IDENTITY_BLOCKS, sessionId, () => fetchIdentityBlock(cfg)),
-          cachedBlock(LESSONS_BLOCKS, sessionId, () => fetchLessonsBlock(cfg)),
+          cachedAgentBlock(LESSONS_BLOCKS, sessionId, agent, () => fetchLessonsBlock(cfg, agent)),
         ]);
         const systemPrompt = appendContextBlocks(event?.systemPrompt, [identityBlock, lessonsBlock]);
 

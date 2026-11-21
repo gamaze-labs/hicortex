@@ -11,7 +11,7 @@
  * server: derived at intake from `source_agent` × the `confidentialAgents`
  * config roster, a `confidentialPaths` workspace match (#609), or marker
  * content validated against the server's `confidentialMarkerKey` (#614) — or
- * stamped by the `backfill-privacy` owner command; the client only RELAYS
+ * stamped by the `hicortex backfill-privacy` command; the client only RELAYS
  * raw inputs, it never declares the class. The class is a hard gate on every
  * agent-facing read path (absent/unknown requester = non-member =
  * confidential rows omitted, single fetch 404) and routes every LLM touch of
@@ -853,8 +853,8 @@ export interface HicortexConfig {
    * #332 — the confidential-circle roster: agent ids (the same sanitized id
    * namespace as `identityAgents` / `?agent=`) whose captures are stamped
    * `confidential` at intake (matched by `source_agent` with the first
-   * `<harness>/` segment stripped, so a Hermes profile `nano` capturing as
-   * `hermes/nano` matches the roster entry `nano`) and whose read requests
+   * `<harness>/` segment stripped, so a Hermes profile `atlas` capturing as
+   * `hermes/atlas` matches the roster entry `atlas`) and whose read requests
    * (the optional `agent` param on every agent-facing read path) see both
    * pools. Absent/empty (the default) = no circle: every capture is
    * standard, nothing is ever omitted, zero behavior change. Deploy-time
@@ -863,7 +863,7 @@ export interface HicortexConfig {
    */
   confidentialAgents?: string[];
   /**
-   * #614 — the confidential marker key: the owner-set secret the workspace
+   * #614 — the confidential marker key: the operator-set secret the workspace
    * marker `.hicortex-confidential` must carry (as its single-line content)
    * for a client-marked folder to stamp `confidential` at intake. The client
    * RELAYS the marker's content (`client_marker` on /distill); the server

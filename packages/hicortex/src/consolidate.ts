@@ -1306,11 +1306,12 @@ export interface LinkCandidate {
  *
  * #602 — ADAPTIVE CLASS-SCOPED FETCH. The pre-#602 code fetched a fixed
  * top-10 UNFILTERED window and then dropped cross-class neighbors in the
- * loop — the #192 filtered-over-fetch defect class. Starvation math: in a
- * 22K-standard / 1K-confidential corpus a confidential memory's 10 nearest
- * neighbors are usually ALL standard (the classes are topically distinct but
- * the majority class is 22× larger), so the confidential pool systematically
- * under-linked — its same-class neighbors never made the window. The fix
+ * loop — the #192 filtered-over-fetch defect class. Starvation math: when
+ * the standard pool heavily outnumbers the confidential pool, a confidential
+ * memory's 10 nearest neighbors are usually ALL standard (the classes are
+ * topically distinct but the majority class is much larger), so the
+ * confidential pool systematically under-linked — its same-class neighbors
+ * never made the window. The fix
  * escalates the window (k × 4 per step, capped at CONSOLIDATE_LINK_FETCH_MAX_K
  * = the #192 over-fetch cap) until the window holds CONSOLIDATE_LINK_TOP_K
  * same-class neighbors, comes back short (no more rows may exist), or hits

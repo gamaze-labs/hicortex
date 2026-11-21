@@ -22,15 +22,15 @@ export const REFLECTION_PRIVACY_LINE_STANDARD =
 
 /**
  * The CONFIDENTIAL pool's reflection privacy line (#602). Three elements:
- *  (a) the pool serves the owner's inner circle only (confidential circle,
- *      #598 — its lessons stay inside the pool via the inherited stamp);
+ *  (a) the pool is scoped to the confidential circle only (#598 — its
+ *      lessons stay inside the pool via the inherited stamp);
  *  (b) lesson text MAY reference the user's personal domains at the process
  *      level where needed to make the lesson actionable — the standard line
  *      suppressed all confidential lessons by construction (#602 finding);
  *  (c) credentials/passwords/API keys/secrets are STILL never included.
  */
 export const REFLECTION_PRIVACY_LINE_CONFIDENTIAL =
-  "Privacy: this pool serves the owner's inner circle only (confidential memories). Lesson text may reference the user's personal domains (names, health, finances) at the process level where needed to make the lesson actionable. Credentials, passwords, API keys, and other secrets are still never included — abstract those away.";
+  "Privacy: this pool serves the confidential circle only (confidential memories). Lesson text may reference the user's personal domains (names, health, finances) at the process level where needed to make the lesson actionable. Credentials, passwords, API keys, and other secrets are still never included — abstract those away.";
 
 /**
  * Importance scoring prompt. Takes a {memories_block} with indexed memories.
@@ -84,16 +84,14 @@ No explanations. Just the JSON array.`;
  * POOL-AWARE (#602): the optional `pool` argument swaps ONLY the privacy line.
  * Absent/undefined = "standard" = the pre-#602 prompt BYTE-IDENTICAL — the
  * standard pool's prompt must never change. The confidential variant exists
- * because the confidential pool is BY DEFINITION personal-domain content
- * (health, finances, the people in the owner's inner circle), so the standard
- * line ("Never include personal data (names, health, finances, credentials)")
- * suppressed every confidential lesson by construction — #602's measured
- * finding: 0 confidential lessons from a real cohort. Owner ruling
- * 2026-11-12: the confidential pool SHOULD generate lessons for the inner
- * circle; only the PROMPT suppressed them. The confidential line keeps one
- * absolute: credentials/passwords/API keys/secrets are never included.
- * Everything else in the prompt (generality bar, examples, output schema) is
- * shared verbatim by both pools — pinned by tests/reflection-prompt.test.ts.
+ * because the confidential pool is personal-domain content by definition,
+ * so the standard line ("Never include personal data (names, health,
+ * finances, credentials)") suppressed confidential lessons by construction
+ * — only the PROMPT suppressed them; the confidential pool SHOULD generate
+ * lessons. The confidential line keeps one absolute: credentials/passwords/
+ * API keys/secrets are never included. Everything else in the prompt
+ * (generality bar, examples, output schema) is shared verbatim by both
+ * pools — pinned by tests/reflection-prompt.test.ts.
  */
 export function reflection(
   memoriesBlock: string,

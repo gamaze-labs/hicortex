@@ -270,8 +270,8 @@ export const QUALITY_GRADE_WEEKLY_CALL_CAP = 60;
 
 /**
  * Auto-grader confidence below which a graded line lands in the CONTESTED
- * slice for the owner's thumbs (#578). PROVISIONAL first anchor (the #426
- * posture): 0.70, expected to move on fleet data. Applied at RENDER only
+ * slice for manual review (#578). PROVISIONAL first anchor: 0.70, expected
+ * to move as real-world data accumulates. Applied at RENDER only
  * (raw score + confidence are stored threshold-free; a recalibration never
  * rewrites history).
  */

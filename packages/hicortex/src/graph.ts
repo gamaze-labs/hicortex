@@ -219,8 +219,7 @@ export function confidentialNodeIds(db: Database.Database): Set<string> {
  * #332: `includeConfidential` defaults to FALSE — the agent-facing surfaces
  * (REST /graph?op=hubs without a member agent, the MCP graph tool) hard-omit
  * confidential hubs (their content snippets ARE content-bearing). The /viz
- * export (the owner surface — deliberately ungated per the #332 owner ruling)
- * passes true.
+ * export (deliberately ungated, #332) passes true.
  */
 export function detectHubs(
   db: Database.Database,
@@ -293,7 +292,7 @@ export function getNeighbors(
   // row). The CENTER memory's own class is the CALLER's gate — an
   // agent-facing adapter must refuse a confidential center id before calling
   // (REST /graph and the MCP tool 404 it for non-members, same contract as
-  // GET /memory). Default false = omit; the owner surfaces pass true.
+  // GET /memory). Default false = omit; member-gated callers pass true.
   const hidden =
     opts?.includeConfidential === true ? null : confidentialNodeIds(db);
   let sql = `SELECT source_id, target_id, relationship, strength
@@ -459,9 +458,8 @@ export function exportGraph(
     created_at: string | null;
   }>;
 
-  // #332: the /viz export is the OWNER surface — deliberately ungated per the
-  // issue-332 owner ruling ("dashboard/viz NOT gated in this build"; a
-  // show-confidential graph toggle is a separate later item). Explicit true.
+  // #332: the /viz export is deliberately ungated (a show-confidential
+  // graph toggle is a separate later item). Explicit true.
   const hubIds = new Set(detectHubs(db, 2, 3, { includeConfidential: true }).map((h) => h.id));
 
   // Score, filter on effective strength, rank, cap

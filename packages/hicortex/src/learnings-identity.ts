@@ -17,6 +17,10 @@
  *   GET /lessons  → episodic memory lessons + memory index, rendered as the
  *                   existing `## Hicortex Memory` block.
  *
+ * #600: both fetches carry `?agent=<sanitized basename of the session cwd>` —
+ * the workspace folder name IS the agent name, so a rostered workspace reads
+ * as a confidential-circle member server-side (fail-closed otherwise).
+ *
  * The two fetches run in Promise.all, each with its OWN 3 s timeout and
  * INDEPENDENT fail-soft: an /identity failure must never cost the lessons
  * block, and vice versa. Sequential fetches would double worst-case
@@ -33,6 +37,7 @@ import { homedir } from "node:os";
 import {
   handleIdentityGet,
   resolveAgentIdentity,
+  sanitizeAgentId,
   SECTION_LABELS,
   SECTION_PRECEDENCE,
   serveIdentityBody,
@@ -73,7 +78,10 @@ export interface ResolvedConfig {
   serverUrl: string;
   authToken: string | undefined;
   home: string;
-  /** Per-agent identity id sent as ?agent= (0.13); null → global (no param). */
+  /** The resolved config `agentName` (0.13). #600: CONFIG/STATUS-REPORTED
+   *  ONLY — the hooks no longer send it (the workspace basename is the agent
+   *  identity on the wire now); `hicortex status` reports it via its own
+   *  resolveAgentIdentity call. null → unset/invalid config value. */
   agentName: string | null;
   /** Max lessons to inject (config.lessonsLimit, default 10). */
   lessonsLimit?: number;
@@ -104,11 +112,11 @@ export function resolveConfig(): ResolvedConfig | null {
     ? (config.serverUrl as string).replace(/\/+$/, "")
     : `http://127.0.0.1:${(config.port as number | undefined) ?? DEFAULT_PORT}`;
 
-  // Per-agent identity id (0.13) via the shared resolver, so the id sent here
-  // always matches what `hicortex status` reports. No configured agentName →
-  // agentId null → NO ?agent= (bare fetch): CC's default is the shared global
-  // identity. A configured agentName that sanitizes to null → agentId null too
-  // (NO ?agent=), never a 400 that the fail-soft hook would silently swallow.
+  // Per-agent identity id (0.13) via the shared resolver, so what an install
+  // has CONFIGURED always matches what `hicortex status` reports. #600: the
+  // hooks no longer send this id — the workspace basename is the agent
+  // identity on the wire (see workspaceAgentId); agentName stays
+  // config/status-reported only.
   const agentName = resolveAgentIdentity(config).agentId;
 
   return {
@@ -143,6 +151,22 @@ export function deriveHookProject(
 }
 
 /**
+ * #600: the workspace-scoped agent id a CC client sends on its read calls —
+ * the SANITIZED basename of the session's working directory (the workspace
+ * folder name IS the agent name, the same basename `project` is derived
+ * from; no precedence chain, no configured-name override). The server's
+ * confidential-circle gate matches rostered BARE ids
+ * here. null when the basename sanitizes to nothing (e.g. "!!!" or "/") → the
+ * caller omits the `agent` param entirely, never sending an id the server
+ * would 400 on (the fail-soft hook would silently swallow that and drop the
+ * whole block). Reuses the package's sanitizeAgentId so client and server
+ * agree on the id grammar by construction.
+ */
+export function workspaceAgentId(cwd: string): string | null {
+  return sanitizeAgentId(basename(cwd));
+}
+
+/**
  * Trust framing + provenance for the injected lessons block (#516). The
  * fence + two lines are byte-identical on every client surface (CC hook,
  * OC/Pi/opencode plugins, Hermes) so the block reads as recalled reference
@@ -159,9 +183,17 @@ const MEMORY_PROVENANCE =
 /**
  * Fetch /lessons and build the `## Hicortex Memory` block, or null on any
  * failure (missing/non-2xx/parse). Preserves the pre-0.12 behavior exactly.
+ * #600: `cwd` is the session's working directory (default process.cwd()) —
+ * the sanitized basename rides the request as `?agent=` (confidential lessons
+ * are member-gated server-side) and feeds the project fold. A null-sanitizing
+ * basename → bare /lessons (non-member, fail-closed).
  */
-async function fetchLessonsBlock(cfg: ResolvedConfig): Promise<string | null> {
-  const resp = await fetch(`${cfg.serverUrl}/lessons`, {
+async function fetchLessonsBlock(cfg: ResolvedConfig, cwd: string = process.cwd()): Promise<string | null> {
+  const agent = workspaceAgentId(cwd);
+  const url = agent
+    ? `${cfg.serverUrl}/lessons?agent=${encodeURIComponent(agent)}`
+    : `${cfg.serverUrl}/lessons`;
+  const resp = await fetch(url, {
     headers: authHeaders(cfg.authToken),
     signal: AbortSignal.timeout(3000),
   });
@@ -176,7 +208,7 @@ async function fetchLessonsBlock(cfg: ResolvedConfig): Promise<string | null> {
   // This enables in-project + same-domain lesson boosting on the CC path.
   // #567: folded through the shared canonicalizer so the local label
   // compares equal to the canonical server corpus (see deriveHookProject).
-  const project = deriveHookProject(process.cwd(), cfg.projectAliases);
+  const project = deriveHookProject(cwd, cfg.projectAliases);
   const selected = await getLessonSelector().select(data.lessons, { maxLessons, moduleIndex, project });
 
   const lessonLines = selected.map((l) => {
@@ -388,14 +420,20 @@ export function gateAndRenderIdentity(
  * Fetch /identity and build the `## Identity` block, or null when nothing should
  * be injected: non-2xx, this harness not in `clients`, no sections, or all
  * sections empty. Throws propagate to the caller's fail-soft catch.
+ * #600: `cwd` is the session's working directory (default process.cwd()) —
+ * its sanitized basename is the workspace-scoped identity sent as `?agent=`.
  */
-async function fetchIdentityBlock(cfg: ResolvedConfig): Promise<string | null> {
+async function fetchIdentityBlock(cfg: ResolvedConfig, cwd: string = process.cwd()): Promise<string | null> {
   // Send ?agent= only when we have a valid id; the server does the merge and
   // returns the resolved sections, so the hook stays dumb (no client-side mode
-  // logic). A null id (CC's default: no configured agentName, or a configured
-  // value that sanitizes to nothing) → bare /identity → the shared global set.
-  const url = cfg.agentName
-    ? `${cfg.serverUrl}/identity?agent=${encodeURIComponent(cfg.agentName)}`
+  // logic). #600: the id is the SANITIZED WORKSPACE BASENAME (the folder
+  // name IS the agent name — it replaces the configured
+  // agentName on the hook path, which stays config/status-reported only). A
+  // null id (a basename that sanitizes to nothing) → bare /identity → the
+  // shared global set.
+  const id = workspaceAgentId(cwd);
+  const url = id
+    ? `${cfg.serverUrl}/identity?agent=${encodeURIComponent(id)}`
     : `${cfg.serverUrl}/identity`;
   const resp = await fetch(url, {
     headers: authHeaders(cfg.authToken),
@@ -416,9 +454,12 @@ async function fetchIdentityBlock(cfg: ResolvedConfig): Promise<string | null> {
  * Fetch identity + lessons concurrently and return the combined Markdown block,
  * or null when neither yields anything (nothing to inject; caller prints
  * nothing and exits 0). The `## Identity` block is prepended before the existing
- * `## Hicortex Memory` block.
+ * `## Hicortex Memory` block. #600: `cwd` is the session's working directory
+ * (default process.cwd()) — its sanitized basename is the workspace-scoped
+ * agent id both fetches send; the optional parameter is the test seam,
+ * mirroring buildHookRequest.
  */
-export async function fetchLessonsIdentity(): Promise<string | null> {
+export async function fetchLessonsIdentity(cwd: string = process.cwd()): Promise<string | null> {
   const cfg = resolveConfig();
   if (!cfg) return null;
 
@@ -426,8 +467,8 @@ export async function fetchLessonsIdentity(): Promise<string | null> {
   // other. Promise.all runs them concurrently — each carries its own 3 s
   // timeout, so worst-case latency stays ~3 s, not ~6 s (spec §7).
   const [identityBlock, lessonsBlock] = await Promise.all([
-    fetchIdentityBlock(cfg).catch(() => null),
-    fetchLessonsBlock(cfg).catch(() => null),
+    fetchIdentityBlock(cfg, cwd).catch(() => null),
+    fetchLessonsBlock(cfg, cwd).catch(() => null),
   ]);
 
   const blocks = [identityBlock, lessonsBlock].filter((b): b is string => b !== null && b !== "");

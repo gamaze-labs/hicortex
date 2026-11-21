@@ -74,7 +74,7 @@ export interface ConfidentialMarkerOptions {
   /**
    * Explicit marker key (#616 ROTATION, the CLI `--key` flag): PUT the chosen
    * value to the server, persist it locally, then write the marker. Checked
-   * BEFORE env and config — an owner rotating deliberately pushes the new
+   * BEFORE env and config — an operator rotating deliberately pushes the new
    * value, not the locally-cached old one.
    */
   key?: string;

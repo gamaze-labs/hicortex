@@ -97,7 +97,7 @@ const DEFAULT_PATTERNS: { name: string; pattern: RegExp }[] = [
 /**
  * The CONFIDENTIAL preset (#332 redaction pilot, the #558 gap): everything in
  * DEFAULT_PATTERNS plus emails and phone numbers. Confidential-pool content
- * is the material an inner-circle agent captures (finance, medical, personal
+ * is the material a confidential-circle agent captures (finance, medical, personal
  * correspondence), so its intake redacts contact identifiers BEFORE queueing
  * — standard deliveries keep today's set unchanged (the general email/phone
  * fix for standard rows is deliberately out of scope, #332 non-goals).

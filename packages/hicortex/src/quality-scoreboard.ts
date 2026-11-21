@@ -867,12 +867,19 @@ async function runQualityGradeStageInner(
   const nowIso = now.toISOString();
 
   // --- Population: every shown (push, memory) pair in the retention window,
-  // with the push's prompt excerpt + the memory row for the line render. ---
+  // with the push's prompt excerpt + the memory row for the line render.
+  // STANDARD-ONLY by construction (#618): the LEFT JOIN + privacy filter keep
+  // confidential rows out of BOTH arms of the lane (revealed-useful marking
+  // AND auto-grading) — a confidential line or excerpt must never egress.
+  // LEFT JOIN so a standard-class row whose memory row is gone still flows
+  // (renderLine already returns null for deleted memories — unchanged). ---
   const shownRows = db
     .prepare(
       `SELECT e.push_id AS push_id, e.memory_id AS memory_id, p.prompt_excerpt AS prompt_excerpt
          FROM recall_events e JOIN recall_pushes p ON p.id = e.push_id
-        WHERE e.day >= ? AND e.kind = 'shown'`,
+         LEFT JOIN memories m ON m.id = e.memory_id
+        WHERE e.day >= ? AND e.kind = 'shown'
+          AND (m.privacy IS NULL OR m.privacy != 'confidential')`,
     )
     .all(fromDay) as Array<{
     push_id: number;
@@ -905,15 +912,20 @@ async function runQualityGradeStageInner(
 
   const requestProject = resolveRequestProjects(db, fromDay, null);
   const memStmt = db.prepare(
-    `SELECT id, content, created_at, domain, project, source_agent, memory_type
+    `SELECT id, content, created_at, domain, project, source_agent, memory_type, privacy
        FROM memories WHERE id = ?`,
   );
   const renderLine = (memoryId: string): string | null => {
     const row = memStmt.get(memoryId) as {
       id: string; content: string; created_at: string; domain: string | null;
       project: string | null; source_agent: string | null; memory_type: string;
+      privacy: string | null;
     } | undefined;
     if (!row) return null; // memory gone (deleted) — not gradable, skipped
+    // #618 belt: the population filter above is the gate; this render-path
+    // refusal means confidential content can NEVER reach the egress even if
+    // the population query changes shape later.
+    if (row.privacy === "confidential") return null;
     return formatIndexLine(
       {
         id: row.id,
