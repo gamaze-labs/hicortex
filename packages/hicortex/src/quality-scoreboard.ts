@@ -84,7 +84,7 @@ export interface QualityTier1 {
    *  attributed lines; null when nothing attributed. */
   cross_share: number | null;
   /** Attributed lines ÷ all lines — the explicit attribution bound rendered
-   *  beside the share (the ~4% gap is visible, never silent); null when no
+   *  beside the share (a small gap stays visible, never silent); null when no
    *  lines. */
   attribution_coverage: number | null;
   /** Attributed cross lines with a measured similarity below the effective

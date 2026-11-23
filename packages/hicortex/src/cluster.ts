@@ -9,6 +9,7 @@
 
 import type Database from "better-sqlite3";
 import { l2ToCosine } from "./retrieval.js";
+import { spaceOf } from "./spaces.js";
 
 /** An undirected similarity edge between two memory ids. */
 export interface Edge {
@@ -85,11 +86,12 @@ export function clusterExcess(clusters: string[][]): number {
  *  rail was REMOVED (#206 decision 2) —
  *  cross-agent clusters merge, because attribution survives on the retained
  *  absorbed-loser row and no recall path filters by source_agent. Project is
- *  one rail; `privacy` (the #332 classification, standard | confidential) is
- *  the other — a cluster mixing classes is NEVER blended (the confidential
- *  pool must not absorb standard rows into hidden view, nor leak
- *  confidential content onto a standard canonical). This re-adds a
- *  classification-shaped rail #206 removed when the column was vestigial. */
+ *  one rail; `privacy` (the #642 space stamp, of which the #332
+ *  standard|confidential pair is the N=1 case) is the other — a cluster
+ *  mixing SPACES is NEVER blended (one pool must not absorb another pool's
+ *  rows into hidden view, nor leak its content onto another pool's
+ *  canonical). This re-adds a classification-shaped rail #206 removed when
+ *  the column was vestigial. */
 export interface ClusterMetaRow {
   project: string | null;
   privacy: string | null;
@@ -98,18 +100,22 @@ export interface ClusterMetaRow {
 
 export interface ClusterMetadataMismatch {
   projectMismatch: boolean;
-  /** #332: members disagree on the standard|confidential classification. */
+  /** #332/#642: members disagree on their SPACE (any two distinct space ids,
+   *  including standard-vs-confidential — the rail is now space-shaped and
+   *  strictly wider than the old two-class check). */
   classificationMismatch: boolean;
 }
 
-/** Do cluster members disagree on project or classification? (merge-safety
- *  input for #100/#206 + #332.) source_agent is intentionally NOT checked —
- *  see ClusterMetaRow. */
+/** Do cluster members disagree on project or space? (merge-safety input for
+ *  #100/#206 + #332/#642.) source_agent is intentionally NOT checked — see
+ *  ClusterMetaRow. */
 export function clusterMetadataMismatch(members: ClusterMetaRow[]): ClusterMetadataMismatch {
   const projects = new Set(members.map((m) => m.project ?? "\u0000null"));
-  // The classification comparison treats NULL (pre-v27 rows) as 'standard' —
-  // the same normalization every read gate applies.
-  const classes = new Set(members.map((m) => (m.privacy === "confidential" ? "confidential" : "standard")));
+  // The space comparison runs through spaceOf: NULL/''/'standard' (pre-v27
+  // rows, the fixed shared pool) all read 'standard', every other stamp is
+  // its own space — so the rail blocks cross-space merges AND still blocks
+  // the standard-vs-confidential blend #332 introduced it for.
+  const classes = new Set(members.map((m) => spaceOf(m.privacy)));
   return {
     projectMismatch: projects.size > 1,
     classificationMismatch: classes.size > 1,

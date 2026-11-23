@@ -1056,7 +1056,7 @@ function saveConfig(configPath: string, config: Record<string, unknown>): void {
  * parse (a hand-edit syntax slip, truncation, corruption), silently seeded `{}`
  * and the writer then OVERWROTE the file — `persistAuthToken` minted a fresh
  * token (fleet-wide 401), `scaffoldDefaultDomains` re-seeded the generic
- * vocabulary over the owner list, etc. `authToken` / `licenseKey` /
+ * vocabulary over the existing list, etc. `authToken` / `licenseKey` /
  * `llmApiKey` / `domains` / `identityClients` (was
  * `contextClients`) all gone.
  * The early-return guards (existing-key checks) did NOT save them: those only
@@ -1302,7 +1302,7 @@ export function ensureAndPersistAgentId(configPath: string): { agentId: string; 
 
 /**
  * Decide the per-agent identity id to persist at init (#179; CC default = global,
- * owner decision 20.07.2026). `agentName` is an explicit opt-in only — there is
+ * #179 decision). `agentName` is an explicit opt-in only — there is
  * NO hostname default, so an install with no `--agent-name` sends no `?agent=`
  * and shares the global identity (one user = one identity across machines).
  *
@@ -1440,7 +1440,7 @@ export const GENERIC_DEFAULT_DOMAINS: DomainDef[] = [
  */
 export function scaffoldDefaultDomains(configPath: string): { scaffolded: boolean } {
   // Strict load: a malformed existing config throws here — NEVER re-seed the
-  // generic defaults over the owner vocabulary (the 0.16.x BLOCKER). ENOENT
+  // generic defaults over the existing vocabulary (the 0.16.x BLOCKER). ENOENT
   // seeds {} (fresh install → scaffold is the point).
   const { config } = loadConfigStrict(configPath);
 

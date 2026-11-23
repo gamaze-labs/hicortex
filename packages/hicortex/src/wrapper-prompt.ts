@@ -12,10 +12,10 @@
  * `<command-name>`/`<command-message>`/`<command-args>` (slash-command
  * envelope), `<local-command-stdout>`, `<system-reminder>`, and
  * `[Request interrupted…]` markers. These reach /recall-index verbatim today —
- * ~15% of live pushes — inflating shown_count, burning hook latency, and
+ * a meaningful share of live pushes — inflating shown_count, burning hook latency, and
  * polluting the Memory Precision denominator.
  *
- * The rule (owner decision 4, refinement A1 — skip ONLY pure plumbing):
+ * The rule (decision 4, refinement A1 — skip ONLY pure plumbing):
  * strip every known wrapper element, then measure PAYLOAD PROSE = the text
  * left outside wrappers PLUS the bodies of `<result>` elements and
  * `<agent-message>` elements (the payload channels — a subagent hand-back is

@@ -5,9 +5,10 @@
  */
 
 import type Database from "better-sqlite3";
-import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain, ResolutionBandStat, MemoryPrivacy } from "./types.js";
-import type { LlmClient } from "./llm.js";
+import type { Memory, ConsolidationReport, ModuleIndex, ModuleDomain, ResolutionBandStat } from "./types.js";
+import type { LlmClient, LlmConfig } from "./llm.js";
 import { clientForPool, type LlmPair } from "./classification.js";
+import { spaceOf, type SpaceDef } from "./spaces.js";
 import type { EmbedFn } from "./retrieval.js";
 import { effectiveStrength, l2ToCosine, findDemotedIds } from "./retrieval.js";
 import * as storage from "./storage.js";
@@ -48,10 +49,10 @@ import * as CALIBRATION from "./calibration.js";
  * #241 consolidateMaxLlmCalls mechanism, renamed and widened). A runaway
  * BACKSTOP that bounds money/load INDEPENDENT OF LATENCY — a fast metered or
  * capacity-limited endpoint permits thousands of calls inside the wall-clock
- * budget, so time alone cannot protect it (owner ruling 2026-09-12). Consumed
+ * budget, so time alone cannot protect it. Consumed
  * in run order: a stage that exhausts it defers its remainder via its cursor.
- * 5000 clears a one-time classification backlog (a ~2000-memory batch drains
- * in ~1-2 runs) with margin. Config: `nightlyLlmCallBudget` (#405); the old
+ * 5000 clears a one-time classification backlog in a couple of runs with
+ * margin. Config: `nightlyLlmCallBudget` (#405); the old
  * `consolidateMaxLlmCalls` key is a deprecated alias honored one release.
  */
 export const DEFAULT_NIGHTLY_LLM_CALL_BUDGET = 5000;
@@ -85,12 +86,12 @@ const CONSOLIDATE_PRUNE_MIN_AGE_DAYS = 90;
 /**
  * Minimum COSINE similarity for a link candidate.
  *
- * Calibration (2026-07): measured top-10 neighbor cosine histogram on the
- * ~3000-memory production corpus. Typical top-1 neighbor cosine:
- * median 0.823, p10 0.743, p90 0.902. Threshold 0.75 combined with the
- * top-3 cap yields ≈ 2.2 candidate links/memory. The previous value (0.55)
+ * Calibration: measured top-10 neighbor cosine histogram on a
+ * several-thousand-memory production corpus — typical top-1 neighbor cosine
+ * sits in the mid-0.8s. Threshold 0.75 combined with the
+ * top-3 cap yields ≈ 2 candidate links/memory. The previous value (0.55)
  * lived on an accidental 1−L2 scale where it required cosine > 0.90 — a
- * near-duplicate detector that linked only 12% of memories.
+ * near-duplicate detector that linked only a small fraction of memories.
  */
 export const CONSOLIDATE_LINK_THRESHOLD = 0.75;
 /** Max link candidates kept per memory (highest-cosine neighbors first). */
@@ -109,9 +110,10 @@ export const CONSOLIDATE_LINK_FETCH_MAX_K = 200;
 /**
  * Minimum COSINE similarity for a CROSS-PROJECT link candidate.
  *
- * A 672-link audit (17 LLM judges, 2026-07) found cross-project links were 65%
- * wrong-link vs 6% for same-project, and that strength (cosine) predicts quality
- * (wrong-link 42% → 6% across strength quartiles). Cross-project pairs must clear
+ * A many-judge link audit found cross-project links were overwhelmingly
+ * wrong-link while same-project links were mostly right, and that strength
+ * (cosine) predicts quality (the wrong-link share fell steadily across
+ * strength quartiles). Cross-project pairs must clear
  * a much higher bar than the same-project 0.75 to survive discovery. Same-project
  * links keep CONSOLIDATE_LINK_THRESHOLD (0.75).
  */
@@ -429,15 +431,32 @@ export async function scoreMemoriesImportance(
     onBatch?: (written: number, failed: number) => void;
     /**
      * #332: the confidential-pool client. The batch builder partitions the
-     * pool by class FIRST (buildImportanceBatches — batches are single-class
-     * by construction), so every LLM call carries one class of text to one
+     * pool by SPACE FIRST (buildImportanceBatches — batches are single-space
+     * by construction), so every LLM call carries one space's text to one
      * client. Confidential batches without a client are SKIPPED (their rows
      * keep importance_scored_at NULL — the watermark pool re-finds them next
      * run; counted in skipped_confidential), never scored on the main model.
      */
     confidentialLlm?: LlmClient | null;
+    /**
+     * #642: per-space clients (every configured space except 'confidential').
+     * A batch whose space has no client HOLDS exactly like the confidential
+     * pool — counted per space id in skipped_spaces, never scored on the
+     * main model. Absent = a legacy two-pool run (any other space id holds).
+     */
+    spaceClients?: Map<string, LlmClient | null>;
+    /** #642: the configured space order for batch emission (config key
+     *  order). Absent = the pre-#642 ['confidential'] two-pool order. */
+    spaceOrder?: string[];
   } = {}
-): Promise<{ scored: number; failed: number; skipped_budget: number; skipped_confidential?: number }> {
+): Promise<{
+  scored: number;
+  failed: number;
+  skipped_budget: number;
+  skipped_confidential?: number;
+  /** #642: rows held per space id (no client for that space). */
+  skipped_spaces?: Record<string, number>;
+}> {
   const budget = opts.budget;
   const deadline = opts.deadline;
   const dryRun = opts.dryRun ?? false;
@@ -445,10 +464,15 @@ export async function scoreMemoriesImportance(
   let failed = 0;
   let skippedBudget = 0;
   let skippedConfidential = 0;
+  const skippedSpaces: Record<string, number> = {};
   let remaining = memories.length;
-  const pair: LlmPair = { standard: llm, confidential: opts.confidentialLlm ?? null };
+  const pair: LlmPair = {
+    standard: llm,
+    confidential: opts.confidentialLlm ?? null,
+    spaces: opts.spaceClients,
+  };
 
-  for (const batch of buildImportanceBatches(memories, 10)) {
+  for (const batch of buildImportanceBatches(memories, 10, opts.spaceOrder)) {
     if (budget?.exhausted) {
       skippedBudget += remaining;
       break;
@@ -466,11 +490,15 @@ export async function scoreMemoriesImportance(
 
     if (dryRun) { remaining -= batch.memories.length; continue; }
 
-    // #332 per-pool selection: the confidential pool needs its client —
-    // absent ⇒ skip-and-hold (rows stay unscored; retried next run).
+    // #332/#642 per-space selection: every non-shared pool needs its own
+    // client — absent ⇒ skip-and-hold (rows stay unscored; retried next run).
     const batchLlm = clientForPool(pair, batch.pool);
     if (!batchLlm) {
-      skippedConfidential += batch.memories.length;
+      if (batch.pool === "confidential") {
+        skippedConfidential += batch.memories.length;
+      } else {
+        skippedSpaces[batch.pool] = (skippedSpaces[batch.pool] ?? 0) + batch.memories.length;
+      }
       remaining -= batch.memories.length;
       continue;
     }
@@ -540,36 +568,61 @@ export async function scoreMemoriesImportance(
         `no confidential model configured (llmConfidentialBaseUrl/ApiKey). Retried next run.`,
     );
   }
+  // #642: same visibility for held SPACES — one line naming every space id
+  // and its held count (a silently-unscored space is the same failure mode).
+  const heldSpaceIds = Object.keys(skippedSpaces);
+  if (heldSpaceIds.length > 0) {
+    console.warn(
+      `[hicortex] importance: held memories by space — ` +
+        heldSpaceIds.map((id) => `${skippedSpaces[id]} ${id}`).join(", ") +
+        `. No model configured for those spaces (spaces.<id>.llm* or the ` +
+        `llmConfidential* endpoint); retried next run, never the main model.`,
+    );
+  }
 
   return {
     scored,
     failed,
     skipped_budget: skippedBudget,
     ...(skippedConfidential > 0 ? { skipped_confidential: skippedConfidential } : {}),
+    ...(heldSpaceIds.length > 0 ? { skipped_spaces: skippedSpaces } : {}),
   };
 }
 
 /**
- * #332 — the importance batch builder: partition by classification, then
- * slice into batches. Every batch is SINGLE-CLASS by construction (AC-10),
- * so the scoring call site can route each batch to the client matching its
- * pool with no per-item checks. Exported for the unit test.
+ * #332/#642 — the importance batch builder: partition by SPACE (spaceOf —
+ * 'standard' is the shared pool, every other stamp its own space), then
+ * slice into batches. Every batch is SINGLE-SPACE by construction (AC-10
+ * widened to N pools), so the scoring call site can route each batch to the
+ * client matching its space with no per-item checks. Exported for the unit
+ * test.
+ *
+ * Emission order (#642, deterministic): the shared pool first (arrival
+ * order), then the `spaceOrder` sequence (the CONFIG key order —
+ * resolveSpaces preserves it), then any residual stored ids no configured
+ * space claims, in first-appearance order. A residual (stored-but-retired)
+ * id has no client by construction, so its batches HOLD at the call site —
+ * retired rows are reported as held, never scored, never lost.
  */
 export function buildImportanceBatches(
   memories: Memory[],
   batchSize = 10,
-): Array<{ pool: MemoryPrivacy; memories: Memory[] }> {
-  const byPool = new Map<MemoryPrivacy, Memory[]>();
+  /** #642: the configured space ids in config order. The default keeps the
+   *  pre-#642 two-pool output (standard then confidential) for every
+   *  existing caller. */
+  spaceOrder: string[] = ["confidential"],
+): Array<{ pool: string; memories: Memory[] }> {
+  const byPool = new Map<string, Memory[]>();
   for (const mem of memories) {
-    const pool: MemoryPrivacy = mem.privacy === "confidential" ? "confidential" : "standard";
+    const pool = spaceOf(mem.privacy);
     const list = byPool.get(pool);
     if (list) list.push(mem);
     else byPool.set(pool, [mem]);
   }
-  // Standard pool first (arrival order), then confidential — a stable,
-  // greppable order.
-  const out: Array<{ pool: MemoryPrivacy; memories: Memory[] }> = [];
-  for (const pool of ["standard", "confidential"] as const) {
+  const order = new Set<string>(["standard", ...spaceOrder]);
+  for (const id of byPool.keys()) order.add(id);
+  const out: Array<{ pool: string; memories: Memory[] }> = [];
+  for (const pool of order) {
     const list = byPool.get(pool);
     if (!list) continue;
     for (let i = 0; i < list.length; i += batchSize) {
@@ -592,14 +645,26 @@ async function stageImportance(
   guardSkipped = 0,
   /** #332: the confidential-pool client (see scoreMemoriesImportance). */
   confidentialLlm?: LlmClient | null,
+  /** #642: per-space clients + the configured batch order (see
+   *  scoreMemoriesImportance). */
+  spaceClients?: Map<string, LlmClient | null>,
+  spaceOrder?: string[],
 ): Promise<{
   scored: number;
   failed: number;
   skipped_budget: number;
   guard_skipped: number;
   skipped_confidential?: number;
+  skipped_spaces?: Record<string, number>;
 }> {
-  const r = await scoreMemoriesImportance(db, memories, llm, { budget, deadline, dryRun, confidentialLlm });
+  const r = await scoreMemoriesImportance(db, memories, llm, {
+    budget,
+    deadline,
+    dryRun,
+    confidentialLlm,
+    spaceClients,
+    spaceOrder,
+  });
   return { ...r, guard_skipped: guardSkipped };
 }
 
@@ -608,21 +673,26 @@ async function stageImportance(
 // ---------------------------------------------------------------------------
 
 /**
- * One reflection run over ONE class-pure cohort (#332). The cohort never
- * mixes classes (the caller splits), the recent-lessons dedup block is
- * class-scoped, the contradiction check only sees same-class lessons, and
- * every generated lesson inherits the pool's stamp at insert. `client` is the
- * client matching `pool` — the caller guarantees it (a confidential cohort
- * without a client never reaches here; it holds instead).
+ * One reflection run over ONE space-pure cohort (#332, widened to spaces by
+ * #642). The cohort never mixes spaces (the caller splits), the
+ * recent-lessons dedup block is space-scoped, the contradiction check only
+ * sees same-space lessons, and every generated lesson inherits the pool's
+ * stamp at insert. `client` is the client matching `pool` — the caller
+ * guarantees it (a cohort whose space has no client never reaches here; it
+ * holds instead). `privacyLine` is the RESOLVED space line threaded from the
+ * caller (SpaceDef.privacyLine); undefined for 'standard' and for a
+ * 'confidential' pool with no resolved SpaceDef — both fall back to the
+ * shipped constants inside reflection(), byte-identical to #602.
  */
 async function reflectPool(
   db: Database.Database,
   cohort: Memory[],
-  pool: MemoryPrivacy,
+  pool: string,
   client: LlmClient,
   budget: BudgetTracker,
   embedFn: EmbedFn,
   dryRun: boolean,
+  privacyLine?: string,
 ): Promise<{ generated: number; failed?: boolean; skipped?: boolean; reason?: string }> {
   if (cohort.length === 0) {
     return { generated: 0, skipped: true, reason: "no memories" };
@@ -638,20 +708,23 @@ async function reflectPool(
   const memoriesBlock = lines.join("\n\n");
 
   // Feed recent lessons to prevent duplicates and enable escalation.
-  // #332: the dedup block is CLASS-SCOPED — a confidential run's prompt must
-  // not quote standard lessons (and vice versa); the pool's own lessons are
-  // the coherent reference set.
+  // #332/#642: the dedup block is SPACE-SCOPED — a private pool's prompt must
+  // not quote another pool's lessons (and vice versa); the pool's own lessons
+  // are the coherent reference set. visibleSpaces {pool} is the same read the
+  // legacy boolean produced for both pre-#642 pools ('standard' reads
+  // shared-only, 'confidential' reads shared+confidential).
   const recentLessons = storage
-    .getLessons(db, 7, null, { includeConfidential: pool === "confidential" })
+    .getLessons(db, 7, null, { visibleSpaces: new Set([pool]) })
     .slice(0, 10);
   const recentBlock = recentLessons.length > 0
     ? recentLessons.map(l => `- ${l.content.slice(0, 150)}`).join("\n")
     : undefined;
 
-  // #602: pool-aware prompt — the confidential pool's reflection prompt swaps
-  // ONLY the privacy line (personal domains allowed at the process level;
-  // secrets still never), so the pool can actually generate its lessons.
-  const prompt = reflection(memoriesBlock, recentBlock, pool);
+  // #602/#642: pool-aware prompt — each pool's reflection prompt swaps ONLY
+  // the privacy line (the RESOLVED space line here; personal domains allowed
+  // at the process level for private pools; secrets still never), so the pool
+  // can actually generate its lessons.
+  const prompt = reflection(memoriesBlock, recentBlock, pool, privacyLine);
 
   if (dryRun) {
     return { generated: 0, skipped: false };
@@ -716,14 +789,14 @@ async function reflectPool(
         // TRUE cosine > 0.80 (#145): the old `1 − n.distance > 0.80` sat on
         // the accidental 1−L2 scale and required cosine > 0.98 — the check
         // effectively never fired. See isContradictionCandidate.
-        // #332: class-scoped — only SAME-POOL lessons enter the check (the
-        // vector search is unscoped; the filter narrows it).
+        // #332/#642: space-scoped — only SAME-SPACE lessons enter the check
+        // (the vector search is unscoped; the filter narrows it).
         const similarLessons = storage.vectorSearch(db, embedding, 3)
           .filter(
             (n) =>
               isContradictionCandidate(n.distance) &&
               n.memory_type === "learnings" &&
-              (n.privacy === "confidential") === (pool === "confidential")
+              spaceOf(n.privacy) === pool
           );
 
         let contradicted = false;
@@ -758,8 +831,8 @@ async function reflectPool(
             project,
             memoryType: "learnings",
             baseStrength: baseStrength[severity] ?? 0.8,
-            // #332: lessons inherit their pool's stamp — the class is born
-            // with the cohort, never judged from content.
+            // #332/#642: lessons inherit their pool's (space's) stamp — the
+            // class is born with the cohort, never judged from content.
             privacy: pool,
           });
           generated++;
@@ -797,8 +870,14 @@ async function stageReflection(
   embedFn: EmbedFn,
   dryRun: boolean,
   /** #332: the confidential-pool client; absent ⇒ the confidential cohort
-   *  holds (skipped, no fallback to the main model). */
+   *  holds (skipped, no fallback to the main model). #642: the confidential
+   *  SPACE keeps this exact role — it is never routed through spaceClients. */
   confidentialLlm?: LlmClient | null,
+  /** #642: per-space clients (every configured space except 'confidential'). */
+  spaceClients?: Map<string, LlmClient | null>,
+  /** #642: the resolved SpaceDef list (config order) — cohort order + each
+   *  space's privacyLine. Absent = the pre-#642 two-pool split. */
+  spaces?: SpaceDef[],
 ): Promise<{
   lessons_generated: number;
   failed?: boolean;
@@ -806,46 +885,85 @@ async function stageReflection(
   reason?: string;
   /** #332: the confidential cohort was skipped — no confidential client. */
   confidential_skipped?: boolean;
+  /** #642: every non-shared cohort that held — the space ids, for the report
+   *  and the hold log. A stored-but-retired id (no configured space claims
+   *  it, so no client can exist) holds here too. */
+  held_spaces?: string[];
 }> {
   if (memories.length === 0) {
     return { lessons_generated: 0, skipped: true, reason: "no memories" };
   }
 
-  // #332: split the watermark cohort by class — the pools NEVER mix in a
-  // reflection prompt (a mixed cohort would distill cross-class lessons with
-  // no honest stamp). Standard run unchanged on the main client.
-  const standardCohort = memories.filter((m) => m.privacy !== "confidential");
-  const confidentialCohort = memories.filter((m) => m.privacy === "confidential");
+  // #332/#642: split the watermark cohort by SPACE — the pools NEVER mix in
+  // a reflection prompt (a mixed cohort would distill cross-space lessons
+  // with no honest stamp). Standard run unchanged on the main client; every
+  // other space runs its own cohort on its own client, config order.
+  const spaceById = new Map((spaces ?? []).map((s) => [s.id, s]));
+  const cohorts = new Map<string, Memory[]>();
+  for (const mem of memories) {
+    const space = spaceOf(mem.privacy);
+    const list = cohorts.get(space);
+    if (list) list.push(mem);
+    else cohorts.set(space, [mem]);
+  }
+  // Deterministic order: shared first, then the configured spaces in CONFIG
+  // order (a legacy-materialized confidential space sits last — the pre-#642
+  // standard→confidential order), then residual stored ids (first-seen).
+  const order = new Set<string>(["standard", ...(spaces ?? []).map((s) => s.id)]);
+  for (const id of cohorts.keys()) order.add(id);
+  // The confidential pool's client is ALWAYS the confidential field — never
+  // the space map (one endpoint, one role; buildSpaceLlms skips the id).
+  const clientForSpace = (id: string): LlmClient | null =>
+    id === "confidential" ? (confidentialLlm ?? null) : (spaceClients?.get(id) ?? null);
 
   let generated = 0;
   let anyFailed = false;
   let anySkipped = false;
   let reason: string | undefined;
   let confidentialSkipped = false;
+  const heldSpaces: string[] = [];
 
-  if (standardCohort.length > 0) {
-    const r = await reflectPool(db, standardCohort, "standard", llm, budget, embedFn, dryRun);
-    generated += r.generated;
-    anyFailed = anyFailed || r.failed === true;
-    anySkipped = anySkipped || r.skipped === true;
-    reason = reason ?? r.reason;
-  }
-  if (confidentialCohort.length > 0) {
-    if (!confidentialLlm) {
-      // Hold: the cohort is retried next run (it is the lastConsolidated
-      // watermark cohort — a held watermark re-finds it). Never the main model.
-      confidentialSkipped = true;
-      console.warn(
-        `[hicortex] reflection: ${confidentialCohort.length} confidential memorie(s) held — ` +
-          `no confidential model configured (llmConfidentialBaseUrl/ApiKey). No lessons generated for the pool.`,
-      );
-    } else {
-      const r = await reflectPool(db, confidentialCohort, "confidential", confidentialLlm, budget, embedFn, dryRun);
+  for (const pool of order) {
+    const cohort = cohorts.get(pool);
+    if (!cohort || cohort.length === 0) continue;
+    if (pool === "standard") {
+      const r = await reflectPool(db, cohort, "standard", llm, budget, embedFn, dryRun);
       generated += r.generated;
       anyFailed = anyFailed || r.failed === true;
       anySkipped = anySkipped || r.skipped === true;
       reason = reason ?? r.reason;
+      continue;
     }
+    const client = clientForSpace(pool);
+    if (!client) {
+      // Hold: the cohort is retried next run (it is the lastConsolidated
+      // watermark cohort — a held watermark re-finds it). Never the main model.
+      if (pool === "confidential") confidentialSkipped = true;
+      heldSpaces.push(pool);
+      console.warn(
+        pool === "confidential"
+          ? `[hicortex] reflection: ${cohort.length} confidential memorie(s) held — ` +
+            `no confidential model configured (llmConfidentialBaseUrl/ApiKey). No lessons generated for the pool.`
+          : `[hicortex] reflection: ${cohort.length} memorie(s) of space '${pool}' held — ` +
+            `no model configured for that space (spaces.${pool}.llm* or the llmConfidential* ` +
+            `endpoint). No lessons generated for the pool; never the main model.`,
+      );
+      continue;
+    }
+    const r = await reflectPool(
+      db,
+      cohort,
+      pool,
+      client,
+      budget,
+      embedFn,
+      dryRun,
+      spaceById.get(pool)?.privacyLine,
+    );
+    generated += r.generated;
+    anyFailed = anyFailed || r.failed === true;
+    anySkipped = anySkipped || r.skipped === true;
+    reason = reason ?? r.reason;
   }
 
   return {
@@ -854,6 +972,7 @@ async function stageReflection(
     ...(anySkipped ? { skipped: true } : {}),
     ...(reason ? { reason } : {}),
     ...(confidentialSkipped ? { confidential_skipped: true } : {}),
+    ...(heldSpaces.length > 0 ? { held_spaces: heldSpaces } : {}),
   };
 }
 
@@ -931,6 +1050,10 @@ async function stageContentDomains(
   /** #332: the confidential-pool client — classification calls pick the
    *  client matching EACH memory's stamp (AC-10 second half). */
   confidentialLlm?: LlmClient | null,
+  /** #642: per-space clients (every configured space except 'confidential') —
+   *  per-row selection is spaceOf(row.privacy), one row's content to one
+   *  client; a space without a client HOLDS its rows. */
+  spaceClients?: Map<string, LlmClient | null>,
 ): Promise<{
   curated: boolean;
   domains: number;
@@ -942,6 +1065,8 @@ async function stageContentDomains(
   no_association_decayed?: number;
   /** #332: confidential rows held (no confidential client) — retried next run. */
   held_confidential?: number;
+  /** #642: rows held per space id (no client for that space). */
+  held_spaces?: Record<string, number>;
   reason?: string;
 }> {
   // Rows needing (re)classification:
@@ -979,7 +1104,12 @@ async function stageContentDomains(
   let weakPrimary = 0;
   let noAssociationDecayed = 0;
   let heldConfidential = 0;
-  const pair: LlmPair = { standard: llm, confidential: confidentialLlm ?? null };
+  const heldSpaces: Record<string, number> = {};
+  const pair: LlmPair = {
+    standard: llm,
+    confidential: confidentialLlm ?? null,
+    spaces: spaceClients,
+  };
 
   if (rows.length > 0) {
     // Prototypes at run start — newly classified memories get their weights
@@ -996,13 +1126,16 @@ async function stageContentDomains(
         console.warn(`[hicortex] content-domain: budget exhausted after ${classified} classified`);
         break;
       }
-      // #332 per-row client selection: the classify call carries this row's
-      // CONTENT — a confidential row goes to the confidential client, and
-      // without one it is HELD (tags untouched, retried next run), never
-      // classified on the main model.
-      const rowLlm = clientForPool(pair, row.privacy === "confidential" ? "confidential" : "standard");
+      // #332/#642 per-row client selection: the classify call carries this
+      // row's CONTENT — a private-pool row goes to ITS space's client
+      // (confidential via the confidential field), and without one it is
+      // HELD (tags untouched, retried next run), never classified on the
+      // main model.
+      const rowSpace = spaceOf(row.privacy);
+      const rowLlm = clientForPool(pair, rowSpace);
       if (!rowLlm) {
-        heldConfidential++;
+        if (rowSpace === "confidential") heldConfidential++;
+        else heldSpaces[rowSpace] = (heldSpaces[rowSpace] ?? 0) + 1;
         continue;
       }
       // classifyMemoryTags returns null ONLY on infra error (throws after retry) —
@@ -1020,7 +1153,7 @@ async function stageContentDomains(
         continue;
       }
       if (result.tags.length === 0) {
-        // Genuine no-fit (owner amendment 07.07): weak primary from the
+        // Genuine no-fit (spec 2026-07-07 amendment): weak primary from the
         // prototype argmax when it clears the floor, else accelerated decay.
         // Each row appears exactly once in `rows`, so a run never
         // double-halves.
@@ -1058,6 +1191,15 @@ async function stageContentDomains(
         `no confidential model configured; they retry next run`,
     );
   }
+  // #642: name every held SPACE (same visibility as the confidential line).
+  const heldSpaceIds = Object.keys(heldSpaces);
+  if (heldSpaceIds.length > 0) {
+    console.warn(
+      `[hicortex] content-domain: rows held by space — ` +
+        heldSpaceIds.map((id) => `${heldSpaces[id]} ${id}`).join(", ") +
+        `. No model configured for those spaces; they retry next run, never the main model.`,
+    );
+  }
   console.log(
     `[hicortex] Graded tags: ${classified} classified, ${weakPrimary} weak-primary, ` +
       `${noAssociationDecayed} no-association decayed, ${prototypes.size} prototypes ` +
@@ -1074,6 +1216,7 @@ async function stageContentDomains(
     weak_primary: weakPrimary,
     no_association_decayed: noAssociationDecayed,
     ...(heldConfidential > 0 ? { held_confidential: heldConfidential } : {}),
+    ...(heldSpaceIds.length > 0 ? { held_spaces: heldSpaces } : {}),
     ...(rows.length === 0 ? { reason: "nothing_stale" } : {}),
   };
 }
@@ -1278,12 +1421,12 @@ async function stageDomainCuration(
 // Stage 3: Link Discovery (vector similarity auto-link + heuristic typing)
 // ---------------------------------------------------------------------------
 //
-// LLM edge classification is RETIRED (2026-07). A 672-link audit (17 LLM
-// judges) found only 31% of typed links overall were correct/defensible, and
-// the LLM-classified UPPERCASE types were near-useless: CONTRADICTS 4%,
-// SUPERSEDES 29%, DEPENDS_ON 26%, CAUSED_BY 24%, VALIDATES 44%. The lowercase
-// heuristics `updates`/`derives` were also weak (~31%). Only `extends` (57%)
-// and `relates_to` (53%) held up, so the pipeline now emits ONLY those two.
+// LLM edge classification is RETIRED. A many-judge link audit found only
+// about a third of typed links overall were correct/defensible, and
+// the LLM-classified UPPERCASE types were near-useless (every one below
+// half acceptable). The lowercase
+// heuristics `updates`/`derives` were also weak (about a third). Only
+// `extends` and `relates_to` held up, so the pipeline now emits ONLY those two.
 //
 // The UPPERCASE types remain in VALID_RELATIONSHIP_TYPES (types.ts) so old data
 // still validates — they are RETIRED, not deleted. Classification via an LLM
@@ -1301,28 +1444,29 @@ export interface LinkCandidate {
 /**
  * Discovery: find link candidates for one memory given its embedding.
  * Vector neighbors (excluding self), keep the CONSOLIDATE_LINK_TOP_K
- * highest-cosine SAME-CLASS neighbors above CONSOLIDATE_LINK_THRESHOLD,
+ * highest-cosine SAME-SPACE neighbors above CONSOLIDATE_LINK_THRESHOLD,
  * pre-compute the heuristic relationship type.
  *
- * #602 — ADAPTIVE CLASS-SCOPED FETCH. The pre-#602 code fetched a fixed
- * top-10 UNFILTERED window and then dropped cross-class neighbors in the
+ * #602 — ADAPTIVE SPACE-SCOPED FETCH (class-scoped at birth, space-scoped
+ * since #642). The pre-#602 code fetched a fixed
+ * top-10 UNFILTERED window and then dropped cross-space neighbors in the
  * loop — the #192 filtered-over-fetch defect class. Starvation math: when
- * the standard pool heavily outnumbers the confidential pool, a confidential
- * memory's 10 nearest neighbors are usually ALL standard (the classes are
- * topically distinct but the majority class is much larger), so the
- * confidential pool systematically under-linked — its same-class neighbors
+ * the shared pool heavily outnumbers a private space, a private
+ * memory's 10 nearest neighbors are usually ALL shared (the spaces are
+ * topically distinct but the majority pool is much larger), so the
+ * private pool systematically under-linked — its same-space neighbors
  * never made the window. The fix
  * escalates the window (k × 4 per step, capped at CONSOLIDATE_LINK_FETCH_MAX_K
  * = the #192 over-fetch cap) until the window holds CONSOLIDATE_LINK_TOP_K
- * same-class neighbors, comes back short (no more rows may exist), or hits
+ * same-space neighbors, comes back short (no more rows may exist), or hits
  * the cap. Balanced corpora do ZERO extra queries (the first window already
- * holds 3+ same-class neighbors).
+ * holds 3+ same-space neighbors).
  *
- * WHY the class is not denormalized into the vec0 table (a WHERE clause
+ * WHY the space is not denormalized into the vec0 table (a WHERE clause
  * would make this a one-fetch query): memory_vectors carries only id +
  * embedding, and privacy is MUTABLE post-insert (`hicortex backfill-privacy`
- * and REST /update can reclassify a row) — a vec0-side class column would go
- * stale the moment a row's class changed without a re-embed. The class is
+ * and REST /update can reclassify a row) — a vec0-side space column would go
+ * stale the moment a row's stamp changed without a re-embed. The space is
  * read live from memories, so it can never disagree with the row.
  *
  * Shared between the nightly `stageLinks` (which embeds via embedFn) and
@@ -1333,13 +1477,13 @@ export function discoverLinkCandidates(
   mem: Memory,
   embedding: Float32Array,
 ): LinkCandidate[] {
-  // #332: class-pure link discovery — a candidate NEVER crosses the circle
-  // (no memory_links row joins the two classes; a pre-#332 cross-class link
-  // stays as historical data, but the stage creates none). NULL privacy (a
-  // pre-v27 row) reads standard, the same normalization everywhere else uses.
-  const memClass = mem.privacy === "confidential" ? "confidential" : "standard";
-  const isSameClass = (m: { privacy: MemoryPrivacy | null }) =>
-    (m.privacy === "confidential" ? "confidential" : "standard") === memClass;
+  // #332/#642: space-pure link discovery — a candidate NEVER crosses a space
+  // boundary (no memory_links row joins two spaces; a pre-existing
+  // cross-space link stays as historical data, but the stage creates none).
+  // NULL privacy (a pre-v27 row) reads standard via spaceOf — the same
+  // normalization every read gate uses.
+  const memSpace = spaceOf(mem.privacy);
+  const isSameSpace = (m: { privacy: string | null }) => spaceOf(m.privacy) === memSpace;
 
   // The excluded self (distance 0 — always the nearest stored row) occupies
   // one seat of the raw window, so each fetch asks for k + 1: a FULL window
@@ -1352,7 +1496,7 @@ export function discoverLinkCandidates(
   let k = CONSOLIDATE_LINK_FETCH_K;
   let neighbors = fetchWindow(k);
   while (
-    neighbors.filter(isSameClass).length < CONSOLIDATE_LINK_TOP_K &&
+    neighbors.filter(isSameSpace).length < CONSOLIDATE_LINK_TOP_K &&
     neighbors.length === k &&
     k < CONSOLIDATE_LINK_FETCH_MAX_K
   ) {
@@ -1368,16 +1512,17 @@ export function discoverLinkCandidates(
   // exactly the highest-cosine neighbors.
   for (const neighbor of neighbors) {
     if (candidates.length >= CONSOLIDATE_LINK_TOP_K) break;
-    // The in-loop class filter stays: it enforces purity (#332) and top-K
-    // cosine order regardless of how wide the escalated window got (#602).
-    if (!isSameClass(neighbor)) continue;
+    // The in-loop space filter stays: it enforces purity (#332/#642) and
+    // top-K cosine order regardless of how wide the escalated window got
+    // (#602).
+    if (!isSameSpace(neighbor)) continue;
     // sqlite-vec vec0 `distance` is L2, not a similarity. Embeddings are
     // L2-normalized (embedder.ts, normalize: true), so cos = 1 − d²/2.
     // The old `1 − distance` formula silently required cosine > 0.90.
     const similarity = l2ToCosine(neighbor.distance);
 
-    // Cross-project guard (2026-07 audit): cross-project links were 65%
-    // wrong-link vs 6% same-project. A candidate whose source/target belong to
+    // Cross-project guard (link audit): cross-project links were overwhelmingly
+    // wrong-link while same-project links were mostly right. A candidate whose source/target belong to
     // DIFFERENT projects must clear the higher CROSS_PROJECT_LINK_THRESHOLD;
     // same-project keeps CONSOLIDATE_LINK_THRESHOLD. A memory with no project
     // (null) is treated as same-project — the guard only fires on two distinct
@@ -1402,9 +1547,9 @@ export function discoverLinkCandidates(
 /**
  * Classification: assign a relationship type to each candidate link.
  *
- * HEURISTIC-ONLY (2026-07). LLM edge classification was retired after the
- * 672-link audit (see the Stage 3 header) found the LLM-classified UPPERCASE
- * types near-useless (CONTRADICTS 4% acceptable). Every candidate now takes its
+ * HEURISTIC-ONLY. LLM edge classification was retired after a comprehensive
+ * link audit (see the Stage 3 header) found the LLM-classified UPPERCASE
+ * types near-useless (every one below half acceptable). Every candidate now takes its
  * pre-computed `heuristicType` (only `extends` or `relates_to` — see
  * classifyRelationship). No LLM call is made. #405: the ignored `llm`/`budget`
  * params are deleted — the signature now tells the truth.
@@ -1476,10 +1621,10 @@ async function stageLinks(
 /**
  * Classify the relationship between two memories.
  *
- * TWO-LABEL heuristic (2026-07). The 672-link audit (see the Stage 3 header)
- * showed only `extends` (57% acceptable) and `relates_to` (53%) held up; the
+ * TWO-LABEL heuristic. The link audit (see the Stage 3 header)
+ * showed only `extends` and `relates_to` held up; the
  * emitted vocabulary is collapsed to exactly those two. The retired labels
- * `updates` and `derives` (~31% acceptable) and all UPPERCASE LLM types are no
+ * `updates` and `derives` (weak in the audit) and all UPPERCASE LLM types are no
  * longer produced. They remain in VALID_RELATIONSHIP_TYPES so pre-existing rows
  * still validate.
  *
@@ -1582,8 +1727,8 @@ export function stageDecayPrune(
  * iterated once per new use — iteration is what makes the ceiling asymptotic
  * (a count-sized single shot would overshoot it).
  *
- * The formula's S input is floored at PROMOTION_STRENGTH_FLOOR (#453 review,
- * owner decision 2026-09-16): S^(−0.3) has a zero-singularity, and a writable
+ * The formula's S input is floored at PROMOTION_STRENGTH_FLOOR (#453 review):
+ * S^(−0.3) has a zero-singularity, and a writable
  * base_strength of 0.0 would otherwise leap to the ceiling via Infinity→clamp
  * on a single access. The floor bounds the first boost at ≈+0.13; it clamps
  * the INPUT only — the stored 0.0 row is not rewritten, and the promoted
@@ -1999,9 +2144,31 @@ export async function runConsolidation(
    * reconsolidation verdicts/rewrites) selects per-pool — confidential work
    * goes here; when null, that work HOLDS/skips, never falls back to `llm`.
    * Optional so every pre-#332 caller (and corpora with no confidential
-   * rows) is byte-identical.
+   * rows) is byte-identical. #642: the confidential SPACE keeps this exact
+   * role — it is never routed through spaceClients.
    */
   confidentialLlm?: LlmClient | null,
+  /**
+   * #642 AC-9: per-space clients — every configured space except
+   * 'confidential' (resolveLlmPair/buildSpaceLlms). Every pool-aware stage
+   * above selects per space; a space with a null entry HOLDS its work
+   * (skipped_spaces / held_spaces report fields), never falls back to `llm`.
+   * Default empty = the pre-#642 two-pool run.
+   */
+  spaceClients?: Map<string, LlmClient | null>,
+  /**
+   * #642: their per-space endpoint configs. No consolidation stage reads a
+   * config today (the drain's per-endpoint chunk-size cache is the consumer);
+   * the field rides here so the nightly threads ONE resolved bundle through
+   * both calls.
+   */
+  spaceConfigs?: Map<string, LlmConfig | null>,
+  /**
+   * #642: the resolved SpaceDef list (config order) — reflection cohort
+   * order, each space's privacyLine, and the importance batch order. Default
+   * [] = the pre-#642 two-pool shape.
+   */
+  spaces?: SpaceDef[],
 ): Promise<ConsolidationReport> {
   const start = new Date();
   const report: ConsolidationReport = {
@@ -2158,6 +2325,8 @@ export async function runConsolidation(
         deadline,
         scoreMemories.length - settleCandidates.length,
         confidentialLlm,
+        spaceClients,
+        spaces && spaces.length > 0 ? spaces.map((s) => s.id) : undefined,
       );
     }
 
@@ -2179,6 +2348,8 @@ export async function runConsolidation(
         embedFn,
         dryRun,
         confidentialLlm,
+        spaceClients,
+        spaces,
       );
     }
 
@@ -2201,6 +2372,7 @@ export async function runConsolidation(
             domainOptions?.weakPrimaryFloor ?? DEFAULT_WEAK_PRIMARY_FLOOR,
             deadline,
             confidentialLlm,
+            spaceClients,
           );
         }
       } else {
@@ -2224,14 +2396,14 @@ export async function runConsolidation(
     // Stage 3.8: Reconsolidation (#384) — resolve corrections: rewrite
     // fact-shaped targets in place (absorbing transition-only triggers),
     // mark everything else. THE unified resolution stage since #392, and
-    // since #206-B (owner decision 6) also the ONLY true-update detector:
+    // since #206-B (decision 6) also the ONLY true-update detector:
     // the standalone supersession stage (3.7) is retired into its
     // `supersedes` verdict action. Rides the same shared budget under its
     // own stage label + cursor.
     if (!deadline?.hit("reconsolidation")) {
       report.stages.reconsolidation = await stageReconsolidation(
         db, llm, budget, embedFn, dryRun, stateDir,
-        { ...reconsolidationOptions, deadline, confidentialLlm },
+        { ...reconsolidationOptions, deadline, confidentialLlm, spaceClients },
       );
     }
 

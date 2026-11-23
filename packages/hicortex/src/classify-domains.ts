@@ -19,7 +19,7 @@
  *     storage.setMemoryTags. After a completed (non-aborted) run the
  *     prototypes, all weights, and all primaries are recomputed from the
  *     final tag sets — same reconsolidation pass as the nightly.
- *   - No-fit (owner amendment 07.07): an LLM reply of {"tags": []} means no
+ *   - No-fit (spec 2026-07-07 amendment): an LLM reply of {"tags": []} means no
  *     configured domain fits — there is NO fallback category. The memory gets
  *     a WEAK primary (argmax prototype cosine, when >= weakPrimaryFloor) or,
  *     below the floor, accelerated decay (base_strength halved, domain left
@@ -321,7 +321,7 @@ export async function runClassifyDomains(
         }
         scannedInBatch++;
         if (result.tags.length === 0) {
-          // Genuine no-fit (owner amendment 07.07): weak primary from the
+          // Genuine no-fit (spec 2026-07-07 amendment): weak primary from the
           // prototype argmax when it clears the floor, else accelerated
           // decay. Each rowid is visited at most once per run (cursor is
           // strictly increasing), so a run never double-halves.

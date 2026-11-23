@@ -7,6 +7,8 @@ import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { Memory, MemoryLink, InsertMemoryOptions, MemoryPrivacy } from "./types.js";
 import { derivePrimary, type WeightedTag } from "./schema-prototypes.js";
+import { isValidAgentId } from "./identity-store.js";
+import { resolveVisibleSet } from "./spaces.js";
 import * as CALIBRATION from "./calibration.js";
 
 // ---------------------------------------------------------------------------
@@ -29,15 +31,46 @@ function rowToMemory(row: Record<string, unknown>): Memory {
 }
 
 /**
- * Normalize any wire/unknown privacy value into the #332 classification
+ * Normalize any wire/unknown privacy value into the classification
  * vocabulary — the insert-boundary guard that keeps legacy values ('WORK',
  * 'PERSONAL', blank, NULL, wrong type) out of the column after migration
  * v27 normalized history. 'confidential' passes through (it is only ever
- * server-derived by the time it reaches storage); everything else becomes
- * 'standard' (the fail-closed default class).
+ * server-derived by the time it reaches storage); everything legacy-shaped
+ * becomes 'standard' (the fail-closed default class).
+ *
+ * #642 AC-7 REVERSES the unknown direction: the column may now carry any
+ * CONFIGURED space id, and an unknown id must fail CLOSED — a valid-shaped
+ * space id that no configured space claims THROWS (write refused), never
+ * silently lands 'standard' (the old fail-open direction was a leak vector
+ * the moment the vocabulary opened). Semantics, in order:
+ *   - 'confidential' / 'standard' → themselves (the fixed ids, always legal);
+ *   - null/undefined/non-string/blank → 'standard' (the v27 contract);
+ *   - a legacy-vocabulary-looking value WITHOUT space-id shape (uppercase
+ *     like 'WORK'/'PERSONAL', punctuation, whitespace — shape =
+ *     isValidAgentId, the one id namespace) → 'standard' (pinned by
+ *     tests/privacy-migration.test.ts);
+ *   - a VALID-SHAPED id in `known` → itself (the stamp survives the boundary);
+ *   - a valid-shaped id NOT in `known` → THROW.
+ *
+ * `known` (optional): the boot-resolved known space ids — pass
+ * knownSpaceIds({byId}) from the calling seam. Default when omitted: no
+ * configured ids pass (only the fixed 'standard'/'confidential'), so every
+ * caller that can carry space stamps MUST thread the set explicitly.
  */
-export function normalizeStoredPrivacy(v: unknown): MemoryPrivacy {
-  return v === "confidential" ? "confidential" : "standard";
+export function normalizeStoredPrivacy(
+  v: unknown,
+  known?: ReadonlySet<string>,
+): MemoryPrivacy {
+  if (v === "confidential") return "confidential";
+  if (v === "standard") return "standard";
+  if (typeof v !== "string" || v.length === 0) return "standard";
+  if (!isValidAgentId(v)) return "standard";
+  if (known?.has(v)) return v;
+  throw new Error(
+    `Refusing to store unknown space id '${v}' in the privacy column — no configured space ` +
+    `claims it (#642 AC-7: unknown ids fail closed, never silently 'standard'). Check the ` +
+    `spaces config or the stamping caller.`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -617,9 +650,9 @@ export const FTS_MATCH_MAX_TOKENS = 24;
  * FTS5 MATCH-safety quoting (#329 item 1). The raw prompt is NOT valid FTS5
  * query syntax: ordinary prompt punctuation (?, -, (, :, URLs, apostrophes, a
  * leading AND/OR) crashes the FTS5 parser, and retrieval.retrieve's catch then
- * silently drops the ENTIRE FTS candidate list — the perf sweep measured 8/12
- * realistic prompts affected, and it is why relevance eval #3 saw 0 FTS rows
- * in 2,208 candidates. Fix: tokenize on whitespace, strip embedded double
+ * silently drops the ENTIRE FTS candidate list — the perf sweep measured
+ * most realistic prompts affected, and it is why relevance eval #3 saw zero
+ * FTS rows across its candidates. Fix: tokenize on whitespace, strip embedded double
  * quotes (a raw `"` would terminate our own quoting), and wrap each token in
  * double quotes — a quoted token is a phrase of LITERAL strings, immune to
  * FTS5 query syntax (`"what" "is" "the" "deployment" "status"`). Punctuation
@@ -909,23 +942,46 @@ export function getMemoriesSince(
  * reflection stamps them confidential at birth), and the SAME membership gate
  * applies — `includeConfidential` defaults to FALSE (fail-closed: the
  * agent-facing consumers — /learnings, the MCP lessons tools — serve standard
- * lessons only unless the requester is a circle member). Server-internal
- * consumers (nightly telemetry, the seed check, the recall-precision standing
- * basis) pass true explicitly: they run inside the server, on the whole store.
+ * lessons only unless the requester is a circle member).
+ *
+ * #642 AC-5: `visibleSpaces` is the generalized form (the requester's resolved
+ * space set; unioned with the boolean by resolveVisibleSet). The SQL fragment
+ * admits NULL (the pre-v27 population reads standard) + 'standard' + one
+ * PARAMETERIZED arm per visible space id — never inlined. An empty visible
+ * set is the two-clause form (shared only); a stored id outside the visible
+ * set — including unknown/retired space ids (AC-7) — is hard-omitted.
+ * Byte-identical rows for the boolean-only calls on standard/confidential
+ * data (false → NULL/standard; true → NULL/standard/confidential).
+ *
+ * #642 follow-up (validator round 1): `allSpaces: true` is the EXPLICIT
+ * whole-store form for the server-internal consumers (nightly telemetry, the
+ * seed check, the recall-precision standing basis) — it skips the privacy
+ * predicate entirely, exactly as those passes did before #642. The boolean
+ * alone (`includeConfidential: true`) now means literally shared +
+ * confidential, so an internal pass that wants EVERY pool must say so with
+ * `allSpaces` — the "internal whole-store reads say so explicitly" rule. It
+ * is never a request-facing surface: no REST/MCP handler passes it.
  */
 export function getLessons(
   db: Database.Database,
   days = 7,
   project?: string | null,
-  opts?: { includeConfidential?: boolean },
+  opts?: { includeConfidential?: boolean; visibleSpaces?: Set<string>; allSpaces?: boolean },
 ): Memory[] {
   const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
   // The hard-omit predicate — NULL-safe by construction (NULL privacy, the
-  // pre-v27 population, reads standard).
-  const classPredicate =
-    opts?.includeConfidential === true
-      ? ""
-      : " AND (privacy IS NULL OR privacy != 'confidential')";
+  // pre-v27 population, reads standard). Every visible space id adds one `?`
+  // arm; the ids ride the statement as parameters (spaces.ts validates ids at
+  // the write boundary, but the parameterized form is the rule regardless).
+  // `allSpaces` (server-internal whole-store passes) skips the predicate.
+  const visibleSpaces = resolveVisibleSet(opts?.includeConfidential, opts?.visibleSpaces);
+  const spaceParams = [...visibleSpaces];
+  const spaceArms = spaceParams.map(() => "privacy = ?").join(" OR ");
+  const classPredicate = opts?.allSpaces === true
+    ? ""
+    : " AND (privacy IS NULL OR privacy = 'standard'" +
+      (spaceArms ? ` OR ${spaceArms}` : "") +
+      ")";
 
   if (project) {
     const rows = db
@@ -934,7 +990,7 @@ export function getLessons(
          WHERE memory_type = 'learnings' AND created_at > ? AND project = ?${classPredicate}
          ORDER BY created_at DESC`
       )
-      .all(cutoff, project) as Array<Record<string, unknown>>;
+      .all(cutoff, project, ...spaceParams) as Array<Record<string, unknown>>;
     return rows.map(rowToMemory);
   }
 
@@ -944,7 +1000,7 @@ export function getLessons(
        WHERE memory_type = 'learnings' AND created_at > ?${classPredicate}
        ORDER BY created_at DESC`
     )
-    .all(cutoff) as Array<Record<string, unknown>>;
+    .all(cutoff, ...spaceParams) as Array<Record<string, unknown>>;
   return rows.map(rowToMemory);
 }
 

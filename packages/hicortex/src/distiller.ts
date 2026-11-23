@@ -12,9 +12,10 @@ import { VOLATILE_STATUS_FILTER, VOLATILE_GATE_MAX_CHARS } from "./calibration.j
 const MAX_TRANSCRIPT_CHARS = 80_000;
 const MIN_CONVERSATION_CHARS = 200;
 
-// #339 (2026-08-24 postmortem): NO_EXTRACT over-firing visibility threshold.
-// Real summary-led segments that the model wrongly abandoned ran 38-64K
-// denoised chars; genuine pure-status noise is ~2.6K. A segment larger than
+// #339 (postmortem): NO_EXTRACT over-firing visibility threshold.
+// Real summary-led segments that the model wrongly abandoned ran tens of
+// thousands of denoised chars; genuine pure-status noise is only a few
+// thousand. A segment larger than
 // this whose every chunk returns an empty LLM verdict is far more likely the
 // model pattern-matching a bookkeeping-heavy OPENING to the ephemera gate than
 // a legitimately empty segment — so it gets a warning line. Warning ONLY: no
@@ -480,11 +481,11 @@ async function distillChunk(
       substanceDropped.push(entry.content);
       continue;
     }
-    // #489 volatility gate (owner decision 2: entry-level, deterministic,
+    // #489 volatility gate (decision 2: entry-level, deterministic,
     // beside the substance gate — cleanMessageContent untouched): GH-ticket /
     // version-bump / commit-state status shapes drop into the SAME #156
-    // trail (owner decision 1: mark-and-skip, never silent). Kill-switch =
-    // the release-managed calibration constant (owner decision 5).
+    // trail (decision 1: mark-and-skip, never silent). Kill-switch =
+    // the release-managed calibration constant (decision 5).
     if (VOLATILE_STATUS_FILTER && isVolatileStatusEntry(entry.content)) {
       volatileDropped.push(entry.content);
       continue;
@@ -599,12 +600,12 @@ export function hasMinimalSubstance(entry: string): boolean {
 
 // ---------------------------------------------------------------------------
 // Volatility gate (#489) — deterministic, entry-level, beside the substance
-// gate. Owner directive (gold-set A adjudication): GitHub ticket/workflow
+// gate. Design directive (gold-set A adjudication): GitHub ticket/workflow
 // states and version numbers churn faster than nightly consolidation retires
 // them — they arrive as supersession noise and inflate the store with
 // same-subject rows. The ephemera PROMPT already names these categories and
-// demonstrably under-fires (a month of it running, gold A still full of
-// GH-status/version rows) — so the filter is deterministic, catching entries
+// demonstrably under-fires (gold set A stayed full of
+// GH-status/version rows even after long runs) — so the filter is deterministic, catching entries
 // synthesized from ANY source prose.
 // ---------------------------------------------------------------------------
 
@@ -647,7 +648,7 @@ const VCS_STATE =
 /**
  * True when the entry is a VOLATILE STATUS SHAPE — GH-ticket/workflow status,
  * version-bump status, or branch/commit state — and carries no durability
- * escape (#489, owner decisions 1+2). Runs in distillChunk's gate zone beside
+ * escape (#489, decisions 1+2). Runs in distillChunk's gate zone beside
  * hasMinimalSubstance; drops ride the SAME #156 dropped[] trail. Also reused
  * verbatim by `hicortex sweep-volatile` over the stored corpus — ONE gate,
  * one meaning.
@@ -745,8 +746,8 @@ export function parseDistilledEntries(markdown: string): DistilledEntry[] {
     // Skip all markdown headers (session title, section headings). Sections
     // are NOT prefixed onto entries: each bullet already starts with its type
     // tag + [SUBJECT] (topic-first, enforced by prompts.ts), and prepending
-    // "[Section]" re-introduced the category-first prefix the 2026-08-02
-    // corpus rewrite removed.
+    // "[Section]" re-introduced the category-first prefix the corpus
+    // rewrite removed.
     if (
       trimmed.startsWith("# ") ||
       trimmed.startsWith("## ") ||

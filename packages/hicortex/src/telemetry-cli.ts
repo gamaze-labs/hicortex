@@ -1,7 +1,7 @@
 /**
  * `hicortex telemetry` — transparency surface for anonymous usage telemetry.
  *
- * Read-only BY DESIGN (owner decision 30.07.2026). It shows the exact payload
+ * Read-only BY DESIGN. It shows the exact payload
  * and both documented ways to switch telemetry off, but it does not flip the
  * switch itself: the `telemetry` key is deliberately NOT scaffolded into
  * config.json, and opting out is a deliberate edit the operator makes. Turning

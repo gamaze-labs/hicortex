@@ -181,8 +181,8 @@ export function recordRecallFetch(
  *
  * #578 retention split — recall_verdicts rides the SAME horizon with ONE
  * carve-out: grader='owner' rows are NEVER dropped (they are the
- * manual-verdict calibration reference, tiny volume by construction — about
- * five thumbs a week). Machine rows ('auto', 'revealed') prune with the events
+ * manual-verdict calibration reference, tiny volume by construction).
+ * Machine rows ('auto', 'revealed') prune with the events
  * they were derived from — a revealed verdict outliving its own event rows
  * would claim a window the store no longer holds.
  */
@@ -271,8 +271,9 @@ export function createStandingContextBasis(
     // not a ledger.
     try {
       // #332: the basis is a server-internal redundancy reference over the
-      // whole lesson store (no agent sees it) — ungated by design.
-      for (const lesson of storage.getLessons(db, 30, null, { includeConfidential: true })) texts.push(lesson.content);
+      // whole lesson store (no agent sees it) — ungated by design. #642:
+      // allSpaces is the explicit whole-store form (every pool).
+      for (const lesson of storage.getLessons(db, 30, null, { allSpaces: true })) texts.push(lesson.content);
     } catch (err) {
       console.warn(
         `[hicortex] standing-context basis: lesson read failed (degraded): ` +
@@ -385,7 +386,7 @@ export interface MemoryPrecision {
     /** Top-3 by window showings DESC, lines rendered through the SHARED
      *  formatIndexLine (≤ RECALL_TITLE_CHARS — the card cannot drift from
      *  what agents see). Hover-only on the card face (no memory lists on
-     *  the main page — owner ruling 2026-09-12). */
+     *  the main page — #578 ruling). */
     top: Array<{ id: string; line: string; shown: number }>;
   };
   /** #578: the Tier-1 quality metrics over the SAME effective window. */

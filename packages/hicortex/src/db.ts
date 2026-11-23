@@ -584,7 +584,7 @@ const MIGRATIONS: Migration[] = [
     version: 15,
     name: "source_machine",
     up: (db) => {
-      // #421 owner direction (machine × harness identity): nullable, NO
+      // #421 direction (machine × harness identity): nullable, NO
       // backfill — honesty over guesses. Rows written before this column
       // stay NULL and group under "earlier captures" in the console; that
       // bucket shrinks as nights accumulate stamped captures. Stamped by the
@@ -739,8 +739,8 @@ const MIGRATIONS: Migration[] = [
     version: 22,
     name: "recall_precision_events",
     up: (db) => {
-      // #476 — the Memory Precision card's event store (Option A, owner
-      // decision 2026-09-19: per-push event rows incl. a ≤256-char prompt
+      // #476 — the Memory Precision card's event store (Option A,
+      // decision: per-push event rows incl. a ≤256-char prompt
       // excerpt — the exact-window Level-1 measures + the judge follow-up's
       // sample frame). Two sidecar tables, the v16 distill_activity pattern:
       // OPERATIONS telemetry, no memories FK — recall_events.memory_id is
@@ -787,7 +787,7 @@ const MIGRATIONS: Migration[] = [
     version: 23,
     name: "volatile_sweep_log",
     up: (db) => {
-      // #489 — `hicortex sweep-volatile` audit trail (owner decision 3:
+      // #489 — `hicortex sweep-volatile` audit trail (decision 3:
       // one-shot store sweep, mark-not-delete). Every swept memory gets a row
       // here as it is absorbed: the sweep is inspectable forever, never
       // silent. The dedup_log precedent (a sidecar audit table, no memories
@@ -812,7 +812,7 @@ const MIGRATIONS: Migration[] = [
       // the REDACTED segment here and answers 201 immediately (no LLM call);
       // the nightly drain distills rows oldest-first and deletes each row in
       // the same transaction as its memory inserts. One table in the shared
-      // SQLite DB — one store, same backup and tooling as the corpus (owner
+      // SQLite DB — one store, same backup and tooling as the corpus (design
       // decision; not files). The row carries every /distill wire field needed
       // to re-distill later (attribution, project, session_date, privacy) so
       // the drain reproduces the sync path's insert exactly.
@@ -888,7 +888,7 @@ const MIGRATIONS: Migration[] = [
       // source_machine precedent: pre-v26 rows stay NULL and attribute via
       // the `#`-prefix join on memories.source_session (which is
       // segment-scoped `<sessionId>#<segment>` — bare equality matches 0
-      // rows, measured #578); the join covers 96%+ of pushes, and the
+      // rows, measured #578); the join covers nearly all pushes, and the
       // attribution COVERAGE % renders beside the cross-project share so the
       // gap is explicit, never silent.
       //
@@ -973,6 +973,29 @@ const MIGRATIONS: Migration[] = [
       if (!hasColumn(db, "distill_queue", "workspace_path")) {
         db.exec("ALTER TABLE distill_queue ADD COLUMN workspace_path TEXT");
       }
+    },
+  },
+  {
+    version: 29,
+    name: "observed_agents",
+    up: (db) => {
+      // #642 AC-11/AC-15 — the observed-agents store. Read-side agent names
+      // were never persisted before (dashboard agent visibility was
+      // capture-time source_agent only), so a brand-new workspace was
+      // INVISIBLE to the dashboard until its first nightly capture. This
+      // store records an agent id the FIRST time it appears on a gated read
+      // (the requesterVisibleSpaces seam in mcp-server.ts) — a workspace
+      // shows as unassigned within seconds of its first prompt, before any
+      // capture exists. Additive only: NO migration touches memories.privacy
+      // (AC-15 — the widened space vocabulary rides v27's column as data,
+      // ids are values, never schema). Idempotent: IF NOT EXISTS.
+      db.exec(
+        `CREATE TABLE IF NOT EXISTS observed_agents (
+           agent TEXT PRIMARY KEY,
+           first_seen TEXT NOT NULL,
+           last_seen TEXT NOT NULL
+         )`,
+      );
     },
   },
 ];

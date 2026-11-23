@@ -33,16 +33,30 @@ export const REFLECTION_PRIVACY_LINE_CONFIDENTIAL =
   "Privacy: this pool serves the confidential circle only (confidential memories). Lesson text may reference the user's personal domains (names, health, finances) at the process level where needed to make the lesson actionable. Credentials, passwords, API keys, and other secrets are still never included — abstract those away.";
 
 /**
+ * The generic SPACE pool's reflection privacy line (#642) — the default for
+ * every configured space without an explicit `privacyLine`. Modeled on the
+ * confidential line (the pool serves its members only; personal domains at
+ * the process level where needed; secrets still never included), neutral
+ * private-pool wording: any space can carry it, confidential included. The
+ * `confidential` space itself is seeded the SHIPPED confidential line above
+ * (byte-identical prompts, #602 pin) — the seeding lives in spaces.ts
+ * resolution, never in prompt-building code.
+ */
+export const REFLECTION_PRIVACY_LINE_SPACE =
+  "Privacy: this pool serves its space's members only (space memories). Lesson text may reference the user's personal domains (names, health, finances) at the process level where needed to make the lesson actionable. Credentials, passwords, API keys, and other secrets are still never included — abstract those away.";
+
+/**
  * Importance scoring prompt. Takes a {memories_block} with indexed memories.
  *
  * RE-ANCHORED (#425): the pre-fix anchors put "useful context" at 0.3-0.5 —
  * but the distiller's ephemera gate already removes trivia before anything
  * reaches this scorer, so the model only ever saw curated material and the
- * distribution compressed upward (measured on the production snapshot via
- * eval:importance: median base 0.8, ~11% at exactly 1.0, which the decay
- * model never forgets). The anchors now place routine-but-curated content
- * LOW and add an explicit distribution instruction (owner decision D2,
- * 2026-09-13: target median 0.30-0.40, p90 <= 0.75; 1.0 is never a valid
+ * distribution compressed upward (measured on a production snapshot via
+ * eval:importance: most memories clustered high, a meaningful share at
+ * exactly 1.0, which the decay model never forgets). The anchors now place
+ * routine-but-curated content
+ * LOW and add an explicit distribution instruction (decision D2:
+ * target median 0.30-0.40, p90 <= 0.75; 1.0 is never a valid
  * score). The strict JSON-array response contract is unchanged.
  */
 export function importanceScoring(memoriesBlock: string): string {
@@ -92,20 +106,32 @@ No explanations. Just the JSON array.`;
  * API keys/secrets are never included. Everything else in the prompt
  * (generality bar, examples, output schema) is shared verbatim by both
  * pools — pinned by tests/reflection-prompt.test.ts.
+ *
+ * #642 SPACE-AWARE: the optional `privacyLine` argument is the RESOLVED
+ * per-space line (SpaceDef.privacyLine — concrete by the time a SpaceDef
+ * exists: explicit config, the confidential space's seeded #602 line, or
+ * REFLECTION_PRIVACY_LINE_SPACE). When given it REPLACES the two-constant
+ * selection entirely; absent, the #602 behavior is byte-identical. The
+ * caller (consolidate.ts reflectPool) threads `spaceById.get(pool)?.privacyLine`
+ * — undefined for 'standard', the seeded confidential text for 'confidential'
+ * (identical bytes to the constant, so both legacy pools are unchanged).
  */
 export function reflection(
   memoriesBlock: string,
   recentLessons?: string,
   pool?: MemoryPrivacy,
+  privacyLine?: string,
 ): string {
   const recentSection = recentLessons
     ? `\nRECENT LESSONS (already generated — do NOT duplicate, but DO escalate if patterns recur):\n${recentLessons}\n`
     : "";
 
-  const privacyLine =
-    pool === "confidential"
-      ? REFLECTION_PRIVACY_LINE_CONFIDENTIAL
-      : REFLECTION_PRIVACY_LINE_STANDARD;
+  const resolvedPrivacyLine =
+    privacyLine !== undefined
+      ? privacyLine
+      : pool === "confidential"
+        ? REFLECTION_PRIVACY_LINE_CONFIDENTIAL
+        : REFLECTION_PRIVACY_LINE_STANDARD;
 
   return `You are a learning analyst for a multi-agent AI system. Review today's memories and extract actionable lessons from BOTH successes and failures.
 
@@ -162,7 +188,7 @@ Focus on:
 - CROSS-AGENT PATTERNS: same issue or success across different agents — especially high-value
 - PROCESS FEEDBACK: user feedback about the agent's approach/behavior, not just its output
 
-${privacyLine}
+${resolvedPrivacyLine}
 
 Skip: isolated trivial actions, already-documented rules, incident notes, changelog entries, and tool-specific recipes. However, if multiple small successes form a consistent pattern of quality, extract that pattern as a reinforcement.
 
@@ -172,7 +198,7 @@ Respond with a JSON array. Empty array [] is a valid response.`;
 /**
  * Distillation prompt. Extracts knowledge from a session transcript.
  *
- * LAYOUT (REVERTED 2026-08-24): transcript BEFORE the static instruction
+ * LAYOUT (REVERTED): transcript BEFORE the static instruction
  * block — the pre-0.19.4 order. The #329 item-6 reorder (static-first, for
  * provider prefix caching) was REVERTED after a deterministic A/B on real
  * segments: with instructions first, the model over-fires NO_EXTRACT on
@@ -182,7 +208,7 @@ Respond with a JSON array. Empty array [] is a valid response.`;
  * loss beats any caching win. Re-attempting instructions-first requires a
  * gate fix that passes the A/B matrix harness first.
  *
- * #339 gate hardening (same day): the NO_EXTRACT rule now carries an explicit
+ * #339 gate hardening (same change): the NO_EXTRACT rule now carries an explicit
  * whole-transcript guard + counter-example (a summary-led session that
  * contains later decisions MUST be extracted) — the over-firing mechanism was
  * the model pattern-matching a bookkeeping-heavy OPENING to the ephemera gate
@@ -350,8 +376,8 @@ Rules:
 Respond with ONLY a JSON array. No explanations.`;
 }
 
-// edgeClassification prompt REMOVED (2026-07). LLM edge classification is
-// retired: the 672-link audit found the LLM-classified UPPERCASE relationship
-// types near-useless (CONTRADICTS 4% acceptable). Linking is now heuristic-only
+// edgeClassification prompt REMOVED. LLM edge classification is
+// retired: a comprehensive link audit found the LLM-classified UPPERCASE relationship
+// types near-useless (every one below half acceptable). Linking is now heuristic-only
 // (extends/relates_to) in consolidate.ts. A classification prompt may return
 // only when a future classifier passes the audit harness at >= 70% acceptable.

@@ -9,8 +9,8 @@
  * classification machinery (discoverLinkCandidates / classifyLinkCandidates
  * from consolidate.ts) — no new linking logic.
  *
- * Classification is HEURISTIC-ONLY (2026-07). LLM edge classification was
- * retired after the 672-link audit (see consolidate.ts Stage 3 header) found
+ * Classification is HEURISTIC-ONLY. LLM edge classification was
+ * retired after a comprehensive link audit (see consolidate.ts Stage 3 header) found
  * the LLM-classified UPPERCASE types near-useless. relink therefore never needs
  * an LLM; the old `--no-llm`, `--max-llm-calls`, and `--llm-base-url/--llm-model`
  * flags are gone. The classifyLinkCandidates call is retained (shared with the
@@ -191,8 +191,8 @@ export async function runRelink(options: RelinkOptions = {}): Promise<RelinkRepo
         `batch ${batchSize}, cursor ${cursor}${options.reset ? " (reset)" : ""}`,
     );
 
-    // Load all existing links once as an unordered pair set (471 rows on the
-    // live corpus — trivial). `seenPairs` additionally accumulates pairs
+    // Load all existing links once as an unordered pair set (a few hundred
+    // rows on the live corpus — trivial). `seenPairs` additionally accumulates pairs
     // handled during this run so re-runs AND within-run reverse candidates
     // never create duplicate edges.
     const preExistingPairs = loadExistingPairs(db);

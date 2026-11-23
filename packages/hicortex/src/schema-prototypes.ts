@@ -275,7 +275,7 @@ export function computeTagWeights(
  * Best prototype match for one memory across ALL configured domains:
  * argmax of cosine(memory embedding, prototype(domain)).
  *
- * Used by the no-fit path (nofit.ts, owner amendment 07.07): when the LLM
+ * Used by the no-fit path (nofit.ts, spec 2026-07-07 amendment): when the LLM
  * says no domain fits, the memory can still earn a WEAK primary from pure
  * embedding association — provided the best cosine clears the weak-primary
  * floor (release-managed since #408; the caller checks the floor, this

@@ -4,8 +4,8 @@
  *
  * The server canonicalizes every project string at entry (project-
  * canonicalize.ts, wired in mcp-server.ts); this command heals the corpus
- * that predates it: the 5,544-row `hicortex`/`Hicortex` case split and the
- * 14% junk-label share measured in #565 WS1. Dry run by default (report
+ * that predates it: the `hicortex`/`Hicortex` case split and the
+ * junk-label share measured in #565 WS1. Dry run by default (report
  * only, zero writes); `--apply` renames along the dedup rails.
  *
  * What a rename is: a pure function of the config alias map + the current

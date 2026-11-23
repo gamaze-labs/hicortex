@@ -4,10 +4,11 @@
  * The SAME project arrives under different labels: `hicortex` vs `Hicortex`
  * (case comes from the session-root dir name) split one project across two,
  * and junk labels (`default`, version-suffix numerics like `3`) carry no
- * project identity at all. Measured on the 22,691-memory corpus audit (#565
- * WS1): 5,544 rows split on case alone, 14% of the corpus under junk labels,
- * and project mismatch blocking 59 of 69 near-duplicate clusters in
- * `hicortex dedup` (423 excess rows). Every comparison that keys on project
+ * project identity at all. Measured on a production corpus audit (#565
+ * WS1): a meaningful share of rows split on case alone, a double-digit
+ * percent of the corpus under junk labels,
+ * and project mismatch blocking most near-duplicate clusters in
+ * `hicortex dedup`. Every comparison that keys on project
  * (recall affinity, lesson selection, the dedup project rail) is exact
  * `===` — so variants break affinity that should exist.
  *
@@ -29,7 +30,7 @@
 
 /**
  * The mechanical fold: trim + lowercase. Labels are dir-name derived and
- * display-lowercase was accepted by the owner (no case-preservation
+ * display-lowercase was the accepted choice (no case-preservation
  * machinery — Option 3 stayed rejected), so this is the whole canonical
  * alphabet.
  */

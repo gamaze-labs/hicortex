@@ -31,7 +31,7 @@ import { hicortexHome } from "./paths.js";
 // under the hood, but with a hidden 5-minute response-HEADER timer that fires
 // FIRST on non-streaming completions — a completion only sends its headers after
 // generation finishes, so a legitimate >5-min generation is abandoned client-side
-// while the server keeps generating for the dead client (the 2026-08-23/24
+// while the server keeps generating for the dead client (a production
 // incident's amplification mechanism). The ollama path already streams to dodge
 // this; these paths get the dispatcher instead.
 import { fetch as undiciFetch, Agent } from "undici";
@@ -421,8 +421,8 @@ const rateLimitedUntilByEndpoint = new Map<string, number>();
 // throw LlmCircuitOpenError with NO network I/O until the cooldown elapses,
 // after which exactly one call is a trial (a failure re-opens, a success
 // resets). This is what bounds a wedged endpoint to K ladder-exhausted calls
-// instead of the ~200-call nightly retrying into it for hours (incident
-// 2026-08-23/24). `openedAt` stays set (breakerOpen stays true) until a
+// instead of the ~200-call nightly retrying into it for hours (a production
+// incident). `openedAt` stays set (breakerOpen stays true) until a
 // SUCCESS resets it — tripped-but-past-cooldown is still "not proven healthy".
 //
 // #405: threshold + cooldown are CONSTANTS — the config knobs
@@ -955,7 +955,7 @@ export class LlmClient {
    * enableThinking is read from config here (one value, all phases — #231).
    * #562: the azure dialect (provider "azure", selected ONLY via config
    * llmProvider) swaps the token-cap parameter to max_completion_tokens and
-   * never sends chat_template_kwargs — Azure 400s on both (probed 2026-10-27).
+   * never sends chat_template_kwargs — Azure 400s on both (verified live).
    *
    * Token usage (#246): the OpenAI spec's `usage` object is always present on
    * a successful completion — `prompt_tokens` / `completion_tokens` /
@@ -984,7 +984,7 @@ export class LlmClient {
     }
 
     // Qwen3 thinking mode: when on, the model can burn the whole token budget on
-    // an unclosed <think> block and emit nothing (probed 2026-08-04). One value
+    // an unclosed <think> block and emit nothing (observed live). One value
     // for all phases (#231): when set (true or false) the chat_template_kwargs
     // kwarg rides every call — so it is LOCAL-endpoint only (ollama, mlx-lm
     // gateway); a cloud OpenAI/OpenRouter/Groq endpoint would 400 on the unknown

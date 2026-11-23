@@ -28,12 +28,15 @@ export function readValueFlag(argv: string[], flag: string): string | undefined 
  * Normalize a raw CLI command word. Hidden aliases resolve to their canonical
  * name so the cli.ts dispatch switch only spells the canonical form. Aliases
  * today (#264 rename): `context` → `identity` and `lessons-context` →
- * `learnings-identity`; kept so old scripts, installed hooks, and muscle memory
- * keep working. Pure + side-effect-free (unlike cli.ts, which dispatches on
- * import) so it can be unit-tested directly.
+ * `learnings-identity`; #642 rename: `backfill-privacy` → `backfill-spaces`
+ * (the confidential N=1 command generalized to per-space stamping). Kept so
+ * old scripts, installed hooks, and muscle memory keep working. Pure +
+ * side-effect-free (unlike cli.ts, which dispatches on import) so it can be
+ * unit-tested directly.
  */
 export function resolveCommandAlias(raw: string | undefined): string | undefined {
   if (raw === "context") return "identity";
   if (raw === "lessons-context") return "learnings-identity";
+  if (raw === "backfill-privacy") return "backfill-spaces";
   return raw;
 }

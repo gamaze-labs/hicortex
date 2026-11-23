@@ -24,7 +24,8 @@ import { initDb, resolveDbPath } from "./db.js";
 import { readNonNegativeConfig, readPositiveConfig, readStringConfig, warnIgnoredConfigKeys } from "./config-read.js";
 import { DEFAULT_FIRST_RUN_LOOKBACK_DAYS, DRAIN_YIELD_PROBE_TIMEOUT_MS } from "./calibration.js";
 import { type LlmConfig } from "./llm.js";
-import { resolveLlmPair, resolveConfidentialAgents, resolveConfidentialPaths, warnIfCircleUnconfigured } from "./classification.js";
+import { resolveLlmPair, resolveConfidentialAgents, resolveConfidentialPaths, warnIfCircleUnconfigured, spaceHoldWarnings } from "./classification.js";
+import { resolveSpaces, knownSpaceIds, unknownStoredSpaceIds } from "./spaces.js";
 import { embed } from "./embedder.js";
 import * as storage from "./storage.js";
 import { runConsolidation, resolveNightlyLlmCallBudget, resolveMemorySoftCap, stageMemoryCapEviction, shouldThrottleTokens, isStaleTokenPeriod, warnUnmeteredTokensRun } from "./consolidate.js";
@@ -130,7 +131,7 @@ function readLastRun(stateDir: string = HICORTEX_HOME): Date | null {
  * already-captured session yields an empty delta.
  *
  * First run (#436): with NO watermark yet, since = now − firstRunLookbackDays
- * (default 7 — owner ruling 2026-09-14: full-history first-run ingestion is
+ * (default 7 — #436 ruling: full-history first-run ingestion is
  * not feasible; a long-term AI user's entire session store must not be
  * discovered night one). The widening-only invariant composes unchanged:
  * min(now−7d, now−N) — a recapture window wider than the default widens, a
@@ -630,7 +631,12 @@ export async function runNightly(options: {
     // drain's confidential items and (from the pool-aware stages) every
     // consolidation touch of confidential text; absent = those hold/skip,
     // never fall back.
-    const resolvedPair = resolveLlmPair(savedConfig);
+    // #642: the spaces resolve ONCE here and feed the pair (per-space
+    // clients, AC-9's inheritance ladder), the unknown-id mirror below, the
+    // drain's known set, and the consolidation threading — one resolution,
+    // one definition (the confidential seam's discipline).
+    const spaceRes = resolveSpaces(savedConfig);
+    const resolvedPair = resolveLlmPair(savedConfig, spaceRes.spaces);
     if (resolvedPair.reason === "claude_binary_missing") {
       console.warn("[hicortex] claude-cli configured but binary not found — consolidation skipped");
     }
@@ -638,6 +644,12 @@ export async function runNightly(options: {
     const llm = resolvedPair.pair?.standard ?? null;
     const confidentialLlm = resolvedPair.pair?.confidential ?? null;
     const confidentialLlmConfig = resolvedPair.confidentialConfig;
+    // #642 AC-9: per-space clients/configs — empty maps on a legacy config
+    // (the only space IS confidential), so every threading below is a no-op
+    // there and the run is byte-identical.
+    const spaceClients = resolvedPair.spaceClients;
+    const spaceConfigs = resolvedPair.spaceConfigs;
+    const knownSpaces = knownSpaceIds({ byId: spaceRes.byId });
     // #332: the ONE loud warning when the circle is active without the
     // confidential model (daemon boot mirrors this). "Active" includes
     // confidentialPaths patterns configured (#609) — a patterns-only circle
@@ -653,6 +665,46 @@ export async function runNightly(options: {
         db.prepare("SELECT COUNT(*) AS c FROM distill_queue WHERE privacy = 'confidential'").get() as { c: number }
       ).c,
     });
+    // #642 AC-7: mirror the daemon boot's unknown-space-id warning at the
+    // nightly funnel (same gate — only when non-empty) so the nightly log
+    // carries it too: stored ids no configured space claims are invisible to
+    // every requester until configured or re-stamped.
+    {
+      const unknownIds = unknownStoredSpaceIds(db, knownSpaces);
+      if (unknownIds.length > 0) {
+        console.warn(
+          `[hicortex] Unknown space ids stored in the DB: ${unknownIds.join(", ")} — ` +
+            `no configured space claims them, so they are invisible to every requester ` +
+            `until configured or re-stamped (#642 AC-7)`
+        );
+      }
+    }
+    // #642 AC-9: the per-space hold warnings (the warnIfCircleUnconfigured
+    // companion) — one line per ACTIVE space with no effective model. On a
+    // legacy or fully-configured install the list is empty and nothing
+    // prints (the zero-change default).
+    {
+      const rowsBySpace = new Map<string, number>();
+      const queueBySpace = new Map<string, number>();
+      for (const table of ["memories", "distill_queue"] as const) {
+        const target = table === "memories" ? rowsBySpace : queueBySpace;
+        for (const row of db
+          .prepare(
+            `SELECT privacy, COUNT(*) AS c FROM ${table} ` +
+              `WHERE privacy IS NOT NULL AND privacy NOT IN ('standard', 'confidential') ` +
+              `GROUP BY privacy`,
+          )
+          .all() as Array<{ privacy: string; c: number }>) {
+          target.set(row.privacy, row.c);
+        }
+      }
+      for (const warning of spaceHoldWarnings(spaceRes.spaces, spaceClients, {
+        rowsBySpace,
+        queueBySpace,
+      })) {
+        console.warn(warning);
+      }
+    }
 
     // Steps 1+2: single-flight capture. The lock guards ONLY the capture phase
     // (fix 10). We acquire it BEFORE reading the cursor store so a run that
@@ -822,6 +874,13 @@ export async function runNightly(options: {
         // boot-time alias map the daemon resolved (rows queued pre-deploy
         // still hold raw wire labels).
         projectAliases: parseProjectAliases(savedConfig),
+        // #642 AC-9/AC-7: per-space clients (a space item distills on ITS
+        // model, holds without one) + the known set for the insert-time
+        // normalize boundary (a retired stamp holds its row). Both empty on
+        // a legacy config.
+        spaceClients,
+        spaceConfigs,
+        knownSpaces,
       });
       // #5 metering, same as the daemon's sync path: record tokens against
       // the monthly budget (incl. a failed item's partial usage) and fold
@@ -992,6 +1051,11 @@ export async function runNightly(options: {
               // (importance batches, reflection, domain classification,
               // reconsolidation) routes confidential text here; absent ⇒ hold.
               confidentialLlm,
+              // #642: per-space clients + the resolved spaces (config order,
+              // privacy lines). Empty/[] on a legacy config — byte-identical.
+              spaceClients,
+              spaceConfigs,
+              spaceRes.spaces,
             );
             console.log(
               `[hicortex] Consolidation ${report.status} in ${report.elapsed_seconds}s` +
@@ -1366,8 +1430,9 @@ export async function runNightly(options: {
         agent: agentType,
         mem: storage.countMemories(db),
         // #332: telemetry counts the whole store (server-internal metric —
-        // not an agent-facing surface, so no membership gate).
-        lessons: storage.getLessons(db, 365, null, { includeConfidential: true }).length,
+        // not an agent-facing surface, so no membership gate). #642: allSpaces
+        // is the explicit whole-store form (every pool).
+        lessons: storage.getLessons(db, 365, null, { allSpaces: true }).length,
         lessonsGenerated,
         consolidation: consolidationStatus,
         // #246: total tokens consumed by this run's consolidation (absent on

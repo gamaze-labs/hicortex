@@ -18,7 +18,7 @@
  *    agent (posts / sessions / bytes / held / retried), bytes DESC.
  *
  *  - readCaptureHealthWindow(db) — the same grouping over the ROLLING
- *    capture window (#409 fix round 7, owner ruling 2026-09-14: the card
+ *    capture window (#409 fix round 7: the card
  *    shows the normal 30 days like the band's other cards). The newest
  *    night's rows stay on the payload too (secondary info: the card's
  *    "tonight" suffix); the window sums are the card's face.
@@ -88,7 +88,7 @@ let lastPruneDay: string | null = null;
 
 /** The rolling capture window the console's card shows, in days — ALSO the
  *  retention horizon for distill_activity (the recorder prunes past it).
- *  Owner ruling 2026-09-14: the capture card shows the normal 30 day like
+ *  #409 fix round 7: the capture card shows the normal 30 day like
  *  the band's other cards, so the store must retain enough nights to sum
  *  one. ONE constant feeds both the window aggregate and the prune: the card
  *  can never claim a window the store no longer has rows for. */

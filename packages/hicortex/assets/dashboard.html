@@ -6,7 +6,7 @@
   visual on real endpoints, zero new write paths (Update/Remove ride the
   existing /update + /delete; identity Save rides PUT /identity).
 
-  NAMING (owner ruling 2026-09-14): this surface is "the Hicortex server
+  NAMING RULE: this surface is "the Hicortex server
   dashboard" — the word "console" never appears in USER-VISIBLE strings
   (titles, tooltips, aria-labels, placeholders, toasts, empty states).
   Historical "console" wording in these comments is internal shorthand and
@@ -27,7 +27,7 @@
     - Capture health: real /distill accounting rows (posts · sessions · MB ·
       held per machine × harness) via /dashboard/data capture_health; the
       phase-1 counts-only rows remain as the degrade.
-      Fix round 7 (#409, owner ruling 2026-09-14 — "the normal 30 day as the
+      Fix round 7 (#409 — "the normal 30 day as the
       other cards"): the card's face is the ROLLING window (window_rows,
       window_days), the newest night rides as a per-row secondary suffix;
       retention == window (CAPTURE_HEALTH_WINDOW_DAYS).
@@ -38,9 +38,9 @@
       /dashboard/model (api key write-only, applies on restart).
     - Overview: the counter/bar/headroom key off LIVE memories (absorbed
       rows show as an "absorbed (kept as evidence)" note); the counter is
-      STATIC (no replay tracking — owner ruling 2026-09-13).
+      STATIC (no replay tracking — design ruling).
     - Recall card: the RAW uses-per-showing ratio, NO
-      grade verdict (#426 owner semantics ruling: recall depends on the
+      grade verdict (#426 semantics ruling: recall depends on the
       conversation, higher is not a target).
     - Rail header: "Fleet".
 
@@ -61,7 +61,7 @@
       (override / global / off) over PUT /identity/mode — applies
       immediately, survives restart. Degrades to read-only on old servers.
 
-  PRE-RELEASE POLISH (owner findings on the live console, 2026-09-13):
+  PRE-RELEASE POLISH (live-console findings):
     - SEARCH: /search accepts an OPTIONAL ?minSimilarity= floor (absent =
       ungated — agents unaffected; the gate is the recall-index's own
       passesRelevanceGate: FTS/both pass, vector-only must clear it). The
@@ -80,11 +80,9 @@
       field takes the viewport remainder (clamp with a measured offset —
       see the #brainwrap CSS note). Scroll stays available as overflow.
 
-  FIX ROUND 2 (owner findings on the live console, 2026-09-14):
-    - ACCOUNT MENU RESTORED TO THE CORNER (owner: "It needs to be an account
-      menu where you can of course upgrade, but you should also be able to
-      get the token — that was the critical problem — and see who you're
-      logged in as and whatnot"). The chip + #365 menu render for EVERY
+  FIX ROUND 2 (live-console findings):
+    - ACCOUNT MENU RESTORED TO THE CORNER (an account menu where you can
+      upgrade, get the token, and see who you're logged in as). The chip + #365 menu render for EVERY
       account shape /account answers — including the all-null self-hosted
       default, which used to degrade the corner to a standalone Upgrade
       button. The upgrade CTA is a MENU ITEM (same plan-unset eligibility
@@ -95,7 +93,7 @@
       height.
     - DOT SIZING: strength→radius through a COMPRESSED mapping (sqrt span +
       dz^0.35 divisor, was s^1.2 + dz^1.25) — the rendered spread stays
-      within ~2–2.5× (owner: no huge green balls, nothing barely visible);
+      within ~2–2.5× (no huge green balls, nothing barely visible);
       stage colors untouched.
 
   FIX ROUND 6 (the approved mockup, variant 3 + copy A): ENTRY LOADING
@@ -120,15 +118,15 @@
     data may still land). #still removes it synchronously (screenshot
     contract); reduced motion rests on the bar's static base transform.
 
-  FIX ROUND 3 (owner findings on the live console, 2026-09-14):
-    - FIELD LINKS (owner: "the white lines … get very thick — they kind of
+  FIX ROUND 3 (live-console findings):
+    - FIELD LINKS (the white lines get very thick — they kind of
       overtake most of the image"): settled strokes are hairline-floored and
       roughly half as opaque in both themes, the dark-theme thread color is
       dimmed (160,190,210 → 108,128,144) so the additive mesh reads as
       structure, not foreground; width still tapers by link strength (use
       count); the formation overlay slimmed in proportion. NO new-vs-old
-      link highlighting (owner rejected it as incorrect). LOD untouched.
-    - RECALL CARD final shape (owner, verbatim intent): the zone WORD is the
+      link highlighting (rejected as incorrect). LOD untouched.
+    - RECALL CARD final shape (the settled intent): the zone WORD is the
       card's big element — the same .big .n slot as the sibling numbers,
       colored by SAMPLING the band gradient at the marker fraction (one JS
       stop table drives band + word; setTheme re-renders). The band moved
@@ -137,17 +135,17 @@
       stays marked; the visible word failed to communicate). Vocabulary
       amendment: Low / HEALTHY / Overfetching. Marker + zone word stay.
 
-  REPLAY + RANGE (#452, owner directives 2026-09-16):
+  REPLAY + RANGE (#452):
     - 30-DAY DEFAULT FOR ALL VIEWS: the replay ledger, the band and the
       snapshot series all default to 30 days (server EVENTS_DEFAULT_DAYS
       90 → 30; the client's every fetch is selector-driven). Longer
       ranges are OPT-IN via a compact 7 / 30 / 90 / 180 segmented control
       in the replay foot — explicit click only, never auto-loaded
-      (SUPERSEDES the 2026-09-12 no-dropdowns ruling). No persistence:
+      (SUPERSEDES the no-dropdowns ruling). No persistence:
       every load starts at 30 (loads fast).
     - PLAY ONCE, THEN REST: the replay auto-starts as before (~3.6 s after
       boot), walks the ledger ONCE to today, and STOPS there — no loop
-      (SUPERSEDES the 2026-09-13 auto-loop/no-buttons ruling). Controls in
+      (SUPERSEDES the auto-loop/no-buttons ruling). Controls in
       the replay foot, styled like "return to now": pause/resume (holds
       position mid-cruise; hides once the playback completed — nothing is
       playing) and "replay again" (appears once completed; restarts from
@@ -165,7 +163,7 @@
     - Recall card: no raw shown/used counts (the per-memory adoption sums
       are not in any payload yet).
     - Stage colors map forming→blue, belief→amber, truth→green, fading→red;
-      thresholds CALIBRATED 2026-09-13 (the field payload echoes them).
+      thresholds CALIBRATED per release (the field payload echoes them).
     - D.fleet absent (pre-phase-3 server) → no dots, no pause toggles — the
       exact phase-2 rendering.
 
@@ -231,7 +229,7 @@
   body{ min-height:100%; }
   body{
     background:var(--bg); color:var(--text); font:14px/1.5 var(--font);
-    /* #424 review (owner mechanics): the document scrolls END-TO-END — no
+    /* #424 review (settled mechanics): the document scrolls END-TO-END — no
        fixed app-shell. The flight field keeps its own viewport-height area
        within the flow (see #brainwrap); canvas interaction is untouched. */
     display:flex; flex-direction:column;
@@ -362,9 +360,9 @@
   }
   .acct-link:hover{ background:var(--panel); }
   .acct-link.acct-danger:hover{ color:var(--red); }
-  /* the Subscription entry's upgrade pill (#371 round 3, owner: the menu's
-     two billing entries merge into ONE "Subscription" item — "it can have
-     an upgrade pill/label after it before any subscription is active").
+  /* the Subscription entry's upgrade pill (#371 round 3: the menu's
+     two billing entries merge into ONE "Subscription" item, which can have
+     an upgrade pill/label after it before any subscription is active).
      The ENTRY always renders; the PILL is what the plan-unset eligibility
      gates. Accent badge in the trigger's chip idiom. */
   .acct-link .acct-pill{
@@ -429,11 +427,11 @@
   .csub b{ color:var(--green-mid); font-weight:600; }
   .csub .blue{ color:var(--blue); }
   .csub.mono{ font-family:var(--mono); font-size:10px; }
-  /* recall card — the designed U-band (#426 final ruling 2026-09-13): a
+  /* recall card — the designed U-band (#426 final ruling): a
      continuous red→green→red gradient over the PROVISIONAL zone edges. NO
-     tick marks or edge numerics — the owner's calibration state is "we have
-     no clue on how to calibrate yet", so nothing implies measured
-     boundaries. #409 fix round 3 (owner, verbatim intent): the ZONE WORD is
+     tick marks or edge numerics — there are no measured calibration
+     boundaries yet, so nothing implies measured
+     boundaries. #409 fix round 3 (the settled intent): the ZONE WORD is
      the card's big element — the same .big .n slot as the sibling numbers,
      its color SAMPLED from the band gradient at the marker fraction (one JS
      stop table drives band fill + word color, so they cannot disagree). The
@@ -441,7 +439,7 @@
      shared .bseg gap rhythm — limitbar alignment; card height matches the
      row). The visible "provisional" word is GONE — the marking is hover-only
      now, a tooltip on the band (the visible word failed to communicate).
-     Vocabulary (owner 2026-09-14): Low / Healthy / Overfetching. The raw
+     Vocabulary: Low / Healthy / Overfetching. The raw
      number stays tooltip-only on the marker (mock
      family). Colors: the band + word carry concrete per-theme colors from
      the JS stop table (setTheme re-renders), the dot rides theme tokens. */
@@ -594,7 +592,7 @@
   }
 
   /* ---- the brain-field ---- */
-  /* ONE-SCREEN AT-REST LAYOUT (#409 polish, owner ruling 2026-09-13): header
+  /* ONE-SCREEN AT-REST LAYOUT (#409 polish, design ruling): header
      + stats band + field fit the first viewport at ~1440×900 (that is the
      reference; 1280×800 verified too). The field takes the viewport REMAINDER
      — the subtracted constant is the MEASURED header+band+paddings total on
@@ -789,7 +787,7 @@
   .btn.confirm{ border-color:color-mix(in srgb, var(--red) 80%, transparent); color:var(--red); }
   .btn.save{ border-color:color-mix(in srgb, var(--blue) 60%, transparent); color:var(--blue); }
   .btn.sm{ padding:4px 11px; font-size:10.5px; flex:none; }
-  /* ---- bounded list mechanics (#424 review, owner numbers): card lists cap
+  /* ---- bounded list mechanics (#424 review): card lists cap
      at 10 visible rows and scroll INSIDE the card — the card's height is
      bounded, the band layout never blows up ---- */
   #cap-rows{ max-height:200px; overflow-y:auto; scrollbar-width:thin; }   /* ~8 rows — tightened for the one-screen at-rest layout */
@@ -827,7 +825,7 @@
   /* rolling 30 nights card — five segments per bar in phase 2 (#422): added
      (blue), merged (grey) + the three graduation deltas (stage palette).
      The chart is not a list — it FLEXES to fill the card's vertical space
-     (owner live-review: 24px left dead space under it); the bounded-list
+     (live review found 24px left dead space under it); the bounded-list
      scroll mechanics elsewhere are untouched. */
   .roll-top{ display:flex; gap:16px; align-items:baseline; flex-wrap:wrap; margin-bottom:4px; }
   .roll-top .rn{ font-size:15px; font-weight:620; font-variant-numeric:tabular-nums; }
@@ -872,7 +870,7 @@
   .cap-bar{ flex:1; height:5px; border-radius:2.5px; background:var(--tbar-bg); overflow:hidden; min-width:30px; }
   /* the share fill sources its accent the same way the activity bars do —
      a plain CSS var, no color-mix (the mix-based fill
-     rendered grey in the owner's live review; both themes flip the var) */
+     rendered grey in live review; both themes flip the var) */
   .cap-bar .fill{ height:100%; border-radius:2.5px; background:var(--green-mid); }
   .cap-row2 .st{ font-size:10px; color:var(--faint); font-family:var(--mono); white-space:nowrap; }
   .cap-row2 .st b{ color:var(--dim); font-weight:500; }
@@ -907,6 +905,59 @@
      nothing. */
   #ag-circle{ margin-left:auto; }
   #ag-circle[hidden]{ display:none; }
+  /* #642: the space chips — one small chip per space membership (the amber
+     circle pill generalized to N pools; the confidential chip KEEPS the amber
+     family via .conf, every other space reads neutral-dim). Shared by the
+     per-agent badges (ctx rows, detail headers) and the bundle chips. */
+  .space-chip{
+    flex:none; display:inline-flex; align-items:center; line-height:1.25;
+    font-size:9px; font-family:var(--mono); letter-spacing:.03em;
+    padding:2px 7px; border-radius:999px; white-space:nowrap;
+    color:var(--dim); background:color-mix(in srgb, var(--dim) 11%, transparent);
+    border:1px solid var(--line2);
+  }
+  .space-chip.conf{
+    color:var(--amber); background:color-mix(in srgb, var(--amber) 13%, transparent);
+    border-color:color-mix(in srgb, var(--amber) 45%, transparent);
+  }
+  /* #642: the space management card (under the fleet rail's agent list) —
+     one lane per space + the Unassigned lane; agent chips assign/unassign
+     through PUT /spaces/assign|unassign. [hidden] wins (the .cap-qrow idiom)
+     so a pre-#642 server — or a zero-space, zero-unassigned payload — shows
+     nothing at all. */
+  #ag-spaces{
+    flex:none; border-top:1px solid var(--line); padding:9px 12px 11px;
+    max-height:44%; overflow-y:auto; scrollbar-width:thin;
+  }
+  #ag-spaces[hidden]{ display:none; }
+  .sp-head{ display:flex; align-items:baseline; gap:7px; margin-bottom:7px; }
+  .sp-head .t{ font-size:10px; color:var(--faint); text-transform:uppercase; letter-spacing:.15em; }
+  .sp-head small{ font-size:9px; color:var(--faint); font-family:var(--mono); }
+  .sp-lane{ margin-bottom:7px; }
+  .sp-lane:last-child{ margin-bottom:0; }
+  .sp-lane-head{ display:flex; align-items:baseline; gap:6px; margin-bottom:4px; min-width:0; }
+  .sp-lane-head b{ font-weight:600; font-size:11px; white-space:nowrap; }
+  .sp-lane-head small{ font-size:9px; color:var(--faint); font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sp-chips{ display:flex; flex-wrap:wrap; gap:4px; align-items:center; }
+  .sp-agent{
+    font-size:9.5px; font-family:var(--mono); color:var(--text);
+    border:1px solid var(--line2); border-radius:999px; padding:2px 8px;
+    background:var(--elev); cursor:pointer; white-space:nowrap;
+    transition:border-color .15s, color .15s;
+  }
+  .sp-agent:hover{ border-color:color-mix(in srgb, var(--green) 40%, transparent); }
+  .sp-agent.confirm{ color:var(--red); border-color:color-mix(in srgb, var(--red) 70%, transparent); }
+  .sp-agent.unassigned{ color:var(--faint); border-style:dashed; }
+  .sp-note{ font-size:9px; color:var(--faint); font-family:var(--mono); padding:2px 0; }
+  /* the per-chip assign picker — inline (never a positioned popover: the rail
+     clips), rendered in place of the clicked unassigned chip */
+  .sp-pick{ display:inline-flex; flex-wrap:wrap; gap:4px; align-items:center; }
+  .sp-pick button{
+    font-size:9.5px; font-family:var(--mono); color:var(--green-mid);
+    border:1px solid color-mix(in srgb, var(--green) 40%, transparent);
+    border-radius:999px; padding:2px 8px; background:transparent; cursor:pointer;
+  }
+  .sp-pick button.cancel{ color:var(--faint); border-color:var(--line2); }
 
   /* ================= the memory dropdown — opens UNDER the left search ================= */
   #panel{
@@ -1047,7 +1098,7 @@
   #model-modal .mm-note{ padding:4px 14px 8px; font-size:10px; color:var(--faint); font-style:italic; }
   #model-modal .mm-foot{ display:flex; justify-content:flex-end; gap:7px; padding:10px 14px; border-top:1px solid var(--line); }
 
-  /* plan & billing overlay (#371, owner amendment 2 2026-09-23: the under-
+  /* plan & billing overlay (#371, amendment 2: the under-
      graph section was rejected — the upgrade surface must COVER the dash).
      The #model-modal idiom, widened for two side-by-side option cards; the
      cover is OPAQUE (var(--bg), not a scrim) — the dash is fully hidden
@@ -1082,8 +1133,8 @@
      cards, shown only while the selected currency is USD (setPlanCur). No
      display rule of its own, so the UA [hidden] hides it. */
   #plan-overlay .po-tax{ font-size:11px; color:var(--dim); }
-  /* what's included (round 3, owner: "NO info on what is included in the
-     plan") — the marketing site's Cloud feature lines, verbatim, per card. */
+  /* what's included (round 3: the plan must say what is included) —
+     the marketing site's Cloud feature lines, verbatim, per card. */
   .po-opt .po-feat{ list-style:none; margin-top:7px; display:flex; flex-direction:column; gap:3px; }
   .po-opt .po-feat li{ font-size:11px; color:var(--dim); display:flex; gap:7px; align-items:baseline; }
   .po-opt .po-feat li::before{ content:"✓"; color:var(--green-mid); font-size:10px; }
@@ -1097,7 +1148,7 @@
   @media (max-width:720px){ .po-opts{ grid-template-columns:1fr; } }
 
   /* connect overlay (#506) — ONE full-cover surface for every "Connect an
-     agent" entry (the #plan-overlay idiom, owner 2026-09-24: the fleet
+     agent" entry (the #plan-overlay idiom, #506 ruling: the fleet
      rail's inline drawer is REMOVED, not kept; the account-menu entry and
      the Agents-detected pill both open THIS). The cover is OPAQUE
      (var(--bg), not a scrim) and the [hidden] override is MANDATORY
@@ -1440,8 +1491,14 @@
   <aside id="agentscol" aria-label="Connected agents">
     <div class="col-head"><span class="t">Fleet</span><small id="ag-sub">0 &middot; auto-detected</small><span id="ag-circle" hidden></span></div>
     <div id="ag-list"></div>
+    <!-- #642: the space management card — one lane per space + the Unassigned
+         lane (first-prompt discovery). Chips drive PUT /spaces/assign and
+         PUT /spaces/unassign (the AC-10 admin API — the same endpoints the
+         CLI uses). Hidden entirely when the payload carries no spaces block
+         (older server) or nothing to show (zero spaces + zero unassigned). -->
+    <div id="ag-spaces" hidden></div>
     <!-- #506: the fleet rail's + connect-an-agent drawer lived here — REMOVED
-         (owner 2026-09-24). Both surviving connect entries (the account-menu
+         (#506 ruling). Both surviving connect entries (the account-menu
          entry + the Agents-detected pill) open the #connect-overlay. -->
   </aside>
 </main>
@@ -1487,11 +1544,10 @@
   </div>
 </div>
 
-<!-- ============ the PLAN & BILLING overlay (#371, owner amendment 2
-     2026-09-23: the under-graph section was rejected after the live look —
-     "the plan and billing needs to open up as overlay, not under the
-     graph, it could not even find it first. needs to cover the normal dash
-     or be a separate tab or view"; the owner picked the full overlay).
+<!-- ============ the PLAN & BILLING overlay (#371, amendment 2:
+     the under-graph section was rejected after the live look — the plan
+     and billing surface must open as a full-cover overlay, not sit under
+     the graph where it cannot be found; the full overlay was picked.
      Opens from the account menu's Subscription entry (round 3: the two
      billing entries merged into one); the opaque .po-cover fully hides
      the dash (not dimmed-partial). × / cover-click / ESC close and return
@@ -1522,7 +1578,7 @@
 <!-- ============ the CONNECT overlay (#506) — ONE full-cover surface for
      every "Connect an agent" entry. Before this there were two shapes: the
      account menu's inline expandable snippets and the fleet rail's +
-     drawer. Owner 2026-09-24: the rail entry is REMOVED, not kept; the
+     drawer. #506 ruling: the rail entry is REMOVED, not kept; the
      account-menu entry and the Agents-detected pill both open THIS
      (#plan-overlay idiom: opaque cover, × / cover-click / ESC). The
      snippet <pre>s and copy buttons keep the acct-* ids so
@@ -1692,7 +1748,7 @@ async function api(path, opts = {}) {
   return resp.json();
 }
 
-/* ---------- the four stages (owner ruling): Forming → Belief → Truth →
+/* ---------- the four stages (design ruling): Forming → Belief → Truth →
    Fading, colored blue → yellow → green → red. Wire keys
    forming/belief/truth/fading ride every surface; thresholds come from the
    field payload echo (calibration.ts server-side). ---------- */
@@ -1713,9 +1769,9 @@ const STAGE_KEYS = ['forming','belief','truth','fading'];
    screen-space floor in the draw path). */
 const DEPTH_BANDS = { truth:[.9,1.05], belief:[1.05,1.3], forming:[1.3,1.55], fading:[1.55,1.8] };
 
-/* #409 fix round 2 — dot sizing (owner: "the green dots are so much bigger
-   than anything else… a few huge green balls while yellow and others are
-   barely visible"). Strength still encodes size, but the RANGE is
+/* #409 fix round 2 — dot sizing (the green dots rendered so much bigger
+   than anything else — a few huge green balls while yellow and others were
+   barely visible). Strength still encodes size, but the RANGE is
    compressed: sqrt over a 3px span (6→9) for the strength term, plus a
    softened depth divisor (dz^0.35, was dz^1.25 — Truth being nearest AND
    strongest used to compound into a ~3.3–4× rendered spread). Worst case
@@ -1725,7 +1781,7 @@ const DEPTH_BANDS = { truth:[.9,1.05], belief:[1.05,1.3], forming:[1.3,1.55], fa
    pre-#425 store shows no monsters. Robust by construction: the mapping is
    absolute (no min/max over the live distribution), so it cannot explode on
    a skewed store. Pure functions — the ratio is behaviorally tested.
-   #474 graph final (owner 2026-09-19): the balls at 30% — 1.8→2.7, exactly
+   #474 graph final: the balls at 30% — 1.8→2.7, exactly
    0.30× of the 6→9 law; the depth divisor and the ruled ratio band are
    scale-invariant and unchanged. */
 function bubbleRadius(s){ return 1.8 + Math.sqrt(clamp(s??0,0,1))*0.9; }
@@ -1733,7 +1789,7 @@ function depthSizeDivisor(dz){ return Math.pow(Math.max(.14,dz),0.35); }
 
 /* ---------- live-data state ---------- */
 let RANGE=30;  // days — the range selector's value (#452; 30-day default for
-               // ALL views, owner directive 2026-09-16). NO persistence: every
+               // ALL views, #452 directive). NO persistence: every
                // load starts at 30 — it loads fast; longer is opt-in per click.
 let D=null;    // /dashboard/data?range=RANGE d — band, series, digest
 let F=null;    // /dashboard/field
@@ -1742,7 +1798,7 @@ let M=null;    // /dashboard/model (#422) — null on failure: label-only degrad
 let TOTAL=0, removedNow=0;
 /* the store's static LIVE count (headline.live_memories ?? total): the
    overview counter shows THIS from login — it does not track the replay
-   clock (owner ruling 2026-09-13; only the boot reveal counts up) */
+   clock (design ruling; only the boot reveal counts up) */
 
 /* =====================================================================
    WORLD — domains, memories, the dateline window (the visible set), real
@@ -1757,7 +1813,7 @@ const links = [];                 // real link edges, engine-decorated
 let crowdByStage = {};            // stage -> [mem refs] (EVERY memory paints)
 const bubbles = [];               // the latest-N-by-dateline visible set (#474
                                   // return; owned by refreshWindow, rebuilt on T)
-const FIELD_WINDOW_N = 1000;       // #474 graph final (owner 2026-09-19): the field shows the latest N memories by dateline
+const FIELD_WINDOW_N = 1000;       // #474 graph final: the field shows the latest N memories by dateline
 let WIN_ORDER = [];               // every mem (live + ghosts), effCreated DESC, id ASC
 let winSet = new Set();           // ids in the window at the current T
 let winCount = [];                // per-domain window counts (labels + tip)
@@ -1770,7 +1826,7 @@ let learnedL = [], mergedL = [], enrichedL = [];
 let NIGHTS = [];                  // the events payload's night list
 let WINDOW = 1, NOW_T = .999, REPLAY_OK = false;
 
-/* Replay pacing (owner 2026-09-19: 2x faster default). Event-driven cruise:
+/* Replay pacing (#474: 2x faster default). Event-driven cruise:
    each ledger event lands every REPLAY_TICK_MS; a heralded (birth/merge)
    event holds the clock REPLAY_HERALD_MS then applies; boundary beats rest
    REPLAY_REST_MS. Halve all three to run 2x; the constants are the only
@@ -2027,7 +2083,7 @@ const THEMES = {
     add:true,
     /* #409 fix round 3: thread dimmed 160,190,210 → 108,128,144 — additive
        stacks on overlap, so a bright base read as foreground mesh, not
-       structure (owner: "the white lines … overtake most of the image") */
+       structure (the white lines read as overtaking most of the image) */
     thread:[108,128,144],
     threadHot:[61,255,122],
     signal:[190,255,215],
@@ -2162,7 +2218,7 @@ function sprite(stage, r){
   const st = PAL.stages[stage] || PAL.stages.forming;
   const rgb = st.rgb;
   if(PAL.name==='dark'){
-    /* #474 final polish (owner 2026-09-20): plain dot — no glow halo, no
+    /* #474 final polish: plain dot — no glow halo, no
        white core gradient. A filled circle with a slightly brighter edge;
        the maturity color carries the reading, the size stays small. */
     const S = Math.ceil(rad*PAL.sprK), c2 = document.createElement('canvas');
@@ -2484,16 +2540,16 @@ function draw(now, dt){
        permanently — a green mesh over the field. The hot style now rides
        only the formation window itself, as an overlay that fades out as
        prog -> 1 (heat pulses are kept in both styles).
-     - VISUAL WEIGHT (#409 fix round 3, owner: "the white lines … kind of
-       overtake most of the image"): the LOD culls COUNT at depth, but the
+     - VISUAL WEIGHT (#409 fix round 3: the white lines kind of
+       overtake most of the image): the LOD culls COUNT at depth, but the
        settled strokes themselves were too heavy — on the real store the
        additive composite stacks overlapping threads toward white. Strokes
        are now hairline-floored and roughly half as opaque, the dark-theme
        thread color is DIMMED to read as structure, not foreground, and the
        width law still tapers by link strength (use count). Dots stay
        dominant: the field is dots first, lines as connective tissue.
-       NO new-vs-old link highlighting — the owner considered and rejected
-       it as incorrect; links never encode age. */
+       NO new-vs-old link highlighting — considered and rejected
+       as incorrect; links never encode age. */
   ctx.globalCompositeOperation=ADD;
   const linkBoot = booting? clamp((bootP*1.7-.55)*2,0,1) : 1;
   const lodK = cam.s>=2.5 ? Infinity : Math.max(3, 3+(cam.s-1)*14);
@@ -2519,7 +2575,7 @@ function draw(now, dt){
     const drawP=Math.min(prog,linkBoot);
     if(drawP<=0) continue;
     /* #474 final polish: domain focus — a thread stays lit only if an
-       endpoint belongs to the focused domain (owner 2026-09-20) */
+       endpoint belongs to the focused domain (#474) */
     const focusDim = (focusDom!=null && a.dom!==focusDom && b.dom!==focusDom) ? .15 : 1;
     const len=Math.hypot(x2-x1,y2-y1)*1.15;
     const superFam = L.rel==='superseded_by'||L.rel==='corrected_by';
@@ -2836,8 +2892,8 @@ function wake(){ lastActivity=performance.now(); }
 
 /* ---------- replay — time travel: drag to take the helm, else the G1
    auto-cruise walks the REAL event ledger (one memory action at a time)
-   ONCE to today, then rests there (#452, owner ruling 2026-09-16 —
-   supersedes the 2026-09-13 auto-loop). Pause/resume + "replay again" sit
+   ONCE to today, then rests there (#452 —
+   supersedes the earlier auto-loop). Pause/resume + "replay again" sit
    in the foot beside "return to now"; a manual take still pauses the
    cruise and re-engages ~12 s after idle, continuing toward today — where
    it now stops instead of looping.
@@ -2937,7 +2993,7 @@ function onTChanged(fromSeek){
   el('rp-pause').classList.toggle('show',REPLAY_OK&&!played);
   el('rp-again').classList.toggle('show',REPLAY_OK&&played);
   updateMeasures();
-  /* #422 owner ruling: the overview counter is STATIC (the store's live
+  /* #422 ruling: the overview counter is STATIC (the store's live
      count, set once at boot + after writes) — scrubbing the replay no longer
      spins the number. Only the boot reveal counts up (tickCounter). */
   dirty=true;
@@ -2978,7 +3034,7 @@ el('rp-again').onclick=()=>{
   seek(.001); wake();
 };
 
-/* #452 — the range selector: 7/30/90/180 days (the owner-fixed option
+/* #452 — the range selector: 7/30/90/180 days (the fixed option
    set), default 30, NO persistence — every load starts at 30 (loads fast).
    A click refetches BOTH range-scoped sources and rebuilds the world
    exactly like boot — the agents rail included (its "last night" line
@@ -3342,7 +3398,7 @@ function renderBand(){
      fills the card's remaining vertical space like the activity bars */
   buildTokNights(used, cap, tok?tok.period_start:null);
 
-  // Recall level — the designed U-band (#426 final ruling 2026-09-13; see
+  // Recall level — the designed U-band (#426 final ruling; see
   // renderRecBand).
   renderRecBand(h?h.uses_per_showing:null);
   loadContested();   /* #593: presence needs the count — one guarded GET at render */
@@ -3389,17 +3445,17 @@ function buildTokNights(used, cap, periodStart){
   }
 }
 
-/* ---------- Recall level — the designed U-band (#426 final ruling
-   2026-09-13). A continuous red→green→red gradient spans the PROVISIONAL
+/* ---------- Recall level — the designed U-band (#426 final ruling).
+   A continuous red→green→red gradient spans the PROVISIONAL
    zone edges (echoed by /dashboard/field as thresholds.recall_uses — the
    page NEVER hardcodes them; a pre-band server simply has no band).
-   #409 fix round 3 (owner, verbatim intent): the zone WORD is the card's
+   #409 fix round 3 (the settled intent): the zone WORD is the card's
    big element — the same slot as the sibling cards' large numbers, colored
    by sampling the band gradient at the marker fraction; the band sits in
    the siblings' chart slot; "provisional" is hover-only (band tooltip).
    The raw ratio stays tooltip-only on the marker. Deliberately NO tick
-   marks or edge numerics: the owner's calibration state is "we have no
-   clue on how to calibrate yet", so no visual element may imply measured
+   marks or edge numerics: there are no measured calibration
+   boundaries yet, so no visual element may imply measured
    boundaries — gradient + sampled word + provisional tooltip. */
 function recallUsesZone(v,z){
   /* pure decision — the edges come in as the echo object; null when either
@@ -3410,7 +3466,7 @@ function recallUsesZone(v,z){
   if(v<z.normal_max) return 'normal';
   return 'over';
 }
-/* vocabulary amendment (owner, 2026-09-14): the middle zone's word is
+/* vocabulary amendment: the middle zone's word is
    Healthy — Low / Healthy / Overfetching (keys + echo field names stay) */
 const RECALL_ZONE_WORD = {low:'Low',normal:'Healthy',over:'Overfetching'};
 const RECALL_ZONE_PLAIN={low:'shown memories are rarely picked up',normal:'shown memories get picked up at a healthy rate',over:'shown memories get picked up almost always'};
@@ -3508,7 +3564,7 @@ function renderRecBand(ups){
   row.hidden=false;
   const pct=v=>clamp(v/axis,0,1)*100;
   band.style.background=recallGradCss(z,theme);
-  /* the provisional marking is HOVER-ONLY now (owner: the visible word
+  /* the provisional marking is HOVER-ONLY now (the visible word
      failed to communicate) — the tooltip IS the marking, still explicit
      about the calibration state */
   const prov='Zone edges are provisional until fleet telemetry locates the valley (#426) — shown for direction only.';
@@ -3541,7 +3597,7 @@ function renderRecBand(ups){
     word.style.color=''; word.style.textShadow='none';
     word.title='no showings yet';
   }
-  /* No trend arrow (owner 2026-09-20: removed — unclear). Its renderer and
+  /* No trend arrow (removed — unclear). Its renderer and
      the element writes are removed WITH it: a leftover write to a removed
      element is a boot-killing TypeError whenever the recall band carries
      real data (a production instance on 0.22.2: "0 memories" — boot died
@@ -3735,9 +3791,9 @@ async function loadContested(force){
 }
 
 let MODEL_LABEL='';
-/* #409 fix round 5 — owner ruling 2026-09-14 (verbatim): "I do NOT want to
-   know what it is compatible with, I want to know the fucking model." The
-   card face shows THE MODEL, nothing else: hero = the namespace-stripped
+/* #409 fix round 5 — the ruling: the card must show THE MODEL, not what
+   it is compatible with.
+   The card face shows THE MODEL, nothing else: hero = the namespace-stripped
    model name (fit-scaled, floor 20px), mono line = the raw config id,
    caption "detected from config", configure pill. NO protocol line, NO
    provider line — local and cloud endpoints render identically. (The
@@ -3926,14 +3982,14 @@ function buildRoll(){
 /* ---------- capture health — phase 2: per machine × harness rows from the
      /dashboard/data capture_health accounting; the counts-only rows remain
      the degrade for old servers / nothing recorded yet.
-     Fix round 7 (owner ruling 2026-09-14 — "the normal 30 day as the other
+     Fix round 7 (#409 — "the normal 30 day as the other
      cards"): the card's face is the ROLLING window (capture_health
      window_rows, summed over the last window_days calendar days); the newest
      night rides as a per-row secondary suffix ("tonight: N sess" / the
      night's date when it is not today). Degradation ladder: pre-round-7
      server (no window_rows) → the newest-night view below; no activity rows
      at all → the counts-only rows. ---------- */
-/* ---------- machine × harness grouping (#424 review fixes 4+5 + the owner's
+/* ---------- machine × harness grouping (#424 review fixes 4+5 + the
    model-B direction): source_agent is "harness/profile" and each context may
    carry a source_machine stamp (migration v15+). The rows a stats card and
    the rail can legibly show are per machine × harness bundles — never the
@@ -4060,16 +4116,26 @@ function circleCount(agentId){
   return typeof n==='number'?n:null;
 }
 /** Per-agent pill — '' for standard agents (no markup at all); the meaning
-    and the count live in the tooltip (tech detail in tooltips). */
+    and the count live in the tooltip (tech detail in tooltips).
+    #642: when fleet.spaces is present the SPACE BADGES replace the single
+    amber pill (the confidential chip keeps the amber family). The D access
+    is typeof-guarded so the #593 rig — which slices this fn out with only
+    circleCount injected — still exercises the pre-#642 branch unchanged. */
 function circlePill(agentId){
+  const sb=(typeof D!=='undefined'&&D&&D.fleet)?D.fleet.spaces:null;
+  if(sb&&Array.isArray(sb.spaces)) return spaceBadges(agentId,sb);
   const n=circleCount(agentId);
   if(n===null) return '';
   return '<span class="conf-pill" title="Confidential circle — this agent\'s captures are confidential, hidden from other agents\' recall · '+n+' confidential '+(n===1?'memory':'memories')+'">confidential</span>';
 }
 /** Bundle-level pill (rail card header / capture rows) — the tooltip names
-    every member agent + its count; '' when none of the ids are members. */
+    every member agent + its count; '' when none of the ids are members.
+    #642: fleet.spaces present → one chip per space covering any of the ids
+    (same typeof-D guard as circlePill). */
 function circleBundlePill(ids){
   if(!Array.isArray(ids)) return '';
+  const sb=(typeof D!=='undefined'&&D&&D.fleet)?D.fleet.spaces:null;
+  if(sb&&Array.isArray(sb.spaces)) return spaceBundleBadges(ids,sb);
   const hits=[];
   for(const id of ids){
     const n=circleCount(id);
@@ -4088,6 +4154,60 @@ function circleLegend(){
   const capturing=Object.keys(c.members||{});
   const title='Confidential circle — amber pills mark agents whose captures are confidential, visible only to circle members (this dashboard shows everything). Roster ('+c.roster.length+'): '+c.roster.join(', ')+(capturing.length?' · capturing: '+capturing.join(', '):'');
   return {html:'<span class="conf-pill" role="img" aria-label="confidential agent" title="'+esc(title)+'"><svg viewBox="0 0 12 12" aria-hidden="true"><rect x="2.2" y="5.2" width="7.6" height="5.6" rx="1.2"/><path d="M4 5.2V3.8a2 2 0 0 1 4 0v1.4"/></svg></span>', title};
+}
+/* ---------- #642: spaces — fleet.spaces rides the same /dashboard/data
+   payload (ALWAYS present; spaces [] when nothing is configured). The
+   per-agent chips REPLACE the single amber circle pill when the block is
+   there (circlePill/circleBundlePill delegate); the confidential chip keeps
+   the amber family. Agents in no space show nothing extra — the management
+   card's Unassigned lane is where they surface. D.fleet.spaces ABSENT on a
+   pre-#642 server → every helper here is never reached (the pill helpers
+   take their prior branch). The match grammar mirrors the server's
+   isConfidentialSourceAgent: members carry BARE sanitized ids, observed
+   source_agent ids are harness-qualified — exact, or exact after stripping
+   the FIRST segment only. ---------- */
+function spacesBlock(){
+  return (D&&D.fleet&&D.fleet.spaces)?D.fleet.spaces:null;
+}
+/** Does observed (possibly harness-qualified) id match member id m? The
+    isConfidentialSourceAgent grammar, client-side. */
+function spaceMemberMatch(observedId,m){
+  if(typeof observedId!=='string'||typeof m!=='string'||!m) return false;
+  const a=observedId.toLowerCase(), b=m.toLowerCase();
+  if(a===b) return true;
+  const slash=a.indexOf('/');
+  if(slash<0) return false;
+  const bare=a.slice(slash+1);
+  return bare.indexOf('/')<0 && bare===b;
+}
+/** One space chip. The confidential space keeps the amber family (.conf). */
+function spaceChip(id,title){
+  return '<span class="space-chip'+(id==='confidential'?' conf':'')+'" title="'+esc(title)+'">'+esc(id)+'</span>';
+}
+/** Per-agent space badges — ONE chip per membership (config order); '' when
+    the agent is in no space (honest absence, the unassigned lane surfaces). */
+function spaceBadges(agentId,b){
+  if(typeof agentId!=='string'||!b||!Array.isArray(b.spaces)) return '';
+  let out='';
+  for(const s of b.spaces){
+    if(!s||!Array.isArray(s.members)) continue;
+    if(!s.members.some(m=>spaceMemberMatch(agentId,m))) continue;
+    out+=spaceChip(s.id,'Space: '+s.id+' — this agent\'s captures are private to the '+s.id+' space (members only; this dashboard shows everything)');
+  }
+  return out;
+}
+/** Bundle-level chips (rail card header / capture rows) — one chip per space
+    covering ANY of the bundle's ids; the tooltip names the member agents. */
+function spaceBundleBadges(ids,b){
+  if(!Array.isArray(ids)||!b||!Array.isArray(b.spaces)) return '';
+  let out='';
+  for(const s of b.spaces){
+    if(!s||!Array.isArray(s.members)) continue;
+    const hits=ids.filter(id=>s.members.some(m=>spaceMemberMatch(id,m)));
+    if(!hits.length) continue;
+    out+='<span class="space-chip'+(s.id==='confidential'?' conf':'')+'" role="img" aria-label="'+esc(s.id)+' space" title="Space: '+esc(s.id)+' — agents in this bundle: '+esc(hits.join(', '))+'">'+esc(s.id)+'</span>';
+  }
+  return out;
 }
 function buildCapture(){
   const host=el('cap-rows');
@@ -4345,7 +4465,7 @@ function buildAgents(){
     const detail=card.querySelector('.ctx-detail');
     let selected=null;
     /* bounded context list: ALL filtered rows render; the LIST itself caps at
-       10 visible rows and scrolls internally (owner mechanics ruling); the
+       10 visible rows and scrolls internally (the #424 mechanics ruling); the
        filter narrows; identity is fetched ONLY for the selected context */
     const renderCtxList=()=>{
       listBox.innerHTML='';
@@ -4530,14 +4650,156 @@ function buildAgents(){
     listEl.appendChild(card);
   }
 }
+/* ---------- #642: the space management card — one lane per space + the
+   Unassigned lane (first-prompt discovery, AC-11). Chips drive the SAME
+   AC-10 admin API the CLI uses: click an unassigned chip → an inline picker
+   of target spaces → PUT /spaces/assign; click an assigned chip → the
+   dw-remove two-step confirm → PUT /spaces/unassign. Failures surface as
+   toasts (the page's non-blocking error line). Graceful degrade: no
+   fleet.spaces block (older server) or nothing to show (zero spaces AND
+   zero unassigned — the zero-change dashboard) → the card stays hidden. */
+let spPickerAgent=null; // the unassigned agent whose inline assign picker is open
+async function spacesAssign(agent,space){
+  try{
+    await api('/spaces/assign',{
+      method:'PUT',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({agent:agent,space:space}),
+    });
+    toast('Assigned '+agent+' to space '+space+' — it sees the space from its next read');
+    refreshFleet();
+  }catch(err){ toast('Assign failed — '+err.message,5600); }
+}
+async function spacesUnassign(agent,space){
+  try{
+    await api('/spaces/unassign',{
+      method:'PUT',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify({agent:agent,space:space}),
+    });
+    toast('Removed '+agent+' from space '+space+' — it sees shared only from its next read');
+    refreshFleet();
+  }catch(err){ toast('Unassign failed — '+err.message,5600); }
+}
+function buildSpaces(){
+  const host=el('ag-spaces');
+  const b=spacesBlock();
+  /* hide entirely when: no block (pre-#642 server), or nothing to manage */
+  if(!b||!Array.isArray(b.spaces)||(b.spaces.length===0&&!(Array.isArray(b.unassigned)&&b.unassigned.length))){
+    spPickerAgent=null;
+    host.hidden=true; host.innerHTML='';
+    return;
+  }
+  host.hidden=false;
+  host.innerHTML='';
+  const head=document.createElement('div');
+  head.className='sp-head';
+  const totalAssigned=b.spaces.reduce((a,s)=>a+((s.members&&s.members.length)||0),0);
+  head.innerHTML='<span class="t">Spaces</span><small>'+b.spaces.length+' space'+(b.spaces.length===1?'':'s')+' · '+totalAssigned+' assigned · spaces exist by config presence</small>';
+  host.appendChild(head);
+  /* one lane per space — chips = members; click (twice) to unassign */
+  for(const s of b.spaces){
+    const lane=document.createElement('div');
+    lane.className='sp-lane';
+    const counts=[];
+    counts.push(fmt(s.memoryCount||0)+' mem');
+    if(s.queuedCount) counts.push(s.queuedCount+' queued');
+    const laneHead=document.createElement('div');
+    laneHead.className='sp-lane-head';
+    laneHead.innerHTML='<b'+(s.id==='confidential'?' class="space-chip conf" style="font-size:10px;padding:1px 6px"':'')+'>'+esc(s.id)+'</b><small>'+esc(counts.join(' · '))+'</small>';
+    lane.appendChild(laneHead);
+    const chips=document.createElement('div');
+    chips.className='sp-chips';
+    const members=Array.isArray(s.members)?s.members:[];
+    if(!members.length){
+      const note=document.createElement('span');
+      note.className='sp-note';
+      note.textContent='no members yet — assign from the Unassigned lane below';
+      chips.appendChild(note);
+    }
+    for(const agent of members){
+      const chip=document.createElement('button');
+      chip.type='button'; chip.className='sp-agent';
+      chip.textContent=agent;
+      chip.title='Member of '+esc(s.id)+' — click twice to remove (the agent drops to shared-only; already-captured memories stay stamped)';
+      chip.onclick=(e)=>{
+        e.stopPropagation();
+        /* the dw-remove pattern: first click arms, second fires */
+        if(!chip.classList.contains('confirm')){
+          chip.classList.add('confirm');
+          chip.textContent='remove from '+s.id+'?';
+          return;
+        }
+        spacesUnassign(agent,s.id);
+        wake();
+      };
+      chips.appendChild(chip);
+    }
+    lane.appendChild(chips);
+    host.appendChild(lane);
+  }
+  /* the Unassigned lane — observed on a first prompt, in no space (newest first) */
+  const un=Array.isArray(b.unassigned)?b.unassigned:[];
+  if(un.length){
+    const lane=document.createElement('div');
+    lane.className='sp-lane';
+    const laneHead=document.createElement('div');
+    laneHead.className='sp-lane-head';
+    laneHead.innerHTML='<b>Unassigned</b><small>'+un.length+' seen on a first prompt — click one to assign</small>';
+    lane.appendChild(laneHead);
+    const chips=document.createElement('div');
+    chips.className='sp-chips';
+    for(const o of un){
+      const agent=o.agent;
+      /* the open picker renders IN PLACE of its chip (inline — the rail clips,
+         never a positioned popover) */
+      if(spPickerAgent===agent){
+        const pick=document.createElement('span');
+        pick.className='sp-pick';
+        pick.setAttribute('role','group');
+        pick.setAttribute('aria-label','assign '+agent+' to space');
+        for(const s of b.spaces){
+          const btn=document.createElement('button');
+          btn.type='button'; btn.textContent=s.id;
+          btn.title='Assign '+agent+' to space '+s.id+' — members see the shared pool + this space, everything else stays hidden';
+          btn.onclick=(e)=>{ e.stopPropagation(); spacesAssign(agent,s.id); wake(); };
+          pick.appendChild(btn);
+        }
+        const cancel=document.createElement('button');
+        cancel.type='button'; cancel.className='cancel'; cancel.textContent='✕';
+        cancel.title='cancel';
+        cancel.onclick=(e)=>{ e.stopPropagation(); spPickerAgent=null; buildSpaces(); wake(); };
+        pick.appendChild(cancel);
+        chips.appendChild(pick);
+        continue;
+      }
+      const chip=document.createElement('button');
+      chip.type='button'; chip.className='sp-agent unassigned';
+      chip.textContent=agent;
+      chip.title='Unassigned — seen '+(agoLabel(o.last_seen)||'recently')+' (first seen '+o.first_seen.slice(0,10)+'). Shared-only until assigned. Click to pick a space.';
+      chip.onclick=(e)=>{
+        e.stopPropagation();
+        spPickerAgent=agent;
+        buildSpaces();
+        wake();
+      };
+      chips.appendChild(chip);
+    }
+    lane.appendChild(chips);
+    host.appendChild(lane);
+  }
+}
 /** Post-pause refresh (#423 phase 3): pull a fresh /dashboard/data (the
  *  fleet block is what changed) and rebuild the rail + capture card + band
- *  counts — the paused state and dots re-derive from the fresh payload. */
+ *  counts — the paused state and dots re-derive from the fresh payload.
+ *  #642: the space management card rebuilds here too — it is how the assign
+ *  flows refresh after their PUT (the fresh payload carries the new members). */
 async function refreshFleet(){
   try{
     const dd=await api('/dashboard/data?range='+RANGE+'d');
     D=dd;
     buildAgents();
+    buildSpaces();
     buildCapture();
     renderBand();
   }catch(e){ toast('Refresh failed: '+e.message); }
@@ -4551,7 +4813,7 @@ el('mm-save').onclick=()=>{ saveModelSettings(); wake(); };
 el('mm-think').addEventListener('change',()=>{ mmThinkTouched=true; });
 /* #506: the Agents-detected pill opens the full-cover connect overlay —
    the rail drawer (+ button, open/scroll mechanics) it used to target is
-   REMOVED (owner 2026-09-24) */
+   REMOVED (#506) */
 el('ag-cta').onclick=()=>{ openConnectOverlay(); wake(); };
 
 /* ---------- the memory browser — dropdown under the search pill ---------- */
@@ -4561,8 +4823,8 @@ let searchResults=null;      // last /search result list (full ids)
 let searchFailed=false;      // last /search attempt errored (honest fail state)
 /* #409 fix round — the results tail. With the relevance floor in place,
    limit=60 returns EVERYTHING above it, so one genuine match dragged ~59
-   0.62–0.70 filler rows into view (owner live finding: "Sirnäs is now
-   first — but then followed by irrelevant mems"). PRESENTATION only (#425
+   0.62–0.70 filler rows into view (live finding: one genuine match
+   surfaced first but was followed by irrelevant mems). PRESENTATION only (#425
    owns ranking/scoring): the strong window renders at full contrast, the
    tail collapses behind an expander and renders dimmed when shown. */
 const RESULTS_STRONG_N=10;   // rows shown before the expander
@@ -4936,10 +5198,8 @@ async function refreshAfterWrite(){
    ===================================================================== */
 const $ = el;   // the harvested block below uses the $ shorthand
 /* Pure decision — what the corner renders for an /account payload (#409 fix
-   round 2, owner ruling 2026-09-14: "It needs to be an account menu where
-   you can of course upgrade, but you should also be able to get the token —
-   that was the critical problem — and see who you're logged in as and
-   whatnot"). The chip + menu render for EVERY account shape /account
+   round 2: an account menu where you can upgrade, get the token, and see
+   who you're logged in as). The chip + menu render for EVERY account shape /account
    answers — including the all-null self-hosted default, which previously
    degraded the corner to a standalone Upgrade button and hid the token.
    The upgrade CTA is a MENU ITEM iff the plan is unset (the same
@@ -4956,7 +5216,7 @@ function acctMenuPlan(a) {
     avatar: ((typeof a.name === "string" && a.name) ? a.name : "?").slice(0, 2).toUpperCase(),
   };
 }
-/* #411 — the overlay's currency state (owner rulings 2026-10-12): exactly
+/* #411 — the overlay's currency state: exactly
    USD + EUR; the first-visit default follows the browser timezone (an
    explicit US IANA zone list — exact zones + the Indiana/Kentucky/
    North_Dakota prefixes — → usd, anything else → eur, ANY error or
@@ -4977,14 +5237,14 @@ function tzDefaultCur() {
 }
 let PLAN_CUR = tzDefaultCur();
 try { const saved = localStorage.getItem("hctx-cur"); if (saved === "usd" || saved === "eur") PLAN_CUR = saved; } catch {}
-/* Pure decision (#371) — the purchasable periods. Decided pricing (owner
-   2026-08-19): ONE price, TWO periods — €12/mo and €108/yr. ANNUAL FIRST:
+/* Pure decision (#371) — the purchasable periods. Decided pricing:
+   ONE price, TWO periods — €12/mo and €108/yr. ANNUAL FIRST:
    annual is the stated product default; its note is the numeric savings
-   sub-line (round-4 addendum 2026-09-24: it replaces the retired
+   sub-line (round-4 addendum: it replaces the retired
    words-only annual tagline — same fact, numbers not words; effective
    monthly 108/12 = €9, discount (144−108)/144 = 25%, derived-pinned by
-   tests so a price change forces the sub-line update). #411 (rulings
-   2026-10-12): the price/note literals are PER-CURRENCY data — USD
+   tests so a price change forces the sub-line update). #411
+   rulings: the price/note literals are PER-CURRENCY data — USD
    MIRRORS the EUR whole numbers ($12/mo, $108/yr), and the savings pair
    is derived per currency from the same-currency bases (never converted;
    no exchange-rate arithmetic anywhere). The router deliberately knows
@@ -4993,14 +5253,14 @@ try { const saved = localStorage.getItem("hctx-cur"); if (saved === "usd" || sav
    Round 3: a PURE DATA ARRAY and the single source of truth — the overlay
    cards are GENERATED from it (renderPlanCards) and the wiring loops it
    (wireChooseButtons); no two-plan hardcoding anywhere. #411 tax wording
-   (tax research brief, 2026-10-12): the price strings carry the VERBATIM
+   (tax research brief): the price strings carry the VERBATIM
    pricing-card wording — EUR consumer prices read VAT-inclusive ("incl.
    25.5% VAT"), USD tax-exclusive ("excl. tax"); fixed wording, the 25.5%
    inside it is never a computed value. The savings note is a derived
    ANNOTATION, not a price point — it carries no qualifier. The bullets
    are the marketing site's Cloud feature lines, verbatim (lockstep-
-   pinned against web/index.html) — the seven owner-decided lines
-   (amendment 4, 2026-09-24: copy-first ruling; the agent-cap enforcement
+   pinned against web/index.html) — the seven decided lines
+   (amendment 4, copy-first ruling; the agent-cap enforcement
    rides its own issue); both periods are the same Cloud product, so both
    carry the same seven. */
 const PLAN_OPTIONS = [
@@ -5040,8 +5300,8 @@ function acctPlanLine(p) {
 /* Pure decision (#371 round 3) — the Subscription entry's Upgrade pill.
    The menu's two billing entries (Upgrade + Plan & billing) merged into
    ONE always-rendered "Subscription" item; the PILL is what the old
-   plan-unset eligibility gates (owner: "it can have an upgrade pill/label
-   after it before any subscription is active"). Returns the pill markup
+   plan-unset eligibility gates (it can have an upgrade pill/label
+   after it before any subscription is active). Returns the pill markup
    or "" — interpolated into the entry's label. */
 function acctPill(p) {
   return p.upgrade ? '<span class="acct-pill">Upgrade</span>' : "";
@@ -5184,7 +5444,7 @@ function wireSubscription() {
   const btn = $("acct-subscription");
   if (!btn) return;
   // #371 round 3: the ONE Subscription entry (Upgrade + Plan & billing
-  // merged, owner) opens the FULL-COVER plan & billing overlay; the entry
+  // merged) opens the FULL-COVER plan & billing overlay; the entry
   // always renders — the Upgrade pill alone marks the plan-unset state.
   // Menu closes first; × / cover-click / ESC return.
   btn.addEventListener("click", () => {
@@ -5502,6 +5762,7 @@ async function boot(){
   buildRoll();
   buildCapture();
   buildAgents();
+  buildSpaces();  /* #642: the space management card — degrades to hidden */
   buildChips(); renderList();
   T=WINDOW; lastT=WINDOW;
   onTChanged(true);

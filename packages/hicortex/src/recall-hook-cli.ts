@@ -13,7 +13,7 @@
  *
  * Fail-soft like learnings-identity: ANY failure (no config, timeout, non-2xx,
  * parse error) prints nothing and exits 0 — a broken hook must never block or
- * slow a CC session beyond the fetch timeout (1000 ms, owner-set).
+ * slow a CC session beyond the fetch timeout (1000 ms, a shipped constant).
  */
 
 import { resolveConfig, workspaceAgentId } from "./learnings-identity.js";
@@ -64,7 +64,7 @@ export function buildHookRequest(
   // request at all — no HTTP call, so the 1000 ms hook budget is spent on
   // real prompts only. A wrapper CARRYING prose (agent-message hand-back,
   // report <result>, user text around the wrapper) recalls on the full text
-  // (owner decision 4) — the shared classifier, same function the server
+  // (decision 4) — the shared classifier, same function the server
   // guards with (wrapper-prompt.ts).
   if (isPureWrapperPrompt(prompt)) return null;
   // #203 scope: derive project from the session cwd so retrieval can apply a

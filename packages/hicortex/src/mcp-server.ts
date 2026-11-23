@@ -89,16 +89,20 @@ import {
   resolveConfidentialAgents,
   resolveConfidentialPaths,
   resolveConfidentialMarkerKey,
-  deriveIntakePrivacy,
-  isCircleMember,
+  deriveIntakeSpace,
   buildConfidentialLlm,
+  buildSpaceLlms,
   warnIfCircleUnconfigured,
+  spaceHoldWarnings,
   confidentialMarkerKeyNote,
   warnRefusedMarker,
   type ConfidentialPathPattern,
 } from "./classification.js";
 import { ensureAndPersistAgentId, loadConfigStrict, persistConfigUpdates } from "./init.js";
 import { handleMarkerKeyGet, handleMarkerKeyPut } from "./marker-key-api.js";
+import { handleSpacesGet, handleSpacesAssign, handleSpacesUnassign } from "./spaces-api.js";
+import { recordObservedAgentSighting, listObservedAgents } from "./observed-agents.js";
+import { resolveSpaces, knownSpaceIds, spaceOf, spacesForMember, isVisiblePrivacy, unknownStoredSpaceIds, type SpaceDef } from "./spaces.js";
 import type { MemorySearchResult } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -116,11 +120,22 @@ let llmConfig: LlmConfig | null = null;
 // same funnel as the main client (boot), with the same tuning overlay.
 let confidentialLlm: LlmClient | null = null;
 let confidentialLlmConfig: LlmConfig | null = null;
+// #642: the per-space LLM clients/configs — buildSpaceLlms at the spaces boot
+// seam below, one entry per configured space EXCEPT 'confidential' (its client
+// keeps the dedicated fields above: explicit spaces.<id>.llm* wins, else the
+// llmConfidential* endpoint is INHERITED as the same client object). A null or
+// absent entry = the space has NO model: the SYNC /distill path refuses such a
+// delivery (503 hold — see the /distill handler) and the nightly drain holds
+// its queued items; never the main model.
+let spaceClients: Map<string, LlmClient | null> = new Map();
+let spaceConfigs: Map<string, LlmConfig | null> = new Map();
 
-// One-time-per-process deprecation warning for the `?privacy=` query param
-// (0.16.x: the column is vestigial, never filtered). Old clients/plugins still
-// send it; we accept it (backward compat) but warn ONCE so an operator relying
-// on privacy filtering discovers from the logs that it is now a no-op.
+// One-time-per-process deprecation warning for the `?privacy=` query param.
+// Old clients/plugins still send it; we accept it (backward compat) but warn
+// ONCE so an operator relying on client-side privacy filtering discovers from
+// the logs that it is a no-op: the param is IGNORED — classification and
+// visibility are server-derived (#332/#642: spaces are configured server-side
+// from agent rosters and path patterns, never requested by clients).
 let privacyDeprecationWarned = false;
 function warnDeprecatedPrivacyParamIfPresent(query: Record<string, unknown>, route: string): void {
   if (privacyDeprecationWarned) return;
@@ -128,8 +143,8 @@ function warnDeprecatedPrivacyParamIfPresent(query: Record<string, unknown>, rou
   privacyDeprecationWarned = true;
   console.warn(
     `[hicortex] client sent ?privacy= on /${route}, which is ignored since 0.16.2 — ` +
-    `privacy is no longer filtered server-side (the column is vestigial). ` +
-    `Use a separate Hicortex server for isolation. (This warning fires once per process.)`
+    `classification/visibility is server-derived, never client-requested (#332/#642). ` +
+    `(This warning fires once per process.)`
   );
 }
 let stateDir = "";
@@ -172,6 +187,14 @@ let confidentialPathPatterns: ConfidentialPathPattern[] = [];
 // circle is otherwise active) — the attack surface ships disabled by
 // default. The compare itself lives in classification.ts (timing-safe).
 let confidentialMarkerKey: string | null = null;
+// #642: the resolved spaces (the `spaces` config map + the legacy-materialized
+// confidential space — see spaces.ts), resolved once at boot at the SAME
+// confidential seam (restart to apply). Empty = zero-space install: intake
+// stamping, read gates, and prompts stay byte-identical to the #332 release
+// (AC-1). deriveIntakeSpace consumes the ordered list; knownSpaceIds feeds
+// the write boundary's known set.
+let resolvedSpaces: SpaceDef[] = [];
+let spaceById: Map<string, SpaceDef> = new Map();
 
 /**
  * #567: fold ONE project string through the boot-resolved alias map — the
@@ -187,18 +210,32 @@ const canonProject = (v: unknown): string | undefined =>
   canonicalizeProject(typeof v === "string" ? v : null, projectAliases) ?? undefined;
 
 /**
- * #332: resolve the classification visibility for ONE request's `agent` param
- * against the boot-resolved roster. Absent/blank/unknown agent → FALSE
- * (fail-closed non-member — confidential rows are hard-omitted); a rostered
- * agent id → TRUE (the additive circle: members see both pools). The `agent`
- * self-asserts identity, exactly like the client-pushed project field — same
- * trust level, documented in the spec (per-agent tokens are the known future
- * fix). Shared by every agent-facing read route below.
+ * #642 AC-5 (was #332's requestSeesConfidential boolean): resolve ONE
+ * request's visible SPACE SET from its `agent` param against the
+ * boot-resolved spaces — the ids of every space whose members list contains
+ * the sanitized agent. Absent/blank/unknown agent → EMPTY set (fail-closed:
+ * shared-only — no space's rows, exactly the old non-member boolean). The
+ * wire NEVER carries a space list — only `?agent=` / body `agent`; membership
+ * is server-configured, so client-declared visibility is a closed channel
+ * (#614's law). On a legacy confidential-only install the materialized
+ * confidential space makes this agree with the old boolean EXACTLY (member ⇔
+ * rostered). The `agent` self-asserts identity, exactly like the
+ * client-pushed project field — same trust level, documented in the spec
+ * (per-agent tokens are the known future fix). Shared by every agent-facing
+ * read route below.
+ *
+ * #642 AC-11 — first-prompt discovery rides the SAME seam (the one place
+ * every gated read already passes through): the sanitized agent id is
+ * recorded in the observed-agents store, fail-soft (a store hiccup must
+ * never break the read — the sighting is advisory, the gate input is not).
+ * Only reads carrying `agent` record; membership resolves from the SAME
+ * sanitized id that was recorded (spacesForMember re-sanitizes it — an
+ * idempotent no-op on an already-sanitized value).
  */
-const requestSeesConfidential = (rawAgent: unknown): boolean =>
-  isCircleMember(
-    typeof rawAgent === "string" && rawAgent ? rawAgent : null,
-    confidentialRoster,
+const requesterVisibleSpaces = (rawAgent: unknown): Set<string> =>
+  spacesForMember(
+    db ? recordObservedAgentSighting(db, rawAgent) : null,
+    resolvedSpaces,
   );
 
 // Cache detectChunkSize results keyed by "<provider>/<model>@<baseUrl>" so we
@@ -373,8 +410,10 @@ export function createMcpServer(): McpServer {
           // #332: the MCP ingest path derives the stamp from its fixed
           // source_agent like every write path (a roster entry
           // "claude-code/manual" — or its bare "manual" — would stamp
-          // confidential; mechanical rule, no special case).
-          privacy: deriveIntakePrivacy("claude-code/manual", confidentialRoster),
+          // confidential; mechanical rule, no special case). #642: the same
+          // derivation now runs over the resolved spaces — value-identical on
+          // zero-space installs, space-aware when configured.
+          privacy: deriveIntakeSpace("claude-code/manual", resolvedSpaces),
         });
         if (explicitMark) applyExplicitMark(db, id, explicitMark);
         return { content: [{ type: "text" as const, text: `Memory stored (id: ${id.slice(0, 8)})${explicitMark ? ` — marked as ${explicitMark.kind === "corrects" ? "correcting" : "superseding"} ${explicitMark.target}` : ""}` }] };
@@ -583,9 +622,12 @@ export function createMcpServer(): McpServer {
       // hard-omitted, and a confidential center/endpoint id reads as not
       // found. Accepted in the spec: circle agents read through their
       // plugin's agent-threaded REST calls, not through MCP tools.
+      // #642 AC-6: shared-ONLY, generalized — a row of ANY space (confidential
+      // included) and any unknown space id reads as not found here; the
+      // graph ops below run opts-less (the shared-only default).
       const idVisible = (fullId: string): boolean => {
         const row = db!.prepare("SELECT privacy FROM memories WHERE id = ?").get(fullId) as { privacy: string | null } | undefined;
-        return row?.privacy !== "confidential";
+        return (row?.privacy ?? "standard") === "standard";
       };
       try {
         if (operation === "neighbors") {
@@ -1149,6 +1191,88 @@ export async function startServer(options: {
     queueConfidential: queueConfidentialCount,
   });
 
+  // #642 spaces: resolve the config map (plus the legacy confidential
+  // materialization) at the SAME boot seam (restart to apply). Dropped
+  // entries and warnings print ONCE here — the resolveIdentityAgents
+  // pattern (a typo must surface, never silently match nothing). Zero-config
+  // installs print NOTHING new (the AC-1 byte-identical boot), and a
+  // pure-legacy install's materialized confidential space is already
+  // announced by the "Confidential circle:" line above — so the status line
+  // fires only when EXPLICIT spaces are configured.
+  const spaceRes = resolveSpaces(savedConfig);
+  resolvedSpaces = spaceRes.spaces;
+  spaceById = spaceRes.byId;
+  if (spaceRes.dropped.length > 0) {
+    console.warn(
+      `[hicortex] Ignoring invalid spaces entries: ${spaceRes.dropped.join(", ")} ` +
+      `(ids must match ^[a-z0-9][a-z0-9_-]*$ like agent ids; entries must be objects; ` +
+      `'standard' is never a space id — a dropped entry matches nothing)`
+    );
+  }
+  for (const spaceWarning of spaceRes.warnings) {
+    console.warn(`[hicortex] spaces: ${spaceWarning}`);
+  }
+  const rawSpacesConfig = savedConfig?.spaces;
+  const explicitConfidentialSpace =
+    rawSpacesConfig !== null && rawSpacesConfig !== undefined &&
+    typeof rawSpacesConfig === "object" && !Array.isArray(rawSpacesConfig) &&
+    "confidential" in (rawSpacesConfig as Record<string, unknown>);
+  if (spaceRes.spaces.some((s) => s.id !== "confidential") || explicitConfidentialSpace) {
+    console.log(
+      `[hicortex] Spaces: ${spaceRes.spaces.length} configured (${spaceRes.spaces.map((s) => s.id).join(", ")})`
+    );
+  }
+  // #642 AC-7: stored space ids no configured space claims are INVISIBLE to
+  // every requester (no members list can contain them — fail-closed, never
+  // normalized to shared). ONE boot warning naming every id (per boot, not
+  // per request) so the operator configures the space or re-stamps; the
+  // nightly funnel mirrors this line so its log carries it too.
+  const unknownSpaceIds = unknownStoredSpaceIds(db, knownSpaceIds({ byId: spaceRes.byId }));
+  if (unknownSpaceIds.length > 0) {
+    console.warn(
+      `[hicortex] Unknown space ids stored in the DB: ${unknownSpaceIds.join(", ")} — ` +
+        `no configured space claims them, so they are invisible to every requester ` +
+        `until configured or re-stamped (#642 AC-7)`
+    );
+  }
+  // #642 AC-9: per-space model resolution at the SAME boot seam — one line
+  // per ACTIVE space with no effective client (no explicit spaces.<id>.llm*
+  // and no llmConfidential* endpoint). Such a space's queued deliveries and
+  // consolidation work HOLD (the nightly drain + pool-aware stages enforce
+  // it; they build their own clients from the same config), never the main
+  // model — this warning is how the operator learns from the log instead of
+  // from a silently growing inbox. Gate on non-empty: a zero-space install
+  // prints nothing (AC-1).
+  {
+    const spaceBundle = buildSpaceLlms(savedConfig, spaceRes.spaces, confidentialBuilt);
+    // Hoisted into the module vars so the SYNC /distill path reads the
+    // boot-resolved per-space clients: the handler below routes a space-
+    // stamped delivery by THIS map (the same selection the nightly drain
+    // makes from its own resolveLlmPair — one resolution per boot).
+    spaceClients = spaceBundle.clients;
+    spaceConfigs = spaceBundle.configs;
+    const rowsBySpace = new Map<string, number>();
+    const queueBySpace = new Map<string, number>();
+    for (const table of ["memories", "distill_queue"] as const) {
+      const target = table === "memories" ? rowsBySpace : queueBySpace;
+      for (const row of db!
+        .prepare(
+          `SELECT privacy, COUNT(*) AS c FROM ${table} ` +
+            `WHERE privacy IS NOT NULL AND privacy NOT IN ('standard', 'confidential') ` +
+            `GROUP BY privacy`,
+        )
+        .all() as Array<{ privacy: string; c: number }>) {
+        target.set(row.privacy, row.c);
+      }
+    }
+    for (const warning of spaceHoldWarnings(spaceRes.spaces, spaceBundle.clients, {
+      rowsBySpace,
+      queueBySpace,
+    })) {
+      console.warn(warning);
+    }
+  }
+
   // #264 dir migration: rename <hicortex-home>/context/ → identity/ on boot
   // when only the legacy dir exists. The fallback read in identity-store.ts
   // (readSectionsWithFallback) is the safety net for a partial/no migration.
@@ -1265,8 +1389,10 @@ export async function startServer(options: {
   const learningsIndexHandler = (req: express.Request, res: express.Response): void => {
     if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
     try {
-      const member = requestSeesConfidential(req.query.agent);
-      const lessons = storage.getLessons(db, 30, null, { includeConfidential: member });
+      // #642 AC-5: the visible-SPACE-SET gate (was the #332 boolean) — the
+      // requester's resolved membership; lessons of other spaces are omitted.
+      const visible = requesterVisibleSpaces(req.query.agent);
+      const lessons = storage.getLessons(db, 30, null, { visibleSpaces: visible });
       const totalCount = storage.countMemories(db);
 
       // Project index
@@ -1374,9 +1500,11 @@ export async function startServer(options: {
         memoryType: normalizedType ?? "experience",
         // #332: server-derived stamp — same source_agent × roster rule as
         // /distill, so the legacy write path is not a stamping bypass.
-        privacy: deriveIntakePrivacy(
+        // #642: the derivation runs over the resolved spaces (agent-only, no
+        // signals today — /ingest carries no workspace path or marker).
+        privacy: deriveIntakeSpace(
           typeof source_agent === "string" ? source_agent : null,
-          confidentialRoster,
+          resolvedSpaces,
         ),
         createdAt: session_date ? new Date(session_date).toISOString() : undefined,
       });
@@ -1418,10 +1546,12 @@ export async function startServer(options: {
     // otherwise).
     // #332: the optional `agent` param is the circle-membership gate —
     // absent/unknown = hard omit of confidential rows.
-    const member = requestSeesConfidential(req.query.agent);
+    // #642 AC-5: generalized to the visible SPACE set — rows of spaces the
+    // requester is not a member of are hard-omitted at candidate-build time.
+    const visible = requesterVisibleSpaces(req.query.agent);
     const minSimilarity = resolveSearchSimilarityFloor(req.query.minSimilarity);
     try {
-      let results = await retrieval.retrieve(db, embed, query, { limit, project, includeConfidential: member });
+      let results = await retrieval.retrieve(db, embed, query, { limit, project, visibleSpaces: visible });
       results = applySearchRelevanceGate(results, { minSimilarity, project, crossProjectMinSimilarity: recallCrossProjectBar });
       res.json({ results });
     } catch (err) {
@@ -1467,11 +1597,12 @@ export async function startServer(options: {
     // factory (built per request) carries it into retrieve() so the omit
     // happens at candidate-build time, not post-hoc. A client-declared
     // `privacy` body field remains ignored (0.16.x backcompat posture).
+    // #642 AC-5: generalized to the visible SPACE set (requesterVisibleSpaces).
     const factory = createRecallRetrieveFn({
       db,
       registry: recallRegistry,
       embedFn: embed,
-      includeConfidential: requestSeesConfidential((req.body as Record<string, unknown> | null)?.agent),
+      visibleSpaces: requesterVisibleSpaces((req.body as Record<string, unknown> | null)?.agent),
     });
     const r = await handleRecallIndex(
       {
@@ -1502,12 +1633,14 @@ export async function startServer(options: {
     // #332: the optional `agent` param is the circle-membership gate — a
     // confidential id fetched by a non-member answers 404 (before any
     // strengthening side effect, inside handleMemoryGet).
+    // #642 AC-5: generalized to the visible SPACE set — a row of a space the
+    // requester is not a member of answers 404 the same way.
     try {
       const r = handleMemoryGet(
         db,
         { id: req.query.id },
         { recordFetch: recordRecallFetch },
-        { includeConfidential: requestSeesConfidential(req.query.agent) },
+        { visibleSpaces: requesterVisibleSpaces(req.query.agent) },
       );
       res.status(r.status).json(r.body);
     } catch (err) {
@@ -1525,11 +1658,12 @@ export async function startServer(options: {
     // default (#408 — was the recentLimit config key).
     // 0.16.x: `privacy` query param accepted but ignored (vestigial column).
     // #332: the optional `agent` param is the circle-membership gate.
+    // #642 AC-5: generalized to the visible SPACE set (requesterVisibleSpaces).
     const limit = req.query.limit ? Number(req.query.limit) : undefined;
     warnDeprecatedPrivacyParamIfPresent(req.query as Record<string, unknown>, "recent");
-    const member = requestSeesConfidential(req.query.agent);
+    const visible = requesterVisibleSpaces(req.query.agent);
     try {
-      const results = retrieval.searchRecent(db, { project, limit, includeConfidential: member });
+      const results = retrieval.searchRecent(db, { project, limit, visibleSpaces: visible });
       res.json({ results });
     } catch (err) {
       logAndSendInternalError(res, "recent", err);
@@ -1703,6 +1837,85 @@ export async function startServer(options: {
     }
   });
 
+  // GET /spaces + PUT /spaces/assign + PUT /spaces/unassign — the #642 AC-10
+  // admin API behind the dashboard's space management (and, next slice, the
+  // CLI). GET assembles the resolved spaces, per-space memory/queue counts
+  // (SQL GROUP BY folded through spaceOf — NULL/''/'standard' count under
+  // 'standard', which is never listed), the observed unassigned agents
+  // (first-prompt discovery, AC-11), and whether each space's work has a
+  // model (the EFFECTIVE client: boot spaceClients, or the confidential
+  // fields for the reserved id). The PUTs run the pure handlers
+  // (spaces-api.ts) against a FRESH config read, persist ONLY the `spaces`
+  // key through persistConfigUpdates, then LIVE RE-RESOLVE — resolveSpaces
+  // over the merged config reassigns resolvedSpaces/spaceById, so the read
+  // gate flips on the NEXT request, no restart (the marker-key live-assign
+  // precedent; boot and these routes are the only writers). The per-space
+  // LLM maps (spaceClients/spaceConfigs) are NOT re-resolved: these routes
+  // edit members lists only, and a space's llm config comes from the
+  // entry's llm* fields or llmConfidential*, neither of which they write.
+  // Server-mode only by construction — the routes exist only on this daemon.
+  // Bearer-only: the standard auth middleware above, no exemption (writable
+  // by any token holder — inherent to the single-token model, #642).
+  app.get("/spaces", (_req, res) => {
+    if (!db) { res.status(503).json({ error: "Server not initialized" }); return; }
+    try {
+      const countsFor = (table: string): Record<string, number> => {
+        const out: Record<string, number> = {};
+        for (const row of db!
+          .prepare(`SELECT privacy, COUNT(*) AS c FROM ${table} GROUP BY privacy`)
+          .all() as Array<{ privacy: string | null; c: number }>) {
+          const key = spaceOf(row.privacy);
+          out[key] = (out[key] ?? 0) + row.c;
+        }
+        return out;
+      };
+      const llmConfigured = new Set<string>();
+      for (const s of resolvedSpaces) {
+        if (s.id === "confidential") {
+          if (confidentialLlm) llmConfigured.add(s.id);
+        } else if (spaceClients.get(s.id)) {
+          llmConfigured.add(s.id);
+        }
+      }
+      const r = handleSpacesGet({
+        spaces: resolvedSpaces,
+        counts: { memory: countsFor("memories"), queued: countsFor("distill_queue") },
+        observed: listObservedAgents(db),
+        llmConfigured,
+      });
+      res.status(r.status).json(r.body);
+    } catch (err) {
+      logAndSendInternalError(res, "spaces", err);
+    }
+  });
+
+  const spacesWriteHandler = (verb: "assign" | "unassign") => (req: express.Request, res: express.Response): void => {
+    try {
+      const fresh = readConfigFile(stateDir) ?? {};
+      const r = verb === "assign"
+        ? handleSpacesAssign(req.body ?? null, fresh)
+        : handleSpacesUnassign(req.body ?? null, fresh);
+      if (r.patch && r.applied) {
+        const merged = persistConfigUpdates(pathJoin(stateDir, "config.json"), r.patch);
+        // LIVE RE-RESOLVE — the read gate + intake stamping flip on the next
+        // request (resolvedSpaces is what requesterVisibleSpaces and
+        // deriveIntakeSpace read; spaceById feeds the known-set boundary).
+        const reResolved = resolveSpaces(merged);
+        resolvedSpaces = reResolved.spaces;
+        spaceById = reResolved.byId;
+        console.log(
+          `[hicortex] spaces: ${verb} '${r.applied.agent}' ${verb === "assign" ? "to" : "from"} ` +
+          `space '${r.applied.space}' — applied live (persisted to config.json)`
+        );
+      }
+      res.status(r.status).json(r.body);
+    } catch (err) {
+      logAndSendInternalError(res, `spaces/${verb}`, err);
+    }
+  };
+  app.put("/spaces/assign", spacesWriteHandler("assign"));
+  app.put("/spaces/unassign", spacesWriteHandler("unassign"));
+
   // REST /distill — canonical capture endpoint (0.9.0+).
   // Every machine (including the server itself) POSTs denoised session text here.
   // The server distills, embeds, stores. Body limit: see `distillBodyLimitMb`
@@ -1756,14 +1969,18 @@ export async function startServer(options: {
     // confidentialMarkerKey compared timing-safe against the relayed content
     // (an absent key makes every marker inert; a refused marker never reduces
     // a server rule).
-    const derivedPrivacy = deriveIntakePrivacy(
+    // #642: the derivation is now space-aware (deriveIntakeSpace): per-space
+    // PATH patterns first, then per-space MEMBER lists, then the confidential
+    // marker arm — over the boot-resolved resolvedSpaces (on a zero-space
+    // install the value is byte-identical: the materialized confidential
+    // space answers every arm exactly as the old roster+paths call did).
+    const derivedPrivacy = deriveIntakeSpace(
       typeof source_agent === "string" ? source_agent : null,
-      confidentialRoster,
+      resolvedSpaces,
       {
         workspacePath,
         markerContent: clientMarker,
         markerKey: confidentialMarkerKey,
-        paths: confidentialPathPatterns,
       },
     );
     // #614: the rate-limited refusal warn at the intake seam. Marker content
@@ -1825,19 +2042,49 @@ export async function startServer(options: {
       // an LLM is configured.
     }
 
-    // #332 sync-mode refusal: a CONFIDENTIAL delivery with no confidential
-    // model answers 503 — the client holds its cursor and retries (the
+    // #642: the sync path's per-space client resolution — the drain's
+    // selection (distill-queue.ts) mirrored at the HTTP boundary. 'standard'
+    // → the main client; 'confidential' → the dedicated confidential fields;
+    // any other stamp → the BOOT-RESOLVED per-space client (buildSpaceLlms at
+    // the spaces seam: explicit spaces.<id>.llm* wins, else the inherited
+    // llmConfidential* endpoint — the same client object the confidential pool
+    // uses). Absent = HOLD, never a fallback: the main model is not a
+    // representable answer for non-shared text.
+    const deliverySpace = spaceOf(derivedPrivacy);
+    const syncDeliveryPair = (): { client: LlmClient; config: LlmConfig } | null => {
+      if (deliverySpace === "confidential") {
+        return confidentialLlm && confidentialLlmConfig
+          ? { client: confidentialLlm, config: confidentialLlmConfig }
+          : null;
+      }
+      if (deliverySpace !== "standard") {
+        const client = spaceClients.get(deliverySpace);
+        const config = spaceConfigs.get(deliverySpace);
+        return client && config ? { client, config } : null;
+      }
+      return llm && llmConfig ? { client: llm, config: llmConfig } : null;
+    };
+
+    // #332/#642 sync-mode refusal: a NON-SHARED delivery whose space has no
+    // client answers 503 — the client holds its cursor and retries (the
     // strict-mode watermark precedent). It is NEVER distilled on the main
-    // model. Queue mode stores it and the drain holds it instead (per-item
-    // skip-and-continue); a fresh install's first delivery can never be
-    // confidential (no roster configured ⇒ nothing derives confidential), so
-    // the fresh-brain immediate-distill carve-out is untouched.
-    if (derivedPrivacy === "confidential" && !queueMode && (!confidentialLlm || !confidentialLlmConfig)) {
+    // model. 'confidential' keeps its exact #332 wording; every other space
+    // id gets the same hold naming itself and its config pointer. Queue mode
+    // stores the delivery and the drain holds it instead (per-item
+    // skip-and-continue); a fresh install's first delivery derives a space
+    // only when members/paths are configured, and a space configured without
+    // a model refuses HERE — the fresh-brain immediate-distill carve-out can
+    // never route non-shared text to the main model either.
+    if (!queueMode && deliverySpace !== "standard" && !syncDeliveryPair()) {
       recordDistillActivity(db, capEntry(0, "held"));
       res.status(503).json({
         error:
-          "Confidential delivery held — no confidential model configured " +
-          "(llmConfidentialBaseUrl/ApiKey). It will be retried; it is never distilled on the main model.",
+          deliverySpace === "confidential"
+            ? "Confidential delivery held — no confidential model configured " +
+              "(llmConfidentialBaseUrl/ApiKey). It will be retried; it is never distilled on the main model."
+            : `Delivery held — space '${deliverySpace}' has no model configured ` +
+              `(spaces.${deliverySpace}.llmBaseUrl + llmApiKey, or the llmConfidential* endpoint). ` +
+              `It will be retried; it is never distilled on the main model.`,
       });
       return;
     }
@@ -1855,9 +2102,12 @@ export async function startServer(options: {
       // The messages branch already redacts via extractConversationText
       // (distiller.ts), which calls redact() as its final step. #332: it
       // receives the SAME redaction config (the extended preset for
-      // confidential deliveries) so both branches redact identically.
+      // non-shared deliveries) so both branches redact identically.
+      // #642: the preset keys on the delivery's SPACE, not the literal
+      // 'confidential' — redaction strength follows the class (any private
+      // pool's captures are the contact-identifier-rich kind).
       conversationText = extractConversationText(messages, {
-        extended: derivedPrivacy === "confidential",
+        extended: deliverySpace !== "standard",
       });
     } else {
       res.status(400).json({ error: "Provide either 'text' (string) or 'messages' (array)" });
@@ -1878,9 +2128,11 @@ export async function startServer(options: {
     // (DEFAULT_PATTERNS + emails + phone numbers) — the material a
     // confidential-circle agent captures is exactly the contact-identifier-rich
     // kind (#558). Standard deliveries keep today's set byte-identically.
+    // #642: the preset keys on the delivery's SPACE, not the literal
+    // 'confidential' — every private pool's deliveries redact identically.
     if (fromTextBranch) {
       const { text: redacted, count } = redact(conversationText, {
-        extended: derivedPrivacy === "confidential",
+        extended: deliverySpace !== "standard",
       });
       if (count > 0) {
         console.log(`[hicortex] Redacted ${count} secret(s) from /distill text`);
@@ -1936,7 +2188,7 @@ export async function startServer(options: {
     // its log line when `queued` is present. NO LLM call: the probe gate,
     // chunk-size detection, and the token gate all live in the nightly's
     // drain now. Redaction already happened above, so the inbox never holds
-    // unredacted text (owner ruling 05.10.2026: same protection as the DB).
+    // unredacted text (#529 ruling: same protection as the DB).
     // The enqueue's UNIQUE(session_id, segment_id) insert is idempotent — a
     // duplicate (only reachable via a racing identical POST; the prechecks
     // above already answered the sequential re-POST) returns the same
@@ -1956,9 +2208,12 @@ export async function startServer(options: {
         segment_id,
         session_date,
         // #332: the queue row carries the DERIVED stamp — the drain trusts it
-        // (and routes the item to the matching model).
+        // (and routes the item to the matching model). #642: the third arg is
+        // the boot-resolved known space set so a space stamp SURVIVES the
+        // normalize boundary (the handler derives only ids resolvedSpaces
+        // knows, so the fail-closed THROW of AC-7 never fires for them).
         privacy: derivedPrivacy,
-      });
+      }, knownSpaceIds({ byId: spaceById }));
       recordDistillActivity(db, capEntry(conversationText.length, duplicate ? "skipped" : "ok"));
       if (duplicate) {
         res.status(200).json({ skipped: true, existing_count: 0 });
@@ -1984,13 +2239,27 @@ export async function startServer(options: {
       return;
     }
 
-    // #332 per-pool client selection (the sync path's mirror of the drain's
-    // selection): a confidential delivery distills on the CONFIDENTIAL client
-    // — the refusal above guarantees it exists by here — and the probe gate +
-    // chunk-size cache below use ITS endpoint. Standard deliveries are
-    // byte-identical to today.
-    const syncLlm: LlmClient = derivedPrivacy === "confidential" ? confidentialLlm! : llm;
-    const syncLlmConfig: LlmConfig = derivedPrivacy === "confidential" ? confidentialLlmConfig! : llmConfig;
+    // #332/#642 per-pool client selection (the sync path's mirror of the
+    // drain's selection), routed by SPACE: standard → the main client;
+    // 'confidential' → the confidential fields; any other stamp → its
+    // boot-resolved per-space client. The refusal above guarantees the pair
+    // exists by here ('standard' by the no-LLM guard just above) — the 503
+    // backstop below is defensive only, but refusing beats a silent `!` if
+    // that invariant ever breaks: there is no code path that answers "give me
+    // SOME client for this space". The probe gate + chunk-size cache below
+    // use the SELECTED endpoint's config.
+    const syncPair = syncDeliveryPair();
+    if (!syncPair) {
+      recordDistillActivity(db, capEntry(conversationText.length, "held"));
+      res.status(503).json({
+        error:
+          "The model configured for this delivery's space vanished mid-request — " +
+          "held; it is never distilled on the main model. It will be retried.",
+      });
+      return;
+    }
+    const syncLlm: LlmClient = syncPair.client;
+    const syncLlmConfig: LlmConfig = syncPair.config;
 
     // #337: readiness gate — cached minimal generation probe BEFORE
     // detectChunkSize + distillSession, so a dead endpoint never even pays the
@@ -2038,8 +2307,9 @@ export async function startServer(options: {
       // server-side per-entry console.log in distillChunk stays as well.
       const dropped: string[] = [];
       const entries = await distillSession(
-        // #332: the per-pool selection — syncLlm is the confidential client
-        // for confidential deliveries (guaranteed non-null by the refusal).
+        // #332/#642: the per-pool selection — syncLlm is the delivery's
+        // SPACE client (confidential fields for 'confidential', the per-space
+        // client otherwise; guaranteed non-null by the refusal).
         syncLlm, conversationText, canonProjectVal ?? "unknown", date, chunkSize, dropped,
         (u) => {
           distillUsage.prompt += u.prompt_tokens ?? 0;
@@ -2359,12 +2629,16 @@ export async function startServer(options: {
     // content-bearing ops). op=export stays UNGATED — it feeds /viz, which
     // is deliberately ungated (a show-confidential toggle is a separate
     // later item).
-    const member = requestSeesConfidential(req.query.agent);
-    // A confidential endpoint/center id is invisible to non-members — same
-    // 404 contract as GET /memory (existence is not revealed).
+    // #642 AC-5: generalized to the visible SPACE set — non-visible rows are
+    // omitted from every op's content, and a non-visible center/endpoint id
+    // reads as not found.
+    const visible = requesterVisibleSpaces(req.query.agent);
+    // A non-visible endpoint/center id is invisible — same 404 contract as
+    // GET /memory (existence is not revealed; the 404 fires BEFORE any side
+    // effect — there is none on this route, the contract is the shape).
     const visibleId = (id: string): boolean => {
       const row = db!.prepare("SELECT privacy FROM memories WHERE id = ?").get(id) as { privacy: string | null } | undefined;
-      return member || row?.privacy !== "confidential";
+      return isVisiblePrivacy(row?.privacy ?? "standard", visible);
     };
 
     try {
@@ -2373,13 +2647,13 @@ export async function startServer(options: {
         if (!idParam) { res.status(400).json({ error: "id is required for neighbors operation" }); return; }
         const resolvedId = resolveMemoryId(db, idParam);
         if (!resolvedId || !visibleId(resolvedId)) { res.status(404).json({ error: `Memory not found: ${idParam}` }); return; }
-        const neighbors = getNeighbors(db, resolvedId, resultLimit, filterRelationship, { includeConfidential: member });
+        const neighbors = getNeighbors(db, resolvedId, resultLimit, filterRelationship, { visibleSpaces: visible });
         res.json({ results: neighbors });
         return;
       }
 
       if (op === "hubs") {
-        let hubs = detectHubs(db, 2, 3, { includeConfidential: member });
+        let hubs = detectHubs(db, 2, 3, { visibleSpaces: visible });
         if (filterDomain) {
           hubs = hubs.filter((h) => h.domain === filterDomain || h.project === filterDomain);
         }
@@ -2397,7 +2671,7 @@ export async function startServer(options: {
         const fromId = resolveMemoryId(db, fromParam);
         const toId = resolveMemoryId(db, toParam);
         if (!fromId || !toId || !visibleId(fromId) || !visibleId(toId)) { res.status(404).json({ error: "One or both memory IDs not found" }); return; }
-        const path = shortestPath(db, fromId, toId, 5, { includeConfidential: member });
+        const path = shortestPath(db, fromId, toId, 5, { visibleSpaces: visible });
         res.json({ path: path ?? null });
         return;
       }

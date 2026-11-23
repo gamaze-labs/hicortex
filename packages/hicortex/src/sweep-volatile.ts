@@ -1,8 +1,8 @@
 /**
- * `hicortex sweep-volatile` (#489, deliverable iii — owner decision 3).
+ * `hicortex sweep-volatile` (#489, deliverable iii — decision 3).
  *
  * The ONE-SHOT store sweep: the live corpus already holds the GH-status /
- * version-bump rows gold set A adjudicated ("not healthy to have GH in mem").
+ * version-bump rows gold set A adjudicated as unhealthy to keep.
  * This command reuses the SAME deterministic gate the distill path applies
  * (distiller.ts isVolatileStatusEntry — one gate, one meaning) over the stored
  * corpus. Mirrors `dedup`:

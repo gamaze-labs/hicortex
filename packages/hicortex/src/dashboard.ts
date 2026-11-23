@@ -43,6 +43,8 @@ import {
 import { readQueueStats } from "./distill-queue.js";
 import { listCapturePauses, readFleetLastSeen, setCapturePause } from "./capture-pause.js";
 import { resolveConfidentialAgents, isConfidentialSourceAgent } from "./classification.js";
+import { resolveSpaces } from "./spaces.js";
+import { listObservedAgents } from "./observed-agents.js";
 import { loadState } from "./state.js";
 import { effectiveStrength } from "./retrieval.js";
 import { deriveStage, type Stage } from "./stages.js";
@@ -201,6 +203,31 @@ export interface DashboardSnapshot {
 }
 
 /**
+ * #642 AC-12 — the spaces management view's data: every configured space
+ * (resolveSpaces — SKIPPING NOTHING, the confidential space included) with
+ * its resolved members and counts, plus the observed-but-unassigned agents
+ * (first-prompt discovery, AC-11) that the page offers for one-click
+ * assignment. Purely informational block — the page DRIVES the AC-10 admin
+ * API for the writes; this payload only paints.
+ */
+export interface SpacesFleetBlock {
+  /** Config order (resolveSpaces) — the page renders one lane per space. */
+  spaces: Array<{
+    id: string;
+    /** The resolved (sanitized) members list. */
+    members: string[];
+    /** Rows stamped with this space id (spaceOf-folded GROUP BY). */
+    memoryCount: number;
+    /** Queued rows stamped with this space id (distill_queue). */
+    queuedCount?: number;
+  }>;
+  /** Observed agents in NO space's members, newest last_seen first (the
+   *  listObservedAgents order, filtered — the operator sees the freshest
+   *  unknown workspace first). */
+  unassigned: Array<{ agent: string; first_seen: string; last_seen: string }>;
+}
+
+/**
  * #601 — the confidential circle's VISIBILITY block: which agents are
  * confidential-circle and, for the observed ones, how many confidential
  * memories they carry. Purely informational (the dashboard is NOT gated —
@@ -211,7 +238,7 @@ export interface AgentCircle {
   /** The sanitized roster (resolveConfidentialAgents — the one agent-id
    *  namespace shared with `?agent=` and identityAgents). */
   roster: string[];
-  /** OBSERVED source_agent values (e.g. "hermes/atlas") that match the
+  /** OBSERVED source_agent values (e.g. "hermes/nova") that match the
    *  roster, each mapped to that agent's confidential memory count.
    *  Membership is KEY PRESENCE (a rostered agent observed with 0
    *  confidential rows is a member at 0); NULL source_agent never matches. */
@@ -269,7 +296,7 @@ export interface DashboardData {
    * recorded (fresh install / all rows pruned — the page degrades to the
    * phase-1 counts-only rows).
    *
-   * #409 fix round 7 (owner ruling 2026-09-14: "the normal 30 day as the
+   * #409 fix round 7 ("the normal 30 day as the
    * other cards"): `day`/`rows` keep the NEWEST night with rows (secondary
    * info — the card's "tonight" suffix), while `window_days`/`window_rows`
    * carry the ROLLING capture window's per machine × agent sums — the card's
@@ -297,11 +324,15 @@ export interface DashboardData {
    * #601 adds `circle` — the confidential-circle visibility block (roster +
    * observed members with counts), also always present; the page degrades to
    * the exact prior rendering when the key is absent (pre-#601 server).
+   * #642 (AC-12) adds `spaces` — the management view's data (spaces +
+   * members + counts + observed unassigned), ALWAYS present the same way;
+   * `circle` STAYS for the page's pre-#642 degrade and the pill helpers.
    */
   fleet: {
     pauses: Array<{ machine: string; harness: string; paused_at: string }>;
     last_seen: Array<{ machine: string; harness: string; last_seen: string; last_outcome: string }>;
     circle: AgentCircle;
+    spaces: SpacesFleetBlock;
   };
   /**
    * #476 — the Memory Precision card: Level 1 (pushed-index precision
@@ -946,6 +977,56 @@ export function readAgentCircle(
 }
 
 /**
+ * #642 AC-12 — compute fleet.spaces: every resolved space with its members
+ * and its memory/queue counts (SQL GROUP BY privacy folded through spaceOf —
+ * NULL/''/'standard' counts under 'standard', the fixed shared pool that is
+ * NEVER listed), plus the observed agents that appear in no space's members
+ * as unassigned (newest last_seen first — the first-prompt discovery lane).
+ * Pure: takes a db + config, returns the block; no side effects. The page
+ * hides the management section entirely when the block is absent (an older
+ * server) and when there is nothing to show (the zero-change dashboard).
+ */
+export function readSpacesBlock(
+  db: Database.Database,
+  config: Record<string, unknown> | null | undefined,
+): SpacesFleetBlock {
+  const { spaces } = resolveSpaces(config);
+  // Counts per space id: one GROUP BY per table, folded through spaceOf so
+  // the shared pool (NULL/''/'standard') lands under 'standard' — a key the
+  // space list below never carries (it is not a space).
+  const countsFor = (table: "memories" | "distill_queue"): Record<string, number> => {
+    const out: Record<string, number> = {};
+    for (const row of db
+      .prepare(`SELECT privacy, COUNT(*) AS c FROM ${table} GROUP BY privacy`)
+      .all() as Array<{ privacy: string | null; c: number }>) {
+      const key = row.privacy === null || row.privacy === "" ? "standard" : row.privacy;
+      out[key] = (out[key] ?? 0) + row.c;
+    }
+    return out;
+  };
+  const memoryCounts = countsFor("memories");
+  const queuedCounts = countsFor("distill_queue");
+
+  const assigned = new Set<string>();
+  for (const s of spaces) for (const m of s.members) assigned.add(m);
+  // listObservedAgents is last_seen DESC (agent ASC tiebreak) — the filter
+  // keeps that order: freshest unknown workspace first.
+  const unassigned = listObservedAgents(db)
+    .filter((o) => !assigned.has(o.agent))
+    .map((o) => ({ agent: o.agent, first_seen: o.first_seen, last_seen: o.last_seen }));
+
+  return {
+    spaces: spaces.map((s) => ({
+      id: s.id,
+      members: s.members,
+      memoryCount: memoryCounts[s.id] ?? 0,
+      queuedCount: queuedCounts[s.id] ?? 0,
+    })),
+    unassigned,
+  };
+}
+
+/**
  * The pure data handler for GET /dashboard/data. Reads query params
  * (`range`, `date`, `digestLimit`) off the request, returns the DashboardData
  * payload. Never throws on empty/missing data — returns a valid empty shape.
@@ -1187,10 +1268,13 @@ export function handleDashboardData(
       // for the rail's dots, toggles and the capture card's PAUSED badges.
       // #601: circle rides the same block — visibility only (roster +
       // observed members + counts), never a gate.
+      // #642 (AC-12): spaces rides it too — the management view's data;
+      // config is already threaded here (dashboardDigestLimit), reused.
       fleet: {
         pauses: listCapturePauses(db),
         last_seen: readFleetLastSeen(db),
         circle: readAgentCircle(db, config),
+        spaces: readSpacesBlock(db, config),
       },
       digest,
     },
@@ -1321,7 +1405,7 @@ export interface DashboardField {
   /** The thresholds the stages were derived with, echoed so the page paints
    *  from the same constants the server scored with (calibration.ts is the
    *  single home — the echo is display, not a second source). Recall grades
-   *  are GONE (#426 owner semantics ruling 2026-09-13: recall depends on the
+   *  are GONE (#426 semantics ruling: recall depends on the
    *  conversation, a graded scale implies a target that does not exist). */
   thresholds: {
     stage: { fading_days: number; fading_strength: number; belief: number; truth: number };
@@ -1331,8 +1415,8 @@ export interface DashboardField {
      *  a second source — same rule as the stage bands). Absent nothing: the
      *  key always rides the payload; a pre-polish page ignores it. */
     recall_min_similarity: number;
-    /** #426 final ruling 2026-09-13: the console's recall-level band edges
-     *  (RECALL_USES_* — PROVISIONAL, owner anchor 2026-09-13, pending fleet
+    /** #426 final ruling: the console's recall-level band edges
+     *  (RECALL_USES_* — PROVISIONAL anchors, pending fleet
      *  telemetry). Same echo rule as recall_min_similarity: calibration.ts is
      *  the single home, the page never hardcodes the edges, and a page older
      *  than this key simply ignores it (no band). These classify the console
@@ -1419,9 +1503,9 @@ export function handleDashboardField(
     status: 200,
     body: {
       generated_at: now.toISOString(),
-      // #426 owner semantics ruling 2026-09-13: recall grades are REMOVED —
+      // #426 semantics ruling: recall grades are REMOVED —
       // recall depends on the conversation, higher is not a target. Only the
-      // stage thresholds ride the echo (calibrated 2026-09-13), plus the two
+      // stage thresholds ride the echo, plus the two
       // #409/#426 display keys: the search floor and the recall-level band
       // edges (PROVISIONAL — see calibration.ts).
       thresholds: {
@@ -1549,7 +1633,7 @@ export interface DashboardEvents {
   nights: DashboardEventsNight[];
 }
 
-// #452 (owner directive 2026-09-16): the default window is 30 days for ALL
+// #452: the default window is 30 days for ALL
 // views — longer ranges are opt-in via the page's selector. MAX stays 365:
 // it is the generic API cap and an explicit ?days= is honored up to it.
 const EVENTS_DEFAULT_DAYS = 30;

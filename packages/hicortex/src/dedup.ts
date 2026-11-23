@@ -47,7 +47,7 @@
  *
  * A cluster whose members disagree on project is SKIPPED entirely and listed
  * for manual review (reason `project_mismatch`) — no --force in this release.
- * The source_agent rail was REMOVED (#206 decision 2, 2026-09-21): cross-agent
+ * The source_agent rail was REMOVED (#206 decision 2): cross-agent
  * clusters merge — attribution is preserved on the retained evidence row and
  * no recall path filters by agent.
  *
@@ -89,8 +89,7 @@ const HICORTEX_HOME = hicortexHome();
 
 /**
  * Default merge threshold — RELEASE-MANAGED since #408: the constant (with
- * its provenance: measured on the #191 mechanical audit corpus, 89 clusters /
- * 110 excess rows at 0.92, data/audit-20260729/eval-report.md) lives in
+ * its provenance: measured on the #191 mechanical audit corpus) lives in
  * calibration.ts. #392: also the deterministic/LLM boundary of the unified
  * resolution pass.
  */

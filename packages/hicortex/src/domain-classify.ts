@@ -5,7 +5,7 @@
  * ---------------
  * The nightly's legacy `stageDomainCuration` groups PROJECTS into domains and
  * assigns every memory its project's domain. For an owner whose "projects" are
- * often AGENT names (alice, bob, ...), one agent produces memories spanning
+ * often AGENT names (alice, carol, ...), one agent produces memories spanning
  * many life areas, so life-memories get smeared under the agent. This module
  * classifies a single memory into life-spheres by its CONTENT, drawn from a
  * user-curated vocabulary in ~/.hicortex/config.json (`domains`).
@@ -21,7 +21,7 @@
  * deterministically (argmax association weight, LLM tag order breaking ties) in
  * schema-prototypes.ts / storage.setMemoryTags.
  *
- * NO-FIT = EMPTY TAG SET (owner amendment 07.07): "Unsorted" is a non-tag —
+ * NO-FIT = EMPTY TAG SET (spec 2026-07-07 amendment): "Unsorted" is a non-tag —
  * there is NO fallback category in the vocabulary and no configured domain is
  * ever auto-assigned on a no-fit. A genuine no-fit is the distinct result
  * `{tags: []}`; the CALLER then derives a weak primary from prototype cosines
@@ -47,9 +47,8 @@
  *
  * SCOPE: sphere-level tags only. Sub-labels within a sphere are a future phase.
  *
- * Example owner vocabulary (documented, NOT hardcoded — lives in config.json):
- *   Work, Ventures, Hardware, Finances, Property, Vehicles, Boating, Health,
- *   Family, People, Travel
+ * Example vocabulary (documented, NOT hardcoded — lives in config.json):
+ *   Work, Personal, People, Health, Finance
  */
 
 import { createHash } from "node:crypto";
@@ -132,8 +131,8 @@ export function matchDomain(reply: string, domains: DomainDef[]): string | null 
  *   - `tags`: 0..N vocabulary names that genuinely apply, MOST-RELEVANT FIRST
  *     (LLM order — used downstream only as an exact-weight tiebreak), deduped,
  *     all members of the configured vocabulary.
- *   - An EMPTY array is a distinct, VALID result: genuine no-fit (owner
- *     amendment 07.07 — no fallback category). Callers route it through the
+ *   - An EMPTY array is a distinct, VALID result: genuine no-fit (spec
+ *     2026-07-07 amendment — no fallback category). Callers route it through the
  *     weak-primary / no-association-decay path (nofit.ts). It is NOT the same
  *     as null (null = infra error → skip and retry later).
  *
@@ -199,7 +198,7 @@ export function buildClassifyPrompt(
  * Return values (three distinct outcomes):
  *   - {tags: [...]} — >= 1 valid vocabulary tag (canonical-cased, ordered).
  *   - {tags: []}    — the model EXPLICITLY replied with an empty tags array:
- *     genuine no-fit (owner amendment 07.07). NOT retried by the caller.
+ *     genuine no-fit (spec 2026-07-07 amendment). NOT retried by the caller.
  *   - null          — unparseable reply, missing/non-array `tags`, or a
  *     NON-EMPTY tags array in which no name matched the vocabulary (invalid
  *     names are dropped — an all-invalid reply is a bad reply, not a no-fit).
@@ -270,7 +269,7 @@ export function parseTagReply(reply: string, domains: DomainDef[]): TagResult | 
  *   - Valid JSON reply with ≥1 vocabulary tag → {tags} (ordered,
  *     most-relevant first).
  *   - Valid reply with an EXPLICIT empty tags array → {tags: []} (genuine
- *     no-fit — owner amendment 07.07: no fallback category is ever assigned;
+ *     no-fit — spec 2026-07-07 amendment: no fallback category is ever assigned;
  *     the caller routes empty tag sets through nofit.ts).
  *   - Unparseable / no-valid-tag reply → retry ONCE, then treat as a genuine
  *     no-fit: {tags: []} (the model responded twice but produced nothing

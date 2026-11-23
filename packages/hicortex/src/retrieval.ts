@@ -24,6 +24,7 @@ import type { Memory, MemorySearchResult } from "./types.js";
 import * as storage from "./storage.js";
 import { l2Normalize, weightedAdd } from "./schema-prototypes.js";
 import { labelForType } from "./type-labels.js";
+import { resolveVisibleSet, isVisiblePrivacy } from "./spaces.js";
 import * as CALIBRATION from "./calibration.js";
 
 /** Default decay half-life (days) at importance 0.5 — release-managed
@@ -152,8 +153,8 @@ export function configureRecall(overrides?: Partial<RecallDefaults> | null): Rec
 // The #430 scope-affinity term (born from #203's two boosts) is ADDITIVE,
 // zero-boost neutral, and NEVER a penalty: absent scope ⇒ the term is 0
 // (byte-identical to pre-#203); a foreign memory adds 0 (ranks equal, not
-// lower — a penalty would re-introduce the soft-exclusion the owner rejected:
-// "no hard filters in brains").
+// lower — a penalty would re-introduce the rejected soft-exclusion:
+// no hard filters in brains).
 //
 // #205 RRF retune nudges toward vector (FTS was winning cross-scope collisions
 // on raw token overlap — the marine "battery" memory beating the hardware one
@@ -297,7 +298,7 @@ export function getScoringWeights(): ScoringWeights {
 //                                kill-switch (pure prompt). Range [0, 1].
 //
 // The EMA rate α is a shipped constant (SESSION_INTENT_ALPHA, 0.4), not a
-// second knob — owner directive 0.15.3: one knob is enough to tune/disable;
+// second knob — the 0.15.3 ruling: one knob is enough to tune/disable;
 // exposing α was speculative generality.
 //
 // The centroid itself lives on SessionRecallRegistry; retrieval only needs to
@@ -1103,6 +1104,17 @@ export async function retrieve(
      * rows the predicate is a no-op — byte-identical behavior.
      */
     includeConfidential?: boolean;
+    /**
+     * #642 AC-5: the generalized gate — the requester's visible SPACE set
+     * (spacesForMember over the boot-resolved spaces, computed by the adapter
+     * from `?agent=`; the wire never carries a space list). Unioned with
+     * includeConfidential by resolveVisibleSet: a row is visible iff
+     * isVisiblePrivacy(privacy, that union) — shared always, the viewer's
+     * spaces yes, everything else (INCLUDING unknown/retired space ids, AC-7)
+     * hard-omitted on every channel. Boolean-only callers are byte-identical
+     * on standard/confidential data.
+     */
+    visibleSpaces?: Set<string>;
   }
 ): Promise<MemorySearchResult[]> {
   const limit = options?.limit ?? recallDefaults.searchLimit;
@@ -1110,11 +1122,12 @@ export async function retrieve(
   const sourceAgent = options?.sourceAgent;
   const missionDomains = options?.missionDomains;
   const now = options?.now ?? new Date();
-  // #332: hard-omit gate — confidential candidates are dropped on EVERY
-  // channel at candidate-build time (never post-hoc, so they never consume a
-  // top-k slot). `privacy !== 'confidential'` is NULL-safe by construction.
-  const includeConfidential = options?.includeConfidential === true;
-  const visible = (m: Memory): boolean => includeConfidential || m.privacy !== "confidential";
+  // #332/#642: hard-omit gate — candidates outside the visible set are
+  // dropped on EVERY channel at candidate-build time (never post-hoc, so
+  // they never consume a top-k slot). isVisiblePrivacy is NULL-safe by
+  // construction (spaceOf maps NULL/''/'standard' to the shared pool).
+  const visible = (m: Memory): boolean =>
+    isVisiblePrivacy(m.privacy, resolveVisibleSet(options?.includeConfidential, options?.visibleSpaces));
 
   // #203 affinity scope — passed to computeScore for every candidate. Built
   // once; absent fields yield no boost (zero-boost neutral).
@@ -1128,8 +1141,8 @@ export async function retrieve(
 
   // 2. Dual retrieval — vector + BM25.
   // #192: sqlite-vec can't push filters into the KNN, so filtered queries must
-  // over-fetch — the old flat limit*3 intersected a global top-15 with (for the
-  // median project) ~1% of the corpus, starving every filtered query.
+  // over-fetch — the old flat limit*3 intersected a global top-15 with (for a
+  // mid-sized project) a small slice of the corpus, starving every filtered query.
   // #203: project is NO LONGER a filter (soft affinity now), so it does not
   // trigger over-fetch; only sourceAgent still does (it remains a hard filter).
   // #332: the classification gate filters in JS after both lists return (the
@@ -1290,7 +1303,7 @@ export async function retrieve(
   // 6. Sort and take top N — with cold-exposure slots (#192).
   // Effective strength + the promotion stage (#448) make past winners
   // self-reinforcing:
-  // 88% of the production corpus had never been returned by any query. Reserve
+  // The large majority of the production corpus had never been returned by any query. Reserve
   // up to 2 of k for the best-scoring never-accessed candidates so the long
   // tail gets nonzero exposure whenever it is semantically in range. Slots are
   // only "reserved" when cold candidates exist; otherwise the top-k is the
@@ -1379,13 +1392,16 @@ export function searchRecent(
      * belief-walk terminals; TRUE only for circle-member requests.
      */
     includeConfidential?: boolean;
+    /** #642 AC-5: the generalized gate — same contract as retrieve()'s
+     *  (resolveVisibleSet union; unknown space ids hard-omitted, AC-7). */
+    visibleSpaces?: Set<string>;
   }
 ): MemorySearchResult[] {
   const limit = options?.limit ?? recallDefaults.recentLimit;
   const project = options?.project;
   const now = new Date();
-  const includeConfidential = options?.includeConfidential === true;
-  const visible = (m: Memory): boolean => includeConfidential || m.privacy !== "confidential";
+  const visible = (m: Memory): boolean =>
+    isVisiblePrivacy(m.privacy, resolveVisibleSet(options?.includeConfidential, options?.visibleSpaces));
 
   // #192 breadth: 30 → 180-day default window (config recentWindowDays).
   // "Recent" for a long-lived corpus is a season, not a month; the narrow

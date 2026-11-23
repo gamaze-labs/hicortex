@@ -31,6 +31,7 @@
 
 import { timingSafeEqual } from "node:crypto";
 import { sanitizeAgentId } from "./identity-store.js";
+import { resolveSpaces, type SpaceDef } from "./spaces.js";
 import {
   resolveExplicitLlmConfig,
   resolveSavedLlmConfig,
@@ -76,11 +77,11 @@ export function resolveConfidentialAgents(
 
 /**
  * Normalize a capture-side `source_agent` for roster matching. Capture stamps
- * harness-qualified ids (`hermes/atlas`, `claude-code/myproject`), while the
+ * harness-qualified ids (`hermes/nova`, `claude-code/myproject`), while the
  * roster carries bare agent ids (the same ids the read side receives as
  * `agent`) — ONE config list, no read-ids/capture-ids sync hazard. The match
- * is exact, or exact after stripping the FIRST path segment (so `hermes/atlas`
- * matches roster `atlas`, and a future `anything/atlas` matches too — generic
+ * is exact, or exact after stripping the FIRST path segment (so `hermes/nova`
+ * matches roster `nova`, and a future `anything/nova` matches too — generic
  * prefix, not a per-harness table). Case-insensitive on the id half via the
  * roster's sanitized (lowercased) form.
  */
@@ -95,8 +96,8 @@ export function isConfidentialSourceAgent(
   if (slash < 0) return false;
   const bare = agent.slice(slash + 1);
   const rest = bare.indexOf("/");
-  // Strip only the FIRST segment — `hermes/atlas` → `atlas`, but
-  // `a/b/atlas` → `b/atlas` (never a deep-suffix match; capture ids are
+  // Strip only the FIRST segment — `hermes/nova` → `nova`, but
+  // `a/b/nova` → `b/nova` (never a deep-suffix match; capture ids are
   // single-qualified by construction).
   return rest < 0 && roster.includes(bare);
 }
@@ -152,8 +153,13 @@ const SEGMENT_METACHARS = /[*?[\]{}]/;
  * segment (partial-segment wildcards), other metacharacters, blank, and
  * ~user-style entries (whose home?). Dropped entries are reported by name at
  * boot — a typo must surface, never silently match nothing.
+ *
+ * #642: exported as the SHARED per-space path compiler (spaces.ts compiles
+ * `spaces.<id>.paths` with the same three forms — one pattern language, not a
+ * copy). The `Confidential` in the surrounding names is the legacy N=1
+ * vocabulary; the forms themselves are space-neutral.
  */
-function compileConfidentialPath(entry: string): ConfidentialPathPattern | null {
+export function compilePathPattern(entry: string): ConfidentialPathPattern | null {
   const trimmed = entry.trim();
   if (!trimmed) return null;
   let s = trimmed;
@@ -203,7 +209,7 @@ export function resolveConfidentialPaths(
       dropped.push(String(entry));
       continue;
     }
-    const compiled = compileConfidentialPath(entry);
+    const compiled = compilePathPattern(entry);
     if (!compiled) {
       dropped.push(entry);
     } else if (!patterns.some((p) => p.raw === compiled.raw)) {
@@ -296,6 +302,58 @@ export function resolveConfidentialMarkerKey(
 }
 
 /**
+ * The intake-side derivation, generalized to N spaces (#642 AC-4): which ONE
+ * space a delivery from `sourceAgent` stamps. Fail-closed by construction —
+ * anything unattributed, unlisted, and unmatched is `standard` (the shared
+ * pool).
+ *
+ * Arm precedence (the more specific birthplace wins; on a pure-legacy install
+ * every arm yields the same value, so the order is invisible there):
+ *   (a) PATHS — the FIRST space, in config order, whose compiled patterns
+ *       match the delivery's workspace path (matchesConfidentialPath);
+ *   (b) MEMBERS — the FIRST space, in config order, whose member list matches
+ *       the source agent (isConfidentialSourceAgent, the `<harness>/`-stripping
+ *       matcher);
+ *   (c) MARKER — the confidential arm EXACTLY as shipped (#614): the relayed
+ *       marker CONTENT must equal the boot-resolved `confidentialMarkerKey`
+ *       (timing-safe, server-side — the client only relays). UNCONDITIONAL of
+ *       the spaces list: 'confidential' is a reserved id the marker arm stamps
+ *       even on installs where no confidential space materialized. Marker
+ *       birthplace stays confidential-only by owner ruling (#642) — markers
+ *       are never generalized to other spaces.
+ *   (d) else 'standard'.
+ *
+ * `spaces` is the boot-resolved SpaceDef list (resolveSpaces in spaces.ts,
+ * config key order preserved). spaces.ts imports runtime values from THIS
+ * module (compilePathPattern, the confidential resolvers) and this module
+ * imports resolveSpaces back — a module cycle that is SAFE by construction:
+ * every cross-edge binding is a hoisted `function` declaration used only
+ * inside other function bodies, never at module-evaluation time, so neither
+ * evaluation order can observe an uninitialized binding.
+ */
+export function deriveIntakeSpace(
+  sourceAgent: string | null | undefined,
+  spaces: SpaceDef[],
+  signals?: IntakeWorkspaceSignals,
+): MemoryPrivacy {
+  for (const space of spaces) {
+    if (matchesConfidentialPath(signals?.workspacePath, space.paths)) return space.id;
+  }
+  for (const space of spaces) {
+    if (isConfidentialSourceAgent(sourceAgent, space.members)) return space.id;
+  }
+  if (
+    typeof signals?.markerKey === "string" &&
+    signals.markerKey.length > 0 &&
+    typeof signals?.markerContent === "string" &&
+    safeMarkerKeyEqual(signals.markerContent, signals.markerKey)
+  ) {
+    return "confidential";
+  }
+  return "standard";
+}
+
+/**
  * The intake-side derivation: which class a delivery from `sourceAgent`
  * stores as. Fail-closed by construction — anything unattributed or
  * unrostered is `standard` (the global pool).
@@ -311,25 +369,32 @@ export function resolveConfidentialMarkerKey(
  * content). The optional third argument
  * keeps every existing caller byte-identical (no signals = the #332
  * agent-only rule).
+ *
+ * #642: now a THIN WRAPPER over deriveIntakeSpace — the roster (+ optional
+ * signals paths) becomes one confidential space and the generalized
+ * derivation runs. At N=1 every arm yields the same value (paths, members,
+ * and the marker arm all answer 'confidential'), so the wrapper is
+ * value-identical to the pre-#642 direct implementation for every input
+ * combination; the pinned privacy-* / classification tests are the proof.
  */
 export function deriveIntakePrivacy(
   sourceAgent: string | null | undefined,
   roster: string[],
   signals?: IntakeWorkspaceSignals,
 ): MemoryPrivacy {
-  if (isConfidentialSourceAgent(sourceAgent, roster)) return "confidential";
-  if (
-    typeof signals?.markerKey === "string" &&
-    signals.markerKey.length > 0 &&
-    typeof signals?.markerContent === "string" &&
-    safeMarkerKeyEqual(signals.markerContent, signals.markerKey)
-  ) {
-    return "confidential";
-  }
-  if (matchesConfidentialPath(signals?.workspacePath, signals?.paths ?? [])) {
-    return "confidential";
-  }
-  return "standard";
+  return deriveIntakeSpace(
+    sourceAgent,
+    [
+      {
+        id: "confidential",
+        members: roster,
+        paths: signals?.paths ?? [],
+        llm: null,
+        privacyLine: "",
+      },
+    ],
+    signals,
+  );
 }
 
 /**
@@ -366,8 +431,8 @@ export interface IntakeWorkspaceSignals {
  * blank, or unknown `agent` → false (fail-closed: an unknown id can never
  * widen visibility, exactly like the identity layer's mode resolution). The
  * `agent` value is sanitized first so a wire id arrives in the roster's
- * namespace (`Atlas` → `atlas`); note sanitizeAgentId also collapses inner
- * separators, so `hermes/atlas` sent as a requester id reads as `hermes-atlas`
+ * namespace (`Nova` → `nova`); note sanitizeAgentId also collapses inner
+ * separators, so `hermes/nova` sent as a requester id reads as `hermes-nova`
  * — the read side intentionally matches BARE ids only (plugins send their
  * resolved profile name, not their capture-side qualified stamp).
  */
@@ -460,15 +525,96 @@ export function buildConfidentialLlm(
 // ---------------------------------------------------------------------------
 
 /**
- * The two clients a pipeline run needs. `standard` is the main model (always
+ * The clients a pipeline run needs. `standard` is the main model (always
  * present when the run does LLM work at all); `confidential` is null when the
  * circle is active but the second model is unconfigured — callers HOLD
  * confidential work in that case (clientForPool returns null), never fall
- * back.
+ * back. #642 adds `spaces`: one client (or null) per configured space EXCEPT
+ * 'confidential', whose client keeps flowing through the field above (one
+ * role, one field — buildSpaceLlms never stamps it into the map). Absent on
+ * a legacy pair (no spaces configured); clientForPool then answers null for
+ * every space id, which callers treat as HOLD — never fallback.
  */
 export interface LlmPair {
   standard: LlmClient;
   confidential: LlmClient | null;
+  /** #642: per-space clients (see above); 'confidential' is never a key. */
+  spaces?: Map<string, LlmClient | null>;
+}
+
+/**
+ * The per-space resolution bundle (#642 AC-9): the effective client + config
+ * for every CONFIGURED space except 'confidential'. A null entry is a HOLD,
+ * not a fallback — the main model is deliberately not representable here.
+ */
+export interface SpaceLlmBundle {
+  clients: Map<string, LlmClient | null>;
+  configs: Map<string, LlmConfig | null>;
+}
+
+/**
+ * Build the per-space clients (#642 AC-9). For each SpaceDef EXCEPT
+ * 'confidential' (the confidential space's client keeps its existing
+ * LlmPair.confidential role), the effective config is the inheritance
+ * ladder:
+ *
+ *   1. the space's EXPLICIT llm (spaces.<id>.llmBaseUrl + llmApiKey, the
+ *      resolveConfidentialLlmConfig pair contract) — built exactly like
+ *      buildConfidentialLlm builds the confidential one:
+ *      resolveExplicitLlmConfig + applyTierTuningOverlay + new LlmClient, so
+ *      a space model is never a second-class client (same maxTokens/timeouts/
+ *      single-flight overlay);
+ *   2. else the `llmConfidential*` endpoint — the SAME client object the
+ *      caller already built for the confidential pool when `inherited` is
+ *      threaded (one breaker/single-flight state per endpoint; resolveLlmPair
+ *      does), else resolved here;
+ *   3. else null — the space's deliveries and consolidation work HOLD
+ *      (spaceHoldWarnings names it), never the main model.
+ */
+export function buildSpaceLlms(
+  savedConfig: Record<string, unknown> | null | undefined,
+  spaces: SpaceDef[],
+  /** The already-built confidential pair — inheriting spaces share the SAME
+   *  client object (one endpoint, one breaker). Pass null when the
+   *  confidential model is absent; omit to resolve the endpoint here. */
+  inherited?: { llm: LlmClient; config: LlmConfig } | null,
+): SpaceLlmBundle {
+  const clients = new Map<string, LlmClient | null>();
+  const configs = new Map<string, LlmConfig | null>();
+  for (const space of spaces) {
+    // The confidential space flows through LlmPair.confidential — stamping it
+    // here too would give one endpoint two breaker states.
+    if (space.id === "confidential") continue;
+    if (space.llm) {
+      const config = resolveExplicitLlmConfig({
+        llmBaseUrl: space.llm.baseUrl,
+        llmApiKey: space.llm.apiKey,
+        llmModel: space.llm.model,
+        llmProvider: space.llm.provider,
+      });
+      // resolveExplicitLlmConfig only answers null when the baseUrl/apiKey
+      // pair is absent — resolveSpaces already enforces the pair, so this is
+      // defensive; null means HOLD, same as an unconfigured space.
+      if (!config) {
+        clients.set(space.id, null);
+        configs.set(space.id, null);
+        continue;
+      }
+      applyTierTuningOverlay(config, savedConfig ?? null);
+      clients.set(space.id, new LlmClient(config));
+      configs.set(space.id, config);
+      continue;
+    }
+    const endpoint = inherited !== undefined ? inherited : buildConfidentialLlm(savedConfig);
+    if (endpoint) {
+      clients.set(space.id, endpoint.llm);
+      configs.set(space.id, endpoint.config);
+    } else {
+      clients.set(space.id, null);
+      configs.set(space.id, null);
+    }
+  }
+  return { clients, configs };
 }
 
 /**
@@ -478,49 +624,80 @@ export interface LlmPair {
  * the /distill sync path need the config for chunk-size detection/probing),
  * and passes through resolveSavedLlmConfig's `reason` so callers keep their
  * claude-binary-missing logging.
+ *
+ * #642: `spaces` (optional) is the boot-resolved SpaceDef list — omitted, it
+ * resolves internally (resolveSpaces). The returned `spaceClients`/
+ * `spaceConfigs` cover every configured space EXCEPT 'confidential'; on a
+ * legacy config the maps are EMPTY (the only space IS confidential), so
+ * pre-#642 callers and their tests see no change.
  */
 export function resolveLlmPair(
   savedConfig: Record<string, unknown> | null | undefined,
+  spaces?: SpaceDef[],
 ): {
   pair: LlmPair | null;
   standardConfig: LlmConfig | null;
   confidentialConfig: LlmConfig | null;
   reason?: "claude_binary_missing";
+  /** #642: per-space clients (buildSpaceLlms) — empty on a legacy config. */
+  spaceClients: Map<string, LlmClient | null>;
+  /** #642: their configs (the drain's per-endpoint chunk-size cache). */
+  spaceConfigs: Map<string, LlmConfig | null>;
 } {
+  const resolvedSpaces = spaces ?? resolveSpaces(savedConfig).spaces;
   const resolved = resolveSavedLlmConfig(savedConfig ?? null);
   const confidential = buildConfidentialLlm(savedConfig);
+  // The confidential client object is REUSED for inheriting spaces (rung 2 of
+  // the ladder) — one endpoint, one breaker state.
+  const spaceBundle = buildSpaceLlms(savedConfig, resolvedSpaces, confidential);
   if (!resolved.config) {
     return {
       pair: null,
       standardConfig: null,
       confidentialConfig: confidential?.config ?? null,
       reason: resolved.reason,
+      spaceClients: spaceBundle.clients,
+      spaceConfigs: spaceBundle.configs,
     };
   }
   return {
     pair: {
       standard: new LlmClient(resolved.config),
       confidential: confidential?.llm ?? null,
+      spaces: spaceBundle.clients,
     },
     standardConfig: resolved.config,
     confidentialConfig: confidential?.config ?? null,
+    spaceClients: spaceBundle.clients,
+    spaceConfigs: spaceBundle.configs,
   };
 }
 
 /**
  * The per-pool selection every stage call site goes through: the client that
- * MUST serve a memory class, or null when the confidential pool has no
- * client configured (the caller holds/skips that pool's work — the
- * structurally-hard guarantee that confidential text can never reach the
+ * MUST serve a memory's space, or null when that space has no client
+ * configured (the caller holds/skips that pool's work — the
+ * structurally-hard guarantee that non-shared text can never reach the
  * standard model: there is no code path that answers "give me SOME client
- * for confidential").
+ * for this pool"). 'confidential' keeps its dedicated field; NULL/''/
+ * 'standard' (the shared pool, spaceOf's normalization) is the main model;
+ * any other value is a space id answered from the #642 map — absent map,
+ * absent entry, or an explicit null entry all HOLD.
  */
 export function clientForPool(
   pair: LlmPair,
   privacy: MemoryPrivacy | null | undefined,
 ): LlmClient | null {
   if (privacy === "confidential") return pair.confidential;
-  return pair.standard;
+  if (
+    privacy === null ||
+    privacy === undefined ||
+    privacy === "" ||
+    privacy === "standard"
+  ) {
+    return pair.standard;
+  }
+  return pair.spaces?.get(privacy) ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +748,53 @@ export function warnIfCircleUnconfigured(opts: {
   console.warn("╚══════════════════════════════════════════════════════════════╝");
   console.warn("");
   return true;
+}
+
+/**
+ * #642 AC-9 — the per-space companion of warnIfCircleUnconfigured: one line
+ * per ACTIVE space whose effective client is null. "Active" = stored rows,
+ * queued drain items, a members list, or path patterns (the same
+ * anything-can-hold-work shape the confidential warning uses). The line
+ * names the space id and states the HOLD posture — deliveries and
+ * consolidation work for that space accumulate until a per-space llm
+ * (spaces.<id>.llmBaseUrl/llmApiKey) or the llmConfidential* endpoint is
+ * configured, and NEVER fall back to the main model.
+ *
+ * Pure — returns the lines; the caller prints them (nightly funnel + daemon
+ * boot, the warnIfCircleUnconfigured call sites) gated on non-empty, so a
+ * zero-space or fully-configured install prints nothing. The `confidential`
+ * space is deliberately NOT handled here (it flows through the confidential
+ * field and warnIfCircleUnconfigured owns its warning — one warning per
+ * exposure, never two).
+ */
+export function spaceHoldWarnings(
+  spaces: SpaceDef[],
+  clients: ReadonlyMap<string, LlmClient | null>,
+  opts: {
+    rowsBySpace: ReadonlyMap<string, number>;
+    queueBySpace: ReadonlyMap<string, number>;
+  },
+): string[] {
+  const out: string[] = [];
+  for (const space of spaces) {
+    if (space.id === "confidential") continue;
+    if (clients.get(space.id)) continue;
+    const active =
+      (opts.rowsBySpace.get(space.id) ?? 0) > 0 ||
+      (opts.queueBySpace.get(space.id) ?? 0) > 0 ||
+      space.members.length > 0 ||
+      space.paths.length > 0;
+    if (!active) continue;
+    out.push(
+      `[hicortex] space '${space.id}' has no model — its queued deliveries and ` +
+        `consolidation work (importance, reflection, classification, ` +
+        `reconsolidation) HOLD until a per-space llm ` +
+        `(spaces.${space.id}.llmBaseUrl + llmApiKey) or the llmConfidential* ` +
+        `endpoint is configured. They retry next run and never run on the ` +
+        `main model.`,
+    );
+  }
+  return out;
 }
 
 /**

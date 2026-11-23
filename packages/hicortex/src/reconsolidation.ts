@@ -88,6 +88,7 @@
 import type Database from "better-sqlite3";
 import type { LlmClient, LlmUsage } from "./llm.js";
 import { clientForPool, type LlmPair } from "./classification.js";
+import { spaceOf } from "./spaces.js";
 import type { Memory, ConsolidationReport, ResolutionBandStat } from "./types.js";
 import type { EmbedFn } from "./retrieval.js";
 import { l2ToCosine, cosineBetweenVectors } from "./retrieval.js";
@@ -118,7 +119,7 @@ export const RECONSOLIDATION_STAGE_LABEL = "reconsolidation";
  * provenance there). Deliberately wide: a retraction often rides inside an
  * otherwise unrelated memory (the field failure that opened this issue), so
  * the neighborhood gate must be a touch wider while the LLM verdict +
- * confidence gate carry the precision load. Since #206-B (owner decision 6)
+ * confidence gate carry the precision load. Since #206-B (decision 6)
  * this floor also subsumes the retired Stage 3.7 supersession scan's 0.80:
  * 3.8 is the ONLY true-update detector, scanning every new memory — no
  * shape gate, wider floor — with `corrects`/`supersedes` partitioning what
@@ -201,10 +202,17 @@ export interface ReconsolidationOptions {
    * selects the client matching the memories it reads; when the confidential
    * side is needed and absent, that pair/group holds (skipped_infra counts,
    * retried next run), never judged on the main model. The deterministic
-   * merge zone needs no client but is class-pure via the classification rail
+   * merge zone needs no client but is space-pure via the classification rail
    * (clusterMetadataMismatch).
    */
   confidentialLlm?: LlmClient | null;
+  /**
+   * #642: per-space clients (every configured space except 'confidential',
+   * which keeps the field above). Same hold-not-fallback law per space: a
+   * candidate/pair/group whose space has no client holds (skipped_infra),
+   * never judged on the standard client.
+   */
+  spaceClients?: Map<string, LlmClient | null>;
 }
 
 /** The stage report (typed once, in ConsolidationReport — field list there). */
@@ -768,15 +776,15 @@ async function findOlderCorrectionNeighbors(
   minSimilarity: number,
 ): Promise<Array<Memory & { distance: number }>> {
   const embedding = storage.getStoredEmbedding(db, candidate.id) ?? (await embedFn(candidate.content));
-  // #332: pairing is class-pure — the KNN pool is unscoped, the filter
-  // narrows it to the candidate's own class (no reconsolidation pair ever
-  // mixes classes; NULL privacy reads standard).
-  const candidateConfidential = candidate.privacy === "confidential";
+  // #332/#642: pairing is space-pure — the KNN pool is unscoped, the filter
+  // narrows it to the candidate's own space (no reconsolidation pair ever
+  // mixes spaces; NULL privacy reads standard via spaceOf).
+  const candidateSpace = spaceOf(candidate.privacy);
   return storage
     .vectorSearch(db, embedding, CORRECTION_NEIGHBOR_POOL, [candidate.id])
     .filter(
       (n) =>
-        (n.privacy === "confidential") === candidateConfidential &&
+        spaceOf(n.privacy) === candidateSpace &&
         n.created_at < candidate.created_at &&
         l2ToCosine(n.distance) >= minSimilarity,
     )
@@ -819,13 +827,13 @@ function findScoutNeighbors(
   if (!references) return [];
   try {
     const hits = storage.searchFts(db, references, CORRECTION_NEIGHBOR_POOL);
-    // #332: the scout source is class-pure too — same filter as the KNN
+    // #332/#642: the scout source is space-pure too — same filter as the KNN
     // source (the FTS pool is unscoped; the filter narrows it).
-    const candidateConfidential = candidate.privacy === "confidential";
+    const candidateSpace = spaceOf(candidate.privacy);
     return hits
       .filter(
         (m) =>
-          (m.privacy === "confidential") === candidateConfidential &&
+          spaceOf(m.privacy) === candidateSpace &&
           m.id !== candidate.id &&
           m.created_at < candidate.created_at &&
           m.status !== "absorbed",
@@ -953,15 +961,25 @@ export async function stageReconsolidation(
   const deadlineHit = (stageLabel = RECONSOLIDATION_STAGE_LABEL): boolean =>
     deadline?.hit(stageLabel) ?? false;
 
-  // ---- #332 per-pool client selection. Every LLM call below goes through
-  // clientFor(...); a null answer means "confidential text, no confidential
-  // model" — the pair/group HOLDS (skippedInfra, retried next run), never
-  // judged on the standard client. (Named llmPair — the merge-batch loop
-  // below has its own local `pair` per queued merge.)
-  const llmPair: LlmPair = { standard: llm, confidential: options.confidentialLlm ?? null };
+  // ---- #332/#642 per-space client selection. Every LLM call below goes
+  // through clientFor(...); a null answer means "non-shared text, no client
+  // for its space" — the pair/group HOLDS (skippedInfra, retried next run),
+  // never judged on the standard client. #642 rule: standard rows may ride
+  // any private pool's client (the pre-#642 confidential posture — a private
+  // model is trusted with shared text), but TWO different spaces' text never
+  // shares one client — such a pair/group holds instead. (Named llmPair —
+  // the merge-batch loop below has its own local `pair` per queued merge.)
+  const llmPair: LlmPair = {
+    standard: llm,
+    confidential: options.confidentialLlm ?? null,
+    spaces: options.spaceClients,
+  };
   const clientFor = (...mems: Array<{ privacy?: string | null }>): LlmClient | null => {
-    const confidential = mems.some((m) => m.privacy === "confidential");
-    return clientForPool(llmPair, confidential ? "confidential" : "standard");
+    const spaces = new Set(mems.map((m) => spaceOf(m.privacy ?? null)));
+    spaces.delete("standard");
+    if (spaces.size === 0) return llmPair.standard;
+    if (spaces.size > 1) return null; // cross-space call — hold, never one client for two spaces
+    return clientForPool(llmPair, [...spaces][0]);
   };
 
   // Per-run verdict statistics by cosine band (#392) — report snapshot here,
@@ -1223,11 +1241,13 @@ export async function stageReconsolidation(
           explicitDivergent++; // mark's target is gone/invisible — retain link, nothing to upgrade
           continue;
         }
-        // #332: an explicit mark may legally cross classes (an agent marked
-        // across pools) — the verdict call selects its client by BOTH sides.
+        // #332/#642: an explicit mark may legally cross pools (an agent
+        // marked across spaces) — the verdict call selects its client by BOTH
+        // sides; two DIFFERENT spaces on one pair hold (no single client may
+        // read both).
         const markClient = clientFor(target, candidate);
         if (!markClient) {
-          skippedInfra++; // held — no confidential model for a confidential side
+          skippedInfra++; // held — no client for a private side (or a cross-space pair)
           continue;
         }
         const { verdict, usage } = await classifyPair(markClient, target.content, candidate.content);
@@ -1244,8 +1264,8 @@ export async function stageReconsolidation(
           explicitVerified++;
         } else {
           // Divergent: the nightly verdict did not confirm a rewrite. The mark
-          // is RETAINED untouched — explicit input is deliberate (owner
-          // decision 1), and marks are cheap to reverse via CLI.
+          // is RETAINED untouched — explicit input is a deliberate design
+          // decision, and marks are cheap to reverse via CLI.
           explicitDivergent++;
           console.log(
             `[hicortex] Reconsolidation: explicit mark on ${candidate.id.slice(0, 8)} diverged ` +
@@ -1280,9 +1300,10 @@ export async function stageReconsolidation(
         boundaryHold = true;
       } else {
         scoutScanned++;
-        // #332: the shape call reads the candidate's content — pool-matched
-        // client; held (skip the scout source for this memory, fail-soft like
-        // a parse failure) when the confidential side is unconfigured.
+        // #332/#642: the shape call reads the candidate's content —
+        // pool-matched client; held (skip the scout source for this memory,
+        // fail-soft like a parse failure) when the candidate's space has no
+        // client.
         const scoutClient = clientFor(candidate);
         if (!scoutClient) {
           skippedInfra++;
@@ -1380,8 +1401,8 @@ export async function stageReconsolidation(
         stopScan = true; // the boundary below still applies what this candidate already confirmed
         break;
       }
-      // #332: the verdict call reads BOTH memories — pool-matched client
-      // (detection pairs are class-pure by construction, so the pool is one
+      // #332/#642: the verdict call reads BOTH memories — pool-matched client
+      // (detection pairs are space-pure by construction, so the pool is one
       // value; a held pair counts skippedInfra and re-detects next run).
       const verdictClient = clientFor(entry.mem, candidate);
       if (!verdictClient) {
@@ -1617,10 +1638,11 @@ export async function stageReconsolidation(
           const triggersArg = group.triggers.map((t) => ({ id: t.id, content: t.memory.content }));
           let contract: RewriteContract | null = null;
           let infraError = false;
-          // #332: the rewrite prompt reads the target AND every trigger —
-          // pool-matched client (groups are class-pure by construction: their
-          // pairs came from the class-pure detection sources). Held when the
-          // confidential side is unconfigured: the group defers untouched.
+          // #332/#642: the rewrite prompt reads the target AND every
+          // trigger — pool-matched client (groups are space-pure by
+          // construction: their pairs came from the space-pure detection
+          // sources). Held when the pool's space has no client: the group
+          // defers untouched.
           const rewriteClient = clientFor(group.target, ...group.triggers.map((t) => t.memory));
           if (!rewriteClient) {
             skippedInfra++;

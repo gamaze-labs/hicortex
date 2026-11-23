@@ -1,5 +1,5 @@
 /**
- * Product-owned memory instructions (#192, owner decision 28.07.2026).
+ * Product-owned memory instructions (#192).
  *
  * The instructions for HOW agents use Hicortex are shipped BY the product,
  * versioned with the server, and injected as a synthetic read-only `memory`
@@ -53,7 +53,7 @@ export function renderMemoryInstructions(): string {
  *  `instructions` field in the initialize result — the MCP-native
  *  SessionStart. Passive MCP clients (Claude Desktop etc.) run no hooks and
  *  see no injected sections, so this field is the ONLY product-owned
- *  guidance their model ever receives; the 2026-09-10 field test showed the
+ *  guidance their model ever receives; a field test showed the
  *  memory going entirely unused without it. Compact by construction (same
  *  ~120-token budget as the identity sibling) and shares the two policy
  *  sentences verbatim — one source, two surfaces. Drops the hook-only

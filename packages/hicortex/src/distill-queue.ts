@@ -6,7 +6,7 @@
  * 201 immediately — no LLM call, no probe, no chunk-size detection, no token
  * gate (all of those move to the drain). The nightly's drain stage then
  * distills queued items oldest-first, round-robin per client, before
- * consolidation, so all distill LLM traffic happens inside the owner's
+ * consolidation, so all distill LLM traffic happens inside the server's
  * scheduled runs instead of on the clients' drifting capture grids.
  *
  * This module holds BOTH halves as pure units:
@@ -35,6 +35,7 @@
 import type Database from "better-sqlite3";
 import { distillSession, detectChunkSize, type DistilledEntry } from "./distiller.js";
 import type { LlmClient, LlmUsage, LlmConfig } from "./llm.js";
+import { spaceOf } from "./spaces.js";
 import {
   DRAIN_YIELD_POLL_MS,
   DRAIN_YIELD_WAIT_CAP_MS,
@@ -112,10 +113,17 @@ function str(v: unknown): string | null {
  * a 200 skip) reports `{ duplicate: true }` and inserts nothing. Posts with
  * no session_id have no dedup key by construction and always insert (SQLite
  * unique indexes treat NULLs as distinct).
+ *
+ * #642: `knownSpaces` is the boot-resolved known space id set the /distill
+ * handler threads (knownSpaceIds) so a space-derived stamp SURVIVES the
+ * normalize boundary; omitted, only the fixed 'standard'/'confidential'
+ * stamps pass (every pre-#642 caller shape — a space stamp would THROW, the
+ * fail-closed write boundary of AC-7).
  */
 export function enqueueDistill(
   db: Database.Database,
   input: EnqueueDistillInput,
+  knownSpaces?: ReadonlySet<string>,
 ): { duplicate: boolean } {
   const result = db
     .prepare(
@@ -144,8 +152,9 @@ export function enqueueDistill(
       // (migration v27 normalized pre-existing rows the same way). The intake
       // handler derives the stamp from source_agent × roster before it gets
       // here, so a rostered agent's delivery is queued 'confidential' even
-      // when the client declares nothing.
-      storage.normalizeStoredPrivacy(input.privacy),
+      // when the client declares nothing. #642: a space-derived stamp passes
+      // through the caller-threaded known set (unknown ids THROW — AC-7).
+      storage.normalizeStoredPrivacy(input.privacy, knownSpaces),
       input.text,
       new Date().toISOString(),
     );
@@ -243,7 +252,7 @@ export function isFreshBrain(db: Database.Database): boolean {
 }
 
 /**
- * The ONE branch condition into the sync flow (owner ruling #529: kill
+ * The ONE branch condition into the sync flow (#529 ruling: kill
  * switch and bootstrap carve-out share it — no third path):
  *
  *   queueMode = distillQueue enabled && NOT a fresh brain
@@ -317,11 +326,31 @@ export interface DrainOptions {
    * on THIS client; when it is absent they are HELD — the row stays queued
    * (skip-and-continue, the no_llm precedent but per-item) and standard items
    * keep draining. There is NO fallback to `llm`: confidential text never
-   * reaches the standard model, held beats exposed.
+   * reaches the standard model, held beats exposed. #642: the confidential
+   * SPACE keeps this exact role — it is never routed through spaceClients.
    */
   confidentialLlm?: DrainLlm | null;
   /** Its config — drives the confidential endpoint's own chunk-size cache. */
   confidentialLlmConfig?: LlmConfig | null;
+  /**
+   * #642 AC-9: per-space clients — every configured space except
+   * 'confidential'. An item stamped with one of those ids distills on ITS
+   * client (paired with its spaceConfigs entry); a null/absent entry HOLDS
+   * the item (row stays queued, counted in held_spaces, the warn names the
+   * id) — never the main `llm`.
+   */
+  spaceClients?: ReadonlyMap<string, DrainLlm | null>;
+  /** Their configs — one chunk-size cache entry per space endpoint. */
+  spaceConfigs?: ReadonlyMap<string, LlmConfig | null>;
+  /**
+   * #642 AC-7: the boot-resolved known space id set (knownSpaceIds at the
+   * nightly seam) for the insert-time normalize boundary. An item whose
+   * stored stamp no configured space claims (a retired space, an id from a
+   * config that changed) HOLDS instead of throwing out of the insert
+   * transaction — the row stays queued until the space returns or the
+   * operator re-stamps it (backfill-spaces).
+   */
+  knownSpaces?: ReadonlySet<string>;
 }
 
 export interface DrainReport {
@@ -350,6 +379,12 @@ export interface DrainReport {
    * per-run queue-growth signal.
    */
   held_confidential?: number;
+  /**
+   * #642: items HELD this run per space id — no client for that space, or a
+   * stored stamp no configured space claims (the normalize hold). Same
+   * posture as held_confidential: row stays queued, never the main model.
+   */
+  held_spaces?: Record<string, number>;
   /** Tokens metered this drain (incl. a failed item's partial usage). */
   usage: { prompt: number; completion: number; total: number };
 }
@@ -513,6 +548,27 @@ export async function drainDistillQueue(
   const warned = { unreachable: false };
   let stopped: DrainReport["outcome"] | undefined;
 
+  // #642: per-space HOLD bookkeeping — one warn line per space id per run
+  // (the waitForYield once-per-run discipline), counted per item in the
+  // report's held_spaces.
+  const heldSpaces: Record<string, number> = {};
+  const warnedHeldSpaces = new Set<string>();
+  const holdSpaceItem = (space: string, reason: "no_model" | "unclaimed_space"): void => {
+    heldSpaces[space] = (heldSpaces[space] ?? 0) + 1;
+    report.held_spaces = heldSpaces;
+    if (warnedHeldSpaces.has(space)) return;
+    warnedHeldSpaces.add(space);
+    console.warn(
+      `[hicortex] drain: item(s) stamped '${space}' HELD — ` +
+        (reason === "no_model"
+          ? `no model configured for that space (spaces.${space}.llmBaseUrl + llmApiKey, ` +
+            `or the llmConfidential* endpoint)`
+          : `no configured space claims that id (retired?) — re-add it to the spaces ` +
+            `config or re-stamp the rows (hicortex backfill-spaces)`) +
+        `. The row stays queued; it is never distilled on the main model.`,
+    );
+  };
+
   outer: while (queues.some((q) => q.length > 0)) {
     for (const q of queues) {
       if (q.length === 0) continue;
@@ -563,22 +619,49 @@ export async function drainDistillQueue(
       // — the caller records it against the monthly meter, same as the sync
       // path's finally.
       //
-      // #332 per-pool client selection: a confidential item distills on the
-      // CONFIDENTIAL client; without one it HOLDS here (skip-and-continue —
-      // the row stays queued, standard items drain on, held count reported).
-      // Standard items use the main client as before.
-      if (item.privacy === "confidential") {
+      // #332/#642 per-space client selection, checked BEFORE any LLM call so
+      // an item that will hold never pays a distillation: a confidential item
+      // distills on the CONFIDENTIAL client; any other space-stamped item on
+      // ITS space client; a pool without its client HOLDS here
+      // (skip-and-continue — the row stays queued, standard items drain on,
+      // held counts reported). Standard items use the main client as before.
+      // There is no fallback to `llm` on any path.
+      const itemSpace = spaceOf(item.privacy);
+      if (itemSpace === "confidential") {
         if (!opts.confidentialLlm || !opts.confidentialLlmConfig) {
           report.held_confidential = (report.held_confidential ?? 0) + 1;
           continue;
         }
+      } else if (itemSpace !== "standard") {
+        if (!opts.spaceClients?.get(itemSpace) || !opts.spaceConfigs?.get(itemSpace)) {
+          holdSpaceItem(itemSpace, "no_model");
+          continue;
+        }
       }
-      const itemLlm = (item.privacy === "confidential"
+      // #642 AC-7 write-boundary hold: normalize the stored stamp ONCE per
+      // item, BEFORE distillation — a stamp no configured space claims (the
+      // nightly's knownSpaces set) would otherwise throw out of the insert
+      // transaction AFTER the LLM calls (misreported endpoint_down, retried
+      // forever). Instead the item HOLDS with the same posture as the
+      // no-model hold: row queued, space named, operator re-claims or
+      // re-stamps.
+      let storedPrivacy: string;
+      try {
+        storedPrivacy = storage.normalizeStoredPrivacy(item.privacy, opts.knownSpaces);
+      } catch {
+        holdSpaceItem(String(item.privacy), "unclaimed_space");
+        continue;
+      }
+      const itemLlm = (itemSpace === "confidential"
         ? opts.confidentialLlm
-        : opts.llm) as unknown as LlmClient;
-      const itemLlmConfig = item.privacy === "confidential"
+        : itemSpace === "standard"
+          ? opts.llm
+          : opts.spaceClients!.get(itemSpace)) as unknown as LlmClient;
+      const itemLlmConfig = itemSpace === "confidential"
         ? opts.confidentialLlmConfig!
-        : opts.llmConfig!;
+        : itemSpace === "standard"
+          ? opts.llmConfig!
+          : opts.spaceConfigs!.get(itemSpace)!;
       const chunkSize = await resolveDrainChunkSizeFor(opts, itemLlmConfig);
       const usage = { prompt: 0, completion: 0, total: 0 };
       const label =
@@ -646,10 +729,12 @@ export async function drainDistillQueue(
               sourceSession: sourcePrefix ? `${sourcePrefix}#${i}` : undefined,
               project: canonProject ?? undefined,
               memoryType,
-              // #332: the row's class stamp rides into the stored memories —
-              // normalized defensively (a NULL from a pre-v27 row reads
-              // standard, same as the read gates).
-              privacy: storage.normalizeStoredPrivacy(item.privacy),
+              // #332/#642: the row's space stamp rides into the stored
+              // memories — normalized defensively (a NULL from a pre-v27 row
+              // reads standard, same as the read gates); the #642 known set
+              // was applied at the per-item hold check above, so this never
+              // throws inside the transaction.
+              privacy: storedPrivacy,
               createdAt,
             });
           }
@@ -692,6 +777,10 @@ export async function drainDistillQueue(
         `${report.memories} memories, ${report.duplicates} duplicate skip(s)` +
         (report.held_confidential
           ? `, ${report.held_confidential} confidential item(s) HELD (no confidential model)`
+          : "") +
+        (report.held_spaces
+          ? `, ${Object.values(report.held_spaces).reduce((s, n) => s + n, 0)} item(s) HELD ` +
+            `across space(s) ${Object.keys(report.held_spaces).join(", ")}`
           : ""),
     );
   }

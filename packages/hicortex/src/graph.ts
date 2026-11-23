@@ -12,6 +12,7 @@
 import type Database from "better-sqlite3";
 import type { MemoryLink } from "./types.js";
 import { effectiveStrength } from "./retrieval.js";
+import { isVisiblePrivacy } from "./spaces.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -200,16 +201,49 @@ export function louvainCommunities(
 // ---------------------------------------------------------------------------
 
 /**
- * #332: the confidential id set — the hard-omit set for the gated graph
- * surfaces. Computed once per call (the graph ops are single-query + small
- * loops; a corpus-wide id set is cheap). NULL-safe: only
- * privacy = 'confidential' rows enter.
+ * #642 AC-5/AC-7: the visible-space HIDE set — ids of every row whose
+ * spaceOf(privacy) is neither 'standard' nor in `visible`. The generalized
+ * form of #332's confidential-only hide set (with an empty visible set it
+ * hides exactly the confidential rows on standard/confidential data, by
+ * construction). Unknown/retired space ids are in NO visible set any
+ * configuration can produce, so they are always hidden — fail-closed.
+ * Computed once per call (the graph ops are single-query + small loops; a
+ * corpus-wide id set is cheap).
  */
-export function confidentialNodeIds(db: Database.Database): Set<string> {
+export function hiddenSpaceNodeIds(
+  db: Database.Database,
+  visible: ReadonlySet<string>,
+): Set<string> {
   const rows = db
-    .prepare("SELECT id FROM memories WHERE privacy = 'confidential'")
-    .all() as Array<{ id: string }>;
-  return new Set(rows.map((r) => r.id));
+    .prepare("SELECT id, privacy FROM memories WHERE privacy IS NOT NULL")
+    .all() as Array<{ id: string; privacy: string }>;
+  const hidden = new Set<string>();
+  for (const r of rows) {
+    if (!isVisiblePrivacy(r.privacy, visible)) hidden.add(r.id);
+  }
+  return hidden;
+}
+
+/** The module-wide empty visible set — the shared-only default arm of
+ *  resolveHiddenNodes (never mutated). */
+const EMPTY_VISIBLE: ReadonlySet<string> = new Set();
+
+/**
+ * Resolve the hide set for one graph op from the two gate forms (#642 AC-5):
+ * `visibleSpaces` given (even empty) → hide everything outside it; else the
+ * legacy boolean — TRUE hides NOTHING (the /viz owner surface keeps its
+ * ungated-by-design behavior), FALSE/absent → shared-only (the empty visible
+ * set, which equals #332's confidentialNodeIds on standard/confidential
+ * data). The MCP tools call the graph ops with NO opts: shared-only by
+ * construction (AC-6).
+ */
+function resolveHiddenNodes(
+  db: Database.Database,
+  opts?: { includeConfidential?: boolean; visibleSpaces?: Set<string> },
+): Set<string> | null {
+  if (opts?.visibleSpaces !== undefined) return hiddenSpaceNodeIds(db, opts.visibleSpaces);
+  if (opts?.includeConfidential === true) return null;
+  return hiddenSpaceNodeIds(db, EMPTY_VISIBLE);
 }
 
 /**
@@ -220,15 +254,15 @@ export function confidentialNodeIds(db: Database.Database): Set<string> {
  * (REST /graph?op=hubs without a member agent, the MCP graph tool) hard-omit
  * confidential hubs (their content snippets ARE content-bearing). The /viz
  * export (deliberately ungated, #332) passes true.
+ * #642: `visibleSpaces` is the generalized form (resolveHiddenNodes).
  */
 export function detectHubs(
   db: Database.Database,
   thresholdMultiplier = 2,
   minLinks = 3,
-  opts?: { includeConfidential?: boolean },
+  opts?: { includeConfidential?: boolean; visibleSpaces?: Set<string> },
 ): HubNode[] {
-  const hidden =
-    opts?.includeConfidential === true ? null : confidentialNodeIds(db);
+  const hidden = resolveHiddenNodes(db, opts);
   const rows = db
     .prepare(
       `SELECT id, cnt FROM (
@@ -286,15 +320,15 @@ export function getNeighbors(
   memoryId: string,
   limit = 10,
   relationship?: string,
-  opts?: { includeConfidential?: boolean },
+  opts?: { includeConfidential?: boolean; visibleSpaces?: Set<string> },
 ): GraphNeighbor[] {
   // #332: hard-omit set for confidential NEIGHBORS (their content rides the
   // row). The CENTER memory's own class is the CALLER's gate — an
   // agent-facing adapter must refuse a confidential center id before calling
   // (REST /graph and the MCP tool 404 it for non-members, same contract as
   // GET /memory). Default false = omit; member-gated callers pass true.
-  const hidden =
-    opts?.includeConfidential === true ? null : confidentialNodeIds(db);
+  // #642: `visibleSpaces` is the generalized form (resolveHiddenNodes).
+  const hidden = resolveHiddenNodes(db, opts);
   let sql = `SELECT source_id, target_id, relationship, strength
        FROM memory_links
        WHERE (source_id = ? OR target_id = ?)`;
@@ -340,8 +374,8 @@ export function getNeighbors(
 // Full graph export (for GET /graph?op=export — the /viz page, #124)
 // ---------------------------------------------------------------------------
 
-// Default shows the whole graph for corpora up to 5k memories (owner request
-// 05.07 — the strongest-500 default hid most edges). Payload note: nodes carry
+// Default shows the whole graph for corpora up to 5k memories (the
+// strongest-500 default hid most edges). Payload note: nodes carry
 // content up to 4000 chars, so 5k nodes can be a several-MB JSON response —
 // acceptable on localhost/LAN, which is the /viz deployment model.
 export const EXPORT_DEFAULT_LIMIT = 5000;
@@ -562,21 +596,22 @@ export function exportGraph(
  * confidential nodes are excluded from TRAVERSAL entirely (a confidential id
  * must not appear even as an intermediate hop; the endpoints' own classes are
  * the caller's gate, same contract as getNeighbors' center).
+ * #642: `visibleSpaces` is the generalized form (resolveHiddenNodes) — nodes
+ * outside the visible set never appear even as an intermediate hop.
  */
 export function shortestPath(
   db: Database.Database,
   fromId: string,
   toId: string,
   maxDepth = 5,
-  opts?: { includeConfidential?: boolean },
+  opts?: { includeConfidential?: boolean; visibleSpaces?: Set<string> },
 ): string[] | null {
   // BFS on the memory_links graph
   const links = db
     .prepare("SELECT source_id, target_id FROM memory_links")
     .all() as Array<{ source_id: string; target_id: string }>;
 
-  const hidden =
-    opts?.includeConfidential === true ? null : confidentialNodeIds(db);
+  const hidden = resolveHiddenNodes(db, opts);
 
   const adj = new Map<string, Set<string>>();
   for (const { source_id, target_id } of links) {

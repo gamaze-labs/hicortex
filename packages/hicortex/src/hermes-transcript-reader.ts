@@ -2,7 +2,7 @@
  * Hermes transcript reader — the nightly capture path for Nous Research Hermes.
  *
  * Hermes stores conversation in a SQLite state DB, one per profile:
- *   ~/.hermes/profiles/<profile>/state.db   (per-profile agents: alice, bob, carol)
+ *   ~/.hermes/profiles/<profile>/state.db   (per-profile agents: alice, carol, dave)
  *   ~/.hermes/state.db                       (global, non-profile setups)
  *
  * Schema (relevant columns):

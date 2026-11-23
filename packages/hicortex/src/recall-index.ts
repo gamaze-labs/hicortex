@@ -55,6 +55,7 @@ import { SessionRecallRegistry } from "./recall-registry.js";
 import { isPureWrapperPrompt } from "./wrapper-prompt.js";
 import { canonicalizeProject } from "./project-canonicalize.js";
 import { labelForType } from "./type-labels.js";
+import { resolveVisibleSet, isVisiblePrivacy } from "./spaces.js";
 import {
   retrieve,
   getSessionIntent,
@@ -70,29 +71,29 @@ export interface RecallIndexOptions {
    *  since #408 — calibration.ts RECALL_MIN_SIMILARITY; this field is the
    *  eval/test seam). FTS-matched candidates pass regardless — a BM25
    *  text match is direct evidence of relevance. 0.62 (raised from 0.55
-   *  on 2026-08-03 per a 0.01-step floor sweep on the rewritten corpus): steady
-   *  ~3:1 noise:signal removal with no knee; 0.62 = +2.2pts precision, 10/98
-   *  prompts silent, sits below the 0.63 local pessimum. The floor is a noise
+   *  after a 0.01-step floor sweep): steady
+   *  ~3:1 noise:signal removal with no knee; sits below the 0.63 local
+   *  pessimum. The floor is a noise
    *  dial, NOT a silence mechanism — at 0.62 each correctly-silenced empty prompt
    *  comes with ~1.5 wrongly-silenced (real signal); a non-cosine gate is the
    *  real silence fix (eval #3 §4). */
   minSimilarity?: number;
   /** Max index lines per response (release-managed — calibration.ts
-   *  RECALL_MAX_ITEMS; seam only). 5 (lowered from 6 on 2026-08-03). Per-slot
+   *  RECALL_MAX_ITEMS; seam only). 5 (lowered from 6). Per-slot
    *  decomposition at floor 0.62: slot 6 gives NO prompt its first relevant
    *  memory — "6 is wrong" is the robust, prompt-set-independent finding, and
-   *  5 captures it. The K-sweep is monotone (precision@4 33.7% > @6 30.6% >
-   *  @8 28.3%), so 4 is lower-noise — but the 4-vs-5 distinction rests on 5
-   *  of 98 prompts and is overfitting-fragile (K and the floor were tuned on
+   *  5 captures it. The K-sweep is monotone toward 4 (lower K, lower noise),
+   *  so 4 is lower-noise — but the 4-vs-5 distinction is
+   *  overfitting-fragile (K and the floor were tuned on
    *  the same set); 5 hedges with coverage at modest cost. */
   maxItems?: number;
   /** Prompts shorter than this are skipped (continuations, "yes", "do it"). */
   minPromptLength?: number;
   /** Max chars of the memory's first line shown in an index entry
    *  (release-managed — calibration.ts RECALL_TITLE_CHARS; seam only).
-   *  100 (reverted from 150 on 2026-08-03): the full-corpus relevance eval
-   *  (#3, §5) found 100 vs 150 statistically identical (0.6pts apart, N=40,
-   *  full CI overlap); 100 saves ~13% tokens per block. */
+   *  100 (reverted from 150): the relevance eval
+   *  (#3, §5) found 100 vs 150 statistically identical (full CI overlap);
+   *  100 saves ~13% tokens per block. */
   titleChars?: number;
   /** Slots of `maxItems` guaranteed to the pure-prompt (unblended) search's
    *  top passing hit(s) — the #324 novelty floor. Release-managed
@@ -108,7 +109,7 @@ export interface RecallIndexOptions {
    *  the firstRunLookbackDays precedent) — production sets it from the
    *  boot-resolved config value; eval/tests inject through this field.
    *  Default = calibration CROSS_PROJECT_MIN_SIMILARITY (0.72, fence ON when
-   *  absent — owner ruling 2026-10-28); 0 or ≤ the recall floor = fence off. */
+   *  absent — #566 ruling); 0 or ≤ the recall floor = fence off. */
   crossProjectMinSimilarity?: number;
   /** #567: the project-identity alias map — `filters.project` is folded at
    *  its build site so a raw client-pushed label (cwd-derived, unnormalized)
@@ -119,15 +120,15 @@ export interface RecallIndexOptions {
 }
 
 /** Relevance-gate floor for vector-only candidates (release-managed —
- *  calibration.ts RECALL_MIN_SIMILARITY). 0.62 (was 0.55; raised 2026-08-03
+ *  calibration.ts RECALL_MIN_SIMILARITY). 0.62 (was 0.55; raised
  *  on the fine-grain floor sweep — see the minSimilarity doc above). */
 const DEFAULT_MIN_SIMILARITY = CALIBRATION.RECALL_MIN_SIMILARITY;
 /** Max index lines per pushed recall block (release-managed — calibration.ts
- *  RECALL_MAX_ITEMS). 5 (was 6; lowered 2026-08-03 — slot 6 is pure padding
+ *  RECALL_MAX_ITEMS). 5 (was 6; slot 6 is pure padding
  *  at floor 0.62). */
 const DEFAULT_MAX_ITEMS = CALIBRATION.RECALL_MAX_ITEMS;
 const DEFAULT_MIN_PROMPT_LENGTH = CALIBRATION.RECALL_MIN_PROMPT_CHARS;
-/** Default index-line title length. 100 (reverted from 150 on 2026-08-03:
+/** Default index-line title length. 100 (reverted from 150:
  *  eval #3 §5 showed 100 vs 150 statistically identical; 100 saves ~13% tokens). */
 const DEFAULT_TITLE_CHARS = CALIBRATION.RECALL_TITLE_CHARS;
 /** Default #324 novelty-floor slots (release-managed — calibration.ts
@@ -197,7 +198,7 @@ function formatDate(iso: string): string {
 }
 
 /**
- * Render one production index line. Exported (2026-08-02, relevance eval #v2)
+ * Render one production index line. Exported (relevance eval #v2)
  * so the eval can measure the REAL rendered surface instead of reimplementing
  * it — `maxLen` threads through to `memoryTitle` unchanged (default
  * DEFAULT_TITLE_CHARS = 100, release-managed since #408) so the eval's snippet-length
@@ -243,8 +244,8 @@ export interface RelevanceScope {
  * 0.62 is off on EVERY surface, not just sites that happen to carry a floor;
  * floor-less surfaces [/search no-param, the MCP tool] must not arm at
  * values the docs call off) — a candidate whose project DIFFERS from the
- * scope's (case-insensitive — 161 measured events sat on Hicortex/hicortex
- * case splits; a null/absent candidate project counts as foreign) must clear
+ * scope's (case-insensitive — measured events sat on case-split project
+ * labels; a null/absent candidate project counts as foreign) must clear
  * max(bar, the site floor) on a MEASURED cosine — the fence only RAISES a
  * site's existing floor, never weakens it. No source branching is needed:
  * FTS-only and graph-only hits carry similarity null → they naturally do not
@@ -411,6 +412,14 @@ export function createRecallRetrieveFn(deps: {
    * rows inside retrieve().
    */
   includeConfidential?: boolean;
+  /**
+   * #642 AC-5: the generalized gate — the request's visible SPACE set
+   * (spacesForMember over the boot-resolved spaces; the route adapter
+   * computes it per request from the body `agent`). Threaded into retrieve()
+   * and unioned with the boolean there (resolveVisibleSet): rows of spaces
+   * outside the set are hard-omitted at candidate-build time.
+   */
+  visibleSpaces?: Set<string>;
 }): RecallRetrieveFactory {
   let embMemo: { query: string; p: Promise<Float32Array> } | null = null;
   const embedOnce = (query: string): Promise<Float32Array> => {
@@ -460,6 +469,10 @@ export function createRecallRetrieveFn(deps: {
         // #332: the classification gate — hard omit unless the requesting
         // agent is a circle member (the factory was built with membership).
         includeConfidential: deps.includeConfidential === true,
+        // #642 AC-5: the generalized gate — the requesting agent's visible
+        // space set, threaded through the factory (unioned with the boolean
+        // inside retrieve via resolveVisibleSet).
+        visibleSpaces: deps.visibleSpaces,
         // #329: shared per-request FTS list. The recall path never passes
         // sourceAgent, so the memo is keyed on (query, fetchLimit) only —
         // exactly the two things retrieve() would pass to searchFts.
@@ -528,7 +541,7 @@ export async function handleRecallIndex(
   // exposure never writes last_accessed anyway). The SAME shared
   // classifier the hook client guards with (wrapper-prompt.ts) — defense in
   // depth. A wrapper carrying real payload prose falls through and recalls on
-  // the full text, exactly today's behavior (owner decision 4).
+  // the full text, exactly today's behavior (decision 4).
   if (isPureWrapperPrompt(prompt)) {
     return { status: 200, body: { block: null, skipped: "wrapper-prompt" } };
   }
@@ -749,7 +762,7 @@ export async function handleRecallIndex(
   const lines = picked.map((r) => formatIndexLine(r, titleChars));
   const block = [
     "## Memory recall (auto)",
-    // Provenance is BUILT IN (owner decision 27.07, option D; extended #202/#204):
+    // Provenance is BUILT IN (option D; extended #202/#204):
     //   - #202: origin agent in each one-liner (formatIndexLine) — trust calibration.
     //   - #204: confidence levels — FETCHED (read in full) vs SNIPPET (one-line entry only),
     //     so "the agent cited a memory" can no longer pass as "the agent read it".
@@ -786,12 +799,17 @@ export interface MemoryGetDeps {
  * — a confidential memory fetched by a non-member answers 404 BEFORE any
  * side effect (no strengthen, no precision event: existence is not revealed).
  * Members (the adapter passes true) fetch both pools normally.
+ *
+ * #642 AC-5: `opts.visibleSpaces` is the generalized form — the predicate is
+ * isVisiblePrivacy over resolveVisibleSet(boolean, set): shared rows for
+ * everyone, the viewer's spaces yes, everything else (including unknown/
+ * retired space ids, AC-7) 404 before any side effect.
  */
 export function handleMemoryGet(
   db: Database.Database,
   query: { id?: unknown },
   deps?: MemoryGetDeps,
-  opts?: { includeConfidential?: boolean },
+  opts?: { includeConfidential?: boolean; visibleSpaces?: Set<string> },
 ): RecallIndexResult {
   const id = typeof query.id === "string" ? query.id : "";
   if (!id) return { status: 400, body: { error: "Missing 'id'" } };
@@ -808,7 +826,14 @@ export function handleMemoryGet(
   // #332: the gate fires BEFORE strengthenMemory + the fetch recorder — a
   // refused fetch must leave no trace on the row and record no event (the
   // same 404 shape an unknown id produces).
-  if (mem.privacy === "confidential" && opts?.includeConfidential !== true) {
+  // #642: the generalized predicate (shared always; the viewer's spaces;
+  // nothing else — unknown space ids included, AC-7).
+  if (
+    !isVisiblePrivacy(
+      mem.privacy,
+      resolveVisibleSet(opts?.includeConfidential, opts?.visibleSpaces),
+    )
+  ) {
     return notFound;
   }
 
@@ -827,7 +852,7 @@ export function handleMemoryGet(
     }
   }
   // `citation` is server-rendered so every plugin surfaces the same built-in
-  // provenance norm (owner directive 27.07) — see #193.
+  // provenance norm — see #193.
   const date = (mem.created_at ?? "").slice(0, 10);
   // Shallow-copy and apply the human-term label to memory_type so the REST
   // response surfaces the user-facing vocabulary, not the raw DB enum. The

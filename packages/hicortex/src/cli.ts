@@ -27,6 +27,8 @@
  *              history --rollback <row>  Undo one rewrite + un-absorb triggers
  *   status     Show config, DB stats, adapter status
  *   uninstall  Clean removal of CC integration
+ *   space      Manage spaces — private memory pools (#642): list, assign,
+ *              unassign, or `space <name>` inside a workspace (one command)
  */
 
 import { readValueFlag, resolveCommandAlias } from "./cli-args.js";
@@ -340,10 +342,13 @@ switch (command) {
     break;
   }
 
-  case "backfill-privacy": {
-    // One-shot classification stamping for EXISTING rows, by source agent
-    // (#332): every row whose source_agent matches the confidentialAgents
-    // roster flips to confidential. Mirrors `dedup`/`reconcile-projects`:
+  case "backfill-spaces": {
+    // One-shot space stamping for EXISTING rows (#642 AC-14; the #332
+    // `backfill-privacy` command generalized — the legacy spelling resolves
+    // here via resolveCommandAlias, flags identical): every still-SHARED row
+    // whose source_agent matches a space's members, or whose stored
+    // workspace_path matches a space's pattern, flips to that space; an
+    // already-stamped row NEVER moves. Mirrors `dedup`/`reconcile-projects`:
     // dry-run default, --apply explicit (backup + capture lock + ONE
     // transaction); flags parsed here, the runner lives in
     // backfill-privacy.ts so this switch stays thin.
@@ -352,13 +357,13 @@ switch (command) {
     try {
       dbPath = readValueFlag(args, "--db");
     } catch {
-      console.error("[hicortex] backfill-privacy: --db requires a path value");
+      console.error("[hicortex] backfill-spaces: --db requires a path value");
       process.exit(1);
     }
     const backfillOptions = { apply: args.includes("--apply"), dbPath };
-    import("./backfill-privacy.js").then(({ runBackfillPrivacy }) => {
-      runBackfillPrivacy(backfillOptions).catch((err) => {
-        console.error(err instanceof Error ? err.message : `[hicortex] backfill-privacy failed: ${err}`);
+    import("./backfill-privacy.js").then(({ runBackfillSpaces }) => {
+      runBackfillSpaces(backfillOptions).catch((err) => {
+        console.error(err instanceof Error ? err.message : `[hicortex] backfill-spaces failed: ${err}`);
         process.exit(1);
       });
     });
@@ -388,6 +393,29 @@ switch (command) {
         console.error(err instanceof Error ? err.message : `[hicortex] confidential failed: ${err}`);
         process.exit(1);
       });
+    });
+    break;
+  }
+
+  case "space": {
+    // #642 AC-13: space management against the AC-10 admin API — the SAME
+    // endpoints the dashboard's space management card drives (one API, two
+    // interfaces). `space list|assign|unassign` are the explicit forms; ANY
+    // other argv[3] is a SPACE NAME — the one-command form that assigns the
+    // CURRENT workspace (its #600 sanitized basename as the agent id). Bare
+    // `space` prints the usage: there is no create/remove (a space exists by
+    // config presence, the `domains` precedent). The runner owns URL/token
+    // resolution + authed fetch (the identity-cli layout); this stays thin.
+    const args = process.argv.slice(3);
+    import("./spaces-cli.js").then(({ runSpacesCommand, SpacesCliError }) => {
+      runSpacesCommand(args).catch((err) => {
+        if (err instanceof SpacesCliError) console.error(err.message);
+        else console.error("[hicortex] space command failed:", err instanceof Error ? err.message : err);
+        process.exit(1);
+      });
+    }).catch((err) => {
+      console.error("[hicortex] space command failed:", err);
+      process.exit(1);
     });
     break;
   }
@@ -557,13 +585,21 @@ Commands:
   relink          Resumable link-discovery pass over the ENTIRE corpus (server mode)
   dedup           Cluster + merge near-duplicate memories (server mode; dry run by default)
   reconcile-projects  Canonicalize existing project labels (server mode; dry run by default)
-  backfill-privacy  Stamp history confidential by source agent (#332; server mode;
-                    dry run by default — --apply executes: backup + capture lock + stamp)
+  backfill-spaces  Stamp history by space assignment — members + path patterns, per space
+                    (#642; server mode; dry run by default — --apply executes: backup +
+                    capture lock + stamp; never moves an already-stamped row)
+                    (alias: backfill-privacy — the pre-#642 name, kept for backcompat)
   confidential    Mark a workspace folder confidential via a local marker file
                     (#616: the marker carries the server's confidentialMarkerKey,
                     provisioned by this very command — fetched from the server,
                     or generated + registered there on first use; --key <value>
                     rotates); confidential [path] writes, --off [path] removes
+  space           Manage spaces — private memory pools (#642)
+                    space list                       spaces, members, counts, unassigned agents
+                    space assign <agent> <space>     add an agent to a space (applies live)
+                    space unassign <agent> <space>   remove an agent (it drops to shared-only)
+                    space <name>                     inside a workspace: assign it in one command
+                    (no create/remove — a space exists by config presence, the domains precedent)
   history         Show a memory's rewrite history, or roll one back (server mode)
                   history <id>                List rewrite events (read-only)
                   history --rollback <row>    Undo one rewrite + un-absorb its triggers
@@ -602,12 +638,14 @@ Options:
   reconcile-projects --apply  Execute the project renames (default: dry run, report only)
                              Backup first; renames memories + distill_queue only
   reconcile-projects --db <path>  DB path override (defaults to the configured DB)
-  backfill-privacy --apply   Execute the stamps (default: dry run, report only)
-                             Backup + capture lock first; stamps memories + distill_queue;
-                             never stamps back to standard (a roster removal is not a demotion)
-                             #609: also plans/stamps per confidentialPaths pattern (rows' stored
-                             workspace_path); NULL-path rows are never matched
-  backfill-privacy --db <path>  DB path override (defaults to the configured DB)
+  backfill-spaces --apply   Execute the stamps (default: dry run, report only)
+                             Backup + capture lock first; stamps memories + distill_queue
+                             shared → space ONLY (per-space member rosters + path patterns
+                             over the stored workspace_path); an already-stamped row NEVER
+                             moves (no demotion, no space→space); NULL-path rows are never
+                             path-matched
+  backfill-spaces --db <path>  DB path override (defaults to the configured DB)
+                             (the legacy 'backfill-privacy' spelling remains as a hidden alias)
   confidential [path]       Mark a folder confidential — writes .hicortex-confidential carrying
                              the server's confidentialMarkerKey at its root (default path: cwd).
                              ONE command, no manual key mirroring (#616): no local key → fetch
@@ -623,6 +661,15 @@ Options:
                              previous key then stamp standard. The server refuses (409) while
                              its HICORTEX_CONFIDENTIAL_MARKER_KEY env override is set
   confidential --off [path]  Remove the marker (succeeds when absent; no key needed, no network)
+  space list                 Every configured space (members, memory counts, llm posture) plus the
+                             observed agents assigned to no space (#642)
+  space assign <agent> <space>   Add an agent to a space (writes the server's config, applies live)
+  space unassign <agent> <space> Remove an agent from a space (it drops to shared-only; already-
+                                 captured memories stay stamped)
+  space <name>               Run INSIDE a workspace: assigns THIS workspace (its folder name, the
+                             #600 agent grammar) to space <name> — the one-command form.
+                             No create/remove: a space exists by config presence (the domains
+                             precedent) — add a spaces.<id> entry to config.json on the server
   history --rollback <row>  Roll back history row <row>: restores prior content/status, un-absorbs triggers
   history --db <path>       DB path override (defaults to the configured DB)
   backup --out <dir>        Write the artifact into <dir> as hicortex-<ISO>.tar.gz (default: <home>/backups)

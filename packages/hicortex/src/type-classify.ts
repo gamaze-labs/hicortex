@@ -6,7 +6,7 @@
  * ---------------
  * Before #216 the distiller NEVER set memory_type — every distilled memory
  * defaulted to "experience" (storage.ts insertMemory `?? "experience"`), so
- * the corpus was ~98% experiences. The distiller now classifies each entry at
+ * the corpus was almost entirely experiences. The distiller now classifies each entry at
  * extract time via the [E]/[K]/[D] tag (distiller.ts), but the EXISTING corpus
  * needs a one-shot backfill. This command is that backfill — modelled on
  * `classify-domains` (resumable cursor, batched, infra-error-safe).

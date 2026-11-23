@@ -1,7 +1,7 @@
 /**
  * `hicortex rescore-importance` (#425) — the one-shot LLM backfill that
  * re-judges the EXISTING corpus under the re-anchored importance rubric
- * (owner decision D1, 2026-09-13: rescore via LLM, resumable, local
+ * (decision D1: rescore via LLM, resumable, local
  * gateway).
  *
  * Precedents, deliberately mixed per the issue's attribution:
@@ -18,7 +18,7 @@
  *
  * Scope: every LIVE (non-absorbed) memory, rowid-ascending. A row's
  * corroboration_count survives untouched; base_strength is re-judged (that
- * is D1's explicit trade: one rubric for all rows, the 2026-08-21-validated
+ * is D1's explicit trade: one rubric for all rows, the previously-validated
  * ORDERING is re-derived rather than mapped).
  */
 
@@ -216,8 +216,11 @@ export async function runRescoreImportance(
   let llm: LlmClient;
   // #332: the confidential client — confidential rows in a slice score on it;
   // without one they hold (the slice's cursor holds below them, retried when
-  // the model is configured).
+  // the model is configured). #642: per-space clients ride the same pair —
+  // a space row scores on ITS model or holds, exactly like the confidential
+  // pool (never the main model).
   let confidentialLlm: LlmClient | null = null;
+  let spaceClients: Map<string, LlmClient | null> | undefined;
   if (options.llm) {
     llm = options.llm;
   } else {
@@ -229,6 +232,7 @@ export async function runRescoreImportance(
     }
     llm = resolved.pair.standard;
     confidentialLlm = resolved.pair.confidential;
+    spaceClients = resolved.pair.spaces;
   }
 
   const dbPath = resolveDbPath(options.dbPath);
@@ -295,6 +299,7 @@ export async function runRescoreImportance(
       const memories = memoriesForIds(db, sliceRows);
       const r = await scoreMemoriesImportance(db, memories, llm, {
         confidentialLlm,
+        spaceClients,
         onBatch: (written, batchFailed) => {
           calls++;
         },
@@ -309,6 +314,22 @@ export async function runRescoreImportance(
           `[hicortex] rescore-importance ABORTED: ${r.skipped_confidential} confidential row(s) ` +
             `in the slice at rowid ${sliceRows[0].__rowid} need a confidential model ` +
             `(llmConfidentialBaseUrl/ApiKey). Cursor held — re-run after configuring.`,
+        );
+        break;
+      }
+      if (r.skipped_spaces && Object.keys(r.skipped_spaces).length > 0) {
+        // #642: same posture for spaces — rows of a space with no model HELD,
+        // never scored on the main model and never advanced past. They retry
+        // once a per-space llm or the llmConfidential* endpoint exists (the
+        // nightly's unscored pool also re-finds them).
+        aborted = true;
+        const heldList = Object.entries(r.skipped_spaces)
+          .map(([id, n]) => `${n} ${id}`)
+          .join(", ");
+        console.warn(
+          `[hicortex] rescore-importance ABORTED: row(s) of space(s) with no model ` +
+            `in the slice at rowid ${sliceRows[0].__rowid} are held (${heldList}). ` +
+            `Cursor held — configure spaces.<id>.llm* or llmConfidential* and re-run.`,
         );
         break;
       }

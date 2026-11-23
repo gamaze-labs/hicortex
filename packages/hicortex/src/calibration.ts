@@ -55,8 +55,8 @@ export const DECAY_HALF_LIFE_DAYS = 365;
 export const PROMOTION_RATE = 0.033;
 
 /**
- * Lower bound on the promotion formula's S input (#453 review Minor finding,
- * owner decision 2026-09-16). base_strength 0.0 is a writable value (legacy
+ * Lower bound on the promotion formula's S input (#453 review Minor finding).
+ * base_strength 0.0 is a writable value (legacy
  * rows, operator edits), and S^(−0.3) has a zero-singularity: unfloored, one
  * access on a 0.0 row computed delta = 0.033 × (1 − 0/0.95) × 0^−0.3 =
  * Infinity, and the ceiling clamp turned that into a leap straight to 0.95.
@@ -78,8 +78,9 @@ export const RECENT_LIMIT = 12;
 export const RECENT_WINDOW_DAYS = 180;
 
 /** Top-k slots reservable for never-accessed memories (cold exposure). #192:
- *  recall was too passive (88% of memories never accessed) — the long tail
- *  gets guaranteed slots instead of waiting for the strength clock. */
+ *  recall was too passive (the large majority of memories went never
+ *  accessed) — the long tail gets guaranteed slots instead of waiting for
+ *  the strength clock. */
 export const COLD_EXPOSURE_SLOTS = 2;
 
 /** Blend weight of the session-intent centroid in the recall search vector
@@ -88,9 +89,9 @@ export const COLD_EXPOSURE_SLOTS = 2;
 export const SESSION_INTENT_WEIGHT = 0.33;
 
 /** Relevance-gate floor for vector-only /recall-index candidates. 0.62
- *  (raised from 0.55 on 2026-08-03 per a 0.01-step floor sweep on the
- *  rewritten corpus): steady ~3:1 noise:signal removal with no knee; sits
- *  below the 0.63 local pessimum. FTS-matched candidates pass regardless. */
+ *  (raised from 0.55 after a 0.01-step floor sweep): steady ~3:1
+ *  noise:signal removal with no knee; sits below the 0.63 local pessimum.
+ *  FTS-matched candidates pass regardless. */
 export const RECALL_MIN_SIMILARITY = 0.62;
 
 /**
@@ -99,34 +100,33 @@ export const RECALL_MIN_SIMILARITY = 0.62;
  * into recall/search results; same-project and no-scope candidates keep the
  * RECALL_MIN_SIMILARITY floor above, byte-identical.
  *
- * Measured 2026-10-28 on the #565 WS2 snapshot bar sweep: at 0.72 a
- * scope-conditional bar keeps ~18% of today's cross-project admissions
- * (projected multi-project cross-share ~29%, audit target ≤35%); a GLOBAL
- * 0.72 floor would kill 91% of same-project admissions, which is why the bar
- * is scope-conditional. Owner ruling 2026-10-28: 0.72 now, 0.75 (the stricter
- * option, keeps ~7.5%) one config edit away.
+ * Bar-sweep evidence (#565): a scope-conditional 0.72 bar trims most of
+ * today's cross-project admissions, while a GLOBAL 0.72 floor would kill the
+ * large majority of same-project admissions — which is why the bar is
+ * scope-conditional. 0.72 now; 0.75 (the stricter option) one config edit
+ * away.
  *
  * Unlike every other constant in the recall family, this one KEEPS a config
  * override (`recallCrossProjectMinSimilarity`, resolved once at server boot)
  * — the ONE deliberate #408 exception, on the DEFAULT_FIRST_RUN_LOOKBACK_DAYS
- * precedent: a posture dial the owner tunes per install, not corpus
+ * precedent: a posture dial the operator tunes per install, not corpus
  * calibration. 0 or any value ≤ the recall floor (0.62) disarms the fence
  * (today's scope-blind behavior).
  */
 export const CROSS_PROJECT_MIN_SIMILARITY = 0.72;
 
-/** Max lines in the pushed recall index. 5 (lowered from 6 on 2026-08-03):
- *  per-slot decomposition at floor 0.62 showed slot 6 gives NO prompt its
- *  first relevant memory. The K-sweep is monotone toward 4, but the 4-vs-5
- *  distinction rests on 5 of 98 prompts — 5 hedges with coverage. */
+/** Max lines in the pushed recall index. 5 (lowered from 6): per-slot
+ *  decomposition at floor 0.62 showed slot 6 gives NO prompt its first
+ *  relevant memory. The K-sweep is monotone toward 4, but the 4-vs-5
+ *  distinction rests on a handful of prompts — 5 hedges with coverage. */
 export const RECALL_MAX_ITEMS = 5;
 
 /** Prompts shorter than this skip the recall index (continuations, "yes"). */
 export const RECALL_MIN_PROMPT_CHARS = 20;
 
 /** Chars of a memory's first line shown in an index entry. 100 (reverted
- *  from 150 on 2026-08-03): the full-corpus relevance eval found 100 vs 150
- *  statistically identical (full CI overlap at N=40); 100 saves ~13% tokens. */
+ *  from 150): the relevance eval found 100 vs 150 statistically identical
+ *  (full CI overlap); 100 saves ~13% tokens. */
 export const RECALL_TITLE_CHARS = 100;
 
 /** Slots of RECALL_MAX_ITEMS guaranteed to the pure-prompt (unblended)
@@ -138,28 +138,26 @@ export const NOVELTY_FLOOR_SLOTS = 2;
  *  it may reappear in the pushed index (#192 turn-based dedup). */
 export const RECALL_RESHOW_TURNS = 30;
 
-// Recall-uses band (console) — PROVISIONAL zone edges. Owner anchor
-// 2026-09-13 (#426 final ruling): the console renders uses-per-showing on a
-// red→green→red band with three zones (Low / Normal / Overfetching; owner
-// confirmed "3 bands is fine"). The owner's calibration state is explicit —
-// "we have no clue on how to calibrate yet" — so these edges are provisional
-// anchors from #426's owner-anchor record, NOT measured boundaries; fleet
+// Recall-uses band (console) — PROVISIONAL zone edges (#426): the console
+// renders uses-per-showing on a red→green→red band with three zones (Low /
+// Normal / Overfetching). There are no measured boundaries yet, so these
+// edges are provisional anchors from #426, NOT calibrated thresholds; fleet
 // telemetry is expected to move them (the console marks the band
 // "provisional" and renders no edge numerics). They position zone boundaries
 // on the console's gradient and classify the marker's zone word; they gate
 // nothing server-side.
 
 /** uses_per_showing below this reads Low on the console band.
- *  PROVISIONAL (owner anchor 2026-09-13, #426). */
+ *  PROVISIONAL (#426). */
 export const RECALL_USES_LOW_MAX = 0.05;
 
 /** uses_per_showing below this (and ≥ RECALL_USES_LOW_MAX) reads Normal.
- *  PROVISIONAL (owner anchor 2026-09-13, #426). */
+ *  PROVISIONAL (#426). */
 export const RECALL_USES_NORMAL_MAX = 0.25;
 
 /** Display-axis maximum for the console band (the marker clamps here).
- *  PROVISIONAL (owner anchor 2026-09-13, #426) — chosen so Overfetching
- *  keeps a visible span, not a measured bound. */
+ *  PROVISIONAL (#426) — chosen so Overfetching keeps a visible span, not a
+ *  measured bound. */
 export const RECALL_USES_AXIS_MAX = 0.30;
 
 // Memory-precision family (#476) — the console card's deterministic proxies.
@@ -198,10 +196,10 @@ export const MEMORY_PRECISION_REDUNDANT_ABOVE = 0.8;
 export const MEMORY_PRECISION_DIVERGENCE_MIN_SHOWN = 5;
 
 /**
- * Cap on the prompt excerpt persisted per recall_pushes row (Option A,
- * owner-blessed 2026-09-19: the first-ever server-side persistence of raw
- * prompt text, bounded to 256 chars and pruned at the retention horizon —
- * the same trust boundary as /distill's denoised conversation text).
+ * Cap on the prompt excerpt persisted per recall_pushes row (Option A:
+ * the first-ever server-side persistence of raw prompt text, bounded to
+ * 256 chars and pruned at the retention horizon — the same trust boundary
+ * as /distill's denoised conversation text).
  */
 export const MEMORY_PRECISION_PROMPT_EXCERPT_CHARS = 256;
 
@@ -294,7 +292,7 @@ export const QUALITY_USEFUL_SCORE = 0.5;
 // ---------------------------------------------------------------------------
 
 /**
- * Kill-switch for the deterministic volatility gate (#489, owner decision 5):
+ * Kill-switch for the deterministic volatility gate (#489, decision 5):
  * false disables isVolatileStatusEntry's use in the distill path (entries
  * keep flowing as before) AND the sweep's candidacy rule — one release-managed
  * constant, no config knob (#408 discipline: moving it is a release decision,
@@ -337,9 +335,8 @@ export const SCORE_CONNECTIONS_WEIGHT = 0.15;
  * the ABSOLUTE undirected-degree scale k — full at k = K, exactly +0 at
  * k = 0 (unlinked rows score bit-identically to the linear term they
  * replace). Provenance: p99 of the REAL undirected degree distribution
- * (read-only audit 2026-09-17 of the canonical wave snapshot, 18,798
- * memories / 14,600 linked: p50 = 4, p90 = 8, p95 = 9, p99 = 15, p99.9 =
- * 28.4, max = 40; 135 memories ≥ 16 links = 0.92% of linked) — so the top
+ * (read-only audit of a production snapshot: p50 = 4, p90 = 8, p95 = 9,
+ * p99 = 15, p99.9 = 28.4, max = 40) — so the top
  * ~1% of hubs tie at full credit and everything below differentiates
  * modestly. Shape grounded in the #449 research base: ACT-R fan saturation
  * (Anderson & Reder 1999 — activation falls with the LOG of fan), SAM's
@@ -411,7 +408,7 @@ export const RRF_VECTOR_WEIGHT = 1.0;
 /**
  * Additive boost for candidates the TWO retrieval channels AGREE on
  * (vector KNN AND BM25 FTS both matched — computeScore option
- * `bothChannel`). #425 (owner decision D3, 2026-09-13): the two-channel
+ * `bothChannel`). #425 (decision D3): the two-channel
  * signal is the genuine-match signature and is immune to FTS-only token
  * collisions, which is why the boost lives in the composite score, not in
  * the RRF FTS weight (raising that re-opens the #205 cross-scope collision
@@ -420,19 +417,19 @@ export const RRF_VECTOR_WEIGHT = 1.0;
  * shipped simWeight 0.50, 0.10 gives that property 2x headroom (a rival
  * needs >0.20 more similarity).
  *
- * SIZING (the #425 sweep, 2026-09-13, production snapshot copy: case-1
- * planted fixture + a 30-query real battery vs the boost-0 baseline): every
- * value in {0.05, 0.10, 0.15} passed the hard gates (exact-match rank-1,
- * no-match byte-stability, zero both-channel exact-match losses, the
- * Sirnäs flip) with IDENTICAL battery stability (96.7% top-1 ex-promotions
- * — every raw change was a both-channel exact match displacing a
- * single-channel row, the property firing); they differed only in case-1
- * margin (0.021 / 0.061 / 0.101) and per-id top-3 churn. 0.10 chosen:
- * 0.05's margin is within one embedder revision of flipping, 0.15 churns
- * more for no gate benefit. Weight rebalances measured WORSE (sim .55/str
- * .15 → 93.3%; sim .60/str .10 → 86.7%, fails the 90% gate) — the
- * SCORE_*_WEIGHT values stay as shipped. ZERO-boost neutral (never a
- * penalty): graph-only and single-channel candidates add nothing.
+ * SIZING (#425 sweep on a production snapshot copy: case-1 planted
+ * fixture + a real-query battery vs the boost-0 baseline): every value in
+ * {0.05, 0.10, 0.15} passed the hard gates (exact-match rank-1, no-match
+ * byte-stability, zero both-channel exact-match losses, the planted
+ * cross-scope flip) with IDENTICAL battery stability — every raw change
+ * was a both-channel exact match displacing a single-channel row, the
+ * property firing; they differed only in case-1 margin (0.021 / 0.061 /
+ * 0.101) and per-id top-3 churn. 0.10 chosen: 0.05's margin is within one
+ * embedder revision of flipping, 0.15 churns more for no gate benefit.
+ * Weight rebalances measured WORSE (both swept alternatives failed the
+ * battery's stability gate) — the SCORE_*_WEIGHT values stay as shipped.
+ * ZERO-boost neutral (never a penalty): graph-only and single-channel
+ * candidates add nothing.
  */
 export const BOTH_CHANNEL_BOOST = 0.10;
 
@@ -453,11 +450,11 @@ export const BM25_WEIGHT_DOMAIN = 2.0;
 // ---------------------------------------------------------------------------
 
 /**
- * Write cap on base_strength / importance (#425, owner decision D2
- * 2026-09-13: cap 0.95). The decay model's rate is `1 − BASE_DECAY·(1 −
+ * Write cap on base_strength / importance (#425, decision D2: cap 0.95).
+ * The decay model's rate is `1 − BASE_DECAY·(1 −
  * importance)` — at importance exactly 1.0 the rate is exactly 1.0 and the
- * row NEVER decays (measured on the production snapshot: ~14% of live rows
- * pegged at ≥0.999, 1838/17399 at exactly 1.0). The cap kills the
+ * row NEVER decays (measured on a production snapshot: a meaningful share
+ * of live rows pegged at ≥0.999, many at exactly 1.0). The cap kills the
  * immortality cliff at every write site (stageImportance, enrich, hub
  * boost) while keeping a multi-year half-life for the top band (0.95 →
  * ~13 years). effectiveStrength ALSO clamps the read side, so legacy
@@ -481,13 +478,13 @@ export const IMPORTANCE_SETTLE_WINDOW_DAYS = 3;
 /** Deterministic merge ceiling of the unified resolution pass (#392): pairs
  *  at/above this cosine merge LLM-free; [CORRECTION_MIN_SIMILARITY, this)
  *  get the one verdict call. 0.92 — measured on the #191 mechanical audit
- *  corpus (89 clusters / 110 excess rows; data/audit-20260729). */
+ *  corpus. */
 export const DEDUP_AUTO_MERGE_THRESHOLD = 0.92;
 
 /** Minimum cosine for a reconsolidation correction pair (#384). Deliberately
  *  wide: a retraction often rides inside an otherwise unrelated memory; the
  *  verdict + confidence gate carry the precision. (The retired Stage 3.7
- *  supersession scan's 0.80 floor — #206-B, owner decision 6 — is subsumed:
+ *  supersession scan's 0.80 floor — #206-B, decision 6 — is subsumed:
  *  3.8 scans all shapes from this wider floor.) */
 export const CORRECTION_MIN_SIMILARITY = 0.75;
 
@@ -497,19 +494,19 @@ export const CORRECTION_MIN_SIMILARITY = 0.75;
 export const CORRECTION_REWRITE_MIN_CONFIDENCE = 0.80;
 
 /** Minimum cosine(memory embedding, best domain prototype) for a no-fit
- *  memory to earn a WEAK primary instead of decaying (owner amendment
- *  07.07). Starting point for bge-small-en-v1.5. */
+ *  memory to earn a WEAK primary instead of decaying (spec 2026-07-07
+ *  amendment). Starting point for bge-small-en-v1.5. */
 export const WEAK_PRIMARY_FLOOR = 0.45;
 
 // ---------------------------------------------------------------------------
 // Console presentation family (#409/#421) — stage thresholds for the
 // /dashboard console. The STAGE BANDS are calibrated per release against the
-// MEASURED distribution (2026-09-13 against the inflated store; this release
+// MEASURED distribution (first against the inflated store; this release
 // re-derived against the post-#425 backfilled store — see the block JSDoc
 // immediately below). The recall-grade zones that used to
-// live here are REMOVED per the owner semantics ruling 2026-09-13 (#426):
-// recall depends only on the conversation — "if the index is good enough for
-// the context needed, it does not have to be fetched" — so a graded
+// live here are REMOVED per the #426 semantics ruling:
+// recall depends only on the conversation — if the index is good enough for
+// the context needed, it does not have to be fetched — so a graded
 // Low/Medium/Good/Excellent scale is the wrong instrument (higher is not a
 // target that exists). The console shows the raw uses-per-showing ratio + a
 // trend; the reference expectations for reading that number live on #426,
@@ -521,22 +518,22 @@ export const WEAK_PRIMARY_FLOOR = 0.45;
 /**
  * Console stage bands (#409/#421) — TWO #408-contract calibrations:
  *
- * (1) 2026-09-13 (PR #424 fix round) against the INFLATED distribution:
+ * (1) The #424 fix round, against the INFLATED distribution:
  *     effectiveStrength p25 = 0.599, p50 = 0.788, p86 = 0.900, ~14%
  *     saturated at exactly 1.000 → edges 0.40/0.60/0.90 targeting a rendered
  *     split ≈ 10/15/61/14 (fading/forming/belief/truth).
  *
  * (2) This release (#425) against the POST-FIX distribution: the importance
  *     recalibration (re-anchored prompt + 0.95 cap) plus the
- *     rescore-importance backfill re-spread the same 17,399-row store to
+ *     rescore-importance backfill re-spread the store to
  *     base_strength median 0.40 / p90 0.60 / max 0.90 (zero rows ≥ 0.999);
  *     measured effectiveStrength on the backfilled copy: p25 ≈ 0.296,
- *     p50 ≈ 0.397, p75 ≈ 0.497, p86 ≈ 0.585, max ≈ 0.900. The stale 2026-09-13
+ *     p50 ≈ 0.397, p75 ≈ 0.497, p86 ≈ 0.585, max ≈ 0.900. The stale
  *     edges rendered that store as 58.5/37.2/4.2/0 — no Truth left. These
  *     edges (0.20/0.30/0.58) re-derive the same ≈ 10/15/61/14 split intent
  *     against the honest distribution and render 11.8/25.6/47.7/14.9 (the
  *     scorer emits one-decimal scores, so the mass clusters at exact atoms —
- *     0.20/0.30/0.60 — and the 0.60 atom alone holds ~12% of the store; the
+ *     0.20/0.30/0.60 — and the 0.60 atom alone holds a large share of the store; the
  *     truth edge therefore sits at 0.58, just under the atom, rather than on
  *     the round number that would strand it). Evidence: the #425
  *     post-backfill band-stats photo (backfilled copy, deriveStage math via
@@ -553,8 +550,8 @@ export const STAGE_FADING_DAYS = 120;
 
 /**
  * Effective-strength ceiling of the living bands: below this the memory is
- * Fading (the measured weak cluster + the recency-gated rim, together ~12% of
- * the post-#425 store) even when recently touched.
+ * Fading (the measured weak cluster + the recency-gated rim, together a
+ * meaningful slice of the post-#425 store) even when recently touched.
  */
 export const STAGE_FADING_STRENGTH = 0.20;
 
@@ -584,11 +581,11 @@ export const ENRICH_STRENGTH_DELTA = 0.10;
  * Days of session history a FIRST nightly run discovers (the first-run
  * watermark is now − this many days, not the epoch).
  *
- * Owner ruling (2026-09-14, #436): full-history first-run ingestion is not
- * feasible — "if everybody signing up ingests their full history, we will
- * pay millions in tokens during the trial period before customers pay us
- * anything." Cloud needs a very short window; the local/installable version
- * uses the SAME default.
+ * Design ruling (#436): full-history first-run ingestion is not
+ * feasible — if everybody signing up ingests their full history, the
+ * service pays millions in tokens during the trial period before
+ * customers pay anything. Cloud needs a very short window; the
+ * local/installable version uses the SAME default.
  *
  * Unlike every other constant in this module, this one KEEPS a config
  * override (`firstRunLookbackDays`, read at the capture call sites): it
@@ -694,10 +691,10 @@ export function resolveOllamaFlushWaitMs(): number {
 
 /**
  * Re-check interval (ms) while the drain's yield signal reports the LLM
- * endpoint busy (#529 owner ruling 05.10.2026: interactive use always
- * yields). The drain waits one interval between probe re-checks instead of
+ * endpoint busy (#529 ruling: interactive use always yields). The drain
+ * waits one interval between probe re-checks instead of
  * polling in a tight loop; 30 s is short enough that the run resumes within
- * half a minute of the owner going idle, long enough not to hammer the
+ * half a minute of interactive use ending, long enough not to hammer the
  * signal endpoint while a long interactive session runs.
  */
 export const DRAIN_YIELD_POLL_MS = 30_000;

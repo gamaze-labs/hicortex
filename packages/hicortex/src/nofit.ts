@@ -1,6 +1,6 @@
 /**
  * No-fit lifecycle — weak-primary floor + no-association decay
- * (owner amendment 07.07).
+ * (spec 2026-07-07 amendment).
  *
  * THE MODEL
  * ---------
@@ -16,7 +16,7 @@
  *      humbly, with one weak association.
  *
  *   2. NO ASSOCIATION — best cosine below the floor means the memory
- *      associates with nothing the owner cares about. It is NOT tagged;
+ *      associates with nothing the user cares about. It is NOT tagged;
  *      instead its base_strength is HALVED (floored at
  *      NO_ASSOCIATION_MIN_STRENGTH) so the existing decay/prune stage
  *      eventually removes it. domain stays NULL, which keeps the memory in

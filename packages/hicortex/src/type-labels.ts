@@ -14,7 +14,7 @@
  * the old keys so a briefly-stale reader (e.g. a snapshot taken mid-migrate)
  * renders correctly.
  *
- * Mapping (decided 2026-08-11, research/2026-08-11-identity-reframe-brainstorm.md):
+ * Mapping (the identity-reframe decision):
  *   fact     → knowledge
  *   episode  → experience
  *   decision → decisions

@@ -25,8 +25,10 @@ export async function injectSeedLesson(
 ): Promise<void> {
   try {
     // #332: existence check over the whole lesson store (server-internal —
-    // the seed must never re-inject because the gate hid it).
-    const existing = storage.getLessons(database, 365, null, { includeConfidential: true });
+    // the seed must never re-inject because the gate hid it). #642: allSpaces
+    // is the explicit whole-store form (every pool, not just shared +
+    // confidential).
+    const existing = storage.getLessons(database, 365, null, { allSpaces: true });
     const hasSeed = existing.some(
       (l) => l.content.includes("1% Daily Self-Improvement") ||
              l.source_agent === "hicortex/seed"

@@ -4,20 +4,27 @@
  */
 
 /**
- * The two-level memory classification (#332), carried by `memories.privacy`
- * (resurrected from its vestigial 0.16.x role — the legacy PUBLIC/WORK/
- * PERSONAL/SENSITIVE vocabulary is dead; migration v27 maps every legacy
- * value and NULL to 'standard'). 'confidential' is ONLY ever set by the
- * server: derived at intake from `source_agent` × the `confidentialAgents`
- * config roster, a `confidentialPaths` workspace match (#609), or marker
- * content validated against the server's `confidentialMarkerKey` (#614) — or
- * stamped by the `hicortex backfill-privacy` command; the client only RELAYS
- * raw inputs, it never declares the class. The class is a hard gate on every
- * agent-facing read path (absent/unknown requester = non-member =
- * confidential rows omitted, single fetch 404) and routes every LLM touch of
- * confidential text to the separately configured confidential model.
+ * The memory classification (#332), carried by `memories.privacy` and WIDENED
+ * IN PLACE by spaces (#642, no migration — values are data): the column now
+ * carries `'standard' | <configured space id>`, where the id of any space in
+ * the `spaces` config map is a legal value and 'confidential' is the
+ * LEGACY-MATERIALIZED space (confidentialAgents/confidentialPaths seed a
+ * pre-configured `confidential` space — an existing confidential-only install
+ * is the N=1 case of the same machinery, byte-for-byte). 'standard' (and
+ * NULL, the pre-v27 shape every NULL-safe predicate already reads as shared)
+ * is the FIXED shared pool, never a space id. Space ids are ONLY ever set by
+ * the server: derived at intake from per-space path patterns or member lists
+ * (deriveIntakeSpace, precedence paths → members → the confidential marker
+ * arm #614), or stamped by backfill; the client only RELAYS raw inputs, it
+ * never declares the class. The stamp is a hard gate on every agent-facing
+ * read path (absent/unknown requester sees shared only — other spaces' rows
+ * omitted, single fetch 404) and routes every LLM touch of non-shared text to
+ * the space's (or the confidential) model — never the main model. The
+ * `(string & {})` tail keeps the literal autocomplete while letting any
+ * configured id typecheck; write paths REFUSE unconfigured ids
+ * (normalizeStoredPrivacy, #642 AC-7).
  */
-export type MemoryPrivacy = "standard" | "confidential";
+export type MemoryPrivacy = "standard" | "confidential" | (string & {});
 
 /** A stored memory record. */
 export interface Memory {
@@ -266,6 +273,13 @@ export interface ConsolidationReport {
        * paid gain; the nightly re-settle leaves them alone.
        */
       guard_skipped?: number;
+      /**
+       * #332: confidential rows held — no confidential client configured
+       * (retried next run, never the main model).
+       */
+      skipped_confidential?: number;
+      /** #642: rows held per space id — no client for that space. */
+      skipped_spaces?: Record<string, number>;
     };
     reflection?: {
       lessons_generated: number;
@@ -273,6 +287,10 @@ export interface ConsolidationReport {
       failed?: boolean;
       skipped?: boolean;
       reason?: string;
+      /** #332: the confidential cohort held — no confidential client. */
+      confidential_skipped?: boolean;
+      /** #642: every non-shared cohort that held (space ids, incl. retired). */
+      held_spaces?: string[];
     };
     domain_curation?: {
       curated: boolean;
@@ -296,6 +314,11 @@ export interface ConsolidationReport {
        * base_strength halved (accelerated decay toward prune).
        */
       no_association_decayed?: number;
+      /** #332: confidential rows held (no confidential client) — retried
+       *  next run. */
+      held_confidential?: number;
+      /** #642: rows held per space id (no client for that space). */
+      held_spaces?: Record<string, number>;
       reason?: string;
     };
     links?: {
@@ -309,7 +332,7 @@ export interface ConsolidationReport {
      * Since #392 this is THE unified resolution stage: its verdict also carries
      * a `merge` disposition, and the deterministic merge zone (pairs at/above
      * the merge ceiling — release-managed since #408) runs inside it,
-     * LLM-free, before the scan. Since #206-B (owner decision 6) it is also
+     * LLM-free, before the scan. Since #206-B (decision 6) it is also
      * the ONLY true-update detector — the standalone supersession stage
      * (3.7, #191 Phase B) is retired into its `supersedes` verdict action,
      * and its former `supersession` report slot no longer exists.
@@ -579,7 +602,7 @@ export interface HicortexConfig {
    * example (a wider life-sphere set) ships as
    * domains.example.json in the package root.
    *
-   * NO fallback bucket is needed or special-cased (owner amendment 07.07):
+   * NO fallback bucket is needed or special-cased (spec 2026-07-07 amendment):
    * a genuine no-fit memory gets a WEAK primary from prototype cosines when
    * possible, else it decays toward pruning (see nofit.ts). A domain named
    * "Unsorted" — if configured — is just a normal domain.
@@ -650,7 +673,7 @@ export interface HicortexConfig {
    * path — applies to ALL phases (distill / reflect / classify / scoring) since one
    * model serves all of them. Default false. A thinking model with thinking ON can
    * burn the entire token budget on an unclosed <think> block and emit nothing
-   * (probed 2026-08-04). When set (true or false), completeOpenAiCompat sends
+   * (observed live). When set (true or false), completeOpenAiCompat sends
    * chat_template_kwargs:{enable_thinking}. LOCAL-ENDPOINT ONLY: this is meaningful
    * only for a chat-template-aware server (ollama, mlx-lm). If the one model is a
    * cloud OpenAI-compatible endpoint (OpenAI / OpenRouter / Groq / z.ai), LEAVE THIS
@@ -667,7 +690,7 @@ export interface HicortexConfig {
    * with undici's hidden 5-minute header/body timers disabled, so this knob is
    * the ONLY ceiling: a legitimate long generation is no longer abandoned
    * client-side at 5 min while the server keeps generating for the dead
-   * client (the 2026-08-23/24 incident's amplification mechanism). Before
+   * client (a production incident's amplification mechanism). Before
    * #337, scoring used a 600 s ceiling and the other phases 900 s; one knob
    * now covers all four. No effect on the ollama path (already streams) or
    * claude-cli (subprocess timeout).
@@ -769,7 +792,7 @@ export interface HicortexConfig {
   memorySoftCap?: number;
   /**
    * The cross-project recall fence bar (#566; default 0.72 — fence ON when
-   * the key is absent, owner ruling 2026-10-28). A memory from a different
+   * the key is absent — #566 ruling). A memory from a different
    * project than the request's must clear this bar on a measured cosine to be
    * admitted into recall/search results; same-project and unscoped recall are
    * unchanged. `0` or any value ≤ the recall floor (0.62) = fence off
@@ -853,8 +876,8 @@ export interface HicortexConfig {
    * #332 — the confidential-circle roster: agent ids (the same sanitized id
    * namespace as `identityAgents` / `?agent=`) whose captures are stamped
    * `confidential` at intake (matched by `source_agent` with the first
-   * `<harness>/` segment stripped, so a Hermes profile `atlas` capturing as
-   * `hermes/atlas` matches the roster entry `atlas`) and whose read requests
+   * `<harness>/` segment stripped, so a Hermes profile `nova` capturing as
+   * `hermes/nova` matches the roster entry `nova`) and whose read requests
    * (the optional `agent` param on every agent-facing read path) see both
    * pools. Absent/empty (the default) = no circle: every capture is
    * standard, nothing is ever omitted, zero behavior change. Deploy-time
